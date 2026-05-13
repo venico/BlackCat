@@ -118,6 +118,7 @@ private struct AssetRow: View {
                     .font(.system(size: 12, weight: .medium))
                     .foregroundColor(Color.labelPrimary)
                     .lineLimit(2)
+                    .frame(minHeight: 32, alignment: .topLeading)
                     .help(asset.name)
 
                 if asset.duration > 0 {
@@ -153,22 +154,33 @@ private struct AssetRow: View {
         }
     }
 
+    private func fmtDur(_ d: Double) -> String {
+        let h = Int(d)/3600; let m = Int(d)/60%60; let s = Int(d)%60
+        return h > 0 ? String(format:"%d:%02d:%02d",h,m,s) : String(format:"%02d:%02d",m,s)
+    }
+
     @ViewBuilder
     private func miniBtn(icon: String, action: @escaping () -> Void) -> some View {
+        MiniBtnView(icon: icon, action: action)
+    }
+}
+
+private struct MiniBtnView: View {
+    let icon: String
+    let action: () -> Void
+    @State private var hovering = false
+
+    var body: some View {
         Button(action: action) {
             Image(systemName: icon)
                 .font(.system(size: 12, weight: .light))
                 .foregroundColor(Color.labelSecondary)
                 .frame(width: 26, height: 26)
-                .background(Color.white.opacity(0.08))
+                .background(hovering ? Color.white.opacity(0.12) : Color.clear)
                 .clipShape(RoundedRectangle(cornerRadius: 5))
         }
         .buttonStyle(.plain)
-    }
-
-    private func fmtDur(_ d: Double) -> String {
-        let h = Int(d)/3600; let m = Int(d)/60%60; let s = Int(d)%60
-        return h > 0 ? String(format:"%d:%02d:%02d",h,m,s) : String(format:"%02d:%02d",m,s)
+        .onHover { hovering = $0 }
     }
 }
 

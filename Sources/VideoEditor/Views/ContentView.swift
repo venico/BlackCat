@@ -7,6 +7,8 @@ struct ContentView: View {
     @State private var topHeight: CGFloat = 420
     @State private var isDraggingH = false
     @State private var sidebarVisible = true
+    @State private var sidebarWidth: CGFloat = 220
+    @State private var inspectorWidth: CGFloat = 280
 
     // Height of the shared "title-bar" row that contains traffic lights + toggle
     private let toolbarH: CGFloat = 28
@@ -30,7 +32,7 @@ struct ContentView: View {
                     // Content
                     MediaLibraryView()
                 }
-                .frame(width: 220)
+                .frame(width: sidebarWidth)
                 .frame(maxHeight: .infinity)
                 .background(Color(red: 0.15, green: 0.15, blue: 0.16))
                 .clipShape(RoundedRectangle(cornerRadius: 12))
@@ -41,8 +43,22 @@ struct ContentView: View {
                 .padding(.top, 8)
                 .padding(.leading, 8)
                 .padding(.bottom, 8)
-                // no trailing — gap to video card comes from video's own leading padding
                 .transition(.move(edge: .leading).combined(with: .opacity))
+                // Sidebar right-edge drag handle (overlaps the 8px gap)
+                .overlay(alignment: .trailing) {
+                    Color.clear
+                        .frame(width: 8)
+                        .contentShape(Rectangle())
+                        .offset(x: 4)
+                        .onHover { h in if h { NSCursor.resizeLeftRight.set() } else { NSCursor.arrow.set() } }
+                        .gesture(DragGesture(minimumDistance: 1)
+                            .onChanged { v in
+                                sidebarWidth = (sidebarWidth + v.translation.width)
+                                    .clamped(to: 160...400)
+                            }
+                            .onEnded { _ in NSCursor.arrow.set() }
+                        )
+                }
             }
 
             // ── Main content ───────────────────────────────────────
@@ -58,11 +74,26 @@ struct ContentView: View {
                                 .overlay(RoundedRectangle(cornerRadius: 12)
                                     .stroke(Color.white.opacity(0.20), lineWidth: 0.5))
                             InspectorView()
-                                .frame(width: 280)
+                                .frame(width: inspectorWidth)
                                 .background(Color.panelBg)
                                 .clipShape(RoundedRectangle(cornerRadius: 12))
                                 .overlay(RoundedRectangle(cornerRadius: 12)
                                     .stroke(Color.white.opacity(0.20), lineWidth: 0.5))
+                                // Inspector left-edge drag handle (overlaps the 8px gap)
+                                .overlay(alignment: .leading) {
+                                    Color.clear
+                                        .frame(width: 8)
+                                        .contentShape(Rectangle())
+                                        .offset(x: -4)
+                                        .onHover { h in if h { NSCursor.resizeLeftRight.set() } else { NSCursor.arrow.set() } }
+                                        .gesture(DragGesture(minimumDistance: 1)
+                                            .onChanged { v in
+                                                inspectorWidth = (inspectorWidth - v.translation.width)
+                                                    .clamped(to: 200...450)
+                                            }
+                                            .onEnded { _ in NSCursor.arrow.set() }
+                                        )
+                                }
                         }
                         .frame(height: topHeight)
                         .padding(.top, 8)
@@ -71,7 +102,8 @@ struct ContentView: View {
                         // Drag handle — the 8px gap between top and bottom cards
                         Color.clear
                             .frame(height: 8)
-                            .onHover { _ in NSCursor.resizeUpDown.set() }
+                            .contentShape(Rectangle())
+                            .onHover { h in if h { NSCursor.resizeUpDown.set() } else { NSCursor.arrow.set() } }
                             .gesture(DragGesture(minimumDistance: 1)
                                 .onChanged { v in
                                     isDraggingH = true
