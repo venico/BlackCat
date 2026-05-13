@@ -3,6 +3,7 @@ import AppKit
 
 struct ContentView: View {
     @StateObject private var project = ProjectState()
+    @StateObject private var exportManager = ExportManager.shared
     @State private var topHeight: CGFloat = 420
     @State private var isDraggingH = false
     @State private var sidebarVisible = true
@@ -111,6 +112,9 @@ struct ContentView: View {
             }
         }
         .background(Color.black)
+        .overlay(alignment: .bottomTrailing) {
+            ExportProgressOverlay(manager: exportManager)
+        }
         .environmentObject(project)
         .ignoresSafeArea()
         .animation(.spring(response: 0.28, dampingFraction: 0.82), value: sidebarVisible)

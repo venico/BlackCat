@@ -162,10 +162,6 @@ final class ProjectState: ObservableObject {
     // Export
     @Published var exportSettings  = ExportSettings()
     @Published var showExportSheet = false
-    @Published var isExporting     = false
-    @Published var exportProgress: Double = 0   // 0…1
-    @Published var exportError:   String? = nil
-    @Published var exportFinishedAt: URL? = nil
 
     // Undo / Redo
     @Published var undoCount: Int = 0

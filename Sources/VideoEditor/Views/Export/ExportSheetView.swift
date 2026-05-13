@@ -2,9 +2,193 @@ import SwiftUI
 import AVFoundation
 import CoreText
 
+// MARK: - Export Job Manager (supports multiple concurrent exports)
+
+final class ExportManager: ObservableObject {
+    static let shared = ExportManager()
+
+    struct Job: Identifiable {
+        let id = UUID()
+        let filename: String
+        var progress: Double = 0
+        var state: JobState = .running
+        var outputURL: URL?
+        var error: String?
+    }
+
+    enum JobState { case running, done, failed }
+
+    @Published var jobs: [Job] = []
+
+    /// 从列表移除已完成/失败的 job
+    func dismiss(_ id: UUID) {
+        withAnimation(.easeOut(duration: 0.25)) {
+            jobs.removeAll { $0.id == id }
+        }
+    }
+
+    /// 启动一个新的导出任务，立即返回
+    func startExport(snapshot: ExportInput) {
+        let job = Job(filename: snapshot.outputURL.lastPathComponent, outputURL: snapshot.outputURL)
+        let jobID = job.id
+        withAnimation(.easeOut(duration: 0.25)) { jobs.append(job) }
+
+        Task.detached {
+            let exporter = TimelineExporter()
+            do {
+                let url = try await exporter.export(snapshot) { p in
+                    Task { @MainActor in
+                        if let i = self.jobs.firstIndex(where: { $0.id == jobID }) {
+                            self.jobs[i].progress = p
+                        }
+                    }
+                }
+                await MainActor.run {
+                    if let i = self.jobs.firstIndex(where: { $0.id == jobID }) {
+                        self.jobs[i].progress = 1
+                        self.jobs[i].state = .done
+                        self.jobs[i].outputURL = url
+                    }
+                }
+            } catch {
+                await MainActor.run {
+                    if let i = self.jobs.firstIndex(where: { $0.id == jobID }) {
+                        self.jobs[i].state = .failed
+                        self.jobs[i].error = error.localizedDescription
+                    }
+                }
+            }
+        }
+    }
+}
+
+// MARK: - Export Progress Overlay (bottom-right bubbles)
+
+struct ExportProgressOverlay: View {
+    @ObservedObject var manager: ExportManager
+
+    var body: some View {
+        VStack(alignment: .trailing, spacing: 8) {
+            ForEach(manager.jobs) { job in
+                ExportJobBubble(job: job) {
+                    if job.state == .done, let url = job.outputURL {
+                        NSWorkspace.shared.activateFileViewerSelecting([url])
+                    }
+                    manager.dismiss(job.id)
+                }
+                .transition(.asymmetric(
+                    insertion: .move(edge: .trailing).combined(with: .opacity),
+                    removal: .opacity))
+            }
+        }
+        .padding(.trailing, 16)
+        .padding(.bottom, 16)
+        .animation(.spring(response: 0.35, dampingFraction: 0.8), value: manager.jobs.count)
+    }
+}
+
+private struct ExportJobBubble: View {
+    let job: ExportManager.Job
+    let onTap: () -> Void
+    @State private var hovering = false
+
+    var body: some View {
+        Button(action: onTap) {
+            HStack(spacing: 10) {
+                // Icon
+                ZStack {
+                    Circle()
+                        .fill(iconBgColor)
+                        .frame(width: 28, height: 28)
+                    Image(systemName: iconName)
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundColor(iconFgColor)
+                }
+
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(job.filename)
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundColor(Color.labelPrimary)
+                        .lineLimit(1).truncationMode(.middle)
+
+                    switch job.state {
+                    case .running:
+                        HStack(spacing: 6) {
+                            ProgressView(value: job.progress)
+                                .progressViewStyle(.linear)
+                                .tint(Color.accent)
+                                .frame(width: 100)
+                            Text("\(Int(job.progress * 100))%")
+                                .font(.system(size: 10).monospacedDigit())
+                                .foregroundColor(Color.labelSecondary)
+                        }
+                    case .done:
+                        Text("导出完成 · 点击查看")
+                            .font(.system(size: 10))
+                            .foregroundColor(Color.accent)
+                    case .failed:
+                        Text("导出失败")
+                            .font(.system(size: 10))
+                            .foregroundColor(.red.opacity(0.8))
+                    }
+                }
+
+                if job.state != .running {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 9, weight: .bold))
+                        .foregroundColor(Color.labelSecondary)
+                        .frame(width: 18, height: 18)
+                        .background(Color.white.opacity(hovering ? 0.15 : 0.08))
+                        .clipShape(Circle())
+                }
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
+            .background(
+                RoundedRectangle(cornerRadius: 10)
+                    .fill(Color(red: 0.16, green: 0.16, blue: 0.17))
+                    .shadow(color: .black.opacity(0.5), radius: 8, y: 4)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 10)
+                    .stroke(Color.white.opacity(0.12), lineWidth: 0.5)
+            )
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering = $0 }
+    }
+
+    private var iconName: String {
+        switch job.state {
+        case .running: return "square.and.arrow.up"
+        case .done:    return "checkmark"
+        case .failed:  return "exclamationmark.triangle"
+        }
+    }
+
+    private var iconBgColor: Color {
+        switch job.state {
+        case .running: return Color.accent.opacity(0.2)
+        case .done:    return Color.green.opacity(0.2)
+        case .failed:  return Color.red.opacity(0.2)
+        }
+    }
+
+    private var iconFgColor: Color {
+        switch job.state {
+        case .running: return Color.accent
+        case .done:    return .green
+        case .failed:  return .red.opacity(0.8)
+        }
+    }
+}
+
+// MARK: - Export Sheet
+
 struct ExportSheetView: View {
     @EnvironmentObject private var project: ProjectState
     @Environment(\.dismiss) private var dismiss
+    @State private var exportError: String?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -30,7 +214,7 @@ struct ExportSheetView: View {
 
             Divider().background(Color.divider)
 
-            // Settings — no ScrollView; content is measured at natural height
+            // Settings
             VStack(alignment: .leading, spacing: 12) {
 
                     // Output path
@@ -89,7 +273,7 @@ struct ExportSheetView: View {
                                 .cornerRadius(7)
                                 .overlay(RoundedRectangle(cornerRadius: 7)
                                     .stroke(Color.white.opacity(0.10)))
-                            Text(".mp4")
+                            Text(extLabel)
                                 .font(.system(size: 11))
                                 .foregroundColor(Color.labelSecondary)
                         }
@@ -156,7 +340,7 @@ struct ExportSheetView: View {
                         }
                     }
 
-                    // Export type — selectable like the fps row
+                    // Export type
                     ESection(title: "导出内容") {
                         HStack(spacing: 8) {
                             ForEach(ExportContent.allCases, id: \.self) { kind in
@@ -184,32 +368,13 @@ struct ExportSheetView: View {
 
             Divider().background(Color.divider)
 
-            // Action row — [progress / error / success status]  ...  取消 [16px] 开始导出
+            // Action row
             HStack(spacing: 16) {
-                // Inline status occupies the flexible left area, left-aligned
-                // with the section content above (same horizontal padding 24).
                 Group {
-                    if project.isExporting {
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text("正在导出… \(Int(project.exportProgress * 100))%")
-                                .font(.system(size: 11)).foregroundColor(Color.labelSecondary)
-                            ProgressView(value: project.exportProgress)
-                                .progressViewStyle(.linear).tint(Color.accent)
-                        }
-                    } else if let err = project.exportError {
-                        Text("导出失败:\(err)")
+                    if let err = exportError {
+                        Text(err)
                             .font(.system(size: 11)).foregroundColor(.red.opacity(0.85))
                             .lineLimit(2)
-                    } else if let url = project.exportFinishedAt {
-                        HStack(spacing: 8) {
-                            Text("已导出到 \(url.lastPathComponent)")
-                                .font(.system(size: 11)).foregroundColor(Color.accent)
-                                .lineLimit(1).truncationMode(.middle)
-                            Button("在 Finder 中显示") {
-                                NSWorkspace.shared.activateFileViewerSelecting([url])
-                            }
-                            .buttonStyle(.link).font(.system(size: 11))
-                        }
                     } else {
                         Color.clear
                     }
@@ -217,7 +382,7 @@ struct ExportSheetView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
 
                 Button { dismiss() } label: {
-                    Text(project.isExporting ? "关闭" : "取消").font(.system(size: 13))
+                    Text("取消").font(.system(size: 13))
                         .foregroundColor(Color.labelSecondary)
                         .frame(width: 80, height: 36)
                         .background(Color.white.opacity(0.08))
@@ -228,22 +393,28 @@ struct ExportSheetView: View {
                 Button {
                     startExport()
                 } label: {
-                    Text(project.isExporting ? "导出中…" : "开始导出")
+                    Text("开始导出")
                         .font(.system(size: 13, weight: .semibold))
                         .foregroundColor(.black)
                         .frame(width: 120, height: 36)
-                        .background(project.isExporting
-                                    ? Color.accent.opacity(0.55) : Color.accent)
+                        .background(Color.accent)
                         .cornerRadius(8)
                 }
                 .buttonStyle(.plain)
-                .disabled(project.isExporting)
             }
             .padding(.horizontal, 24)
             .padding(.vertical, 16)
         }
         .frame(width: 540)
         .background(Color(red: 0.13, green: 0.13, blue: 0.14))
+    }
+
+    private var extLabel: String {
+        switch project.exportSettings.content {
+        case .video:        return ".mp4"
+        case .audioOnly:    return ".m4a"
+        case .subtitleOnly: return ".srt"
+        }
     }
 
     private func defaultFilename() -> String {
@@ -270,8 +441,7 @@ struct ExportSheetView: View {
 
     private func startExport() {
         guard let outputDir = project.exportSettings.outputPath else {
-            project.exportError = "请先选择输出位置"
-            project.exportFinishedAt = nil
+            exportError = "请先选择输出位置"
             return
         }
         let raw = project.exportSettings.filename.trimmingCharacters(in: .whitespaces)
@@ -285,12 +455,6 @@ struct ExportSheetView: View {
         let cleanName = baseName.hasSuffix(ext) ? baseName : "\(baseName)\(ext)"
         let outputURL = outputDir.appendingPathComponent(cleanName)
 
-        // Reset state
-        project.exportError = nil
-        project.exportFinishedAt = nil
-        project.isExporting = true
-        project.exportProgress = 0
-
         let snapshot = ExportInput(
             videoTracks: project.videoTracks,
             audioTracks: project.audioTracks,
@@ -299,24 +463,9 @@ struct ExportSheetView: View {
             settings: project.exportSettings,
             outputURL: outputURL)
 
-        Task.detached {
-            let exporter = TimelineExporter()
-            do {
-                let url = try await exporter.export(snapshot) { p in
-                    Task { @MainActor in project.exportProgress = p }
-                }
-                await MainActor.run {
-                    project.isExporting = false
-                    project.exportProgress = 1
-                    project.exportFinishedAt = url
-                }
-            } catch {
-                await MainActor.run {
-                    project.isExporting = false
-                    project.exportError = error.localizedDescription
-                }
-            }
-        }
+        // 立即关闭导出面板，进度在右下角气泡显示
+        dismiss()
+        ExportManager.shared.startExport(snapshot: snapshot)
     }
 }
 
