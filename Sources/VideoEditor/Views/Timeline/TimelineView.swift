@@ -72,12 +72,46 @@ struct TimelineView: View {
         // (an NSTextView acting as field editor inside an NSTextField).
         // Inspector panels contain TextFields but only block delete while focused.
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
-            guard event.keyCode == 51 || event.keyCode == 117 else { return event }  // ⌫ or ⌦
+            // 文本编辑中不拦截
             if let tv = NSApp.keyWindow?.firstResponder as? NSTextView, tv.isFieldEditor {
-                return event  // user is typing in a text field — let it delete text
+                return event
             }
-            project.deleteSelected()
-            return nil
+
+            // ⌫ or ⌦ → 删除
+            if event.keyCode == 51 || event.keyCode == 117 {
+                project.deleteSelected()
+                return nil
+            }
+
+            // ⌘C → 复制
+            if event.modifierFlags.contains(.command) && event.charactersIgnoringModifiers == "c" {
+                project.copySelected()
+                return nil
+            }
+            // ⌘X → 剪切
+            if event.modifierFlags.contains(.command) && event.charactersIgnoringModifiers == "x" {
+                project.cutSelected()
+                return nil
+            }
+            // ⌘V → 粘贴到播放头位置
+            if event.modifierFlags.contains(.command) && event.charactersIgnoringModifiers == "v" {
+                project.pasteAtPlayhead()
+                return nil
+            }
+            // ⌘⇧Z → 重做（先检查，避免被⌘Z拦截）
+            if event.modifierFlags.contains(.command) && event.modifierFlags.contains(.shift)
+                && event.charactersIgnoringModifiers?.lowercased() == "z" {
+                project.redo()
+                return nil
+            }
+            // ⌘Z → 撤销
+            if event.modifierFlags.contains(.command)
+                && event.charactersIgnoringModifiers?.lowercased() == "z" {
+                project.undo()
+                return nil
+            }
+
+            return event
         }
 
         // Command + scroll wheel → zoom timeline (pixelsPerSecond)

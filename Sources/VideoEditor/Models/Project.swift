@@ -159,6 +159,16 @@ final class ProjectState: ObservableObject {
     // Multi-selection (used by box-select & bulk delete)
     @Published var selectedClipIDs: Set<UUID>    = []
 
+    // Clipboard for copy/cut/paste
+    enum ClipboardItem {
+        case video(VideoClip, trackIndex: Int)
+        case audio(AudioClip, trackIndex: Int)
+        case subtitle(SubtitleClip, trackIndex: Int)
+    }
+    var clipboard: ClipboardItem?
+    var clipboardIsCut: Bool = false   // true = cut (remove source on paste)
+    var clipboardSourceID: UUID?       // original clip ID for cut
+
     // Export
     @Published var exportSettings  = ExportSettings()
     @Published var showExportSheet = false
@@ -508,6 +518,7 @@ final class ProjectState: ObservableObject {
         audioTracks    = s.audioTracks
         subtitleTracks = s.subtitleTracks
         subtitleStyles = s.subtitleStyles
+        rebuildTimelinePreview()
     }
 
     // MARK: - Edit operations
@@ -622,6 +633,149 @@ final class ProjectState: ObservableObject {
             redoCount = 0
             rebuildTimelinePreview()
         }
+    }
+
+    // MARK: - Copy / Cut / Paste
+
+    /// 复制当前选中的片段到剪贴板
+    func copySelected() {
+        if let id = selectedVideoClipID {
+            for (ti, track) in videoTracks.enumerated() {
+                if let clip = track.clips.first(where: { $0.id == id }) {
+                    clipboard = .video(clip, trackIndex: ti)
+                    clipboardIsCut = false
+                    clipboardSourceID = nil
+                    return
+                }
+            }
+        }
+        if let id = selectedAudioClipID {
+            for (ti, track) in audioTracks.enumerated() {
+                if let clip = track.clips.first(where: { $0.id == id }) {
+                    clipboard = .audio(clip, trackIndex: ti)
+                    clipboardIsCut = false
+                    clipboardSourceID = nil
+                    return
+                }
+            }
+        }
+        if let id = selectedSubtitleClipID {
+            for (ti, track) in subtitleTracks.enumerated() {
+                if let clip = track.clips.first(where: { $0.id == id }) {
+                    clipboard = .subtitle(clip, trackIndex: ti)
+                    clipboardIsCut = false
+                    clipboardSourceID = nil
+                    return
+                }
+            }
+        }
+    }
+
+    /// 剪切当前选中的片段（粘贴时移除原始片段）
+    func cutSelected() {
+        if let id = selectedVideoClipID {
+            for (ti, track) in videoTracks.enumerated() {
+                if let clip = track.clips.first(where: { $0.id == id }) {
+                    clipboard = .video(clip, trackIndex: ti)
+                    clipboardIsCut = true
+                    clipboardSourceID = id
+                    return
+                }
+            }
+        }
+        if let id = selectedAudioClipID {
+            for (ti, track) in audioTracks.enumerated() {
+                if let clip = track.clips.first(where: { $0.id == id }) {
+                    clipboard = .audio(clip, trackIndex: ti)
+                    clipboardIsCut = true
+                    clipboardSourceID = id
+                    return
+                }
+            }
+        }
+        if let id = selectedSubtitleClipID {
+            for (ti, track) in subtitleTracks.enumerated() {
+                if let clip = track.clips.first(where: { $0.id == id }) {
+                    clipboard = .subtitle(clip, trackIndex: ti)
+                    clipboardIsCut = true
+                    clipboardSourceID = id
+                    return
+                }
+            }
+        }
+    }
+
+    /// 粘贴剪贴板内容到当前播放头位置，放在同类型的当前选中轨道或原始轨道
+    func pasteAtPlayhead() {
+        guard let item = clipboard else { return }
+        let snap = currentSnapshot()
+        let t = currentTime
+
+        // 如果是剪切，先删除原始片段
+        if clipboardIsCut, let srcID = clipboardSourceID {
+            for i in videoTracks.indices {
+                videoTracks[i].clips.removeAll { $0.id == srcID }
+            }
+            for i in audioTracks.indices {
+                audioTracks[i].clips.removeAll { $0.id == srcID }
+            }
+            for i in subtitleTracks.indices {
+                subtitleTracks[i].clips.removeAll { $0.id == srcID }
+            }
+            // 剪切只能粘贴一次
+            clipboardIsCut = false
+            clipboardSourceID = nil
+        }
+
+        switch item {
+        case .video(let clip, let trackIdx):
+            var newClip = VideoClip(assetID: clip.assetID, name: clip.name, url: clip.url,
+                                    startTime: t, endTime: t + clip.duration, trimStart: clip.trimStart)
+            newClip.volume = clip.volume
+            newClip.overrideResolution = clip.overrideResolution
+            newClip.overrideFPS = clip.overrideFPS
+            newClip.overrideBitrate = clip.overrideBitrate
+            let idx = videoTracks.indices.contains(trackIdx) ? trackIdx : 0
+            if videoTracks.indices.contains(idx) {
+                videoTracks[idx].clips.append(newClip)
+                selectedVideoClipID = newClip.id
+                selectedAudioClipID = nil
+                selectedSubtitleClipID = nil
+            }
+
+        case .audio(let clip, let trackIdx):
+            var newClip = AudioClip(assetID: clip.assetID, name: clip.name, url: clip.url,
+                                    startTime: t, endTime: t + clip.duration, trimStart: clip.trimStart)
+            newClip.volume = clip.volume
+            newClip.leftChannel = clip.leftChannel
+            newClip.rightChannel = clip.rightChannel
+            newClip.sampleRate = clip.sampleRate
+            newClip.format = clip.format
+            let idx = audioTracks.indices.contains(trackIdx) ? trackIdx : 0
+            if audioTracks.indices.contains(idx) {
+                audioTracks[idx].clips.append(newClip)
+                selectedAudioClipID = newClip.id
+                selectedVideoClipID = nil
+                selectedSubtitleClipID = nil
+            }
+
+        case .subtitle(let clip, let trackIdx):
+            let newClip = SubtitleClip(text: clip.text, startTime: t, endTime: t + clip.duration)
+            let idx = subtitleTracks.indices.contains(trackIdx) ? trackIdx : 0
+            if subtitleTracks.indices.contains(idx) {
+                subtitleTracks[idx].clips.append(newClip)
+                selectedSubtitleClipID = newClip.id
+                selectedVideoClipID = nil
+                selectedAudioClipID = nil
+            }
+        }
+
+        undoStack.append(snap)
+        if undoStack.count > 50 { undoStack.removeFirst() }
+        redoStack.removeAll()
+        undoCount = undoStack.count
+        redoCount = 0
+        rebuildTimelinePreview()
     }
 
     /// Move the selected clip so its start aligns with the current playhead.
