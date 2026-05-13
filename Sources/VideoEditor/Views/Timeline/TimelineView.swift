@@ -13,15 +13,17 @@ struct TimelineView: View {
     @State private var dragOp:   DragOp?  = nil
     @State private var boxStart: CGPoint? = nil
     @State private var boxEnd:   CGPoint? = nil
+    @State private var dragGhostPos: CGPoint? = nil  // cursor position during clip drag
+    @State private var draggingClipID: UUID? = nil   // hide original while dragging
 
     // Global event monitors
     @State private var keyMonitor:    Any? = nil
     @State private var scrollMonitor: Any? = nil
 
     private enum DragOp {
-        case moveVideo(id: UUID, originStart: Double, originDur: Double)
-        case moveAudio(id: UUID, originStart: Double, originDur: Double)
-        case moveSubtitle(id: UUID, originStart: Double, originDur: Double)
+        case moveVideo(id: UUID, originStart: Double, originDur: Double, srcTrack: Int)
+        case moveAudio(id: UUID, originStart: Double, originDur: Double, srcTrack: Int)
+        case moveSubtitle(id: UUID, originStart: Double, originDur: Double, srcTrack: Int)
         case moveMulti(items: [DragItem])
         case trimVideoLeft(id: UUID, originStart: Double, originEnd: Double, originTrimStart: Double)
         case trimVideoRight(id: UUID, originStart: Double, originEnd: Double)
@@ -57,6 +59,76 @@ struct TimelineView: View {
 
     private enum ClipTrimEdge { case left, right }
 
+    // Custom trim cursors: trapezoid + triangle indicating direction
+    private static func makeTrimCursorImage(leftSide: Bool) -> NSImage {
+        let w: CGFloat = 20, h: CGFloat = 22
+        return NSImage(size: NSSize(width: w, height: h), flipped: false) { _ in
+            let ctx = NSGraphicsContext.current!.cgContext
+            ctx.setShouldAntialias(true)
+
+            if leftSide {
+                // 微梯形：左窄右宽，宽度减半
+                let trap = CGMutablePath()
+                trap.move(to: CGPoint(x: 4, y: 3))
+                trap.addLine(to: CGPoint(x: 7, y: 1))
+                trap.addLine(to: CGPoint(x: 7, y: 21))
+                trap.addLine(to: CGPoint(x: 4, y: 19))
+                trap.closeSubpath()
+                ctx.setStrokeColor(NSColor.white.cgColor)
+                ctx.setLineWidth(1.5)
+                ctx.addPath(trap); ctx.strokePath()
+                ctx.setFillColor(NSColor.black.withAlphaComponent(0.85).cgColor)
+                ctx.addPath(trap); ctx.fillPath()
+
+                // 右三角 ▶
+                let tri = CGMutablePath()
+                tri.move(to: CGPoint(x: 11, y: 7))
+                tri.addLine(to: CGPoint(x: 16, y: 11))
+                tri.addLine(to: CGPoint(x: 11, y: 15))
+                tri.closeSubpath()
+                ctx.setStrokeColor(NSColor.white.cgColor)
+                ctx.setLineWidth(1.0)
+                ctx.addPath(tri); ctx.strokePath()
+                ctx.setFillColor(NSColor.black.withAlphaComponent(0.85).cgColor)
+                ctx.addPath(tri); ctx.fillPath()
+            } else {
+                // 微梯形：右窄左宽，宽度减半
+                let trap = CGMutablePath()
+                trap.move(to: CGPoint(x: 13, y: 1))
+                trap.addLine(to: CGPoint(x: 16, y: 3))
+                trap.addLine(to: CGPoint(x: 16, y: 19))
+                trap.addLine(to: CGPoint(x: 13, y: 21))
+                trap.closeSubpath()
+                ctx.setStrokeColor(NSColor.white.cgColor)
+                ctx.setLineWidth(1.5)
+                ctx.addPath(trap); ctx.strokePath()
+                ctx.setFillColor(NSColor.black.withAlphaComponent(0.85).cgColor)
+                ctx.addPath(trap); ctx.fillPath()
+
+                // 左三角 ◀
+                let tri = CGMutablePath()
+                tri.move(to: CGPoint(x: 9, y: 7))
+                tri.addLine(to: CGPoint(x: 4, y: 11))
+                tri.addLine(to: CGPoint(x: 9, y: 15))
+                tri.closeSubpath()
+                ctx.setStrokeColor(NSColor.white.cgColor)
+                ctx.setLineWidth(1.0)
+                ctx.addPath(tri); ctx.strokePath()
+                ctx.setFillColor(NSColor.black.withAlphaComponent(0.85).cgColor)
+                ctx.addPath(tri); ctx.fillPath()
+            }
+            return true
+        }
+    }
+
+    static let trimLeftCursor: NSCursor = {
+        NSCursor(image: makeTrimCursorImage(leftSide: true), hotSpot: NSPoint(x: 6, y: 11))
+    }()
+
+    static let trimRightCursor: NSCursor = {
+        NSCursor(image: makeTrimCursorImage(leftSide: false), hotSpot: NSPoint(x: 14, y: 11))
+    }()
+
     var body: some View {
         HStack(spacing: 0) {
             labelColumn
@@ -75,6 +147,15 @@ struct TimelineView: View {
             // 文本编辑中不拦截
             if let tv = NSApp.keyWindow?.firstResponder as? NSTextView, tv.isFieldEditor {
                 return event
+            }
+
+            // Esc → 取消选择
+            if event.keyCode == 53 {
+                project.selectedVideoClipID    = nil
+                project.selectedAudioClipID    = nil
+                project.selectedSubtitleClipID = nil
+                project.selectedClipIDs.removeAll()
+                return nil
             }
 
             // ⌫ or ⌦ → 删除
@@ -220,6 +301,28 @@ struct TimelineView: View {
                             .allowsHitTesting(false)
                     }
 
+                    // Drag ghost overlay
+                    if let gPos = dragGhostPos, let ghostInfo = dragGhostInfo() {
+                        RoundedRectangle(cornerRadius: 4)
+                            .fill(ghostInfo.color.opacity(0.5))
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 4)
+                                    .stroke(Color.white.opacity(0.6), lineWidth: 1.5)
+                            )
+                            .overlay(
+                                Text(ghostInfo.name)
+                                    .font(.system(size: 9, weight: .medium))
+                                    .foregroundColor(.white.opacity(0.9))
+                                    .lineLimit(1)
+                                    .padding(.horizontal, 5)
+                                , alignment: .leading
+                            )
+                            .frame(width: max(ghostInfo.duration * project.pixelsPerSecond, 30),
+                                   height: trackH - 8)
+                            .position(x: gPos.x, y: gPos.y)
+                            .allowsHitTesting(false)
+                    }
+
                     // Playhead (draggable)
                     DraggablePlayhead(pps: project.pixelsPerSecond)
                 }
@@ -244,8 +347,8 @@ struct TimelineView: View {
                     guard dragOp == nil else { return }
                     switch phase {
                     case .active(let loc):
-                        if findClipTarget(at: loc)?.trimEdge != nil {
-                            NSCursor.resizeLeftRight.set()
+                        if let edge = findClipTarget(at: loc)?.trimEdge {
+                            (edge == .left ? Self.trimLeftCursor : Self.trimRightCursor).set()
                         } else {
                             NSCursor.arrow.set()
                         }
@@ -283,13 +386,39 @@ struct TimelineView: View {
                     }
                 }
                 guard let op = dragOp else { return }
+                // Track ghost position for move ops
+                switch op {
+                case .moveVideo, .moveAudio, .moveSubtitle:
+                    dragGhostPos = v.location
+                default: break
+                }
                 applyDrag(op: op, totalTranslation: v.translation, current: v.location)
             }
-            .onEnded { _ in
+            .onEnded { v in
                 if case .box = dragOp, let s = boxStart, let e = boxEnd {
                     let rect = CGRect(x: min(s.x, e.x), y: min(s.y, e.y),
                                       width: abs(e.x - s.x), height: abs(e.y - s.y))
                     finalizeBoxSelect(rect: rect)
+                }
+                // Cross-track move: if the clip was dragged to a different track of the same type
+                if let op = dragOp {
+                    let endY = v.location.y
+                    let destTrack = trackIndexFromY(endY)
+                    switch op {
+                    case .moveVideo(let id, _, _, let srcTrack):
+                        if let dst = destTrack.videoIndex, dst != srcTrack {
+                            project.moveVideoClipToTrack(id: id, from: srcTrack, to: dst)
+                        }
+                    case .moveAudio(let id, _, _, let srcTrack):
+                        if let dst = destTrack.audioIndex, dst != srcTrack {
+                            project.moveAudioClipToTrack(id: id, from: srcTrack, to: dst)
+                        }
+                    case .moveSubtitle(let id, _, _, let srcTrack):
+                        if let dst = destTrack.subtitleIndex, dst != srcTrack {
+                            project.moveSubtitleClipToTrack(id: id, from: srcTrack, to: dst)
+                        }
+                    default: break
+                    }
                 }
                 switch dragOp {
                 case .trimVideoLeft, .trimVideoRight,
@@ -297,13 +426,15 @@ struct TimelineView: View {
                      .trimSubtitleLeft, .trimSubtitleRight:
                     NSCursor.arrow.set()
                     project.rebuildTimelinePreview()
-                case .moveVideo, .moveAudio, .moveMulti:
+                case .moveVideo, .moveAudio, .moveSubtitle, .moveMulti:
                     project.rebuildTimelinePreview()
                 default: break
                 }
                 dragOp = nil
                 boxStart = nil
                 boxEnd = nil
+                dragGhostPos = nil
+                draggingClipID = nil
             }
     }
 
@@ -330,51 +461,57 @@ struct TimelineView: View {
                 project.selectedVideoClipID    = id
                 project.selectedAudioClipID    = nil
                 project.selectedSubtitleClipID = nil
-                dragOp = .moveVideo(id: id, originStart: s, originDur: d)
+                let ti = project.videoTracks.firstIndex { $0.clips.contains { $0.id == id } } ?? 0
+                draggingClipID = id
+                dragOp = .moveVideo(id: id, originStart: s, originDur: d, srcTrack: ti)
             case (.video(let id, let s, let d), .left):
                 let ts = project.videoTracks.flatMap(\.clips).first(where: { $0.id == id })?.trimStart ?? 0
                 selectVideoAndLoad(id: id)
                 dragOp = .trimVideoLeft(id: id, originStart: s, originEnd: s + d, originTrimStart: ts)
-                NSCursor.resizeLeftRight.set()
+                Self.trimLeftCursor.set()
             case (.video(let id, let s, let d), .right):
                 selectVideoAndLoad(id: id)
                 dragOp = .trimVideoRight(id: id, originStart: s, originEnd: s + d)
-                NSCursor.resizeLeftRight.set()
+                Self.trimRightCursor.set()
             case (.audio(let id, let s, let d), nil):
                 project.selectedAudioClipID    = id
                 project.selectedVideoClipID    = nil
                 project.selectedSubtitleClipID = nil
-                dragOp = .moveAudio(id: id, originStart: s, originDur: d)
+                let ti = project.audioTracks.firstIndex { $0.clips.contains { $0.id == id } } ?? 0
+                draggingClipID = id
+                dragOp = .moveAudio(id: id, originStart: s, originDur: d, srcTrack: ti)
             case (.audio(let id, let s, let d), .left):
                 let ts = project.audioTracks.flatMap(\.clips).first(where: { $0.id == id })?.trimStart ?? 0
                 project.selectedAudioClipID    = id
                 project.selectedVideoClipID    = nil
                 project.selectedSubtitleClipID = nil
                 dragOp = .trimAudioLeft(id: id, originStart: s, originEnd: s + d, originTrimStart: ts)
-                NSCursor.resizeLeftRight.set()
+                Self.trimLeftCursor.set()
             case (.audio(let id, let s, let d), .right):
                 project.selectedAudioClipID    = id
                 project.selectedVideoClipID    = nil
                 project.selectedSubtitleClipID = nil
                 dragOp = .trimAudioRight(id: id, originStart: s, originEnd: s + d)
-                NSCursor.resizeLeftRight.set()
+                Self.trimRightCursor.set()
             case (.subtitle(let id, let s, let d), nil):
                 project.selectedSubtitleClipID = id
                 project.selectedVideoClipID    = nil
                 project.selectedAudioClipID    = nil
-                dragOp = .moveSubtitle(id: id, originStart: s, originDur: d)
+                let ti = project.subtitleTracks.firstIndex { $0.clips.contains { $0.id == id } } ?? 0
+                draggingClipID = id
+                dragOp = .moveSubtitle(id: id, originStart: s, originDur: d, srcTrack: ti)
             case (.subtitle(let id, let s, let d), .left):
                 project.selectedSubtitleClipID = id
                 project.selectedVideoClipID    = nil
                 project.selectedAudioClipID    = nil
                 dragOp = .trimSubtitleLeft(id: id, originStart: s, originEnd: s + d)
-                NSCursor.resizeLeftRight.set()
+                Self.trimLeftCursor.set()
             case (.subtitle(let id, let s, let d), .right):
                 project.selectedSubtitleClipID = id
                 project.selectedVideoClipID    = nil
                 project.selectedAudioClipID    = nil
                 dragOp = .trimSubtitleRight(id: id, originStart: s, originEnd: s + d)
-                NSCursor.resizeLeftRight.set()
+                Self.trimRightCursor.set()
             }
         } else {
             dragOp = .box
@@ -424,13 +561,13 @@ struct TimelineView: View {
         let pps = project.pixelsPerSecond
         let dt  = Double(totalTranslation.width) / pps
         switch op {
-        case .moveVideo(let id, let s, let d):
+        case .moveVideo(let id, let s, let d, _):
             let ns = max(0, s + dt)
             project.updateVideoClip(id: id) { $0.startTime = ns; $0.endTime = ns + d }
-        case .moveAudio(let id, let s, let d):
+        case .moveAudio(let id, let s, let d, _):
             let ns = max(0, s + dt)
             project.updateAudioClip(id: id) { $0.startTime = ns; $0.endTime = ns + d }
-        case .moveSubtitle(let id, let s, let d):
+        case .moveSubtitle(let id, let s, let d, _):
             let ns = max(0, s + dt)
             project.updateSubtitleTime(id: id, start: ns, end: ns + d)
         case .moveMulti(let items):
@@ -594,7 +731,8 @@ struct TimelineView: View {
             trackRow(height: trackH, hidden: !project.videoTracks[i].isVisible) {
                 ForEach(project.videoTracks[i].clips) { clip in
                     VideoClipView(clip: clip, pps: project.pixelsPerSecond, h: trackH,
-                                  sel: isSelected(clip.id, primary: project.selectedVideoClipID))
+                                  sel: isSelected(clip.id, primary: project.selectedVideoClipID),
+                                  isDragging: draggingClipID == clip.id)
                 }
             }
         }
@@ -602,7 +740,8 @@ struct TimelineView: View {
             trackRow(height: trackH, hidden: !project.audioTracks[i].isVisible) {
                 ForEach(project.audioTracks[i].clips) { clip in
                     AudioClipView(clip: clip, pps: project.pixelsPerSecond, h: trackH,
-                                  sel: isSelected(clip.id, primary: project.selectedAudioClipID))
+                                  sel: isSelected(clip.id, primary: project.selectedAudioClipID),
+                                  isDragging: draggingClipID == clip.id)
                 }
             }
         }
@@ -610,14 +749,58 @@ struct TimelineView: View {
             trackRow(height: trackH, hidden: !project.subtitleTracks[i].isVisible) {
                 ForEach(project.subtitleTracks[i].clips) { clip in
                     SubtitleClipView(clip: clip, pps: project.pixelsPerSecond, h: trackH,
-                                     sel: isSelected(clip.id, primary: project.selectedSubtitleClipID))
+                                     sel: isSelected(clip.id, primary: project.selectedSubtitleClipID),
+                                     isDragging: draggingClipID == clip.id)
                 }
             }
         }
     }
 
+    private struct GhostInfo {
+        let name: String
+        let duration: Double
+        let color: Color
+    }
+
+    private func dragGhostInfo() -> GhostInfo? {
+        switch dragOp {
+        case .moveVideo(let id, _, _, _):
+            guard let clip = project.videoTracks.flatMap(\.clips).first(where: { $0.id == id }) else { return nil }
+            return GhostInfo(name: clip.name, duration: clip.duration, color: Color(hex: "#3DBFBA"))
+        case .moveAudio(let id, _, _, _):
+            guard let clip = project.audioTracks.flatMap(\.clips).first(where: { $0.id == id }) else { return nil }
+            return GhostInfo(name: clip.name, duration: clip.duration, color: Color(hex: "#5DB85D"))
+        case .moveSubtitle(let id, _, _, _):
+            guard let clip = project.subtitleTracks.flatMap(\.clips).first(where: { $0.id == id }) else { return nil }
+            return GhostInfo(name: clip.text, duration: clip.duration, color: Color(hex: "#7B6FC4"))
+        default: return nil
+        }
+    }
+
     private func isSelected(_ id: UUID, primary: UUID?) -> Bool {
         primary == id || project.selectedClipIDs.contains(id)
+    }
+
+    /// Determine which track type & index the y coordinate falls on
+    private struct TrackTarget {
+        var videoIndex: Int?
+        var audioIndex: Int?
+        var subtitleIndex: Int?
+    }
+
+    private func trackIndexFromY(_ y: CGFloat) -> TrackTarget {
+        let row = Int((y - rulerH) / trackH)
+        let vCount = project.videoTracks.count
+        let aCount = project.audioTracks.count
+        let sCount = project.subtitleTracks.count
+        if row < vCount {
+            return TrackTarget(videoIndex: row)
+        } else if row < vCount + aCount {
+            return TrackTarget(audioIndex: row - vCount)
+        } else if row < vCount + aCount + sCount {
+            return TrackTarget(subtitleIndex: row - vCount - aCount)
+        }
+        return TrackTarget()
     }
 
     @ViewBuilder
@@ -711,13 +894,14 @@ private struct VideoClipView: View {
     let pps: Double
     let h: CGFloat
     let sel: Bool
+    var isDragging: Bool = false
     @EnvironmentObject var project: ProjectState
 
     var body: some View {
         let w = max(clip.duration*pps, 5)
         ZStack(alignment:.leading) {
             RoundedRectangle(cornerRadius:4).fill(Color(hex:"#3DBFBA").opacity(0.82))
-                .overlay(RoundedRectangle(cornerRadius:4).stroke(sel ? Color.accent : Color.clear, lineWidth: 1.5))
+                .overlay(RoundedRectangle(cornerRadius:4).stroke(sel ? Color.white : Color.clear, lineWidth: sel ? 2 : 0))
             VStack(alignment:.leading, spacing:1) {
                 Text(clip.name).font(.system(size:9, weight:.medium))
                     .foregroundColor(.white.opacity(0.9)).lineLimit(1)
@@ -726,13 +910,28 @@ private struct VideoClipView: View {
             }.padding(.horizontal, 5)
         }
         .frame(width: w, height: h-4)
+        .opacity(isDragging ? 0 : (project.clipboardIsCut && project.clipboardSourceID == clip.id ? 0.35 : 1.0))
         .offset(x: clip.startTime*pps + 1)
-        .onTapGesture {
+        .gesture(TapGesture().modifiers(.shift).onEnded {
+            project.shiftToggleClip(clip.id)
+        })
+        .simultaneousGesture(TapGesture().onEnded {
+            guard !NSEvent.modifierFlags.contains(.shift) else { return }
             project.selectedVideoClipID    = clip.id
             project.selectedAudioClipID    = nil
             project.selectedSubtitleClipID = nil
             project.selectedClipIDs.removeAll()
             project.loadClipForPreview(clip)
+        })
+        .contextMenu {
+            Button { project.selectLeftOf(clip.id) } label: { Label("向左全选", systemImage: "arrow.left.to.line") }
+            Button { project.selectRightOf(clip.id) } label: { Label("向右全选", systemImage: "arrow.right.to.line") }
+            Divider()
+            Button { project.copySelected() } label: { Label("复制", systemImage: "doc.on.doc") }
+            Button { project.cutSelected() } label: { Label("剪切", systemImage: "scissors") }
+            Button { project.pasteAtPlayhead() } label: { Label("粘贴", systemImage: "doc.on.clipboard") }
+            Divider()
+            Button(role: .destructive) { project.deleteSelected() } label: { Label("删除", systemImage: "trash") }
         }
     }
 }
@@ -742,25 +941,41 @@ private struct AudioClipView: View {
     let pps: Double
     let h: CGFloat
     let sel: Bool
+    var isDragging: Bool = false
     @EnvironmentObject var project: ProjectState
 
     var body: some View {
         let w = max(clip.duration*pps, 5)
         ZStack(alignment: .leading) {
             RoundedRectangle(cornerRadius:4).fill(Color(hex:"#5DB85D").opacity(0.78))
-                .overlay(RoundedRectangle(cornerRadius:4).stroke(sel ? Color.accent : Color.clear, lineWidth: 1.5))
+                .overlay(RoundedRectangle(cornerRadius:4).stroke(sel ? Color.white : Color.clear, lineWidth: sel ? 2 : 0))
             Text(clip.name).font(.system(size:9, weight:.medium))
                 .foregroundColor(.white.opacity(0.9))
                 .padding(.leading, 5).lineLimit(1)
         }
         .frame(width: w, height: h-4)
+        .opacity(isDragging ? 0 : (project.clipboardIsCut && project.clipboardSourceID == clip.id ? 0.35 : 1.0))
         .offset(x: clip.startTime*pps + 1)
-            .onTapGesture {
-                project.selectedAudioClipID    = clip.id
-                project.selectedVideoClipID    = nil
-                project.selectedSubtitleClipID = nil
-                project.selectedClipIDs.removeAll()
-            }
+        .gesture(TapGesture().modifiers(.shift).onEnded {
+            project.shiftToggleClip(clip.id)
+        })
+        .simultaneousGesture(TapGesture().onEnded {
+            guard !NSEvent.modifierFlags.contains(.shift) else { return }
+            project.selectedAudioClipID    = clip.id
+            project.selectedVideoClipID    = nil
+            project.selectedSubtitleClipID = nil
+            project.selectedClipIDs.removeAll()
+        })
+        .contextMenu {
+            Button { project.selectLeftOf(clip.id) } label: { Label("向左全选", systemImage: "arrow.left.to.line") }
+            Button { project.selectRightOf(clip.id) } label: { Label("向右全选", systemImage: "arrow.right.to.line") }
+            Divider()
+            Button { project.copySelected() } label: { Label("复制", systemImage: "doc.on.doc") }
+            Button { project.cutSelected() } label: { Label("剪切", systemImage: "scissors") }
+            Button { project.pasteAtPlayhead() } label: { Label("粘贴", systemImage: "doc.on.clipboard") }
+            Divider()
+            Button(role: .destructive) { project.deleteSelected() } label: { Label("删除", systemImage: "trash") }
+        }
     }
 }
 
@@ -769,6 +984,7 @@ private struct SubtitleClipView: View {
     let pps: Double
     let h: CGFloat
     let sel: Bool
+    var isDragging: Bool = false
     @EnvironmentObject var project: ProjectState
 
     var body: some View {
@@ -776,7 +992,7 @@ private struct SubtitleClipView: View {
         ZStack(alignment:.topLeading) {
             RoundedRectangle(cornerRadius:4).fill(Color(hex:"#7B6FC4").opacity(0.85))
                 .overlay(RoundedRectangle(cornerRadius:4)
-                    .stroke(sel ? Color.accent : Color(hex:"#9B8FD4").opacity(0.4), lineWidth: 1))
+                    .stroke(sel ? Color.white : Color(hex:"#9B8FD4").opacity(0.4), lineWidth: sel ? 2 : 1))
             if w > 16 {
                 VStack(alignment:.leading, spacing:1) {
                     Text(clip.text.components(separatedBy:"\n").first ?? clip.text)
@@ -788,13 +1004,28 @@ private struct SubtitleClipView: View {
             }
         }
         .frame(width: w, height: h-4)
+        .opacity(isDragging ? 0 : (project.clipboardIsCut && project.clipboardSourceID == clip.id ? 0.35 : 1.0))
         .offset(x: clip.startTime*pps + 1)
-        .onTapGesture {
+        .gesture(TapGesture().modifiers(.shift).onEnded {
+            project.shiftToggleClip(clip.id)
+        })
+        .simultaneousGesture(TapGesture().onEnded {
+            guard !NSEvent.modifierFlags.contains(.shift) else { return }
             project.selectedSubtitleClipID = clip.id
             project.selectedVideoClipID    = nil
             project.selectedAudioClipID    = nil
             project.selectedClipIDs.removeAll()
             project.currentTime = clip.startTime
+        })
+        .contextMenu {
+            Button { project.selectLeftOf(clip.id) } label: { Label("向左全选", systemImage: "arrow.left.to.line") }
+            Button { project.selectRightOf(clip.id) } label: { Label("向右全选", systemImage: "arrow.right.to.line") }
+            Divider()
+            Button { project.copySelected() } label: { Label("复制", systemImage: "doc.on.doc") }
+            Button { project.cutSelected() } label: { Label("剪切", systemImage: "scissors") }
+            Button { project.pasteAtPlayhead() } label: { Label("粘贴", systemImage: "doc.on.clipboard") }
+            Divider()
+            Button(role: .destructive) { project.deleteSelected() } label: { Label("删除", systemImage: "trash") }
         }
     }
 }

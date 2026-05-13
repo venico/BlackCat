@@ -166,8 +166,8 @@ final class ProjectState: ObservableObject {
         case subtitle(SubtitleClip, trackIndex: Int)
     }
     var clipboard: ClipboardItem?
-    var clipboardIsCut: Bool = false   // true = cut (remove source on paste)
-    var clipboardSourceID: UUID?       // original clip ID for cut
+    @Published var clipboardIsCut: Bool = false
+    @Published var clipboardSourceID: UUID?
 
     // Export
     @Published var exportSettings  = ExportSettings()
@@ -205,6 +205,109 @@ final class ProjectState: ObservableObject {
         guard let id = selectedAudioClipID else { return nil }
         for t in audioTracks { if let c = t.clips.first(where:{ $0.id == id }) { return c } }
         return nil
+    }
+
+    // MARK: - Cross-track move
+
+    func moveVideoClipToTrack(id: UUID, from: Int, to: Int) {
+        guard videoTracks.indices.contains(from), videoTracks.indices.contains(to) else { return }
+        guard let idx = videoTracks[from].clips.firstIndex(where: { $0.id == id }) else { return }
+        let clip = videoTracks[from].clips.remove(at: idx)
+        videoTracks[to].clips.append(clip)
+    }
+
+    func moveAudioClipToTrack(id: UUID, from: Int, to: Int) {
+        guard audioTracks.indices.contains(from), audioTracks.indices.contains(to) else { return }
+        guard let idx = audioTracks[from].clips.firstIndex(where: { $0.id == id }) else { return }
+        let clip = audioTracks[from].clips.remove(at: idx)
+        audioTracks[to].clips.append(clip)
+    }
+
+    func moveSubtitleClipToTrack(id: UUID, from: Int, to: Int) {
+        guard subtitleTracks.indices.contains(from), subtitleTracks.indices.contains(to) else { return }
+        guard let idx = subtitleTracks[from].clips.firstIndex(where: { $0.id == id }) else { return }
+        let clip = subtitleTracks[from].clips.remove(at: idx)
+        subtitleTracks[to].clips.append(clip)
+    }
+
+    // MARK: - Multi-select helpers
+
+    /// Shift+click: toggle a clip in/out of multi-selection
+    func shiftToggleClip(_ id: UUID) {
+        if selectedClipIDs.contains(id) {
+            selectedClipIDs.remove(id)
+            // Also clear primary if it matches
+            if selectedVideoClipID == id    { selectedVideoClipID = nil }
+            if selectedAudioClipID == id    { selectedAudioClipID = nil }
+            if selectedSubtitleClipID == id { selectedSubtitleClipID = nil }
+        } else {
+            // Move current primary into multi-set if needed
+            if let pid = selectedVideoClipID, pid != id { selectedClipIDs.insert(pid) }
+            if let pid = selectedAudioClipID, pid != id { selectedClipIDs.insert(pid) }
+            if let pid = selectedSubtitleClipID, pid != id { selectedClipIDs.insert(pid) }
+            selectedClipIDs.insert(id)
+            // Set as new primary based on type
+            if videoTracks.flatMap(\.clips).contains(where: { $0.id == id }) {
+                selectedVideoClipID = id
+                selectedAudioClipID = nil; selectedSubtitleClipID = nil
+            } else if audioTracks.flatMap(\.clips).contains(where: { $0.id == id }) {
+                selectedAudioClipID = id
+                selectedVideoClipID = nil; selectedSubtitleClipID = nil
+            } else if subtitleTracks.flatMap(\.clips).contains(where: { $0.id == id }) {
+                selectedSubtitleClipID = id
+                selectedVideoClipID = nil; selectedAudioClipID = nil
+            }
+        }
+    }
+
+    /// 向左全选：选中同轨道中 startTime <= 当前片段的所有片段
+    func selectLeftOf(_ id: UUID) {
+        for track in videoTracks {
+            if let clip = track.clips.first(where: { $0.id == id }) {
+                let ids = track.clips.filter { $0.startTime <= clip.startTime }.map(\.id)
+                selectedClipIDs.formUnion(ids)
+                return
+            }
+        }
+        for track in audioTracks {
+            if let clip = track.clips.first(where: { $0.id == id }) {
+                let ids = track.clips.filter { $0.startTime <= clip.startTime }.map(\.id)
+                selectedClipIDs.formUnion(ids)
+                return
+            }
+        }
+        for track in subtitleTracks {
+            if let clip = track.clips.first(where: { $0.id == id }) {
+                let ids = track.clips.filter { $0.startTime <= clip.startTime }.map(\.id)
+                selectedClipIDs.formUnion(ids)
+                return
+            }
+        }
+    }
+
+    /// 向右全选：选中同轨道中 startTime >= 当前片段的所有片段
+    func selectRightOf(_ id: UUID) {
+        for track in videoTracks {
+            if let clip = track.clips.first(where: { $0.id == id }) {
+                let ids = track.clips.filter { $0.startTime >= clip.startTime }.map(\.id)
+                selectedClipIDs.formUnion(ids)
+                return
+            }
+        }
+        for track in audioTracks {
+            if let clip = track.clips.first(where: { $0.id == id }) {
+                let ids = track.clips.filter { $0.startTime >= clip.startTime }.map(\.id)
+                selectedClipIDs.formUnion(ids)
+                return
+            }
+        }
+        for track in subtitleTracks {
+            if let clip = track.clips.first(where: { $0.id == id }) {
+                let ids = track.clips.filter { $0.startTime >= clip.startTime }.map(\.id)
+                selectedClipIDs.formUnion(ids)
+                return
+            }
+        }
     }
 
     // MARK: - Preview
