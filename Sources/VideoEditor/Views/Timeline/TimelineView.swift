@@ -220,10 +220,10 @@ struct TimelineView: View {
         VStack(spacing: 0) {
             // "+" dropdown to add tracks
             Menu {
-                Button("添加视频轨道") { project.videoTracks.append(Track(label: "视频轨道 \(project.videoTracks.count+1)")) }
-                Button("添加音频轨道") { project.audioTracks.append(Track(label: "音频轨道 \(project.audioTracks.count+1)")) }
+                Button("添加视频轨道") { project.videoTracks.append(Track(label: "视频")) }
+                Button("添加音频轨道") { project.audioTracks.append(Track(label: "音频")) }
                 Button("添加字幕轨道") {
-                    project.subtitleTracks.append(Track(label: "字幕轨道 \(project.subtitleTracks.count+1)"))
+                    project.subtitleTracks.append(Track(label: "字幕"))
                     project.subtitleStyles.append(SubtitleStyle())
                 }
             } label: {
@@ -826,7 +826,7 @@ private struct TrackLabel: View {
 
     var body: some View {
         ZStack {
-            // 默认：居中图标 + 标题 + 数量
+            // 默认：图标+标题左对齐，数量右对齐
             HStack(spacing: 4) {
                 Image(systemName: icon)
                     .font(.system(size: 10, weight: .light))
@@ -835,10 +835,13 @@ private struct TrackLabel: View {
                     .font(.system(size: 10, weight: .semibold))
                     .foregroundColor(Color.labelPrimary)
                     .lineLimit(1)
+                Spacer()
                 Text("\(count)")
                     .font(.system(size: 9, weight: .medium).monospacedDigit())
                     .foregroundColor(Color.labelSecondary.opacity(0.6))
             }
+            .padding(.leading, 16)
+            .padding(.trailing, 16)
             .opacity(isHovered ? 0 : 1)
 
             // hover 时：遮罩 + 三个图标按钮
@@ -1188,7 +1191,7 @@ private struct TranslateToolGroup: View {
 
     private func ensureTrack2() {
         if project.subtitleTracks.count < 2 {
-            project.subtitleTracks.append(Track(label: "字幕轨道 2"))
+            project.subtitleTracks.append(Track(label: "字幕"))
         }
         while project.subtitleStyles.count < 2 {
             var s = SubtitleStyle()

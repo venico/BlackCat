@@ -130,9 +130,9 @@ final class ProjectState: ObservableObject {
     @Published var mediaAssets: [MediaAsset] = []
 
     // Tracks
-    @Published var videoTracks: [Track<VideoClip>]    = [Track(label: "视频轨道")]
+    @Published var videoTracks: [Track<VideoClip>]    = [Track(label: "视频")]
     @Published var audioTracks: [Track<AudioClip>]    = []
-    @Published var subtitleTracks: [Track<SubtitleClip>] = [Track(label: "字幕轨道")]
+    @Published var subtitleTracks: [Track<SubtitleClip>] = [Track(label: "字幕")]
     @Published var subtitleStyles: [SubtitleStyle]    = [SubtitleStyle(), SubtitleStyle()]
 
     // Playback
@@ -465,7 +465,7 @@ final class ProjectState: ObservableObject {
             if let emptyIdx = videoTracks.firstIndex(where: { $0.clips.isEmpty }) {
                 trackIdx = emptyIdx
             } else {
-                videoTracks.append(Track(label: "视频轨道 \(videoTracks.count + 1)"))
+                videoTracks.append(Track(label: "视频"))
                 trackIdx = videoTracks.count - 1
             }
             Task {
@@ -480,7 +480,7 @@ final class ProjectState: ObservableObject {
                 }
             }
         case .audio:
-            if audioTracks.isEmpty { audioTracks.append(Track(label: "音频轨道")) }
+            if audioTracks.isEmpty { audioTracks.append(Track(label: "音频")) }
             let st = audioTracks[0].clips.map(\.endTime).max() ?? 0
             Task {
                 let dur = (try? await AVURLAsset(url: asset.url).load(.duration))?.seconds ?? 30
@@ -505,7 +505,7 @@ final class ProjectState: ObservableObject {
                 }
             } else {
                 subtitleTracks.append(
-                    Track(clips: clips, label: "字幕轨道 \(subtitleTracks.count + 1)"))
+                    Track(clips: clips, label: "字幕"))
                 subtitleStyles.append(SubtitleStyle())
             }
             if let mx = clips.map(\.endTime).max() { duration = max(duration, mx) }
@@ -917,7 +917,7 @@ final class ProjectState: ObservableObject {
     func insertSubtitleAtPlayhead() {
         let snap = currentSnapshot()
         if subtitleTracks.isEmpty {
-            subtitleTracks.append(Track(label: "字幕轨道 1"))
+            subtitleTracks.append(Track(label: "字幕"))
             subtitleStyles.append(SubtitleStyle())
         }
         var trackIdx = 0

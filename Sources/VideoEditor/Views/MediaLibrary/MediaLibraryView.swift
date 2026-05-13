@@ -115,7 +115,7 @@ private struct AssetRow: View {
             // Title + duration (no type label)
             VStack(alignment: .leading, spacing: 2) {
                 Text(asset.name)
-                    .font(.system(size: 12, weight: .medium))
+                    .font(.system(size: 12))
                     .foregroundColor(Color.labelPrimary)
                     .lineLimit(2)
                     .frame(minHeight: 32, alignment: .topLeading)
