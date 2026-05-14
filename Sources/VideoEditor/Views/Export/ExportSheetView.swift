@@ -459,6 +459,7 @@ struct ExportSheetView: View {
             videoTracks: project.videoTracks,
             audioTracks: project.audioTracks,
             subtitleTracks: project.subtitleTracks,
+            imageTracks: project.imageTracks,
             subtitleStyles: project.subtitleStyles,
             settings: project.exportSettings,
             outputURL: outputURL)
@@ -475,6 +476,7 @@ struct ExportInput {
     let videoTracks:    [Track<VideoClip>]
     let audioTracks:    [Track<AudioClip>]
     let subtitleTracks: [Track<SubtitleClip>]
+    let imageTracks:    [Track<ImageClip>]
     let subtitleStyles: [SubtitleStyle]
     let settings:       ExportSettings
     let outputURL:      URL
@@ -556,6 +558,29 @@ actor TimelineExporter {
             }
         }
 
+        // ── 图片轨道（上层）──
+        var imageCompTracks: [(track: AVMutableCompositionTrack, clip: ImageClip)] = []
+        if includeVideo {
+            for track in input.imageTracks {
+                guard track.isVisible else { continue }
+                for clip in track.clips {
+                    guard let url = clip.videoURL else { continue }
+                    let asset = AVURLAsset(url: url)
+                    let assetDur = try await asset.load(.duration)
+                    let useDur = CMTimeMinimum(CMTime(seconds: clip.duration, preferredTimescale: 600), assetDur)
+                    guard useDur.seconds > 0.01 else { continue }
+                    let range = CMTimeRange(start: .zero, duration: useDur)
+                    let at = CMTime(seconds: clip.startTime, preferredTimescale: 600)
+                    if let vAsset = try? await asset.loadTracks(withMediaType: .video).first,
+                       let vt = composition.addMutableTrack(withMediaType: .video,
+                                                            preferredTrackID: kCMPersistentTrackID_Invalid) {
+                        try vt.insertTimeRange(range, of: vAsset, at: at)
+                        imageCompTracks.append((track: vt, clip: clip))
+                    }
+                }
+            }
+        }
+
         // ── AudioMix（音量 + 声道）──
         let audioMix = AVMutableAudioMix()
         audioMix.inputParameters = audioMixParams.map { param in
@@ -570,7 +595,7 @@ actor TimelineExporter {
             return p
         }
 
-        // ── 字幕烧录（仅 video 模式）──
+        // ── 字幕烧录 + 图片合成（仅 video 模式）──
         var videoComposition: AVMutableVideoComposition? = nil
         if includeVideo {
             // 应用导出设置的分辨率
@@ -583,7 +608,85 @@ actor TimelineExporter {
                 $0.element.isVisible && !$0.element.clips.isEmpty
                     ? (idx: $0.offset, track: $0.element) : nil
             }
-            if !visibleSubs.isEmpty, let sourceVTrack = composition.tracks(withMediaType: .video).first {
+
+            let hasImageTracks = !imageCompTracks.isEmpty
+            let videoTracksList = composition.tracks(withMediaType: .video).filter { ct in
+                !imageCompTracks.contains(where: { $0.track.trackID == ct.trackID })
+            }
+
+            if hasImageTracks {
+                // Build time-segmented instructions for image layers on top of video
+                let vc = AVMutableVideoComposition()
+                vc.renderSize = renderSize
+                vc.frameDuration = frameDuration
+
+                var imageClipRanges: [(start: Double, end: Double, clip: ImageClip)] = []
+                for entry in imageCompTracks {
+                    imageClipRanges.append((entry.clip.startTime, entry.clip.endTime, entry.clip))
+                }
+
+                var boundaries: Set<Double> = [0, composition.duration.seconds]
+                for r in imageClipRanges { boundaries.insert(r.start); boundaries.insert(r.end) }
+                let sorted = boundaries.sorted()
+
+                var instructions: [AVMutableVideoCompositionInstruction] = []
+                for i in 0..<(sorted.count - 1) {
+                    let segStart = sorted[i]
+                    let segEnd   = sorted[i + 1]
+                    guard segEnd - segStart > 0.001 else { continue }
+
+                    let instruction = AVMutableVideoCompositionInstruction()
+                    instruction.timeRange = CMTimeRange(
+                        start: CMTime(seconds: segStart, preferredTimescale: 600),
+                        duration: CMTime(seconds: segEnd - segStart, preferredTimescale: 600))
+                    instruction.backgroundColor = CGColor(gray: 0, alpha: 1)
+
+                    let hasImage = imageClipRanges.contains { segStart >= $0.start - 0.001 && segStart < $0.end - 0.001 }
+
+                    var layerInstructions: [AVMutableVideoCompositionLayerInstruction] = []
+                    if hasImage {
+                        for entry in imageCompTracks {
+                            let li = AVMutableVideoCompositionLayerInstruction(assetTrack: entry.track)
+                            if let natSize = try? await entry.track.load(.naturalSize), natSize.width > 0, natSize.height > 0 {
+                                let sx = renderSize.width / natSize.width
+                                let sy = renderSize.height / natSize.height
+                                let baseScale = min(sx, sy)
+                                let finalSX = baseScale * entry.clip.scaleX
+                                let finalSY = baseScale * entry.clip.scaleY
+                                let tx = (renderSize.width - natSize.width * finalSX) / 2
+                                let ty = (renderSize.height - natSize.height * finalSY) / 2
+                                li.setTransform(CGAffineTransform(scaleX: finalSX, y: finalSY)
+                                    .concatenating(CGAffineTransform(translationX: tx, y: ty)), at: .zero)
+                            }
+                            layerInstructions.append(li)
+                        }
+                        for vt in videoTracksList {
+                            let li = AVMutableVideoCompositionLayerInstruction(assetTrack: vt)
+                            let scaleX = renderSize.width / sourceVideoSize.width
+                            let scaleY = renderSize.height / sourceVideoSize.height
+                            li.setTransform(CGAffineTransform(scaleX: scaleX, y: scaleY), at: .zero)
+                            layerInstructions.append(li)
+                        }
+                    } else {
+                        for entry in imageCompTracks {
+                            let li = AVMutableVideoCompositionLayerInstruction(assetTrack: entry.track)
+                            li.setOpacity(0, at: .zero)
+                            layerInstructions.append(li)
+                        }
+                        for vt in videoTracksList {
+                            let li = AVMutableVideoCompositionLayerInstruction(assetTrack: vt)
+                            let scaleX = renderSize.width / sourceVideoSize.width
+                            let scaleY = renderSize.height / sourceVideoSize.height
+                            li.setTransform(CGAffineTransform(scaleX: scaleX, y: scaleY), at: .zero)
+                            layerInstructions.append(li)
+                        }
+                    }
+                    instruction.layerInstructions = layerInstructions
+                    instructions.append(instruction)
+                }
+                if !instructions.isEmpty { vc.instructions = instructions }
+                videoComposition = vc
+            } else if !visibleSubs.isEmpty, let sourceVTrack = composition.tracks(withMediaType: .video).first {
                 videoComposition = self.buildVideoCompositionWithSubtitles(
                     composition: composition,
                     videoTrack: sourceVTrack,
@@ -600,7 +703,6 @@ actor TimelineExporter {
                     let instr = AVMutableVideoCompositionInstruction()
                     instr.timeRange = CMTimeRange(start: .zero, duration: composition.duration)
                     let li = AVMutableVideoCompositionLayerInstruction(assetTrack: sourceVTrack)
-                    // 缩放视频到目标分辨率
                     let scaleX = renderSize.width / sourceVideoSize.width
                     let scaleY = renderSize.height / sourceVideoSize.height
                     li.setTransform(CGAffineTransform(scaleX: scaleX, y: scaleY), at: .zero)
