@@ -4,6 +4,15 @@ import UniformTypeIdentifiers
 struct MediaLibraryView: View {
     @EnvironmentObject private var project: ProjectState
     @State private var isDragOver = false
+    @State private var selectedTab: AssetType = .video
+
+    private var filteredAssets: [MediaAsset] {
+        project.mediaAssets.filter { $0.type == selectedTab }
+    }
+
+    private func countFor(_ type: AssetType) -> Int {
+        project.mediaAssets.filter { $0.type == type }.count
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -14,34 +23,49 @@ struct MediaLibraryView: View {
                     .foregroundColor(Color.labelSecondary)
                     .textCase(.uppercase)
                 Spacer()
-                if project.mediaAssets.count > 0 {
-                    Text("\(project.mediaAssets.count)")
-                        .font(.system(size: 10, weight: .medium))
-                        .foregroundColor(Color.labelSecondary)
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 2)
-                        .background(Color.white.opacity(0.10))
-                        .clipShape(Capsule())
-                }
             }
             .padding(.leading, 10)
             .padding(.trailing, 8)
             .padding(.top, 8)
-            .padding(.bottom, 8)
+            .padding(.bottom, 4)
+
+            // Tab bar — Finder-style segmented icons
+            HStack(spacing: 0) {
+                tabIcon(.video, icon: "film")
+                tabIcon(.audio, icon: "music.note")
+                tabIcon(.image, icon: "photo")
+                tabIcon(.subtitle, icon: "captions.bubble")
+            }
+            .background(Color.white.opacity(0.06))
+            .clipShape(Capsule())
+            .padding(.horizontal, 8)
+            .padding(.bottom, 6)
 
             // Asset list + drag-drop target
             ZStack {
-                if project.mediaAssets.isEmpty {
+                if filteredAssets.isEmpty {
                     emptyState
                 } else {
                     ScrollView(showsIndicators: false) {
-                        VStack(spacing: 2) {
-                            ForEach(project.mediaAssets) { asset in
-                                AssetRow(asset: asset)
+                        if selectedTab == .image {
+                            // 2-column grid for images
+                            LazyVGrid(columns: [GridItem(.flexible(), spacing: 4),
+                                                GridItem(.flexible(), spacing: 4)], spacing: 4) {
+                                ForEach(filteredAssets) { asset in
+                                    AssetRow(assetID: asset.id)
+                                }
                             }
+                            .padding(.horizontal, 8)
+                            .padding(.bottom, 8)
+                        } else {
+                            VStack(spacing: 2) {
+                                ForEach(filteredAssets) { asset in
+                                    AssetRow(assetID: asset.id)
+                                }
+                            }
+                            .padding(.horizontal, 8)
+                            .padding(.bottom, 8)
                         }
-                        .padding(.horizontal, 8)
-                        .padding(.bottom, 8)
                     }
                 }
 
@@ -84,6 +108,20 @@ struct MediaLibraryView: View {
         }
     }
 
+    @ViewBuilder
+    private func tabIcon(_ type: AssetType, icon: String) -> some View {
+        let isActive = selectedTab == type
+        Button { selectedTab = type } label: {
+            Image(systemName: icon)
+                .font(.system(size: 12, weight: .medium))
+                .foregroundColor(isActive ? .white : Color.labelSecondary)
+                .frame(width: 34, height: 26)
+                .background(isActive ? Color.white.opacity(0.15) : Color.clear)
+                .clipShape(Capsule())
+        }
+        .buttonStyle(.plain)
+    }
+
     private var emptyState: some View {
         VStack(spacing: 10) {
             Image(systemName: "photo.badge.plus")
@@ -101,27 +139,152 @@ struct MediaLibraryView: View {
 
 private struct AssetRow: View {
     @EnvironmentObject private var project: ProjectState
-    let asset: MediaAsset
+    let assetID: UUID
     @State private var hovered = false
 
-    var body: some View {
-        HStack(spacing: 10) {
-            // Icon — plain colored icon, no background
-            Image(systemName: asset.type.icon)
-                .font(.system(size: 14, weight: .medium))
-                .foregroundColor(asset.type.color)
-                .frame(width: 20)
+    private var asset: MediaAsset {
+        project.mediaAssets.first(where: { $0.id == assetID }) ?? MediaAsset(url: URL(fileURLWithPath: "/"), name: "?", type: .video)
+    }
 
-            // Title + duration (no type label)
+    var body: some View {
+        Group {
+            if asset.type == .video || asset.type == .image {
+                videoAssetCard
+            } else {
+                normalAssetRow
+            }
+        }
+        .background(
+            RoundedRectangle(cornerRadius: 8)
+                .fill(hovered ? Color.white.opacity(0.08) : Color.clear)
+        )
+        .contentShape(RoundedRectangle(cornerRadius: 8))
+        .onHover { hovered = $0 }
+        .gesture(TapGesture(count: 2).onEnded {
+            if asset.fileExists { project.addToTimeline(asset) } else { relinkAsset() }
+        })
+        .contextMenu {
+            if asset.fileExists {
+                Button("添加到时间轴") { project.addToTimeline(asset) }
+            }
+            if !asset.fileExists {
+                Button("重新关联文件…") { relinkAsset() }
+            }
+            Divider()
+            Button("移除", role: .destructive) { project.mediaAssets.removeAll { $0.id == asset.id } }
+        }
+    }
+
+    // MARK: Video asset card — thumbnail on top, name below
+
+    private var videoAssetCard: some View {
+        VStack(spacing: 0) {
+            // Thumbnail
+            ZStack(alignment: .topTrailing) {
+                if let thumb = project.mediaThumbnails[asset.id] {
+                    Color.clear
+                        .frame(maxWidth: .infinity)
+                        .frame(height: 90)
+                        .overlay(
+                            Image(nsImage: thumb)
+                                .resizable()
+                                .aspectRatio(contentMode: .fill)
+                        )
+                        .clipShape(RoundedRectangle(cornerRadius: 6))
+                } else {
+                    RoundedRectangle(cornerRadius: 6)
+                        .fill(Color.white.opacity(0.06))
+                        .frame(height: 90)
+                        .overlay(
+                            Image(systemName: asset.type == .image ? "photo" : "film")
+                                .font(.system(size: 22, weight: .ultraLight))
+                                .foregroundColor(Color.labelSecondary.opacity(0.3))
+                        )
+                }
+                // Duration badge
+                if asset.duration > 0 {
+                    Text(fmtDur(asset.duration))
+                        .font(.system(size: 9).monospacedDigit())
+                        .foregroundColor(.white)
+                        .padding(.horizontal, 4)
+                        .padding(.vertical, 2)
+                        .background(Color.black.opacity(0.6))
+                        .clipShape(RoundedRectangle(cornerRadius: 3))
+                        .padding(4)
+                }
+                // Missing overlay
+                if !asset.fileExists {
+                    RoundedRectangle(cornerRadius: 6)
+                        .fill(Color.black.opacity(0.5))
+                        .frame(height: 90)
+                        .overlay(
+                            VStack(spacing: 4) {
+                                Image(systemName: "exclamationmark.triangle.fill")
+                                    .font(.system(size: 16))
+                                    .foregroundColor(.orange)
+                                Text("素材丢失")
+                                    .font(.system(size: 10))
+                                    .foregroundColor(.orange)
+                            }
+                        )
+                }
+                // Hover action buttons — white 80%
+                if hovered {
+                    HStack(spacing: 2) {
+                        if asset.fileExists {
+                            videoMiniBtn(icon: "plus.circle") { project.addToTimeline(asset) }
+                        } else {
+                            videoMiniBtn(icon: "arrow.triangle.2.circlepath") { relinkAsset() }
+                        }
+                        videoMiniBtn(icon: "trash") { project.mediaAssets.removeAll { $0.id == asset.id } }
+                    }
+                    .padding(4)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                }
+            }
+
+            // Name
+            Text(asset.name)
+                .font(.system(size: 11))
+                .foregroundColor(asset.fileExists ? Color.labelPrimary : Color.labelSecondary)
+                .lineLimit(1)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 4)
+                .padding(.vertical, 5)
+                .help(asset.name)
+        }
+        .padding(4)
+    }
+
+    // MARK: Normal asset row — audio / subtitle
+
+    private var normalAssetRow: some View {
+        HStack(spacing: 10) {
+            if asset.fileExists {
+                Image(systemName: asset.type.icon)
+                    .font(.system(size: 14, weight: .medium))
+                    .foregroundColor(asset.type.color)
+                    .frame(width: 20)
+            } else {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .font(.system(size: 14, weight: .medium))
+                    .foregroundColor(.orange)
+                    .frame(width: 20)
+            }
+
             VStack(alignment: .leading, spacing: 2) {
                 Text(asset.name)
                     .font(.system(size: 12))
-                    .foregroundColor(Color.labelPrimary)
+                    .foregroundColor(asset.fileExists ? Color.labelPrimary : Color.labelSecondary)
                     .lineLimit(2)
                     .frame(minHeight: 32, alignment: .topLeading)
                     .help(asset.name)
 
-                if asset.duration > 0 {
+                if !asset.fileExists {
+                    Text("素材丢失")
+                        .font(.system(size: 10))
+                        .foregroundColor(.orange)
+                } else if asset.duration > 0 {
                     Text(fmtDur(asset.duration))
                         .font(.system(size: 10).monospacedDigit())
                         .foregroundColor(Color.labelSecondary)
@@ -130,27 +293,33 @@ private struct AssetRow: View {
 
             Spacer()
 
-            // Action buttons on hover
             if hovered {
                 HStack(spacing: 2) {
-                    miniBtn(icon: "plus.circle") { project.addToTimeline(asset) }
-                    miniBtn(icon: "trash")       { project.mediaAssets.removeAll { $0.id == asset.id } }
+                    if asset.fileExists {
+                        miniBtn(icon: "plus.circle") { project.addToTimeline(asset) }
+                    } else {
+                        miniBtn(icon: "arrow.triangle.2.circlepath") { relinkAsset() }
+                    }
+                    miniBtn(icon: "trash") { project.mediaAssets.removeAll { $0.id == asset.id } }
                 }
             }
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 7)
-        .background(
-            RoundedRectangle(cornerRadius: 8)
-                .fill(hovered ? Color.white.opacity(0.08) : Color.clear)
-        )
-        .contentShape(RoundedRectangle(cornerRadius: 8))
-        .onHover { hovered = $0 }
-        .gesture(TapGesture(count: 2).onEnded { project.addToTimeline(asset) })
-        .contextMenu {
-            Button("添加到时间轴") { project.addToTimeline(asset) }
-            Divider()
-            Button("移除", role: .destructive) { project.mediaAssets.removeAll { $0.id == asset.id } }
+    }
+
+    private func relinkAsset() {
+        let panel = NSOpenPanel()
+        panel.allowsMultipleSelection = false
+        panel.message = "请选择「\(asset.name)」的新位置"
+        panel.begin { r in
+            guard r == .OK, let url = panel.url else { return }
+            if let i = project.mediaAssets.firstIndex(where: { $0.id == asset.id }) {
+                project.mediaAssets[i].url = url
+                project.mediaAssets[i].name = url.lastPathComponent
+                // Update all timeline clips referencing this asset
+                project.relinkAsset(id: asset.id, newURL: url)
+            }
         }
     }
 
@@ -162,6 +331,11 @@ private struct AssetRow: View {
     @ViewBuilder
     private func miniBtn(icon: String, action: @escaping () -> Void) -> some View {
         MiniBtnView(icon: icon, action: action)
+    }
+
+    @ViewBuilder
+    private func videoMiniBtn(icon: String, action: @escaping () -> Void) -> some View {
+        VideoMiniBtnView(icon: icon, action: action)
     }
 }
 
@@ -177,6 +351,25 @@ private struct MiniBtnView: View {
                 .foregroundColor(Color.labelSecondary)
                 .frame(width: 26, height: 26)
                 .background(hovering ? Color.white.opacity(0.12) : Color.clear)
+                .clipShape(RoundedRectangle(cornerRadius: 5))
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering = $0 }
+    }
+}
+
+private struct VideoMiniBtnView: View {
+    let icon: String
+    let action: () -> Void
+    @State private var hovering = false
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: icon)
+                .font(.system(size: 12, weight: .light))
+                .foregroundColor(Color.white.opacity(0.80))
+                .frame(width: 26, height: 26)
+                .background(hovering ? Color.black.opacity(0.4) : Color.black.opacity(0.25))
                 .clipShape(RoundedRectangle(cornerRadius: 5))
         }
         .buttonStyle(.plain)
@@ -209,7 +402,7 @@ private struct ImportButton: View {
         let panel = NSOpenPanel()
         panel.allowsMultipleSelection = true
         panel.allowedContentTypes = [
-            .movie, .audio,
+            .movie, .audio, .image,
             UTType(filenameExtension: "srt") ?? .plainText,
             UTType(filenameExtension: "ass") ?? .plainText,
             UTType(filenameExtension: "vtt") ?? .plainText

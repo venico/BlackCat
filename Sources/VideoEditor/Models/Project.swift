@@ -6,15 +6,15 @@ import Accelerate
 // MARK: - Asset Type
 
 enum AssetType {
-    case video, audio, subtitle
+    case video, audio, subtitle, image
     var label: String {
-        switch self { case .video: return "视频"; case .audio: return "音频"; case .subtitle: return "字幕" }
+        switch self { case .video: return "视频"; case .audio: return "音频"; case .subtitle: return "字幕"; case .image: return "图片" }
     }
     var icon: String {
-        switch self { case .video: return "film"; case .audio: return "music.note"; case .subtitle: return "captions.bubble" }
+        switch self { case .video: return "film"; case .audio: return "music.note"; case .subtitle: return "captions.bubble"; case .image: return "photo" }
     }
     var color: Color {
-        switch self { case .video: return Color(hex:"#3DBFBA"); case .audio: return Color(hex:"#5DB85D"); case .subtitle: return Color(hex:"#8B7ED8") }
+        switch self { case .video: return Color(hex:"#3DBFBA"); case .audio: return Color(hex:"#5DB85D"); case .subtitle: return Color(hex:"#8B7ED8"); case .image: return Color(hex:"#E8A54B") }
     }
 }
 
@@ -26,6 +26,7 @@ struct MediaAsset: Identifiable, Equatable {
     var name: String
     var type: AssetType
     var duration: Double = 0
+    var fileExists: Bool { FileManager.default.fileExists(atPath: url.path) }
     static func == (lhs: MediaAsset, rhs: MediaAsset) -> Bool { lhs.id == rhs.id }
 }
 
@@ -87,6 +88,22 @@ struct AudioClip: Identifiable, Equatable {
     var format: String = "AAC"
 }
 
+struct ImageClip: Identifiable, Equatable {
+    let id = UUID()
+    var assetID: UUID
+    var name: String   = ""
+    var imageURL: URL?  = nil   // original image
+    var videoURL: URL?  = nil   // generated video for preview/export
+    var startTime: Double
+    var endTime: Double
+    var duration: Double { endTime - startTime }
+    var imageWidth: Int  = 0
+    var imageHeight: Int = 0
+    var scaleX: Double   = 1.0
+    var scaleY: Double   = 1.0
+    var lockAspect: Bool = true
+}
+
 struct Track<Clip: Identifiable & Equatable>: Identifiable {
     let id = UUID()
     var clips: [Clip]   = []
@@ -114,11 +131,24 @@ struct ExportSettings {
     static let fpsOptions  = [24, 25, 30, 60]
 }
 
+// MARK: - Thumbnail & Waveform
+
+struct ThumbnailFrame {
+    let time: Double
+    let image: NSImage
+}
+
+struct WaveformData {
+    let totalDuration: Double
+    let samples: [Float]  // normalized 0..1 peak values
+}
+
 // MARK: - Snapshot (for undo/redo)
 
 struct ProjectSnapshot {
     var videoTracks: [Track<VideoClip>]
     var audioTracks: [Track<AudioClip>]
+    var imageTracks: [Track<ImageClip>]
     var subtitleTracks: [Track<SubtitleClip>]
     var subtitleStyles: [SubtitleStyle]
 }
@@ -132,6 +162,7 @@ final class ProjectState: ObservableObject {
     // Tracks
     @Published var videoTracks: [Track<VideoClip>]    = [Track(label: "视频")]
     @Published var audioTracks: [Track<AudioClip>]    = []
+    @Published var imageTracks: [Track<ImageClip>]       = []
     @Published var subtitleTracks: [Track<SubtitleClip>] = [Track(label: "字幕")]
     @Published var subtitleStyles: [SubtitleStyle]    = [SubtitleStyle(), SubtitleStyle()]
 
@@ -155,6 +186,7 @@ final class ProjectState: ObservableObject {
     // Selection (single — used by Inspector)
     @Published var selectedVideoClipID: UUID?    = nil
     @Published var selectedAudioClipID: UUID?    = nil
+    @Published var selectedImageClipID: UUID?    = nil
     @Published var selectedSubtitleClipID: UUID? = nil
     // Multi-selection (used by box-select & bulk delete)
     @Published var selectedClipIDs: Set<UUID>    = []
@@ -163,6 +195,7 @@ final class ProjectState: ObservableObject {
     enum ClipboardItem {
         case video(VideoClip, trackIndex: Int)
         case audio(AudioClip, trackIndex: Int)
+        case image(ImageClip, trackIndex: Int)
         case subtitle(SubtitleClip, trackIndex: Int)
     }
     var clipboard: ClipboardItem?
@@ -178,6 +211,12 @@ final class ProjectState: ObservableObject {
     @Published var redoCount: Int = 0
     private var undoStack: [ProjectSnapshot] = []
     private var redoStack: [ProjectSnapshot] = []
+
+    // Thumbnail & Waveform cache
+    @Published var mediaThumbnails: [UUID: NSImage] = [:]          // asset ID → single thumbnail (media library)
+    @Published var assetThumbnails: [UUID: [ThumbnailFrame]] = [:] // asset ID → timeline thumbnail strip
+    @Published var waveformCache: [UUID: WaveformData] = [:]       // asset ID → waveform peaks
+    var imageVideoCache: [UUID: URL] = [:]                         // asset ID → generated video file
 
     // Translation
     @Published var translationTargetLang: String = "中文（简体）"
@@ -201,10 +240,143 @@ final class ProjectState: ObservableObject {
         return nil
     }
 
+    var selectedImageClip: ImageClip? {
+        guard let id = selectedImageClipID else { return nil }
+        for t in imageTracks { if let c = t.clips.first(where:{ $0.id == id }) { return c } }
+        return nil
+    }
+
     var selectedAudioClip: AudioClip? {
         guard let id = selectedAudioClipID else { return nil }
         for t in audioTracks { if let c = t.clips.first(where:{ $0.id == id }) { return c } }
         return nil
+    }
+
+    // MARK: - Thumbnail & Waveform Generation
+
+    /// Generate a single thumbnail for the media library (video assets only).
+    func loadMediaThumbnail(assetID: UUID, url: URL) {
+        guard mediaThumbnails[assetID] == nil else { return }
+        let id = assetID
+        Task {
+            let av = AVURLAsset(url: url)
+            let gen = AVAssetImageGenerator(asset: av)
+            gen.appliesPreferredTrackTransform = true
+            gen.maximumSize = CGSize(width: 200, height: 200)
+            if let cg = try? gen.copyCGImage(at: .zero, actualTime: nil) {
+                let img = NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
+                await MainActor.run { self.mediaThumbnails[id] = img }
+            }
+        }
+    }
+
+    /// Generate timeline thumbnail strip for a video asset (evenly spaced frames).
+    func loadTimelineThumbnails(assetID: UUID, url: URL) {
+        guard assetThumbnails[assetID] == nil else { return }
+        let id = assetID
+        Task {
+            let av = AVURLAsset(url: url)
+            let dur = (try? await av.load(.duration))?.seconds ?? 0
+            guard dur > 0.1 else { return }
+            let gen = AVAssetImageGenerator(asset: av)
+            gen.appliesPreferredTrackTransform = true
+            gen.maximumSize = CGSize(width: 80, height: 52)
+            gen.requestedTimeToleranceBefore = CMTime(seconds: 0.5, preferredTimescale: 600)
+            gen.requestedTimeToleranceAfter  = CMTime(seconds: 0.5, preferredTimescale: 600)
+
+            let interval = max(1.0, dur / 30.0)  // at most ~30 frames
+            var frames: [ThumbnailFrame] = []
+            var t = 0.0
+            while t < dur {
+                let time = CMTime(seconds: t, preferredTimescale: 600)
+                if let cg = try? gen.copyCGImage(at: time, actualTime: nil) {
+                    let img = NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
+                    frames.append(ThumbnailFrame(time: t, image: img))
+                }
+                t += interval
+            }
+            await MainActor.run { self.assetThumbnails[id] = frames }
+        }
+    }
+
+    /// Generate waveform peak data for an audio asset.
+    func loadWaveform(assetID: UUID, url: URL) {
+        guard waveformCache[assetID] == nil else { return }
+        let id = assetID
+        Task {
+            let av = AVURLAsset(url: url)
+            let dur = (try? await av.load(.duration))?.seconds ?? 0
+            guard dur > 0 else { return }
+            guard let track = try? await av.loadTracks(withMediaType: .audio).first else { return }
+            guard let reader = try? AVAssetReader(asset: av) else { return }
+            let settings: [String: Any] = [
+                AVFormatIDKey: kAudioFormatLinearPCM,
+                AVLinearPCMBitDepthKey: 16,
+                AVLinearPCMIsFloatKey: false,
+                AVLinearPCMIsBigEndianKey: false,
+                AVLinearPCMIsNonInterleaved: false
+            ]
+            let output = AVAssetReaderTrackOutput(track: track, outputSettings: settings)
+            reader.add(output)
+            reader.startReading()
+
+            var allPeaks: [Float] = []
+            var buf16: [Int16] = []
+            let chunkTarget = 2000  // samples per peak
+
+            while let sampleBuf = output.copyNextSampleBuffer() {
+                guard let blockBuf = CMSampleBufferGetDataBuffer(sampleBuf) else { continue }
+                var length = 0
+                var dataPtr: UnsafeMutablePointer<Int8>?
+                CMBlockBufferGetDataPointer(blockBuf, atOffset: 0, lengthAtOffsetOut: nil,
+                                            totalLengthOut: &length, dataPointerOut: &dataPtr)
+                guard let ptr = dataPtr else { continue }
+                let count = length / MemoryLayout<Int16>.size
+                let samples = UnsafeBufferPointer(
+                    start: UnsafeRawPointer(ptr).bindMemory(to: Int16.self, capacity: count), count: count)
+                buf16.append(contentsOf: samples)
+
+                while buf16.count >= chunkTarget {
+                    let chunk = Array(buf16.prefix(chunkTarget))
+                    buf16.removeFirst(chunkTarget)
+                    let peak = chunk.map { abs(Float($0)) }.max() ?? 0
+                    allPeaks.append(peak / Float(Int16.max))
+                }
+            }
+            if !buf16.isEmpty {
+                let peak = buf16.map { abs(Float($0)) }.max() ?? 0
+                allPeaks.append(peak / Float(Int16.max))
+            }
+
+            await MainActor.run {
+                self.waveformCache[id] = WaveformData(totalDuration: dur, samples: allPeaks)
+            }
+        }
+    }
+
+    /// Load an image file as thumbnail for the media library.
+    func loadImageThumbnail(assetID: UUID, url: URL) {
+        guard mediaThumbnails[assetID] == nil else { return }
+        if let img = NSImage(contentsOf: url) {
+            mediaThumbnails[assetID] = img
+        }
+    }
+
+    // MARK: - Relink missing asset
+
+    /// Update all timeline clips that reference a given asset to use a new URL.
+    func relinkAsset(id: UUID, newURL: URL) {
+        for ti in videoTracks.indices {
+            for ci in videoTracks[ti].clips.indices where videoTracks[ti].clips[ci].assetID == id {
+                videoTracks[ti].clips[ci].url = newURL
+            }
+        }
+        for ti in audioTracks.indices {
+            for ci in audioTracks[ti].clips.indices where audioTracks[ti].clips[ci].assetID == id {
+                audioTracks[ti].clips[ci].url = newURL
+            }
+        }
+        rebuildTimelinePreview()
     }
 
     // MARK: - Cross-track move
@@ -214,6 +386,13 @@ final class ProjectState: ObservableObject {
         guard let idx = videoTracks[from].clips.firstIndex(where: { $0.id == id }) else { return }
         let clip = videoTracks[from].clips.remove(at: idx)
         videoTracks[to].clips.append(clip)
+    }
+
+    func moveImageClipToTrack(id: UUID, from: Int, to: Int) {
+        guard imageTracks.indices.contains(from), imageTracks.indices.contains(to) else { return }
+        guard let idx = imageTracks[from].clips.firstIndex(where: { $0.id == id }) else { return }
+        let clip = imageTracks[from].clips.remove(at: idx)
+        imageTracks[to].clips.append(clip)
     }
 
     func moveAudioClipToTrack(id: UUID, from: Int, to: Int) {
@@ -238,24 +417,29 @@ final class ProjectState: ObservableObject {
             selectedClipIDs.remove(id)
             // Also clear primary if it matches
             if selectedVideoClipID == id    { selectedVideoClipID = nil }
+            if selectedImageClipID == id    { selectedImageClipID = nil }
             if selectedAudioClipID == id    { selectedAudioClipID = nil }
             if selectedSubtitleClipID == id { selectedSubtitleClipID = nil }
         } else {
             // Move current primary into multi-set if needed
             if let pid = selectedVideoClipID, pid != id { selectedClipIDs.insert(pid) }
+            if let pid = selectedImageClipID, pid != id { selectedClipIDs.insert(pid) }
             if let pid = selectedAudioClipID, pid != id { selectedClipIDs.insert(pid) }
             if let pid = selectedSubtitleClipID, pid != id { selectedClipIDs.insert(pid) }
             selectedClipIDs.insert(id)
             // Set as new primary based on type
             if videoTracks.flatMap(\.clips).contains(where: { $0.id == id }) {
                 selectedVideoClipID = id
-                selectedAudioClipID = nil; selectedSubtitleClipID = nil
+                selectedImageClipID = nil; selectedAudioClipID = nil; selectedSubtitleClipID = nil
+            } else if imageTracks.flatMap(\.clips).contains(where: { $0.id == id }) {
+                selectedImageClipID = id
+                selectedVideoClipID = nil; selectedAudioClipID = nil; selectedSubtitleClipID = nil
             } else if audioTracks.flatMap(\.clips).contains(where: { $0.id == id }) {
                 selectedAudioClipID = id
-                selectedVideoClipID = nil; selectedSubtitleClipID = nil
+                selectedVideoClipID = nil; selectedImageClipID = nil; selectedSubtitleClipID = nil
             } else if subtitleTracks.flatMap(\.clips).contains(where: { $0.id == id }) {
                 selectedSubtitleClipID = id
-                selectedVideoClipID = nil; selectedAudioClipID = nil
+                selectedVideoClipID = nil; selectedImageClipID = nil; selectedAudioClipID = nil
             }
         }
     }
@@ -264,23 +448,22 @@ final class ProjectState: ObservableObject {
     func selectLeftOf(_ id: UUID) {
         for track in videoTracks {
             if let clip = track.clips.first(where: { $0.id == id }) {
-                let ids = track.clips.filter { $0.startTime <= clip.startTime }.map(\.id)
-                selectedClipIDs.formUnion(ids)
-                return
+                selectedClipIDs.formUnion(track.clips.filter { $0.startTime <= clip.startTime }.map(\.id)); return
+            }
+        }
+        for track in imageTracks {
+            if let clip = track.clips.first(where: { $0.id == id }) {
+                selectedClipIDs.formUnion(track.clips.filter { $0.startTime <= clip.startTime }.map(\.id)); return
             }
         }
         for track in audioTracks {
             if let clip = track.clips.first(where: { $0.id == id }) {
-                let ids = track.clips.filter { $0.startTime <= clip.startTime }.map(\.id)
-                selectedClipIDs.formUnion(ids)
-                return
+                selectedClipIDs.formUnion(track.clips.filter { $0.startTime <= clip.startTime }.map(\.id)); return
             }
         }
         for track in subtitleTracks {
             if let clip = track.clips.first(where: { $0.id == id }) {
-                let ids = track.clips.filter { $0.startTime <= clip.startTime }.map(\.id)
-                selectedClipIDs.formUnion(ids)
-                return
+                selectedClipIDs.formUnion(track.clips.filter { $0.startTime <= clip.startTime }.map(\.id)); return
             }
         }
     }
@@ -289,23 +472,22 @@ final class ProjectState: ObservableObject {
     func selectRightOf(_ id: UUID) {
         for track in videoTracks {
             if let clip = track.clips.first(where: { $0.id == id }) {
-                let ids = track.clips.filter { $0.startTime >= clip.startTime }.map(\.id)
-                selectedClipIDs.formUnion(ids)
-                return
+                selectedClipIDs.formUnion(track.clips.filter { $0.startTime >= clip.startTime }.map(\.id)); return
+            }
+        }
+        for track in imageTracks {
+            if let clip = track.clips.first(where: { $0.id == id }) {
+                selectedClipIDs.formUnion(track.clips.filter { $0.startTime >= clip.startTime }.map(\.id)); return
             }
         }
         for track in audioTracks {
             if let clip = track.clips.first(where: { $0.id == id }) {
-                let ids = track.clips.filter { $0.startTime >= clip.startTime }.map(\.id)
-                selectedClipIDs.formUnion(ids)
-                return
+                selectedClipIDs.formUnion(track.clips.filter { $0.startTime >= clip.startTime }.map(\.id)); return
             }
         }
         for track in subtitleTracks {
             if let clip = track.clips.first(where: { $0.id == id }) {
-                let ids = track.clips.filter { $0.startTime >= clip.startTime }.map(\.id)
-                selectedClipIDs.formUnion(ids)
-                return
+                selectedClipIDs.formUnion(track.clips.filter { $0.startTime >= clip.startTime }.map(\.id)); return
             }
         }
     }
@@ -318,21 +500,25 @@ final class ProjectState: ObservableObject {
     func rebuildTimelinePreview(seekTo: Double? = nil) {
         // Snapshot the clip arrays so the async task captures stable values.
         let vTracks = videoTracks
+        let iTracks = imageTracks
         let aTracks = audioTracks
         let sTracks = subtitleTracks
         // 默认保留当前播放位置
         let restoreTime = seekTo ?? currentTime
         // endTime 取所有轨道（不管可见性），保证播放头范围正确
         let vEnd = vTracks.flatMap(\.clips).map(\.endTime).max() ?? 0
+        let iEnd = iTracks.flatMap(\.clips).map(\.endTime).max() ?? 0
         let aEnd = aTracks.flatMap(\.clips).map(\.endTime).max() ?? 0
         let sEnd = sTracks.flatMap(\.clips).map(\.endTime).max() ?? 0
-        let endTime = max(vEnd, max(aEnd, sEnd))
+        let endTime = max(vEnd, max(iEnd, max(aEnd, sEnd)))
         Task {
             let composition = AVMutableComposition()
-            // 记录每条 composition 音频轨道对应的音量，用于构建 AudioMix
             var audioParams: [(trackID: CMPersistentTrackID, volume: Float, left: Float, right: Float)] = []
+            var videoCompTracks: [AVMutableCompositionTrack] = []  // from video clips
+            var imageCompTracks: [(track: AVMutableCompositionTrack, clip: ImageClip)] = []  // from image clips (on top)
+            var renderSize = CGSize(width: 1920, height: 1080)
 
-            // 视频轨道：隐藏的不加视频，但如果未静音仍加音频
+            // 视频轨道
             for track in vTracks {
                 for clip in track.clips.sorted(by: { $0.startTime < $1.startTime }) {
                     guard let url = clip.url else { continue }
@@ -345,20 +531,45 @@ final class ProjectState: ObservableObject {
                     let range = CMTimeRange(start: trimSt, duration: useDur)
                     let at    = CMTime(seconds: clip.startTime, preferredTimescale: 600)
 
-                    // 可见时才添加视频画面
                     if track.isVisible,
                        let vAsset = try? await asset.loadTracks(withMediaType: .video).first,
                        let vt = composition.addMutableTrack(withMediaType: .video,
                                                             preferredTrackID: kCMPersistentTrackID_Invalid) {
                         try? vt.insertTimeRange(range, of: vAsset, at: at)
+                        videoCompTracks.append(vt)
+                        // Detect render size from first video
+                        if let natSize = try? await vAsset.load(.naturalSize) {
+                            if natSize.width > 0 && natSize.height > 0 {
+                                renderSize = natSize
+                            }
+                        }
                     }
-                    // 未静音时添加音频（即使视频隐藏，音频仍可播放）
                     if !track.isMuted,
                        let aAsset = try? await asset.loadTracks(withMediaType: .audio).first,
                        let at2 = composition.addMutableTrack(withMediaType: .audio,
                                                              preferredTrackID: kCMPersistentTrackID_Invalid) {
                         try? at2.insertTimeRange(range, of: aAsset, at: at)
                         audioParams.append((at2.trackID, clip.volume, 1.0, 1.0))
+                    }
+                }
+            }
+
+            // 图片轨道（上层）
+            for track in iTracks {
+                guard track.isVisible else { continue }
+                for clip in track.clips {
+                    guard let url = clip.videoURL else { continue }
+                    let asset = AVURLAsset(url: url)
+                    let assetDur = (try? await asset.load(.duration)) ?? .zero
+                    let useDur = CMTimeMinimum(CMTime(seconds: clip.duration, preferredTimescale: 600), assetDur)
+                    guard useDur.seconds > 0.01 else { continue }
+                    let range = CMTimeRange(start: .zero, duration: useDur)
+                    let at = CMTime(seconds: clip.startTime, preferredTimescale: 600)
+                    if let vAsset = try? await asset.loadTracks(withMediaType: .video).first,
+                       let vt = composition.addMutableTrack(withMediaType: .video,
+                                                            preferredTrackID: kCMPersistentTrackID_Invalid) {
+                        try? vt.insertTimeRange(range, of: vAsset, at: at)
+                        imageCompTracks.append((track: vt, clip: clip))
                     }
                 }
             }
@@ -410,6 +621,91 @@ final class ProjectState: ObservableObject {
                 return p
             }
 
+            // Build AVVideoComposition to layer image tracks on top of video tracks.
+            // We need time-segmented instructions so image layers only appear during
+            // their clip range and disappear afterwards (letting video show through).
+            let allVideoTracks = videoCompTracks + imageCompTracks.map(\.track)
+            var videoComposition: AVMutableVideoComposition? = nil
+            if !allVideoTracks.isEmpty && composition.duration.seconds > 0.01 {
+                let vc = AVMutableVideoComposition()
+                vc.renderSize = renderSize
+                vc.frameDuration = CMTime(value: 1, timescale: 30)
+
+                // Collect image clip time ranges to build segmented instructions
+                var imageClipRanges: [(start: Double, end: Double)] = []
+                for track in iTracks where track.isVisible {
+                    for clip in track.clips {
+                        guard clip.videoURL != nil else { continue }
+                        imageClipRanges.append((clip.startTime, clip.endTime))
+                    }
+                }
+
+                // Collect all time boundaries
+                var boundaries: Set<Double> = [0, composition.duration.seconds]
+                for r in imageClipRanges { boundaries.insert(r.start); boundaries.insert(r.end) }
+                let sorted = boundaries.sorted()
+
+                var instructions: [AVMutableVideoCompositionInstruction] = []
+                for i in 0..<(sorted.count - 1) {
+                    let segStart = sorted[i]
+                    let segEnd   = sorted[i + 1]
+                    guard segEnd - segStart > 0.001 else { continue }
+
+                    let instruction = AVMutableVideoCompositionInstruction()
+                    instruction.timeRange = CMTimeRange(
+                        start: CMTime(seconds: segStart, preferredTimescale: 600),
+                        duration: CMTime(seconds: segEnd - segStart, preferredTimescale: 600))
+                    instruction.backgroundColor = CGColor(gray: 0, alpha: 1)
+
+                    // Is any image clip active in this segment?
+                    let hasImage = imageClipRanges.contains { segStart >= $0.start - 0.001 && segStart < $0.end - 0.001 }
+
+                    var layerInstructions: [AVMutableVideoCompositionLayerInstruction] = []
+                    if hasImage {
+                        // Image on top, video below
+                        for entry in imageCompTracks {
+                            let li = AVMutableVideoCompositionLayerInstruction(assetTrack: entry.track)
+                            if let natSize = try? await entry.track.load(.naturalSize), natSize.width > 0, natSize.height > 0 {
+                                // Base scale to fit image into render size
+                                let sx = renderSize.width / natSize.width
+                                let sy = renderSize.height / natSize.height
+                                let baseScale = min(sx, sy)
+                                // Apply user scale from inspector
+                                let finalSX = baseScale * entry.clip.scaleX
+                                let finalSY = baseScale * entry.clip.scaleY
+                                let tx = (renderSize.width - natSize.width * finalSX) / 2
+                                let ty = (renderSize.height - natSize.height * finalSY) / 2
+                                li.setTransform(CGAffineTransform(scaleX: finalSX, y: finalSY)
+                                    .concatenating(CGAffineTransform(translationX: tx, y: ty)), at: .zero)
+                            }
+                            layerInstructions.append(li)
+                        }
+                        for track in videoCompTracks {
+                            let li = AVMutableVideoCompositionLayerInstruction(assetTrack: track)
+                            layerInstructions.append(li)
+                        }
+                    } else {
+                        // Video only — hide image tracks
+                        for entry in imageCompTracks {
+                            let li = AVMutableVideoCompositionLayerInstruction(assetTrack: entry.track)
+                            li.setOpacity(0, at: .zero)
+                            layerInstructions.append(li)
+                        }
+                        for track in videoCompTracks {
+                            let li = AVMutableVideoCompositionLayerInstruction(assetTrack: track)
+                            layerInstructions.append(li)
+                        }
+                    }
+                    instruction.layerInstructions = layerInstructions
+                    instructions.append(instruction)
+                }
+
+                if !instructions.isEmpty {
+                    vc.instructions = instructions
+                    videoComposition = vc
+                }
+            }
+
             await MainActor.run {
                 self.lastVideoEndTime = endTime
                 self.pendingSeekTime = restoreTime
@@ -418,6 +714,9 @@ final class ProjectState: ObservableObject {
                 } else {
                     let item = AVPlayerItem(asset: composition)
                     item.audioMix = audioMix
+                    if let vc = videoComposition {
+                        item.videoComposition = vc
+                    }
                     self.playerItem = item
                 }
             }
@@ -438,12 +737,22 @@ final class ProjectState: ObservableObject {
         case "mp4","mov","mkv","avi","m4v": type = .video
         case "mp3","wav","aac","m4a","flac": type = .audio
         case "srt","ass","vtt": type = .subtitle
+        case "png","jpg","jpeg","gif","bmp","tiff","tif","webp","heic": type = .image
         default: return
         }
         let asset = MediaAsset(url: url, name: url.lastPathComponent, type: type)
         let aid = asset.id
         mediaAssets.append(asset)
-        if type != .subtitle {
+        // Trigger thumbnail / waveform generation
+        if type == .video {
+            loadMediaThumbnail(assetID: aid, url: url)
+            loadTimelineThumbnails(assetID: aid, url: url)
+        } else if type == .audio {
+            loadWaveform(assetID: aid, url: url)
+        } else if type == .image {
+            loadImageThumbnail(assetID: aid, url: url)
+        }
+        if type != .subtitle && type != .image {
             Task {
                 let av = AVURLAsset(url: url)
                 if let d = try? await av.load(.duration) {
@@ -512,6 +821,45 @@ final class ProjectState: ObservableObject {
             if let i = mediaAssets.firstIndex(where:{ $0.id == asset.id }) {
                 mediaAssets[i].duration = clips.last?.endTime ?? 0
             }
+        case .image:
+            let trackIdx: Int
+            if let emptyIdx = imageTracks.firstIndex(where: { $0.clips.isEmpty }) {
+                trackIdx = emptyIdx
+            } else {
+                imageTracks.append(Track(label: "图片"))
+                trackIdx = imageTracks.count - 1
+            }
+            let dur = 5.0
+            let videoURL = imageVideoCache[asset.id]
+            var imgW = 0, imgH = 0
+            if let img = NSImage(contentsOf: asset.url) {
+                if let rep = img.representations.first {
+                    imgW = rep.pixelsWide; imgH = rep.pixelsHigh
+                }
+            }
+            imageTracks[trackIdx].clips.append(
+                ImageClip(assetID: asset.id, name: asset.name, imageURL: asset.url,
+                          videoURL: videoURL, startTime: 0, endTime: dur,
+                          imageWidth: imgW, imageHeight: imgH))
+            duration = max(duration, dur)
+            // Generate video if not cached yet, then update clip
+            if videoURL == nil {
+                let aid = asset.id
+                let imgURL = asset.url
+                let ti = trackIdx
+                Task {
+                    guard let vURL = await Self.createVideoFromImage(imageURL: imgURL, duration: dur) else { return }
+                    await MainActor.run {
+                        self.imageVideoCache[aid] = vURL
+                        for ci in self.imageTracks[ti].clips.indices where self.imageTracks[ti].clips[ci].assetID == aid {
+                            self.imageTracks[ti].clips[ci].videoURL = vURL
+                        }
+                        self.rebuildTimelinePreview()
+                    }
+                }
+            } else {
+                rebuildTimelinePreview()
+            }
         }
     }
 
@@ -539,6 +887,14 @@ final class ProjectState: ObservableObject {
         for i in videoTracks.indices {
             if let j = videoTracks[i].clips.firstIndex(where:{ $0.id == id }) {
                 modify(&videoTracks[i].clips[j]); return
+            }
+        }
+    }
+
+    func updateImageClip(id: UUID, _ modify: (inout ImageClip) -> Void) {
+        for i in imageTracks.indices {
+            if let j = imageTracks[i].clips.firstIndex(where:{ $0.id == id }) {
+                modify(&imageTracks[i].clips[j]); return
             }
         }
     }
@@ -614,11 +970,13 @@ final class ProjectState: ObservableObject {
 
     private func currentSnapshot() -> ProjectSnapshot {
         ProjectSnapshot(videoTracks: videoTracks, audioTracks: audioTracks,
+                        imageTracks: imageTracks,
                         subtitleTracks: subtitleTracks, subtitleStyles: subtitleStyles)
     }
     private func applySnapshot(_ s: ProjectSnapshot) {
         videoTracks    = s.videoTracks
         audioTracks    = s.audioTracks
+        imageTracks    = s.imageTracks
         subtitleTracks = s.subtitleTracks
         subtitleStyles = s.subtitleStyles
         rebuildTimelinePreview()
@@ -703,6 +1061,7 @@ final class ProjectState: ObservableObject {
         // Pool of all IDs to remove
         var ids = selectedClipIDs
         if let id = selectedVideoClipID    { ids.insert(id) }
+        if let id = selectedImageClipID    { ids.insert(id) }
         if let id = selectedAudioClipID    { ids.insert(id) }
         if let id = selectedSubtitleClipID { ids.insert(id) }
         guard !ids.isEmpty else { return }
@@ -711,6 +1070,11 @@ final class ProjectState: ObservableObject {
             let before = videoTracks[i].clips.count
             videoTracks[i].clips.removeAll { ids.contains($0.id) }
             if videoTracks[i].clips.count != before { changed = true }
+        }
+        for i in imageTracks.indices {
+            let before = imageTracks[i].clips.count
+            imageTracks[i].clips.removeAll { ids.contains($0.id) }
+            if imageTracks[i].clips.count != before { changed = true }
         }
         for i in audioTracks.indices {
             let before = audioTracks[i].clips.count
@@ -724,6 +1088,7 @@ final class ProjectState: ObservableObject {
         }
 
         selectedVideoClipID    = nil
+        selectedImageClipID    = nil
         selectedAudioClipID    = nil
         selectedSubtitleClipID = nil
         selectedClipIDs.removeAll()
@@ -746,9 +1111,15 @@ final class ProjectState: ObservableObject {
             for (ti, track) in videoTracks.enumerated() {
                 if let clip = track.clips.first(where: { $0.id == id }) {
                     clipboard = .video(clip, trackIndex: ti)
-                    clipboardIsCut = false
-                    clipboardSourceID = nil
-                    return
+                    clipboardIsCut = false; clipboardSourceID = nil; return
+                }
+            }
+        }
+        if let id = selectedImageClipID {
+            for (ti, track) in imageTracks.enumerated() {
+                if let clip = track.clips.first(where: { $0.id == id }) {
+                    clipboard = .image(clip, trackIndex: ti)
+                    clipboardIsCut = false; clipboardSourceID = nil; return
                 }
             }
         }
@@ -780,9 +1151,15 @@ final class ProjectState: ObservableObject {
             for (ti, track) in videoTracks.enumerated() {
                 if let clip = track.clips.first(where: { $0.id == id }) {
                     clipboard = .video(clip, trackIndex: ti)
-                    clipboardIsCut = true
-                    clipboardSourceID = id
-                    return
+                    clipboardIsCut = true; clipboardSourceID = id; return
+                }
+            }
+        }
+        if let id = selectedImageClipID {
+            for (ti, track) in imageTracks.enumerated() {
+                if let clip = track.clips.first(where: { $0.id == id }) {
+                    clipboard = .image(clip, trackIndex: ti)
+                    clipboardIsCut = true; clipboardSourceID = id; return
                 }
             }
         }
@@ -819,6 +1196,9 @@ final class ProjectState: ObservableObject {
             for i in videoTracks.indices {
                 videoTracks[i].clips.removeAll { $0.id == srcID }
             }
+            for i in imageTracks.indices {
+                imageTracks[i].clips.removeAll { $0.id == srcID }
+            }
             for i in audioTracks.indices {
                 audioTracks[i].clips.removeAll { $0.id == srcID }
             }
@@ -844,6 +1224,16 @@ final class ProjectState: ObservableObject {
                 selectedVideoClipID = newClip.id
                 selectedAudioClipID = nil
                 selectedSubtitleClipID = nil
+            }
+
+        case .image(let clip, let trackIdx):
+            let newClip = ImageClip(assetID: clip.assetID, name: clip.name, imageURL: clip.imageURL,
+                                     videoURL: clip.videoURL, startTime: t, endTime: t + clip.duration)
+            let idx = imageTracks.indices.contains(trackIdx) ? trackIdx : 0
+            if imageTracks.indices.contains(idx) {
+                imageTracks[idx].clips.append(newClip)
+                selectedImageClipID = newClip.id
+                selectedVideoClipID = nil; selectedAudioClipID = nil; selectedSubtitleClipID = nil
             }
 
         case .audio(let clip, let trackIdx):
@@ -911,6 +1301,68 @@ final class ProjectState: ObservableObject {
             undoCount = undoStack.count
             redoCount = 0
         }
+    }
+
+    // MARK: - Image → Video generation
+
+    static func createVideoFromImage(imageURL: URL, duration: Double) async -> URL? {
+        guard let nsImage = NSImage(contentsOf: imageURL),
+              let cgImage = nsImage.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return nil }
+
+        let outputURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString).appendingPathExtension("mov")
+        let width = cgImage.width
+        let height = cgImage.height
+
+        guard let writer = try? AVAssetWriter(outputURL: outputURL, fileType: .mov) else { return nil }
+        let settings: [String: Any] = [
+            AVVideoCodecKey: AVVideoCodecType.h264,
+            AVVideoWidthKey: width,
+            AVVideoHeightKey: height
+        ]
+        let input = AVAssetWriterInput(mediaType: .video, outputSettings: settings)
+        let adaptor = AVAssetWriterInputPixelBufferAdaptor(
+            assetWriterInput: input,
+            sourcePixelBufferAttributes: [
+                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32ARGB,
+                kCVPixelBufferWidthKey as String: width,
+                kCVPixelBufferHeightKey as String: height
+            ])
+        writer.add(input)
+        writer.startWriting()
+        writer.startSession(atSourceTime: .zero)
+
+        var pixelBuffer: CVPixelBuffer?
+        CVPixelBufferCreate(kCFAllocatorDefault, width, height, kCVPixelFormatType_32ARGB, nil, &pixelBuffer)
+        guard let pb = pixelBuffer else { return nil }
+
+        CVPixelBufferLockBaseAddress(pb, [])
+        if let ctx = CGContext(data: CVPixelBufferGetBaseAddress(pb),
+                               width: width, height: height, bitsPerComponent: 8,
+                               bytesPerRow: CVPixelBufferGetBytesPerRow(pb),
+                               space: CGColorSpaceCreateDeviceRGB(),
+                               bitmapInfo: CGImageAlphaInfo.noneSkipFirst.rawValue) {
+            ctx.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
+        }
+        CVPixelBufferUnlockBaseAddress(pb, [])
+
+        // Write 1 frame per second
+        let totalFrames = max(Int(duration), 1)
+        for i in 0..<totalFrames {
+            while !input.isReadyForMoreMediaData {
+                try? await Task.sleep(nanoseconds: 10_000_000)
+            }
+            adaptor.append(pb, withPresentationTime: CMTime(value: Int64(i), timescale: 1))
+        }
+        // Final frame at exact end
+        while !input.isReadyForMoreMediaData {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        adaptor.append(pb, withPresentationTime: CMTime(seconds: duration, preferredTimescale: 600))
+
+        input.markAsFinished()
+        await writer.finishWriting()
+        return writer.status == .completed ? outputURL : nil
     }
 
     /// Insert a new subtitle clip into the active subtitle track at the playhead.

@@ -22,11 +22,14 @@ struct TimelineView: View {
 
     private enum DragOp {
         case moveVideo(id: UUID, originStart: Double, originDur: Double, srcTrack: Int)
+        case moveImage(id: UUID, originStart: Double, originDur: Double, srcTrack: Int)
         case moveAudio(id: UUID, originStart: Double, originDur: Double, srcTrack: Int)
         case moveSubtitle(id: UUID, originStart: Double, originDur: Double, srcTrack: Int)
         case moveMulti(items: [DragItem])
         case trimVideoLeft(id: UUID, originStart: Double, originEnd: Double, originTrimStart: Double)
         case trimVideoRight(id: UUID, originStart: Double, originEnd: Double)
+        case trimImageLeft(id: UUID, originStart: Double, originEnd: Double)
+        case trimImageRight(id: UUID, originStart: Double, originEnd: Double)
         case trimAudioLeft(id: UUID, originStart: Double, originEnd: Double, originTrimStart: Double)
         case trimAudioRight(id: UUID, originStart: Double, originEnd: Double)
         case trimSubtitleLeft(id: UUID, originStart: Double, originEnd: Double)
@@ -37,7 +40,7 @@ struct TimelineView: View {
     }
 
     struct DragItem {
-        enum Kind { case video, audio, subtitle }
+        enum Kind { case video, image, audio, subtitle }
         let id: UUID
         let kind: Kind
         let originStart: Double
@@ -46,12 +49,13 @@ struct TimelineView: View {
 
     private enum ClipHit {
         case video(id: UUID, start: Double, dur: Double)
+        case image(id: UUID, start: Double, dur: Double)
         case audio(id: UUID, start: Double, dur: Double)
         case subtitle(id: UUID, start: Double, dur: Double)
 
         var id: UUID {
             switch self {
-            case .video(let id, _, _), .audio(let id, _, _), .subtitle(let id, _, _):
+            case .video(let id, _, _), .image(let id, _, _), .audio(let id, _, _), .subtitle(let id, _, _):
                 return id
             }
         }
@@ -221,6 +225,7 @@ struct TimelineView: View {
             // "+" dropdown to add tracks
             Menu {
                 Button("添加视频轨道") { project.videoTracks.append(Track(label: "视频")) }
+                Button("添加图片轨道") { project.imageTracks.append(Track(label: "图片")) }
                 Button("添加音频轨道") { project.audioTracks.append(Track(label: "音频")) }
                 Button("添加字幕轨道") {
                     project.subtitleTracks.append(Track(label: "字幕"))
@@ -237,6 +242,15 @@ struct TimelineView: View {
             .menuIndicator(.hidden)
             .frame(height: rulerH)
 
+            ForEach(project.imageTracks.indices, id:\.self) { i in
+                TrackLabel(icon:"photo", title: project.imageTracks[i].label,
+                           count: project.imageTracks[i].clips.count, hasMute: false,
+                           isMuted: false, isVis: project.imageTracks[i].isVisible,
+                           onMute: nil,
+                           onVis:  { project.imageTracks[i].isVisible.toggle(); project.rebuildTimelinePreview() },
+                           onDel:  { project.imageTracks.remove(at:i) })
+                    .frame(height: trackH)
+            }
             ForEach(project.videoTracks.indices, id:\.self) { i in
                 TrackLabel(icon:"film", title: project.videoTracks[i].label,
                            count: project.videoTracks[i].clips.count, hasMute: true,
@@ -388,7 +402,7 @@ struct TimelineView: View {
                 guard let op = dragOp else { return }
                 // Track ghost position for move ops
                 switch op {
-                case .moveVideo, .moveAudio, .moveSubtitle:
+                case .moveVideo, .moveImage, .moveAudio, .moveSubtitle:
                     dragGhostPos = v.location
                 default: break
                 }
@@ -409,6 +423,10 @@ struct TimelineView: View {
                         if let dst = destTrack.videoIndex, dst != srcTrack {
                             project.moveVideoClipToTrack(id: id, from: srcTrack, to: dst)
                         }
+                    case .moveImage(let id, _, _, let srcTrack):
+                        if let dst = destTrack.imageIndex, dst != srcTrack {
+                            project.moveImageClipToTrack(id: id, from: srcTrack, to: dst)
+                        }
                     case .moveAudio(let id, _, _, let srcTrack):
                         if let dst = destTrack.audioIndex, dst != srcTrack {
                             project.moveAudioClipToTrack(id: id, from: srcTrack, to: dst)
@@ -422,11 +440,12 @@ struct TimelineView: View {
                 }
                 switch dragOp {
                 case .trimVideoLeft, .trimVideoRight,
+                     .trimImageLeft, .trimImageRight,
                      .trimAudioLeft, .trimAudioRight,
                      .trimSubtitleLeft, .trimSubtitleRight:
                     NSCursor.arrow.set()
                     project.rebuildTimelinePreview()
-                case .moveVideo, .moveAudio, .moveSubtitle, .moveMulti:
+                case .moveVideo, .moveImage, .moveAudio, .moveSubtitle, .moveMulti:
                     project.rebuildTimelinePreview()
                 default: break
                 }
@@ -472,6 +491,28 @@ struct TimelineView: View {
             case (.video(let id, let s, let d), .right):
                 selectVideoAndLoad(id: id)
                 dragOp = .trimVideoRight(id: id, originStart: s, originEnd: s + d)
+                Self.trimRightCursor.set()
+            case (.image(let id, let s, let d), nil):
+                project.selectedImageClipID    = id
+                project.selectedVideoClipID    = nil
+                project.selectedAudioClipID    = nil
+                project.selectedSubtitleClipID = nil
+                let ti = project.imageTracks.firstIndex { $0.clips.contains { $0.id == id } } ?? 0
+                draggingClipID = id
+                dragOp = .moveImage(id: id, originStart: s, originDur: d, srcTrack: ti)
+            case (.image(let id, let s, let d), .left):
+                project.selectedImageClipID    = id
+                project.selectedVideoClipID    = nil
+                project.selectedAudioClipID    = nil
+                project.selectedSubtitleClipID = nil
+                dragOp = .trimImageLeft(id: id, originStart: s, originEnd: s + d)
+                Self.trimLeftCursor.set()
+            case (.image(let id, let s, let d), .right):
+                project.selectedImageClipID    = id
+                project.selectedVideoClipID    = nil
+                project.selectedAudioClipID    = nil
+                project.selectedSubtitleClipID = nil
+                dragOp = .trimImageRight(id: id, originStart: s, originEnd: s + d)
                 Self.trimRightCursor.set()
             case (.audio(let id, let s, let d), nil):
                 project.selectedAudioClipID    = id
@@ -541,6 +582,12 @@ struct TimelineView: View {
                                           originStart: c.startTime, originDur: c.duration))
                 }
             }
+            for t in project.imageTracks {
+                if let c = t.clips.first(where: { $0.id == id }) {
+                    items.append(DragItem(id: id, kind: .image,
+                                          originStart: c.startTime, originDur: c.duration))
+                }
+            }
             for t in project.audioTracks {
                 if let c = t.clips.first(where: { $0.id == id }) {
                     items.append(DragItem(id: id, kind: .audio,
@@ -564,6 +611,9 @@ struct TimelineView: View {
         case .moveVideo(let id, let s, let d, _):
             let ns = max(0, s + dt)
             project.updateVideoClip(id: id) { $0.startTime = ns; $0.endTime = ns + d }
+        case .moveImage(let id, let s, let d, _):
+            let ns = max(0, s + dt)
+            project.updateImageClip(id: id) { $0.startTime = ns; $0.endTime = ns + d }
         case .moveAudio(let id, let s, let d, _):
             let ns = max(0, s + dt)
             project.updateAudioClip(id: id) { $0.startTime = ns; $0.endTime = ns + d }
@@ -579,6 +629,7 @@ struct TimelineView: View {
                 let ne = ns + it.originDur
                 switch it.kind {
                 case .video:    project.updateVideoClip(id: it.id) { $0.startTime = ns; $0.endTime = ne }
+                case .image:    project.updateImageClip(id: it.id) { $0.startTime = ns; $0.endTime = ne }
                 case .audio:    project.updateAudioClip(id: it.id) { $0.startTime = ns; $0.endTime = ne }
                 case .subtitle: project.updateSubtitleTime(id: it.id, start: ns, end: ne)
                 }
@@ -590,6 +641,13 @@ struct TimelineView: View {
         case .trimVideoRight(let id, let originStart, let originEnd):
             let ne = max(originStart + 0.1, originEnd + dt)
             project.updateVideoClip(id: id) { $0.endTime = ne }
+            if ne > project.duration { project.duration = ne }
+        case .trimImageLeft(let id, let originStart, let originEnd):
+            let ns = max(0, min(originStart + dt, originEnd - 0.1))
+            project.updateImageClip(id: id) { $0.startTime = ns }
+        case .trimImageRight(let id, let originStart, let originEnd):
+            let ne = max(originStart + 0.1, originEnd + dt)
+            project.updateImageClip(id: id) { $0.endTime = ne }
             if ne > project.duration { project.duration = ne }
         case .trimAudioLeft(let id, let originStart, let originEnd, let originTrimStart):
             let ns = max(0, min(originStart + dt, originEnd - 0.1))
@@ -631,6 +689,20 @@ struct TimelineView: View {
             return nil
         }
 
+        for ti in project.imageTracks.indices {
+            if pt.y >= rowTop && pt.y < rowTop + trackH {
+                for c in project.imageTracks[ti].clips {
+                    let xMin = CGFloat(c.startTime * pps) + 1
+                    let xMax = CGFloat(c.endTime   * pps) + 1
+                    if pt.x >= xMin - threshold && pt.x <= xMax + threshold {
+                        let hit = ClipHit.image(id: c.id, start: c.startTime, dur: c.duration)
+                        return (hit, edge(x: pt.x, xMin: xMin, xMax: xMax))
+                    }
+                }
+                return nil
+            }
+            rowTop += trackH
+        }
         for ti in project.videoTracks.indices {
             if pt.y >= rowTop && pt.y < rowTop + trackH {
                 for c in project.videoTracks[ti].clips {
@@ -681,6 +753,14 @@ struct TimelineView: View {
         var ids: Set<UUID> = []
         var rowTop = rulerH
 
+        for ti in project.imageTracks.indices {
+            let yRange = rowTop ... (rowTop + trackH)
+            for c in project.imageTracks[ti].clips {
+                let xRange = (c.startTime*pps) ... (c.endTime*pps)
+                if rectIntersects(rect, xRange: xRange, yRange: yRange) { ids.insert(c.id) }
+            }
+            rowTop += trackH
+        }
         for ti in project.videoTracks.indices {
             let yRange = rowTop ... (rowTop + trackH)
             for c in project.videoTracks[ti].clips {
@@ -721,12 +801,22 @@ struct TimelineView: View {
 
     private func totalContentH() -> CGFloat {
         rulerH + trackH * CGFloat(project.videoTracks.count
+                                  + project.imageTracks.count
                                   + project.audioTracks.count
                                   + project.subtitleTracks.count)
     }
 
     @ViewBuilder
     private var trackRows: some View {
+        ForEach(project.imageTracks.indices, id:\.self) { i in
+            trackRow(height: trackH, hidden: !project.imageTracks[i].isVisible) {
+                ForEach(project.imageTracks[i].clips) { clip in
+                    ImageClipView(clip: clip, pps: project.pixelsPerSecond, h: trackH,
+                                  sel: isSelected(clip.id, primary: project.selectedImageClipID),
+                                  isDragging: draggingClipID == clip.id)
+                }
+            }
+        }
         ForEach(project.videoTracks.indices, id:\.self) { i in
             trackRow(height: trackH, hidden: !project.videoTracks[i].isVisible) {
                 ForEach(project.videoTracks[i].clips) { clip in
@@ -767,6 +857,9 @@ struct TimelineView: View {
         case .moveVideo(let id, _, _, _):
             guard let clip = project.videoTracks.flatMap(\.clips).first(where: { $0.id == id }) else { return nil }
             return GhostInfo(name: clip.name, duration: clip.duration, color: Color(hex: "#3DBFBA"))
+        case .moveImage(let id, _, _, _):
+            guard let clip = project.imageTracks.flatMap(\.clips).first(where: { $0.id == id }) else { return nil }
+            return GhostInfo(name: clip.name, duration: clip.duration, color: Color(hex: "#E8A54B"))
         case .moveAudio(let id, _, _, _):
             guard let clip = project.audioTracks.flatMap(\.clips).first(where: { $0.id == id }) else { return nil }
             return GhostInfo(name: clip.name, duration: clip.duration, color: Color(hex: "#5DB85D"))
@@ -784,21 +877,25 @@ struct TimelineView: View {
     /// Determine which track type & index the y coordinate falls on
     private struct TrackTarget {
         var videoIndex: Int?
+        var imageIndex: Int?
         var audioIndex: Int?
         var subtitleIndex: Int?
     }
 
     private func trackIndexFromY(_ y: CGFloat) -> TrackTarget {
         let row = Int((y - rulerH) / trackH)
+        let iCount = project.imageTracks.count
         let vCount = project.videoTracks.count
         let aCount = project.audioTracks.count
         let sCount = project.subtitleTracks.count
-        if row < vCount {
-            return TrackTarget(videoIndex: row)
-        } else if row < vCount + aCount {
-            return TrackTarget(audioIndex: row - vCount)
-        } else if row < vCount + aCount + sCount {
-            return TrackTarget(subtitleIndex: row - vCount - aCount)
+        if row < iCount {
+            return TrackTarget(imageIndex: row)
+        } else if row < iCount + vCount {
+            return TrackTarget(videoIndex: row - iCount)
+        } else if row < iCount + vCount + aCount {
+            return TrackTarget(audioIndex: row - iCount - vCount)
+        } else if row < iCount + vCount + aCount + sCount {
+            return TrackTarget(subtitleIndex: row - iCount - vCount - aCount)
         }
         return TrackTarget()
     }
@@ -903,18 +1000,34 @@ private struct VideoClipView: View {
     var body: some View {
         let w = max(clip.duration*pps, 5)
         ZStack(alignment:.leading) {
-            RoundedRectangle(cornerRadius:4).fill(Color(hex:"#3DBFBA").opacity(0.82))
-                .overlay(RoundedRectangle(cornerRadius:4).stroke(sel ? Color.white : Color.clear, lineWidth: sel ? 2 : 0))
-            VStack(alignment:.leading, spacing:1) {
-                Text(clip.name).font(.system(size:9, weight:.medium))
-                    .foregroundColor(.white.opacity(0.9)).lineLimit(1)
-                Text(fmtT(clip.duration)).font(.system(size:8).monospacedDigit())
-                    .foregroundColor(.white.opacity(0.55))
-            }.padding(.horizontal, 5)
+            // Thumbnail strip or solid color
+            if let frames = project.assetThumbnails[clip.assetID], !frames.isEmpty {
+                thumbnailStrip(frames: frames, clipWidth: w)
+            } else {
+                RoundedRectangle(cornerRadius:4).fill(Color(hex:"#3DBFBA").opacity(0.82))
+            }
+            // Selection border
+            RoundedRectangle(cornerRadius:4)
+                .stroke(sel ? Color.white : Color.clear, lineWidth: sel ? 2 : 0)
+            // Name label top-left with shadow
+            Text(clip.name).font(.system(size:9, weight:.medium))
+                .foregroundColor(.white)
+                .shadow(color: .black.opacity(0.8), radius: 2, x: 0, y: 1)
+                .shadow(color: .black.opacity(0.5), radius: 4, x: 0, y: 1)
+                .lineLimit(1)
+                .padding(.leading, 5)
+                .padding(.top, 4)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         }
         .frame(width: w, height: h-4)
+        .clipShape(RoundedRectangle(cornerRadius: 4))
         .opacity(isDragging ? 0 : (project.clipboardIsCut && project.clipboardSourceID == clip.id ? 0.35 : 1.0))
         .offset(x: clip.startTime*pps + 1)
+        .onAppear {
+            if let url = clip.url {
+                project.loadTimelineThumbnails(assetID: clip.assetID, url: url)
+            }
+        }
         .gesture(TapGesture().modifiers(.shift).onEnded {
             project.shiftToggleClip(clip.id)
         })
@@ -925,6 +1038,91 @@ private struct VideoClipView: View {
             project.selectedSubtitleClipID = nil
             project.selectedClipIDs.removeAll()
             project.loadClipForPreview(clip)
+        })
+        .contextMenu {
+            Button { project.selectLeftOf(clip.id) } label: { Label("向左全选", systemImage: "arrow.left.to.line") }
+            Button { project.selectRightOf(clip.id) } label: { Label("向右全选", systemImage: "arrow.right.to.line") }
+            Divider()
+            Button { project.copySelected() } label: { Label("复制", systemImage: "doc.on.doc") }
+            Button { project.cutSelected() } label: { Label("剪切", systemImage: "scissors") }
+            Button { project.pasteAtPlayhead() } label: { Label("粘贴", systemImage: "doc.on.clipboard") }
+            Divider()
+            Button(role: .destructive) { project.deleteSelected() } label: { Label("删除", systemImage: "trash") }
+        }
+    }
+
+    @ViewBuilder
+    private func thumbnailStrip(frames: [ThumbnailFrame], clipWidth: CGFloat) -> some View {
+        let thumbW = h - 4  // roughly square tiles
+        let count = max(1, Int(ceil(clipWidth / thumbW)))
+        HStack(spacing: 0) {
+            ForEach(0..<count, id: \.self) { i in
+                let t = clip.trimStart + clip.duration * Double(i) / Double(count)
+                let frame = closestFrame(frames, at: t)
+                Image(nsImage: frame.image)
+                    .resizable()
+                    .aspectRatio(contentMode: .fill)
+                    .frame(width: i == count - 1 ? clipWidth - thumbW * CGFloat(count - 1) : thumbW,
+                           height: h - 4)
+                    .clipped()
+            }
+        }
+        .frame(width: clipWidth, height: h - 4)
+        .clipShape(RoundedRectangle(cornerRadius: 4))
+    }
+
+    private func closestFrame(_ frames: [ThumbnailFrame], at time: Double) -> ThumbnailFrame {
+        frames.min(by: { abs($0.time - time) < abs($1.time - time) }) ?? frames[0]
+    }
+}
+
+private struct ImageClipView: View {
+    let clip: ImageClip
+    let pps: Double
+    let h: CGFloat
+    let sel: Bool
+    var isDragging: Bool = false
+    @EnvironmentObject var project: ProjectState
+
+    var body: some View {
+        let w = max(clip.duration*pps, 5)
+        ZStack(alignment:.leading) {
+            // Thumbnail or solid color
+            if let thumb = project.mediaThumbnails[clip.assetID] {
+                Image(nsImage: thumb)
+                    .resizable()
+                    .aspectRatio(contentMode: .fill)
+                    .frame(width: w, height: h - 4)
+                    .clipped()
+                    .clipShape(RoundedRectangle(cornerRadius: 4))
+            } else {
+                RoundedRectangle(cornerRadius:4).fill(Color(hex:"#E8A54B").opacity(0.82))
+            }
+            RoundedRectangle(cornerRadius:4)
+                .stroke(sel ? Color.white : Color.clear, lineWidth: sel ? 2 : 0)
+            Text(clip.name).font(.system(size:9, weight:.medium))
+                .foregroundColor(.white)
+                .shadow(color: .black.opacity(0.8), radius: 2, x: 0, y: 1)
+                .shadow(color: .black.opacity(0.5), radius: 4, x: 0, y: 1)
+                .lineLimit(1)
+                .padding(.leading, 5)
+                .padding(.top, 4)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        }
+        .frame(width: w, height: h-4)
+        .clipShape(RoundedRectangle(cornerRadius: 4))
+        .opacity(isDragging ? 0 : (project.clipboardIsCut && project.clipboardSourceID == clip.id ? 0.35 : 1.0))
+        .offset(x: clip.startTime*pps + 1)
+        .gesture(TapGesture().modifiers(.shift).onEnded {
+            project.shiftToggleClip(clip.id)
+        })
+        .simultaneousGesture(TapGesture().onEnded {
+            guard !NSEvent.modifierFlags.contains(.shift) else { return }
+            project.selectedImageClipID    = clip.id
+            project.selectedVideoClipID    = nil
+            project.selectedAudioClipID    = nil
+            project.selectedSubtitleClipID = nil
+            project.selectedClipIDs.removeAll()
         })
         .contextMenu {
             Button { project.selectLeftOf(clip.id) } label: { Label("向左全选", systemImage: "arrow.left.to.line") }
@@ -951,14 +1149,32 @@ private struct AudioClipView: View {
         let w = max(clip.duration*pps, 5)
         ZStack(alignment: .leading) {
             RoundedRectangle(cornerRadius:4).fill(Color(hex:"#5DB85D").opacity(0.78))
-                .overlay(RoundedRectangle(cornerRadius:4).stroke(sel ? Color.white : Color.clear, lineWidth: sel ? 2 : 0))
+            // Waveform overlay — full height
+            if let wave = project.waveformCache[clip.assetID] {
+                AudioWaveformCanvas(waveData: wave, trimStart: clip.trimStart,
+                                     clipDuration: clip.duration, fullHeight: true)
+                    .clipShape(RoundedRectangle(cornerRadius: 4))
+            }
+            // Selection border
+            RoundedRectangle(cornerRadius:4).stroke(sel ? Color.white : Color.clear, lineWidth: sel ? 2 : 0)
+            // Name top-left with light shadow
             Text(clip.name).font(.system(size:9, weight:.medium))
-                .foregroundColor(.white.opacity(0.9))
-                .padding(.leading, 5).lineLimit(1)
+                .foregroundColor(.white)
+                .shadow(color: .black.opacity(0.4), radius: 2, x: 0, y: 1)
+                .lineLimit(1)
+                .padding(.leading, 5)
+                .padding(.top, 4)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         }
         .frame(width: w, height: h-4)
+        .clipShape(RoundedRectangle(cornerRadius: 4))
         .opacity(isDragging ? 0 : (project.clipboardIsCut && project.clipboardSourceID == clip.id ? 0.35 : 1.0))
         .offset(x: clip.startTime*pps + 1)
+        .onAppear {
+            if let url = clip.url {
+                project.loadWaveform(assetID: clip.assetID, url: url)
+            }
+        }
         .gesture(TapGesture().modifiers(.shift).onEnded {
             project.shiftToggleClip(clip.id)
         })
@@ -982,6 +1198,58 @@ private struct AudioClipView: View {
     }
 }
 
+/// Canvas-based audio waveform visualization
+private struct AudioWaveformCanvas: View {
+    let waveData: WaveformData
+    let trimStart: Double
+    let clipDuration: Double
+    var fullHeight: Bool = false
+
+    var body: some View {
+        Canvas { ctx, size in
+            guard waveData.totalDuration > 0, !waveData.samples.isEmpty else { return }
+            let startFrac = trimStart / waveData.totalDuration
+            let endFrac   = (trimStart + clipDuration) / waveData.totalDuration
+            let startIdx  = Int(startFrac * Double(waveData.samples.count))
+            let endIdx    = min(Int(endFrac * Double(waveData.samples.count)), waveData.samples.count)
+            guard startIdx < endIdx else { return }
+
+            let visible = Array(waveData.samples[startIdx..<endIdx])
+            let barCount = Int(size.width)
+            guard barCount > 0 else { return }
+
+            if fullHeight {
+                // Normalize: find max peak in visible range so waveform fills height
+                let maxPeak = max(visible.max() ?? 1, 0.01)
+                // Bars grow from bottom, full height
+                for x in 0..<barCount {
+                    let sIdx = x * visible.count / barCount
+                    let eIdx = min(sIdx + max(1, visible.count / barCount), visible.count)
+                    guard sIdx < eIdx else { continue }
+                    let peak = (visible[sIdx..<eIdx].max() ?? 0) / maxPeak  // normalized 0..1
+                    let barH = max(1, CGFloat(peak) * size.height)
+                    let rect = CGRect(x: CGFloat(x), y: size.height - barH,
+                                      width: 1, height: barH)
+                    ctx.fill(Path(rect), with: .color(.white.opacity(0.30)))
+                }
+            } else {
+                // Centered waveform
+                let midY = size.height / 2
+                for x in 0..<barCount {
+                    let sIdx = x * visible.count / barCount
+                    let eIdx = min(sIdx + max(1, visible.count / barCount), visible.count)
+                    guard sIdx < eIdx else { continue }
+                    let peak = visible[sIdx..<eIdx].max() ?? 0
+                    let barH = CGFloat(peak) * (size.height * 0.75)
+                    let rect = CGRect(x: CGFloat(x), y: midY - barH / 2,
+                                      width: 1, height: max(1, barH))
+                    ctx.fill(Path(rect), with: .color(.white.opacity(0.35)))
+                }
+            }
+        }
+    }
+}
+
 private struct SubtitleClipView: View {
     let clip: SubtitleClip
     let pps: Double
@@ -992,21 +1260,19 @@ private struct SubtitleClipView: View {
 
     var body: some View {
         let w = max(clip.duration*pps, 4)
-        ZStack(alignment:.topLeading) {
-            RoundedRectangle(cornerRadius:4).fill(Color(hex:"#7B6FC4").opacity(0.85))
-                .overlay(RoundedRectangle(cornerRadius:4)
+        let clipH = (h - 4) / 2  // half height
+        ZStack(alignment:.leading) {
+            RoundedRectangle(cornerRadius:3).fill(Color(hex:"#7B6FC4").opacity(0.85))
+                .overlay(RoundedRectangle(cornerRadius:3)
                     .stroke(sel ? Color.white : Color(hex:"#9B8FD4").opacity(0.4), lineWidth: sel ? 2 : 1))
             if w > 16 {
-                VStack(alignment:.leading, spacing:1) {
-                    Text(clip.text.components(separatedBy:"\n").first ?? clip.text)
-                        .font(.system(size:8, weight:.medium))
-                        .foregroundColor(.white.opacity(0.9)).lineLimit(1)
-                    Text(fmtT(clip.startTime)).font(.system(size:7).monospacedDigit())
-                        .foregroundColor(.white.opacity(0.5))
-                }.padding(.horizontal, 3).padding(.vertical, 2)
+                Text(clip.text.components(separatedBy:"\n").first ?? clip.text)
+                    .font(.system(size:8, weight:.medium))
+                    .foregroundColor(.white.opacity(0.9)).lineLimit(1)
+                    .padding(.horizontal, 4)
             }
         }
-        .frame(width: w, height: h-4)
+        .frame(width: w, height: clipH)
         .opacity(isDragging ? 0 : (project.clipboardIsCut && project.clipboardSourceID == clip.id ? 0.35 : 1.0))
         .offset(x: clip.startTime*pps + 1)
         .gesture(TapGesture().modifiers(.shift).onEnded {

@@ -15,6 +15,8 @@ struct InspectorView: View {
             ScrollView(showsIndicators: false) {
                 if let clip = project.selectedSubtitleClip {
                     SubtitleInspector(clip: clip)
+                } else if let clip = project.selectedImageClip {
+                    ImageInspector(clip: clip)
                 } else if let clip = project.selectedVideoClip {
                     VideoInspector(clip: clip)
                 } else if let clip = project.selectedAudioClip {
@@ -43,6 +45,7 @@ struct InspectorView: View {
 
     private var tag: String {
         if project.selectedSubtitleClipID != nil { return "字幕片段" }
+        if project.selectedImageClipID    != nil { return "图片片段" }
         if project.selectedVideoClipID    != nil { return "视频片段" }
         if project.selectedAudioClipID    != nil { return "音频片段" }
         return ""
@@ -314,6 +317,141 @@ enum Translator {
         case "Português":   return "pt"
         case "Italiano":    return "it"
         default:            return "zh-CN"
+        }
+    }
+}
+
+// MARK: - Video Inspector
+
+// MARK: - Image Inspector
+
+private struct ImageInspector: View {
+    @EnvironmentObject private var project: ProjectState
+    let clip: ImageClip
+
+    @State private var scaleX: Double = 1.0
+    @State private var scaleY: Double = 1.0
+    @State private var lockAspect: Bool = true
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            // Thumbnail
+            if let thumb = project.mediaThumbnails[clip.assetID] {
+                Image(nsImage: thumb)
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .frame(maxWidth: .infinity)
+                    .frame(height: 120)
+                    .clipShape(RoundedRectangle(cornerRadius: 6))
+            }
+
+            // Name
+            inspRow("名称") {
+                Text(clip.name)
+                    .font(.system(size: 11))
+                    .foregroundColor(Color.labelPrimary)
+                    .lineLimit(2)
+            }
+
+            // Resolution
+            inspRow("分辨率") {
+                Text("\(clip.imageWidth) × \(clip.imageHeight)")
+                    .font(.system(size: 11).monospacedDigit())
+                    .foregroundColor(Color.labelPrimary)
+            }
+
+            // Duration
+            inspRow("时长") {
+                Text(String(format: "%.1f 秒", clip.duration))
+                    .font(.system(size: 11).monospacedDigit())
+                    .foregroundColor(Color.labelPrimary)
+            }
+
+            Divider().background(Color.divider)
+
+            // Scale
+            HStack {
+                Text("缩放")
+                    .font(.system(size: 11))
+                    .foregroundColor(Color.labelSecondary)
+                    .frame(width: 50, alignment: .leading)
+                Spacer()
+                Button { lockAspect.toggle(); syncLock() } label: {
+                    Image(systemName: lockAspect ? "lock.fill" : "lock.open")
+                        .font(.system(size: 10))
+                        .foregroundColor(lockAspect ? Color.accent : Color.labelSecondary)
+                }
+                .buttonStyle(.plain)
+            }
+
+            HStack(spacing: 8) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("宽").font(.system(size: 9)).foregroundColor(Color.labelSecondary)
+                    HStack(spacing: 2) {
+                        Slider(value: $scaleX, in: 0.1...3.0)
+                            .frame(width: 80)
+                            .onChange(of: scaleX) { v in
+                                if lockAspect { scaleY = v }
+                                applyScale()
+                            }
+                        Text("\(Int(scaleX * 100))%")
+                            .font(.system(size: 10).monospacedDigit())
+                            .foregroundColor(Color.labelPrimary)
+                            .frame(width: 36)
+                    }
+                }
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("高").font(.system(size: 9)).foregroundColor(Color.labelSecondary)
+                    HStack(spacing: 2) {
+                        Slider(value: $scaleY, in: 0.1...3.0)
+                            .frame(width: 80)
+                            .onChange(of: scaleY) { v in
+                                if lockAspect { scaleX = v }
+                                applyScale()
+                            }
+                        Text("\(Int(scaleY * 100))%")
+                            .font(.system(size: 10).monospacedDigit())
+                            .foregroundColor(Color.labelPrimary)
+                            .frame(width: 36)
+                    }
+                }
+            }
+        }
+        .padding(14)
+        .onAppear {
+            scaleX = clip.scaleX
+            scaleY = clip.scaleY
+            lockAspect = clip.lockAspect
+        }
+        .onChange(of: clip.id) { _ in
+            scaleX = clip.scaleX
+            scaleY = clip.scaleY
+            lockAspect = clip.lockAspect
+        }
+    }
+
+    private func syncLock() {
+        project.updateImageClip(id: clip.id) { $0.lockAspect = lockAspect }
+    }
+
+    private func applyScale() {
+        project.updateImageClip(id: clip.id) {
+            $0.scaleX = scaleX
+            $0.scaleY = scaleY
+            $0.lockAspect = lockAspect
+        }
+        project.rebuildTimelinePreview()
+    }
+
+    @ViewBuilder
+    private func inspRow(_ label: String, @ViewBuilder content: () -> some View) -> some View {
+        HStack {
+            Text(label)
+                .font(.system(size: 11))
+                .foregroundColor(Color.labelSecondary)
+                .frame(width: 50, alignment: .leading)
+            Spacer()
+            content()
         }
     }
 }
