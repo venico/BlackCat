@@ -5,7 +5,7 @@ import AVFoundation
 
 struct TimelineView: View {
     @EnvironmentObject private var project: ProjectState
-    private let labelW: CGFloat = 130
+    private let labelW: CGFloat = 84
     private let trackH: CGFloat = 52
     private let rulerH: CGFloat = 26
 
@@ -13,7 +13,8 @@ struct TimelineView: View {
     @State private var dragOp:   DragOp?  = nil
     @State private var boxStart: CGPoint? = nil
     @State private var boxEnd:   CGPoint? = nil
-    @State private var dragGhostPos: CGPoint? = nil  // cursor position during clip drag
+    @State private var dragGhostPos: CGPoint? = nil  // ghost center position during clip drag
+    @State private var dragGhostOffset: CGSize = .zero // offset from mouse to clip center at drag start
     @State private var draggingClipID: UUID? = nil   // hide original while dragging
 
     // Global event monitors
@@ -57,6 +58,18 @@ struct TimelineView: View {
             switch self {
             case .video(let id, _, _), .image(let id, _, _), .audio(let id, _, _), .subtitle(let id, _, _):
                 return id
+            }
+        }
+        var start: Double {
+            switch self {
+            case .video(_, let s, _), .image(_, let s, _), .audio(_, let s, _), .subtitle(_, let s, _):
+                return s
+            }
+        }
+        var duration: Double {
+            switch self {
+            case .video(_, _, let d), .image(_, _, let d), .audio(_, _, let d), .subtitle(_, _, let d):
+                return d
             }
         }
     }
@@ -156,6 +169,7 @@ struct TimelineView: View {
             // Esc → 取消选择
             if event.keyCode == 53 {
                 project.selectedVideoClipID    = nil
+                project.selectedImageClipID    = nil
                 project.selectedAudioClipID    = nil
                 project.selectedSubtitleClipID = nil
                 project.selectedClipIDs.removeAll()
@@ -317,22 +331,24 @@ struct TimelineView: View {
 
                     // Drag ghost overlay
                     if let gPos = dragGhostPos, let ghostInfo = dragGhostInfo() {
-                        RoundedRectangle(cornerRadius: 4)
+                        let cr: CGFloat = ghostInfo.isSubtitle ? 3 : 4
+                        RoundedRectangle(cornerRadius: cr)
                             .fill(ghostInfo.color.opacity(0.5))
                             .overlay(
-                                RoundedRectangle(cornerRadius: 4)
+                                RoundedRectangle(cornerRadius: cr)
                                     .stroke(Color.white.opacity(0.6), lineWidth: 1.5)
                             )
                             .overlay(
                                 Text(ghostInfo.name)
-                                    .font(.system(size: 9, weight: .medium))
+                                    .font(.system(size: ghostInfo.isSubtitle ? 8 : 9, weight: .medium))
                                     .foregroundColor(.white.opacity(0.9))
                                     .lineLimit(1)
-                                    .padding(.horizontal, 5)
-                                , alignment: .leading
+                                    .padding(.leading, ghostInfo.isSubtitle ? 4 : 5)
+                                    .padding(.top, ghostInfo.isSubtitle ? 0 : 4)
+                                , alignment: ghostInfo.isSubtitle ? .leading : .topLeading
                             )
                             .frame(width: max(ghostInfo.duration * project.pixelsPerSecond, 30),
-                                   height: trackH - 8)
+                                   height: ghostInfo.height)
                             .position(x: gPos.x, y: gPos.y)
                             .allowsHitTesting(false)
                     }
@@ -340,8 +356,7 @@ struct TimelineView: View {
                     // Playhead (draggable)
                     DraggablePlayhead(pps: project.pixelsPerSecond)
                 }
-                .padding(.leading, 6)   // prevent playhead triangle from being clipped at x=0
-                .frame(width: totalW + 6,
+                .frame(width: totalW,
                        height: max(geo.size.height, totalContentH()),
                        alignment: .topLeading)
                 .contentShape(Rectangle())
@@ -372,6 +387,7 @@ struct TimelineView: View {
                 }
                 .simultaneousGesture(unifiedDragGesture)
             }
+            .scrollClipDisabled(true)
         }
     }
 
@@ -400,15 +416,26 @@ struct TimelineView: View {
                     }
                 }
                 guard let op = dragOp else { return }
-                // Track ghost position for move ops
+                // Track ghost position for move ops (offset so clip stays under grab point)
                 switch op {
                 case .moveVideo, .moveImage, .moveAudio, .moveSubtitle:
-                    dragGhostPos = v.location
+                    dragGhostPos = CGPoint(x: v.location.x - dragGhostOffset.width,
+                                           y: v.location.y - dragGhostOffset.height)
                 default: break
                 }
                 applyDrag(op: op, totalTranslation: v.translation, current: v.location)
             }
             .onEnded { v in
+                // 点击空白处（没有拖动）→ 取消所有选择
+                if dragOp == nil && v.startLocation.y >= rulerH {
+                    if findClipTarget(at: v.startLocation) == nil {
+                        project.selectedClipIDs.removeAll()
+                        project.selectedVideoClipID    = nil
+                        project.selectedImageClipID    = nil
+                        project.selectedAudioClipID    = nil
+                        project.selectedSubtitleClipID = nil
+                    }
+                }
                 if case .box = dragOp, let s = boxStart, let e = boxEnd {
                     let rect = CGRect(x: min(s.x, e.x), y: min(s.y, e.y),
                                       width: abs(e.x - s.x), height: abs(e.y - s.y))
@@ -453,6 +480,7 @@ struct TimelineView: View {
                 boxStart = nil
                 boxEnd = nil
                 dragGhostPos = nil
+                dragGhostOffset = .zero
                 draggingClipID = nil
             }
     }
@@ -471,6 +499,15 @@ struct TimelineView: View {
                 project.pushUndo()
                 dragOp = .moveMulti(items: items)
                 return
+            }
+
+            // 计算鼠标点击位置相对于片段中心的偏移（用于拖拽跟手）
+            if trimEdge == nil {
+                let pps = project.pixelsPerSecond
+                let clipCenterX = hit.start * pps + hit.duration * pps / 2
+                let trackRow = trackRowForClip(hit)
+                let clipCenterY = rulerH + (CGFloat(trackRow) + 0.5) * trackH
+                dragGhostOffset = CGSize(width: pt.x - clipCenterX, height: pt.y - clipCenterY)
             }
 
             project.selectedClipIDs.removeAll()
@@ -559,6 +596,7 @@ struct TimelineView: View {
             boxStart = pt
             project.selectedClipIDs.removeAll()
             project.selectedVideoClipID    = nil
+            project.selectedImageClipID    = nil
             project.selectedAudioClipID    = nil
             project.selectedSubtitleClipID = nil
         }
@@ -809,7 +847,7 @@ struct TimelineView: View {
     @ViewBuilder
     private var trackRows: some View {
         ForEach(project.imageTracks.indices, id:\.self) { i in
-            trackRow(height: trackH, hidden: !project.imageTracks[i].isVisible) {
+            trackRow(height: trackH, hidden: !project.imageTracks[i].isVisible, tint: Color(hex: "#E8A54B")) {
                 ForEach(project.imageTracks[i].clips) { clip in
                     ImageClipView(clip: clip, pps: project.pixelsPerSecond, h: trackH,
                                   sel: isSelected(clip.id, primary: project.selectedImageClipID),
@@ -818,7 +856,7 @@ struct TimelineView: View {
             }
         }
         ForEach(project.videoTracks.indices, id:\.self) { i in
-            trackRow(height: trackH, hidden: !project.videoTracks[i].isVisible) {
+            trackRow(height: trackH, hidden: !project.videoTracks[i].isVisible, tint: Color(hex: "#3DBFBA")) {
                 ForEach(project.videoTracks[i].clips) { clip in
                     VideoClipView(clip: clip, pps: project.pixelsPerSecond, h: trackH,
                                   sel: isSelected(clip.id, primary: project.selectedVideoClipID),
@@ -827,7 +865,7 @@ struct TimelineView: View {
             }
         }
         ForEach(project.audioTracks.indices, id:\.self) { i in
-            trackRow(height: trackH, hidden: !project.audioTracks[i].isVisible) {
+            trackRow(height: trackH, hidden: !project.audioTracks[i].isVisible, tint: Color(hex: "#5DB85D")) {
                 ForEach(project.audioTracks[i].clips) { clip in
                     AudioClipView(clip: clip, pps: project.pixelsPerSecond, h: trackH,
                                   sel: isSelected(clip.id, primary: project.selectedAudioClipID),
@@ -836,7 +874,7 @@ struct TimelineView: View {
             }
         }
         ForEach(project.subtitleTracks.indices, id:\.self) { i in
-            trackRow(height: trackH, hidden: !project.subtitleTracks[i].isVisible) {
+            trackRow(height: trackH, hidden: !project.subtitleTracks[i].isVisible, tint: Color(hex: "#7B6FC4")) {
                 ForEach(project.subtitleTracks[i].clips) { clip in
                     SubtitleClipView(clip: clip, pps: project.pixelsPerSecond, h: trackH,
                                      sel: isSelected(clip.id, primary: project.selectedSubtitleClipID),
@@ -850,22 +888,24 @@ struct TimelineView: View {
         let name: String
         let duration: Double
         let color: Color
+        let height: CGFloat
+        let isSubtitle: Bool
     }
 
     private func dragGhostInfo() -> GhostInfo? {
         switch dragOp {
         case .moveVideo(let id, _, _, _):
             guard let clip = project.videoTracks.flatMap(\.clips).first(where: { $0.id == id }) else { return nil }
-            return GhostInfo(name: clip.name, duration: clip.duration, color: Color(hex: "#3DBFBA"))
+            return GhostInfo(name: clip.name, duration: clip.duration, color: Color(hex: "#3DBFBA"), height: trackH - 4, isSubtitle: false)
         case .moveImage(let id, _, _, _):
             guard let clip = project.imageTracks.flatMap(\.clips).first(where: { $0.id == id }) else { return nil }
-            return GhostInfo(name: clip.name, duration: clip.duration, color: Color(hex: "#E8A54B"))
+            return GhostInfo(name: clip.name, duration: clip.duration, color: Color(hex: "#E8A54B"), height: trackH - 4, isSubtitle: false)
         case .moveAudio(let id, _, _, _):
             guard let clip = project.audioTracks.flatMap(\.clips).first(where: { $0.id == id }) else { return nil }
-            return GhostInfo(name: clip.name, duration: clip.duration, color: Color(hex: "#5DB85D"))
+            return GhostInfo(name: clip.name, duration: clip.duration, color: Color(hex: "#5DB85D"), height: trackH - 4, isSubtitle: false)
         case .moveSubtitle(let id, _, _, _):
             guard let clip = project.subtitleTracks.flatMap(\.clips).first(where: { $0.id == id }) else { return nil }
-            return GhostInfo(name: clip.text, duration: clip.duration, color: Color(hex: "#7B6FC4"))
+            return GhostInfo(name: clip.text.components(separatedBy: "\n").first ?? clip.text, duration: clip.duration, color: Color(hex: "#7B6FC4"), height: (trackH - 4) / 2, isSubtitle: true)
         default: return nil
         }
     }
@@ -880,6 +920,26 @@ struct TimelineView: View {
         var imageIndex: Int?
         var audioIndex: Int?
         var subtitleIndex: Int?
+    }
+
+    private func trackRowForClip(_ hit: ClipHit) -> Int {
+        let iCount = project.imageTracks.count
+        let vCount = project.videoTracks.count
+        let aCount = project.audioTracks.count
+        switch hit {
+        case .image(let id, _, _):
+            let ti = project.imageTracks.firstIndex { $0.clips.contains { $0.id == id } } ?? 0
+            return ti
+        case .video(let id, _, _):
+            let ti = project.videoTracks.firstIndex { $0.clips.contains { $0.id == id } } ?? 0
+            return iCount + ti
+        case .audio(let id, _, _):
+            let ti = project.audioTracks.firstIndex { $0.clips.contains { $0.id == id } } ?? 0
+            return iCount + vCount + ti
+        case .subtitle(let id, _, _):
+            let ti = project.subtitleTracks.firstIndex { $0.clips.contains { $0.id == id } } ?? 0
+            return iCount + vCount + aCount + ti
+        }
     }
 
     private func trackIndexFromY(_ y: CGFloat) -> TrackTarget {
@@ -901,9 +961,9 @@ struct TimelineView: View {
     }
 
     @ViewBuilder
-    private func trackRow<C: View>(height: CGFloat, hidden: Bool = false, @ViewBuilder clips: () -> C) -> some View {
+    private func trackRow<C: View>(height: CGFloat, hidden: Bool = false, tint: Color = .white, @ViewBuilder clips: () -> C) -> some View {
         ZStack(alignment: .leading) {
-            Rectangle().fill(Color.white.opacity(0.02)).allowsHitTesting(false)
+            Rectangle().fill(tint.opacity(0.03)).allowsHitTesting(false)
             clips()
         }
         .frame(height: height)
@@ -923,29 +983,22 @@ private struct TrackLabel: View {
 
     var body: some View {
         ZStack {
-            // 默认：图标+标题左对齐，数量右对齐
-            HStack(spacing: 4) {
+            // 默认：图标 + 数量
+            HStack(spacing: 3) {
                 Image(systemName: icon)
                     .font(.system(size: 10, weight: .light))
                     .foregroundColor(Color.labelSecondary)
-                Text(title)
-                    .font(.system(size: 10, weight: .semibold))
-                    .foregroundColor(Color.labelPrimary)
-                    .lineLimit(1)
-                Spacer()
                 Text("\(count)")
                     .font(.system(size: 9, weight: .medium).monospacedDigit())
                     .foregroundColor(Color.labelSecondary.opacity(0.6))
             }
-            .padding(.leading, 16)
-            .padding(.trailing, 16)
             .opacity(isHovered ? 0 : 1)
 
-            // hover 时：遮罩 + 三个图标按钮
+            // hover 时：操作按钮
             if isHovered {
                 Color(red: 0.09, green: 0.09, blue: 0.10).opacity(0.92)
 
-                HStack(spacing: 6) {
+                HStack(spacing: 2) {
                     if hasMute, let onMute {
                         OverlayBtn(icon: isMuted ? "speaker.slash" : "speaker.wave.2",
                                    action: onMute)
@@ -971,11 +1024,11 @@ private struct OverlayBtn: View {
     var body: some View {
         Button(action: action) {
             Image(systemName: icon)
-                .font(.system(size: 11, weight: .light))
+                .font(.system(size: 9, weight: .light))
                 .foregroundColor(hov ? (destructive ? .red.opacity(0.9) : .white) : Color.labelSecondary)
-                .frame(width: 26, height: 22)
+                .frame(width: 20, height: 20)
                 .background(hov ? Color.white.opacity(0.12) : Color.white.opacity(0.06))
-                .cornerRadius(4)
+                .cornerRadius(3)
         }
         .buttonStyle(.plain)
         .onHover { hov = $0 }

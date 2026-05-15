@@ -153,6 +153,14 @@ struct ContentView: View {
         .sheet(isPresented: $project.showExportSheet) {
             ExportSheetView().environmentObject(project)
         }
+        .onReceive(NotificationCenter.default.publisher(for: .menuImportFiles)) { note in
+            if let urls = note.object as? [URL] {
+                urls.forEach { project.importFile($0) }
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .menuExportVideo)) { _ in
+            project.showExportSheet = true
+        }
     }
 
     private var toggleButton: some View {

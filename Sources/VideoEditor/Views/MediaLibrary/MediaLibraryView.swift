@@ -115,9 +115,11 @@ struct MediaLibraryView: View {
             Image(systemName: icon)
                 .font(.system(size: 12, weight: .medium))
                 .foregroundColor(isActive ? .white : Color.labelSecondary)
-                .frame(width: 34, height: 26)
+                .frame(maxWidth: .infinity)
+                .frame(height: 26)
                 .background(isActive ? Color.white.opacity(0.15) : Color.clear)
                 .clipShape(Capsule())
+                .contentShape(Capsule())
         }
         .buttonStyle(.plain)
     }

@@ -221,6 +221,7 @@ final class ProjectState: ObservableObject {
 
     // Debounce timer for preview rebuild (prevents flickering during interactive edits)
     private var rebuildDebounceTimer: Timer?
+    private var rebuildTask: Task<Void, Never>?
 
     // Thumbnail & Waveform cache
     @Published var mediaThumbnails: [UUID: NSImage] = [:]          // asset ID → single thumbnail (media library)
@@ -530,7 +531,8 @@ final class ProjectState: ObservableObject {
         let aEnd = aTracks.flatMap(\.clips).map(\.endTime).max() ?? 0
         let sEnd = sTracks.flatMap(\.clips).map(\.endTime).max() ?? 0
         let endTime = max(vEnd, max(iEnd, max(aEnd, sEnd)))
-        Task {
+        rebuildTask?.cancel()
+        rebuildTask = Task {
             let composition = AVMutableComposition()
             var audioParams: [(trackID: CMPersistentTrackID, volume: Float, left: Float, right: Float)] = []
             var videoCompTracks: [AVMutableCompositionTrack] = []  // from video clips
@@ -577,17 +579,57 @@ final class ProjectState: ObservableObject {
             for track in iTracks {
                 guard track.isVisible else { continue }
                 for clip in track.clips {
-                    guard let url = clip.videoURL else { continue }
+                    var url = clip.videoURL
+                    if let u = url, !FileManager.default.fileExists(atPath: u.path) {
+                        url = nil
+                    }
+                    if url == nil, let imgURL = clip.imageURL {
+                        url = await Self.createVideoFromImage(imageURL: imgURL, duration: clip.duration)
+                        if let u = url {
+                            await MainActor.run {
+                                self.imageVideoCache[clip.assetID] = u
+                                self.updateImageClip(id: clip.id) { $0.videoURL = u }
+                            }
+                        }
+                    }
+                    guard let url else { continue }
                     let asset = AVURLAsset(url: url)
                     let assetDur = (try? await asset.load(.duration)) ?? .zero
                     let useDur = CMTimeMinimum(CMTime(seconds: clip.duration, preferredTimescale: 600), assetDur)
                     guard useDur.seconds > 0.01 else { continue }
-                    let range = CMTimeRange(start: .zero, duration: useDur)
-                    let at = CMTime(seconds: clip.startTime, preferredTimescale: 600)
                     if let vAsset = try? await asset.loadTracks(withMediaType: .video).first,
                        let vt = composition.addMutableTrack(withMediaType: .video,
                                                             preferredTrackID: kCMPersistentTrackID_Invalid) {
+                        // 先填充 clip 之前的空白区间（确保 track 在所有 segment 都有 sample）
+                        // AVVideoComposition 的 instruction 要求至少 1 个 layerInstruction，
+                        // 而不活跃的 clip 也需要 layerInstruction（opacity=0），
+                        // track 必须在该时间段有 sample 数据才能被引用。
+                        if clip.startTime > 0.01 {
+                            var pos = CMTime.zero
+                            let fillEnd = CMTime(seconds: clip.startTime, preferredTimescale: 600)
+                            while pos < fillEnd {
+                                let remaining = fillEnd - pos
+                                let fillDur = CMTimeMinimum(assetDur, remaining)
+                                try? vt.insertTimeRange(CMTimeRange(start: .zero, duration: fillDur), of: vAsset, at: pos)
+                                pos = pos + fillDur
+                            }
+                        }
+                        // 在 clip 的时间位置插入实际内容
+                        let range = CMTimeRange(start: .zero, duration: useDur)
+                        let at = CMTime(seconds: clip.startTime, preferredTimescale: 600)
                         try? vt.insertTimeRange(range, of: vAsset, at: at)
+                        // clip 之后也填充到 endTime（处理视频比图片长的情况）
+                        let afterEnd = clip.startTime + useDur.seconds
+                        if endTime > afterEnd + 0.01 {
+                            var pos = CMTime(seconds: afterEnd, preferredTimescale: 600)
+                            let fillEnd = CMTime(seconds: endTime, preferredTimescale: 600)
+                            while pos < fillEnd {
+                                let remaining = fillEnd - pos
+                                let fillDur = CMTimeMinimum(assetDur, remaining)
+                                try? vt.insertTimeRange(CMTimeRange(start: .zero, duration: fillDur), of: vAsset, at: pos)
+                                pos = pos + fillDur
+                            }
+                        }
                         imageCompTracks.append((track: vt, clip: clip))
                     }
                 }
@@ -650,40 +692,41 @@ final class ProjectState: ObservableObject {
                 vc.renderSize = renderSize
                 vc.frameDuration = CMTime(value: 1, timescale: 30)
 
-                // Collect image clip time ranges to build segmented instructions
-                var imageClipRanges: [(start: Double, end: Double)] = []
-                for track in iTracks where track.isVisible {
-                    for clip in track.clips {
-                        guard clip.videoURL != nil else { continue }
-                        imageClipRanges.append((clip.startTime, clip.endTime))
-                    }
+                // Collect image clip time ranges — 使用 CMTime 量化后的值避免精度偏差
+                let ts: CMTimeScale = 600
+                let imageClipCMRanges = imageCompTracks.map { entry -> (start: CMTime, end: CMTime) in
+                    let s = CMTime(seconds: entry.clip.startTime, preferredTimescale: ts)
+                    let e = CMTime(seconds: entry.clip.endTime, preferredTimescale: ts)
+                    return (s, e)
                 }
 
-                // Collect all time boundaries
-                var boundaries: Set<Double> = [0, composition.duration.seconds]
-                for r in imageClipRanges { boundaries.insert(r.start); boundaries.insert(r.end) }
-                let sorted = boundaries.sorted()
+                // Collect all time boundaries (CMTime)
+                var cmBoundaries: [CMTime] = [.zero, composition.duration]
+                for r in imageClipCMRanges { cmBoundaries.append(r.start); cmBoundaries.append(r.end) }
+                // 去重 + 排序
+                let sortedCM = Array(Set(cmBoundaries.map { $0.value })).sorted().map { CMTime(value: $0, timescale: ts) }
 
                 var instructions: [AVMutableVideoCompositionInstruction] = []
-                for i in 0..<(sorted.count - 1) {
-                    let segStart = sorted[i]
-                    let segEnd   = sorted[i + 1]
-                    guard segEnd - segStart > 0.001 else { continue }
+                for i in 0..<(sortedCM.count - 1) {
+                    let segStartCM = sortedCM[i]
+                    let segEndCM   = sortedCM[i + 1]
+                    let segDur = segEndCM - segStartCM
+                    guard segDur.seconds > 0.001 else { continue }
 
                     let instruction = AVMutableVideoCompositionInstruction()
-                    instruction.timeRange = CMTimeRange(
-                        start: CMTime(seconds: segStart, preferredTimescale: 600),
-                        duration: CMTime(seconds: segEnd - segStart, preferredTimescale: 600))
+                    instruction.timeRange = CMTimeRange(start: segStartCM, duration: segDur)
                     instruction.backgroundColor = CGColor(gray: 0, alpha: 1)
 
-                    // Is any image clip active in this segment?
-                    let hasImage = imageClipRanges.contains { segStart >= $0.start - 0.001 && segStart < $0.end - 0.001 }
-
+                    let segStart = segStartCM.seconds
                     var layerInstructions: [AVMutableVideoCompositionLayerInstruction] = []
-                    if hasImage {
-                        // Image on top, video below
-                        for entry in imageCompTracks {
-                            let li = AVMutableVideoCompositionLayerInstruction(assetTrack: entry.track)
+                    // 所有 image track 都有 sample（填充了整个时间线），
+                    // 不活跃的 clip 用 opacity=0 隐藏。
+                    for (idx, entry) in imageCompTracks.enumerated() {
+                        let clipStartCM = imageClipCMRanges[idx].start
+                        let clipEndCM   = imageClipCMRanges[idx].end
+                        let clipActive = segStartCM >= clipStartCM && segStartCM < clipEndCM
+                        let li = AVMutableVideoCompositionLayerInstruction(assetTrack: entry.track)
+                        if clipActive {
                             if let natSize = try? await entry.track.load(.naturalSize), natSize.width > 0, natSize.height > 0 {
                                 let t = Self.imageTransform(clip: entry.clip, natSize: natSize, renderSize: renderSize)
                                 li.setTransform(t, at: .zero)
@@ -692,23 +735,14 @@ final class ProjectState: ObservableObject {
                                     li.setCropRectangle(Self.imageCropRect(clip: c, natSize: natSize), at: .zero)
                                 }
                             }
-                            layerInstructions.append(li)
-                        }
-                        for track in videoCompTracks {
-                            let li = AVMutableVideoCompositionLayerInstruction(assetTrack: track)
-                            layerInstructions.append(li)
-                        }
-                    } else {
-                        // Video only — hide image tracks
-                        for entry in imageCompTracks {
-                            let li = AVMutableVideoCompositionLayerInstruction(assetTrack: entry.track)
+                        } else {
                             li.setOpacity(0, at: .zero)
-                            layerInstructions.append(li)
                         }
-                        for track in videoCompTracks {
-                            let li = AVMutableVideoCompositionLayerInstruction(assetTrack: track)
-                            layerInstructions.append(li)
-                        }
+                        layerInstructions.append(li)
+                    }
+                    for track in videoCompTracks {
+                        let li = AVMutableVideoCompositionLayerInstruction(assetTrack: track)
+                        layerInstructions.append(li)
                     }
                     instruction.layerInstructions = layerInstructions
                     instructions.append(instruction)
@@ -720,11 +754,13 @@ final class ProjectState: ObservableObject {
                 }
             }
 
+            guard !Task.isCancelled else { return }
             await MainActor.run {
                 self.lastVideoEndTime = endTime
                 self.pendingSeekTime = restoreTime
                 if composition.tracks.isEmpty && endTime < 0.01 {
                     self.playerItem = nil
+                    NSLog("[Rebuild] playerItem = nil (empty)")
                 } else {
                     let item = AVPlayerItem(asset: composition)
                     item.audioMix = audioMix
@@ -732,6 +768,7 @@ final class ProjectState: ObservableObject {
                         item.videoComposition = vc
                     }
                     self.playerItem = item
+                    NSLog("[Rebuild] playerItem set, tracks=%d", composition.tracks.count)
                 }
             }
         }

@@ -27,6 +27,18 @@ final class ExportManager: ObservableObject {
         }
     }
 
+    private var autoDismissTimers: [UUID: DispatchWorkItem] = [:]
+
+    private func scheduleAutoDismiss(id: UUID) {
+        autoDismissTimers[id]?.cancel()
+        let item = DispatchWorkItem { [weak self] in
+            self?.dismiss(id)
+            self?.autoDismissTimers.removeValue(forKey: id)
+        }
+        autoDismissTimers[id] = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5, execute: item)
+    }
+
     /// 启动一个新的导出任务，立即返回
     func startExport(snapshot: ExportInput) {
         let job = Job(filename: snapshot.outputURL.lastPathComponent, outputURL: snapshot.outputURL)
@@ -49,6 +61,7 @@ final class ExportManager: ObservableObject {
                         self.jobs[i].state = .done
                         self.jobs[i].outputURL = url
                     }
+                    self.scheduleAutoDismiss(id: jobID)
                 }
             } catch {
                 await MainActor.run {
@@ -561,6 +574,7 @@ actor TimelineExporter {
         // ── 图片轨道（上层）──
         var imageCompTracks: [(track: AVMutableCompositionTrack, clip: ImageClip)] = []
         if includeVideo {
+            let endTime = composition.duration.seconds
             for track in input.imageTracks {
                 guard track.isVisible else { continue }
                 for clip in track.clips {
@@ -569,12 +583,36 @@ actor TimelineExporter {
                     let assetDur = try await asset.load(.duration)
                     let useDur = CMTimeMinimum(CMTime(seconds: clip.duration, preferredTimescale: 600), assetDur)
                     guard useDur.seconds > 0.01 else { continue }
-                    let range = CMTimeRange(start: .zero, duration: useDur)
-                    let at = CMTime(seconds: clip.startTime, preferredTimescale: 600)
                     if let vAsset = try? await asset.loadTracks(withMediaType: .video).first,
                        let vt = composition.addMutableTrack(withMediaType: .video,
                                                             preferredTrackID: kCMPersistentTrackID_Invalid) {
-                        try vt.insertTimeRange(range, of: vAsset, at: at)
+                        // 先填充 clip 之前的空白区间
+                        if clip.startTime > 0.01 {
+                            var pos = CMTime.zero
+                            let fillEnd = CMTime(seconds: clip.startTime, preferredTimescale: 600)
+                            while pos < fillEnd {
+                                let remaining = fillEnd - pos
+                                let fillDur = CMTimeMinimum(assetDur, remaining)
+                                try? vt.insertTimeRange(CMTimeRange(start: .zero, duration: fillDur), of: vAsset, at: pos)
+                                pos = pos + fillDur
+                            }
+                        }
+                        // 在 clip 的时间位置插入实际内容
+                        let range = CMTimeRange(start: .zero, duration: useDur)
+                        let at = CMTime(seconds: clip.startTime, preferredTimescale: 600)
+                        try? vt.insertTimeRange(range, of: vAsset, at: at)
+                        // clip 之后也填充到 endTime
+                        let afterEnd = clip.startTime + useDur.seconds
+                        if endTime > afterEnd + 0.01 {
+                            var pos = CMTime(seconds: afterEnd, preferredTimescale: 600)
+                            let fillEnd = CMTime(seconds: endTime, preferredTimescale: 600)
+                            while pos < fillEnd {
+                                let remaining = fillEnd - pos
+                                let fillDur = CMTimeMinimum(assetDur, remaining)
+                                try? vt.insertTimeRange(CMTimeRange(start: .zero, duration: fillDur), of: vAsset, at: pos)
+                                pos = pos + fillDur
+                            }
+                        }
                         imageCompTracks.append((track: vt, clip: clip))
                     }
                 }
@@ -620,33 +658,36 @@ actor TimelineExporter {
                 vc.renderSize = renderSize
                 vc.frameDuration = frameDuration
 
-                var imageClipRanges: [(start: Double, end: Double, clip: ImageClip)] = []
-                for entry in imageCompTracks {
-                    imageClipRanges.append((entry.clip.startTime, entry.clip.endTime, entry.clip))
+                // 使用 CMTime 量化后的值避免精度偏差
+                let ts: CMTimeScale = 600
+                let imageClipCMRanges = imageCompTracks.map { entry -> (start: CMTime, end: CMTime) in
+                    let s = CMTime(seconds: entry.clip.startTime, preferredTimescale: ts)
+                    let e = CMTime(seconds: entry.clip.endTime, preferredTimescale: ts)
+                    return (s, e)
                 }
 
-                var boundaries: Set<Double> = [0, composition.duration.seconds]
-                for r in imageClipRanges { boundaries.insert(r.start); boundaries.insert(r.end) }
-                let sorted = boundaries.sorted()
+                var cmBoundaries: [CMTime] = [.zero, composition.duration]
+                for r in imageClipCMRanges { cmBoundaries.append(r.start); cmBoundaries.append(r.end) }
+                let sortedCM = Array(Set(cmBoundaries.map { $0.value })).sorted().map { CMTime(value: $0, timescale: ts) }
 
                 var instructions: [AVMutableVideoCompositionInstruction] = []
-                for i in 0..<(sorted.count - 1) {
-                    let segStart = sorted[i]
-                    let segEnd   = sorted[i + 1]
-                    guard segEnd - segStart > 0.001 else { continue }
+                for i in 0..<(sortedCM.count - 1) {
+                    let segStartCM = sortedCM[i]
+                    let segEndCM   = sortedCM[i + 1]
+                    let segDur = segEndCM - segStartCM
+                    guard segDur.seconds > 0.001 else { continue }
 
                     let instruction = AVMutableVideoCompositionInstruction()
-                    instruction.timeRange = CMTimeRange(
-                        start: CMTime(seconds: segStart, preferredTimescale: 600),
-                        duration: CMTime(seconds: segEnd - segStart, preferredTimescale: 600))
+                    instruction.timeRange = CMTimeRange(start: segStartCM, duration: segDur)
                     instruction.backgroundColor = CGColor(gray: 0, alpha: 1)
 
-                    let hasImage = imageClipRanges.contains { segStart >= $0.start - 0.001 && segStart < $0.end - 0.001 }
-
                     var layerInstructions: [AVMutableVideoCompositionLayerInstruction] = []
-                    if hasImage {
-                        for entry in imageCompTracks {
-                            let li = AVMutableVideoCompositionLayerInstruction(assetTrack: entry.track)
+                    for (idx, entry) in imageCompTracks.enumerated() {
+                        let clipStartCM = imageClipCMRanges[idx].start
+                        let clipEndCM   = imageClipCMRanges[idx].end
+                        let clipActive = segStartCM >= clipStartCM && segStartCM < clipEndCM
+                        let li = AVMutableVideoCompositionLayerInstruction(assetTrack: entry.track)
+                        if clipActive {
                             if let natSize = try? await entry.track.load(.naturalSize), natSize.width > 0, natSize.height > 0 {
                                 let t = ProjectState.imageTransform(clip: entry.clip, natSize: natSize, renderSize: renderSize)
                                 li.setTransform(t, at: .zero)
@@ -655,28 +696,17 @@ actor TimelineExporter {
                                     li.setCropRectangle(ProjectState.imageCropRect(clip: c, natSize: natSize), at: .zero)
                                 }
                             }
-                            layerInstructions.append(li)
-                        }
-                        for vt in videoTracksList {
-                            let li = AVMutableVideoCompositionLayerInstruction(assetTrack: vt)
-                            let scaleX = renderSize.width / sourceVideoSize.width
-                            let scaleY = renderSize.height / sourceVideoSize.height
-                            li.setTransform(CGAffineTransform(scaleX: scaleX, y: scaleY), at: .zero)
-                            layerInstructions.append(li)
-                        }
-                    } else {
-                        for entry in imageCompTracks {
-                            let li = AVMutableVideoCompositionLayerInstruction(assetTrack: entry.track)
+                        } else {
                             li.setOpacity(0, at: .zero)
-                            layerInstructions.append(li)
                         }
-                        for vt in videoTracksList {
-                            let li = AVMutableVideoCompositionLayerInstruction(assetTrack: vt)
-                            let scaleX = renderSize.width / sourceVideoSize.width
-                            let scaleY = renderSize.height / sourceVideoSize.height
-                            li.setTransform(CGAffineTransform(scaleX: scaleX, y: scaleY), at: .zero)
-                            layerInstructions.append(li)
-                        }
+                        layerInstructions.append(li)
+                    }
+                    for vt in videoTracksList {
+                        let li = AVMutableVideoCompositionLayerInstruction(assetTrack: vt)
+                        let scaleX = renderSize.width / sourceVideoSize.width
+                        let scaleY = renderSize.height / sourceVideoSize.height
+                        li.setTransform(CGAffineTransform(scaleX: scaleX, y: scaleY), at: .zero)
+                        layerInstructions.append(li)
                     }
                     instruction.layerInstructions = layerInstructions
                     instructions.append(instruction)

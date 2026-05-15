@@ -498,6 +498,11 @@ final class PlayerController: ObservableObject {
         if let item = item {
             var obs: NSKeyValueObservation?
             obs = item.observe(\.status, options: [.initial, .new]) { [weak self] it, _ in
+                if it.status == .failed {
+                    NSLog("[Player] AVPlayerItem FAILED: %@", it.error?.localizedDescription ?? "unknown")
+                    obs?.invalidate(); obs = nil
+                    return
+                }
                 guard it.status == .readyToPlay else { return }
                 obs?.invalidate(); obs = nil
                 self?.player.seek(to: CMTime(seconds: seekTo, preferredTimescale: 600),
