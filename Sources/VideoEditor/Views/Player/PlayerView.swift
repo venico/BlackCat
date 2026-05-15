@@ -19,6 +19,7 @@ struct PlayerView: View {
                     Color.black
                 }
                 SubtitleOverlay()
+                ImageTransformOverlay()
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
 
@@ -171,6 +172,304 @@ private struct PlaybackBar: View {
     private func fmtT(_ t: Double) -> String {
         let m = Int(t)/60%60; let s = Int(t)%60; let ms = Int((t - Double(Int(t)))*1000)
         return String(format: "%02d:%02d.%03d", m, s, ms)
+    }
+}
+
+// MARK: - Image Transform Overlay
+
+/// When an image clip is selected, shows a bounding box with corner handles
+/// for scaling, edge bars for cropping, and allows drag-to-move.
+/// Cropping one edge keeps the opposite edge fixed.
+private struct ImageTransformOverlay: View {
+    @EnvironmentObject private var project: ProjectState
+
+    enum DragMode { case none, move, scale, crop }
+    @State private var dragMode: DragMode = .none
+    @State private var didPushUndo = false
+    // Move
+    @State private var dragStartOffset: CGPoint = .zero
+    // Scale
+    @State private var scaleStartValues: (sx: Double, sy: Double) = (1, 1)
+    // Crop — 保存拖动开始时的完整clip快照，用于计算对面边补偿
+    @State private var cropEdge: Int = 0
+    @State private var cropStartClip: ImageClip?
+    @State private var isHoveringImage = false
+
+    var body: some View {
+        GeometryReader { geo in
+            if let clip = project.selectedImageClip,
+               clip.startTime <= project.currentTime,
+               clip.endTime > project.currentTime {
+                let info = computeRenderInfo(viewSize: geo.size)
+                let imgRect = computeImageRect(clip: clip, info: info)
+
+                ZStack {
+                    // 最底层：移动区域
+                    Color.clear
+                        .frame(width: max(imgRect.width, 1), height: max(imgRect.height, 1))
+                        .position(x: imgRect.midX, y: imgRect.midY)
+                        .contentShape(Rectangle())
+                        .onHover { isHoveringImage = $0 }
+                        .gesture(moveDrag(clip: clip, info: info))
+
+                    // 边框（不接受事件）
+                    Rectangle()
+                        .stroke(Color.accent, lineWidth: 1.5)
+                        .frame(width: max(imgRect.width, 1), height: max(imgRect.height, 1))
+                        .position(x: imgRect.midX, y: imgRect.midY)
+                        .allowsHitTesting(false)
+
+                    // 四边裁剪手柄 — 橙色长细条（在缩放角下面渲染，但角和边不重叠）
+                    ForEach(0..<4, id: \.self) { edge in
+                        let pos = edgeMidPos(edge, imgRect)
+                        let isH = edge < 2
+                        let barLen = isH ? max(min(imgRect.width * 0.35, 50), 20) : max(min(imgRect.height * 0.35, 50), 20)
+                        CropEdgeBar(isHorizontal: isH, length: barLen)
+                            .position(x: pos.x, y: pos.y)
+                            .gesture(cropDrag(clip: clip, info: info, edge: edge))
+                    }
+
+                    // 四角缩放手柄 — 白色圆点（最上层，优先接收角落事件）
+                    ForEach(0..<4, id: \.self) { corner in
+                        let pos = cornerPos(corner, imgRect)
+                        ScaleHandleDot()
+                            .position(x: pos.x, y: pos.y)
+                            .gesture(scaleDrag(clip: clip, info: info, corner: corner))
+                    }
+                }
+                .cursor(cursorForState)
+            }
+        }
+    }
+
+    // MARK: - 鼠标样式
+    private var cursorForState: NSCursor {
+        switch dragMode {
+        case .move:  return .closedHand
+        case .scale: return .crosshair
+        case .crop:  return cropEdge < 2 ? .resizeUpDown : .resizeLeftRight
+        case .none:  return isHoveringImage ? .openHand : .arrow
+        }
+    }
+
+    // MARK: - 移动手势
+    private func moveDrag(clip: ImageClip, info: RenderInfo) -> some Gesture {
+        DragGesture(minimumDistance: 1)
+            .onChanged { value in
+                if dragMode == .none {
+                    pushUndoOnce()
+                    dragMode = .move
+                    dragStartOffset = CGPoint(x: clip.offsetX, y: clip.offsetY)
+                }
+                guard dragMode == .move else { return }
+                let dx = value.translation.width / info.renderArea.width
+                let dy = value.translation.height / info.renderArea.height
+                project.updateImageClip(id: clip.id) {
+                    $0.offsetX = dragStartOffset.x + dx
+                    $0.offsetY = dragStartOffset.y + dy
+                }
+                project.rebuildTimelinePreviewDebounced()
+            }
+            .onEnded { _ in
+                dragMode = .none; didPushUndo = false
+                project.rebuildTimelinePreview()
+            }
+    }
+
+    // MARK: - 缩放手势
+    private func scaleDrag(clip: ImageClip, info: RenderInfo, corner: Int) -> some Gesture {
+        DragGesture(minimumDistance: 1)
+            .onChanged { value in
+                if dragMode == .none {
+                    pushUndoOnce()
+                    dragMode = .scale
+                    scaleStartValues = (clip.scaleX, clip.scaleY)
+                }
+                guard dragMode == .scale else { return }
+                let imgRect = computeImageRect(clip: clip, info: info)
+                let center = CGPoint(x: imgRect.midX, y: imgRect.midY)
+                let startDist = hypot(value.startLocation.x - center.x,
+                                      value.startLocation.y - center.y)
+                let curDist = hypot(value.location.x - center.x,
+                                    value.location.y - center.y)
+                guard startDist > 1 else { return }
+                let ratio = curDist / startDist
+                project.updateImageClip(id: clip.id) {
+                    $0.scaleX = max(0.05, scaleStartValues.sx * ratio)
+                    $0.scaleY = max(0.05, scaleStartValues.sy * ratio)
+                }
+                project.rebuildTimelinePreviewDebounced()
+            }
+            .onEnded { _ in
+                dragMode = .none; didPushUndo = false
+                project.rebuildTimelinePreview()
+            }
+    }
+
+    // MARK: - 裁剪手势（对面边自然不动，因为 scale 不随 crop 变化）
+    private func cropDrag(clip: ImageClip, info: RenderInfo, edge: Int) -> some Gesture {
+        DragGesture(minimumDistance: 1)
+            .onChanged { value in
+                if dragMode == .none {
+                    pushUndoOnce()
+                    dragMode = .crop
+                    cropEdge = edge
+                    cropStartClip = clip
+                }
+                guard dragMode == .crop, let startClip = cropStartClip else { return }
+
+                // 计算拖动的裁剪量：基于当前图片的实际渲染尺寸
+                let imgRect = computeImageRect(clip: startClip, info: info)
+                var delta: Double = 0
+                switch edge {
+                case 0: delta =  value.translation.height / imgRect.height  // 拖上
+                case 1: delta = -value.translation.height / imgRect.height  // 拖下
+                case 2: delta =  value.translation.width  / imgRect.width   // 拖左
+                case 3: delta = -value.translation.width  / imgRect.width   // 拖右
+                default: break
+                }
+
+                let startVal: Double
+                switch edge {
+                case 0: startVal = startClip.cropTop
+                case 1: startVal = startClip.cropBottom
+                case 2: startVal = startClip.cropLeft
+                case 3: startVal = startClip.cropRight
+                default: startVal = 0
+                }
+                let newCrop = (startVal + delta).clamped(to: 0...0.99)
+
+                project.updateImageClip(id: clip.id) {
+                    switch edge {
+                    case 0: $0.cropTop    = newCrop
+                    case 1: $0.cropBottom = newCrop
+                    case 2: $0.cropLeft   = newCrop
+                    case 3: $0.cropRight  = newCrop
+                    default: break
+                    }
+                }
+                project.rebuildTimelinePreviewDebounced()
+            }
+            .onEnded { _ in
+                dragMode = .none; didPushUndo = false; cropStartClip = nil
+                project.rebuildTimelinePreview()
+            }
+    }
+
+    // MARK: - 撤销
+    private func pushUndoOnce() {
+        guard !didPushUndo else { return }
+        project.pushUndo()
+        didPushUndo = true
+    }
+
+    // MARK: - 手柄
+
+    /// 四角缩放手柄 — 白色圆点
+    private struct ScaleHandleDot: View {
+        var body: some View {
+            ZStack {
+                Circle().fill(Color.white).frame(width: 10, height: 10)
+                Circle().stroke(Color.accent, lineWidth: 1.5).frame(width: 10, height: 10)
+            }
+            .shadow(color: .black.opacity(0.3), radius: 2, x: 0, y: 1)
+            .frame(width: 22, height: 22)
+            .contentShape(Rectangle())
+        }
+    }
+
+    /// 四边裁剪手柄 — 橙色长细条，加大点击区域
+    private struct CropEdgeBar: View {
+        let isHorizontal: Bool
+        let length: CGFloat
+        var body: some View {
+            RoundedRectangle(cornerRadius: 1.5)
+                .fill(Color.orange)
+                .frame(width: isHorizontal ? length : 3,
+                       height: isHorizontal ? 3 : length)
+                .shadow(color: .black.opacity(0.4), radius: 2, x: 0, y: 1)
+                // 点击区域比视觉大很多，防止误触到移动或缩放
+                .frame(width: isHorizontal ? length + 16 : 28,
+                       height: isHorizontal ? 28 : length + 16)
+                .contentShape(Rectangle())
+        }
+    }
+
+    // MARK: - 位置计算
+
+    private func cornerPos(_ corner: Int, _ r: CGRect) -> CGPoint {
+        switch corner {
+        case 0: return CGPoint(x: r.minX, y: r.minY)
+        case 1: return CGPoint(x: r.maxX, y: r.minY)
+        case 2: return CGPoint(x: r.minX, y: r.maxY)
+        case 3: return CGPoint(x: r.maxX, y: r.maxY)
+        default: return r.origin
+        }
+    }
+
+    private func edgeMidPos(_ edge: Int, _ r: CGRect) -> CGPoint {
+        switch edge {
+        case 0: return CGPoint(x: r.midX, y: r.minY)
+        case 1: return CGPoint(x: r.midX, y: r.maxY)
+        case 2: return CGPoint(x: r.minX, y: r.midY)
+        case 3: return CGPoint(x: r.maxX, y: r.midY)
+        default: return r.origin
+        }
+    }
+
+    struct RenderInfo {
+        var renderArea: CGRect
+        var videoSize: CGSize
+    }
+
+    private func computeRenderInfo(viewSize: CGSize) -> RenderInfo {
+        let videoW: CGFloat = 1920; let videoH: CGFloat = 1080
+        let s = min(viewSize.width / videoW, viewSize.height / videoH)
+        let w = videoW * s; let h = videoH * s
+        return RenderInfo(
+            renderArea: CGRect(x: (viewSize.width - w)/2, y: (viewSize.height - h)/2, width: w, height: h),
+            videoSize: CGSize(width: videoW, height: videoH))
+    }
+
+    private func computeImageRect(clip: ImageClip, info: RenderInfo) -> CGRect {
+        let imgW = CGFloat(clip.imageWidth)
+        let imgH = CGFloat(clip.imageHeight)
+        guard imgW > 0, imgH > 0 else { return .zero }
+
+        // Scale based on FULL image (crop does NOT affect scale)
+        let baseScale = min(info.videoSize.width / imgW, info.videoSize.height / imgH)
+        let finalSX = baseScale * clip.scaleX
+        let finalSY = baseScale * clip.scaleY
+
+        // Full image position in video coords
+        let fullW = imgW * finalSX
+        let fullH = imgH * finalSY
+        let cx = info.videoSize.width / 2 + clip.offsetX * info.videoSize.width
+        let cy = info.videoSize.height / 2 + clip.offsetY * info.videoSize.height
+        let fullLeft = cx - fullW / 2
+        let fullTop  = cy - fullH / 2
+
+        // Crop region within the full image (in video coords)
+        let cropX = fullLeft + imgW * CGFloat(clip.cropLeft) * finalSX
+        let cropY = fullTop  + imgH * CGFloat(clip.cropTop)  * finalSY
+        let cropW = imgW * (1 - CGFloat(clip.cropLeft + clip.cropRight))  * finalSX
+        let cropH = imgH * (1 - CGFloat(clip.cropTop  + clip.cropBottom)) * finalSY
+        guard cropW > 0, cropH > 0 else { return .zero }
+
+        let vs = info.renderArea.width / info.videoSize.width
+        return CGRect(
+            x: info.renderArea.minX + cropX * vs,
+            y: info.renderArea.minY + cropY * vs,
+            width: cropW * vs, height: cropH * vs)
+    }
+}
+
+/// Cursor modifier for macOS
+private extension View {
+    func cursor(_ cursor: NSCursor) -> some View {
+        self.onHover { inside in
+            if inside { cursor.push() } else { NSCursor.pop() }
+        }
     }
 }
 

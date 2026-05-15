@@ -648,15 +648,12 @@ actor TimelineExporter {
                         for entry in imageCompTracks {
                             let li = AVMutableVideoCompositionLayerInstruction(assetTrack: entry.track)
                             if let natSize = try? await entry.track.load(.naturalSize), natSize.width > 0, natSize.height > 0 {
-                                let sx = renderSize.width / natSize.width
-                                let sy = renderSize.height / natSize.height
-                                let baseScale = min(sx, sy)
-                                let finalSX = baseScale * entry.clip.scaleX
-                                let finalSY = baseScale * entry.clip.scaleY
-                                let tx = (renderSize.width - natSize.width * finalSX) / 2
-                                let ty = (renderSize.height - natSize.height * finalSY) / 2
-                                li.setTransform(CGAffineTransform(scaleX: finalSX, y: finalSY)
-                                    .concatenating(CGAffineTransform(translationX: tx, y: ty)), at: .zero)
+                                let t = ProjectState.imageTransform(clip: entry.clip, natSize: natSize, renderSize: renderSize)
+                                li.setTransform(t, at: .zero)
+                                let c = entry.clip
+                                if c.cropTop > 0.001 || c.cropBottom > 0.001 || c.cropLeft > 0.001 || c.cropRight > 0.001 {
+                                    li.setCropRectangle(ProjectState.imageCropRect(clip: c, natSize: natSize), at: .zero)
+                                }
                             }
                             layerInstructions.append(li)
                         }

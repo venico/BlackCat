@@ -102,6 +102,13 @@ struct ImageClip: Identifiable, Equatable {
     var scaleX: Double   = 1.0
     var scaleY: Double   = 1.0
     var lockAspect: Bool = true
+    var offsetX: Double  = 0    // normalized offset (-1...1), 0 = centered
+    var offsetY: Double  = 0
+    // Crop: normalized 0...1, fraction of image to remove from each edge
+    var cropTop: Double    = 0
+    var cropBottom: Double = 0
+    var cropLeft: Double   = 0
+    var cropRight: Double  = 0
 }
 
 struct Track<Clip: Identifiable & Equatable>: Identifiable {
@@ -211,6 +218,9 @@ final class ProjectState: ObservableObject {
     @Published var redoCount: Int = 0
     private var undoStack: [ProjectSnapshot] = []
     private var redoStack: [ProjectSnapshot] = []
+
+    // Debounce timer for preview rebuild (prevents flickering during interactive edits)
+    private var rebuildDebounceTimer: Timer?
 
     // Thumbnail & Waveform cache
     @Published var mediaThumbnails: [UUID: NSImage] = [:]          // asset ID → single thumbnail (media library)
@@ -494,6 +504,15 @@ final class ProjectState: ObservableObject {
 
     // MARK: - Preview
 
+    /// Debounced rebuild — coalesces rapid changes (e.g. dragging sliders)
+    /// into a single rebuild after a short delay, preventing flicker.
+    func rebuildTimelinePreviewDebounced() {
+        rebuildDebounceTimer?.invalidate()
+        rebuildDebounceTimer = Timer.scheduledTimer(withTimeInterval: 0.15, repeats: false) { [weak self] _ in
+            self?.rebuildTimelinePreview()
+        }
+    }
+
     /// Build a full timeline composition from all clips and load it as the
     /// playerItem. If `seekTo` is given, also seeks to that time after load.
     /// Gaps between clips are rendered black by AVPlayer automatically.
@@ -666,17 +685,12 @@ final class ProjectState: ObservableObject {
                         for entry in imageCompTracks {
                             let li = AVMutableVideoCompositionLayerInstruction(assetTrack: entry.track)
                             if let natSize = try? await entry.track.load(.naturalSize), natSize.width > 0, natSize.height > 0 {
-                                // Base scale to fit image into render size
-                                let sx = renderSize.width / natSize.width
-                                let sy = renderSize.height / natSize.height
-                                let baseScale = min(sx, sy)
-                                // Apply user scale from inspector
-                                let finalSX = baseScale * entry.clip.scaleX
-                                let finalSY = baseScale * entry.clip.scaleY
-                                let tx = (renderSize.width - natSize.width * finalSX) / 2
-                                let ty = (renderSize.height - natSize.height * finalSY) / 2
-                                li.setTransform(CGAffineTransform(scaleX: finalSX, y: finalSY)
-                                    .concatenating(CGAffineTransform(translationX: tx, y: ty)), at: .zero)
+                                let t = Self.imageTransform(clip: entry.clip, natSize: natSize, renderSize: renderSize)
+                                li.setTransform(t, at: .zero)
+                                let c = entry.clip
+                                if c.cropTop > 0.001 || c.cropBottom > 0.001 || c.cropLeft > 0.001 || c.cropRight > 0.001 {
+                                    li.setCropRectangle(Self.imageCropRect(clip: c, natSize: natSize), at: .zero)
+                                }
                             }
                             layerInstructions.append(li)
                         }
@@ -721,6 +735,35 @@ final class ProjectState: ObservableObject {
                 }
             }
         }
+    }
+
+    // MARK: - Image transform helpers
+
+    /// Compute the CGAffineTransform for an image clip, accounting for scale and offset.
+    /// Scale is based on the FULL image (not crop region), so cropping one edge doesn't affect scale.
+    /// Crop is handled separately via setCropRectangle.
+    static func imageTransform(clip: ImageClip, natSize: CGSize, renderSize: CGSize) -> CGAffineTransform {
+        guard natSize.width > 0, natSize.height > 0 else {
+            return CGAffineTransform(scaleX: 0, y: 0)
+        }
+        // Base scale: fit FULL image into render size (crop does NOT affect scale)
+        let baseScale = min(renderSize.width / natSize.width, renderSize.height / natSize.height)
+        let finalSX = baseScale * CGFloat(clip.scaleX)
+        let finalSY = baseScale * CGFloat(clip.scaleY)
+        // Center the full image, then apply user offset
+        let tx = (renderSize.width  - natSize.width  * finalSX) / 2 + CGFloat(clip.offsetX) * renderSize.width
+        let ty = (renderSize.height - natSize.height * finalSY) / 2 + CGFloat(clip.offsetY) * renderSize.height
+        return CGAffineTransform(scaleX: finalSX, y: finalSY)
+            .concatenating(CGAffineTransform(translationX: tx, y: ty))
+    }
+
+    /// Compute the crop rectangle in the source image's coordinate space.
+    static func imageCropRect(clip: ImageClip, natSize: CGSize) -> CGRect {
+        let x = natSize.width  * CGFloat(clip.cropLeft)
+        let y = natSize.height * CGFloat(clip.cropTop)
+        let w = natSize.width  * (1 - CGFloat(clip.cropLeft + clip.cropRight))
+        let h = natSize.height * (1 - CGFloat(clip.cropTop  + clip.cropBottom))
+        return CGRect(x: x, y: y, width: max(w, 1), height: max(h, 1))
     }
 
     /// Select a clip for preview and seek to its start so the user sees it.
@@ -832,10 +875,9 @@ final class ProjectState: ObservableObject {
             let dur = 5.0
             let videoURL = imageVideoCache[asset.id]
             var imgW = 0, imgH = 0
-            if let img = NSImage(contentsOf: asset.url) {
-                if let rep = img.representations.first {
-                    imgW = rep.pixelsWide; imgH = rep.pixelsHigh
-                }
+            if let img = NSImage(contentsOf: asset.url),
+               let cg = img.cgImage(forProposedRect: nil, context: nil, hints: nil) {
+                imgW = cg.width; imgH = cg.height
             }
             imageTracks[trackIdx].clips.append(
                 ImageClip(assetID: asset.id, name: asset.name, imageURL: asset.url,

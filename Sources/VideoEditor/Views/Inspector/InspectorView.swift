@@ -332,6 +332,13 @@ private struct ImageInspector: View {
     @State private var scaleX: Double = 1.0
     @State private var scaleY: Double = 1.0
     @State private var lockAspect: Bool = true
+    @State private var offsetX: Double = 0
+    @State private var offsetY: Double = 0
+    @State private var cropTop: Double = 0
+    @State private var cropBottom: Double = 0
+    @State private var cropLeft: Double = 0
+    @State private var cropRight: Double = 0
+    @State private var hasPushedUndo = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -369,12 +376,56 @@ private struct ImageInspector: View {
 
             Divider().background(Color.divider)
 
+            // Position
+            Text("位置")
+                .font(.system(size: 10, weight: .medium))
+                .foregroundColor(Color.labelSecondary)
+                .tracking(0.4)
+
+            HStack(spacing: 8) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("X").font(.system(size: 9)).foregroundColor(Color.labelSecondary)
+                    HStack(spacing: 2) {
+                        Slider(value: $offsetX, in: -1.0...1.0)
+                            .frame(width: 80)
+                            .onChange(of: offsetX) { _ in applyTransform() }
+                        Text("\(Int(offsetX * 100))")
+                            .font(.system(size: 10).monospacedDigit())
+                            .foregroundColor(Color.labelPrimary)
+                            .frame(width: 30)
+                    }
+                }
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Y").font(.system(size: 9)).foregroundColor(Color.labelSecondary)
+                    HStack(spacing: 2) {
+                        Slider(value: $offsetY, in: -1.0...1.0)
+                            .frame(width: 80)
+                            .onChange(of: offsetY) { _ in applyTransform() }
+                        Text("\(Int(offsetY * 100))")
+                            .font(.system(size: 10).monospacedDigit())
+                            .foregroundColor(Color.labelPrimary)
+                            .frame(width: 30)
+                    }
+                }
+            }
+
+            Button {
+                offsetX = 0; offsetY = 0
+                applyTransform()
+            } label: {
+                Text("居中")
+                    .font(.system(size: 10))
+                    .foregroundColor(Color.labelSecondary)
+            }.buttonStyle(.plain)
+
+            Divider().background(Color.divider)
+
             // Scale
             HStack {
                 Text("缩放")
-                    .font(.system(size: 11))
+                    .font(.system(size: 10, weight: .medium))
                     .foregroundColor(Color.labelSecondary)
-                    .frame(width: 50, alignment: .leading)
+                    .tracking(0.4)
                 Spacer()
                 Button { lockAspect.toggle(); syncLock() } label: {
                     Image(systemName: lockAspect ? "lock.fill" : "lock.open")
@@ -392,7 +443,7 @@ private struct ImageInspector: View {
                             .frame(width: 80)
                             .onChange(of: scaleX) { v in
                                 if lockAspect { scaleY = v }
-                                applyScale()
+                                applyTransform()
                             }
                         Text("\(Int(scaleX * 100))%")
                             .font(.system(size: 10).monospacedDigit())
@@ -407,7 +458,7 @@ private struct ImageInspector: View {
                             .frame(width: 80)
                             .onChange(of: scaleY) { v in
                                 if lockAspect { scaleX = v }
-                                applyScale()
+                                applyTransform()
                             }
                         Text("\(Int(scaleY * 100))%")
                             .font(.system(size: 10).monospacedDigit())
@@ -416,31 +467,115 @@ private struct ImageInspector: View {
                     }
                 }
             }
+
+            Divider().background(Color.divider)
+
+            // Crop
+            HStack {
+                Text("裁剪")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundColor(Color.labelSecondary)
+                    .tracking(0.4)
+                Spacer()
+                Button {
+                    cropTop = 0; cropBottom = 0; cropLeft = 0; cropRight = 0
+                    applyTransform()
+                } label: {
+                    Text("重置")
+                        .font(.system(size: 9, weight: .medium))
+                        .foregroundColor(hasCrop ? .black : Color.labelSecondary)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(hasCrop ? Color(hex: "#E8A54B") : Color.white.opacity(0.08))
+                        .clipShape(RoundedRectangle(cornerRadius: 4))
+                }
+                .buttonStyle(.plain)
+                .disabled(!hasCrop)
+            }
+
+            VStack(spacing: 12) {
+                cropSlider(label: "上", value: $cropTop, edge: 0)
+                cropSlider(label: "下", value: $cropBottom, edge: 1)
+                cropSlider(label: "左", value: $cropLeft, edge: 2)
+                cropSlider(label: "右", value: $cropRight, edge: 3)
+            }
         }
         .padding(14)
-        .onAppear {
-            scaleX = clip.scaleX
-            scaleY = clip.scaleY
-            lockAspect = clip.lockAspect
+        .onAppear { syncFromClip() }
+        .onChange(of: clip.id) { _ in syncFromClip() }
+        // Sync back from external changes (e.g. preview drag)
+        .onChange(of: clip.offsetX)    { v in if abs(v - offsetX) > 0.001 { offsetX = v } }
+        .onChange(of: clip.offsetY)    { v in if abs(v - offsetY) > 0.001 { offsetY = v } }
+        .onChange(of: clip.scaleX)     { v in if abs(v - scaleX)  > 0.001 { scaleX  = v } }
+        .onChange(of: clip.scaleY)     { v in if abs(v - scaleY)  > 0.001 { scaleY  = v } }
+        .onChange(of: clip.cropTop)    { v in if abs(v - cropTop)    > 0.001 { cropTop    = v } }
+        .onChange(of: clip.cropBottom) { v in if abs(v - cropBottom) > 0.001 { cropBottom = v } }
+        .onChange(of: clip.cropLeft)   { v in if abs(v - cropLeft)   > 0.001 { cropLeft   = v } }
+        .onChange(of: clip.cropRight)  { v in if abs(v - cropRight)  > 0.001 { cropRight  = v } }
+    }
+
+    private var hasCrop: Bool {
+        cropTop > 0.001 || cropBottom > 0.001 || cropLeft > 0.001 || cropRight > 0.001
+    }
+
+    @ViewBuilder
+    private func cropSlider(label: String, value: Binding<Double>, edge: Int) -> some View {
+        HStack(spacing: 6) {
+            Text(label).font(.system(size: 9)).foregroundColor(Color.labelSecondary).frame(width: 14)
+            Slider(value: value, in: 0...0.99)
+                .onChange(of: value.wrappedValue) { _ in applyCropWithCompensation(edge: edge) }
+            Text("\(Int(value.wrappedValue * 100))%")
+                .font(.system(size: 10).monospacedDigit())
+                .foregroundColor(Color.labelPrimary)
+                .frame(width: 30)
         }
-        .onChange(of: clip.id) { _ in
-            scaleX = clip.scaleX
-            scaleY = clip.scaleY
-            lockAspect = clip.lockAspect
-        }
+    }
+
+    private func syncFromClip() {
+        scaleX = clip.scaleX
+        scaleY = clip.scaleY
+        lockAspect = clip.lockAspect
+        offsetX = clip.offsetX
+        offsetY = clip.offsetY
+        cropTop = clip.cropTop
+        cropBottom = clip.cropBottom
+        cropLeft = clip.cropLeft
+        cropRight = clip.cropRight
+        hasPushedUndo = false
     }
 
     private func syncLock() {
         project.updateImageClip(id: clip.id) { $0.lockAspect = lockAspect }
     }
 
-    private func applyScale() {
+    private func applyTransform() {
+        if !hasPushedUndo {
+            project.pushUndo()
+            hasPushedUndo = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { hasPushedUndo = false }
+        }
         project.updateImageClip(id: clip.id) {
             $0.scaleX = scaleX
             $0.scaleY = scaleY
             $0.lockAspect = lockAspect
+            $0.offsetX = offsetX
+            $0.offsetY = offsetY
+            $0.cropTop = cropTop
+            $0.cropBottom = cropBottom
+            $0.cropLeft = cropLeft
+            $0.cropRight = cropRight
         }
-        project.rebuildTimelinePreview()
+        project.rebuildTimelinePreviewDebounced()
+    }
+
+    /// 裁剪滑块变化时，直接更新裁剪值（scale 不随 crop 变化，对面边自然不动）
+    private func applyCropWithCompensation(edge: Int) {
+        if !hasPushedUndo {
+            project.pushUndo()
+            hasPushedUndo = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { hasPushedUndo = false }
+        }
+        applyTransform()
     }
 
     @ViewBuilder
