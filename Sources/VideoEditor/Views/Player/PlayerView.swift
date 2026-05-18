@@ -22,6 +22,13 @@ struct PlayerView: View {
                 ImageTransformOverlay()
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .overlay(alignment: .topTrailing) {
+                if hoveringPlayer {
+                    PreviewResolutionPicker()
+                        .padding(8)
+                        .transition(.opacity)
+                }
+            }
 
             if hoveringPlayer {
                 PlaybackBar(ctrl: ctrl)
@@ -83,6 +90,7 @@ private struct SubtitleOverlay: View {
 
     var body: some View {
         GeometryReader { geo in
+            let scale = geo.size.width / project.previewRenderSize.width
             let pairs: [(String, SubtitleStyle)] = project.subtitleTracks.indices.compactMap { i in
                 guard project.subtitleTracks[i].isVisible else { return nil }
                 let style = project.subtitleStyles.indices.contains(i)
@@ -95,12 +103,12 @@ private struct SubtitleOverlay: View {
 
             if !pairs.isEmpty {
                 let baseStyle  = pairs[0].1
-                let spacing    = CGFloat(baseStyle.lineSpacing)
+                let spacing    = CGFloat(baseStyle.lineSpacing) * scale
                 let bottomPad  = geo.size.height * baseStyle.bottomMargin / 100.0
 
                 VStack(spacing: spacing) {
                     ForEach(pairs.indices, id: \.self) { i in
-                        SubtitleLabel(text: pairs[i].0, style: pairs[i].1)
+                        SubtitleLabel(text: pairs[i].0, style: pairs[i].1, scale: scale)
                     }
                 }
                 .frame(maxWidth: geo.size.width * baseStyle.widthPercent / 100)
@@ -119,17 +127,57 @@ private struct SubtitleOverlay: View {
 }
 
 private struct SubtitleLabel: View {
-    let text: String; let style: SubtitleStyle
+    let text: String; let style: SubtitleStyle; var scale: CGFloat = 1.0
     var body: some View {
         Text(text)
-            .font(.custom(style.fontName, size: style.fontSize).weight(style.bold ? .bold : .regular))
+            .font(.custom(style.fontName, size: style.fontSize * scale).weight(style.bold ? .bold : .regular))
             .italic(style.italic)
             .foregroundColor(style.textColor)
-            .shadow(color: .black.opacity(0.8), radius: 1, x: 1, y: 1)
-            .shadow(color: .black.opacity(0.8), radius: 1, x: -1, y: -1)
-            .padding(.horizontal, 10).padding(.vertical, 3)
+            .shadow(color: .black.opacity(0.8), radius: 1 * scale, x: 1 * scale, y: 1 * scale)
+            .shadow(color: .black.opacity(0.8), radius: 1 * scale, x: -1 * scale, y: -1 * scale)
+            .padding(.horizontal, 10 * scale).padding(.vertical, 3 * scale)
             .background(style.backgroundColor.opacity(style.backgroundOpacity))
-            .cornerRadius(3)
+            .cornerRadius(3 * scale)
+    }
+}
+
+// MARK: - Preview Resolution Picker
+
+private struct PreviewResolutionPicker: View {
+    @EnvironmentObject private var project: ProjectState
+
+    var body: some View {
+        Menu {
+            ForEach(ProjectState.previewResolutions, id: \.self) { res in
+                Button {
+                    project.previewResolution = res
+                } label: {
+                    HStack {
+                        Text(shortLabel(res))
+                        if res == project.previewResolution {
+                            Image(systemName: "checkmark")
+                        }
+                    }
+                }
+            }
+        } label: {
+            Text(shortLabel(project.previewResolution))
+                .font(.system(size: 10, weight: .medium).monospacedDigit())
+                .foregroundColor(Color.labelPrimary)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+                .background(Color.black.opacity(0.55))
+                .cornerRadius(4)
+        }
+        .menuStyle(.borderlessButton)
+        .fixedSize()
+    }
+
+    private func shortLabel(_ res: String) -> String {
+        if let spaceIdx = res.firstIndex(of: " ") {
+            return String(res[res.startIndex..<spaceIdx])
+        }
+        return res
     }
 }
 

@@ -340,7 +340,7 @@ private struct ImageInspector: View {
     @State private var hasPushedUndo = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
+        VStack(alignment: .leading, spacing: 6) {
             // Thumbnail
             if let thumb = project.mediaThumbnails[clip.assetID] {
                 Image(nsImage: thumb)
@@ -373,13 +373,29 @@ private struct ImageInspector: View {
                     .foregroundColor(Color.labelPrimary)
             }
 
-            Divider().background(Color.divider)
-
             // Position
-            Text("位置")
-                .font(.system(size: 10, weight: .medium))
-                .foregroundColor(Color.labelSecondary)
-                .tracking(0.4)
+            HStack {
+                Text("位置")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundColor(Color.labelSecondary.opacity(0.7))
+                    .tracking(0.4)
+                Spacer()
+                Button {
+                    offsetX = 0; offsetY = 0
+                    applyTransform()
+                } label: {
+                    Text("居中")
+                        .font(.system(size: 9, weight: .medium))
+                        .foregroundColor(hasOffset ? .black : Color.labelSecondary)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(hasOffset ? Color(hex: "#E8A54B") : Color.white.opacity(0.08))
+                        .clipShape(RoundedRectangle(cornerRadius: 4))
+                }
+                .buttonStyle(.plain)
+                .disabled(!hasOffset)
+            }
+            .padding(.top, 16)
 
             HStack(spacing: 8) {
                 VStack(alignment: .leading, spacing: 2) {
@@ -408,22 +424,11 @@ private struct ImageInspector: View {
                 }
             }
 
-            Button {
-                offsetX = 0; offsetY = 0
-                applyTransform()
-            } label: {
-                Text("居中")
-                    .font(.system(size: 10))
-                    .foregroundColor(Color.labelSecondary)
-            }.buttonStyle(.plain)
-
-            Divider().background(Color.divider)
-
             // Scale
             HStack {
                 Text("缩放")
                     .font(.system(size: 10, weight: .medium))
-                    .foregroundColor(Color.labelSecondary)
+                    .foregroundColor(Color.labelSecondary.opacity(0.7))
                     .tracking(0.4)
                 Spacer()
                 Button { lockAspect.toggle(); syncLock() } label: {
@@ -433,6 +438,7 @@ private struct ImageInspector: View {
                 }
                 .buttonStyle(.plain)
             }
+            .padding(.top, 16)
 
             HStack(spacing: 8) {
                 VStack(alignment: .leading, spacing: 2) {
@@ -467,13 +473,11 @@ private struct ImageInspector: View {
                 }
             }
 
-            Divider().background(Color.divider)
-
             // Crop
             HStack {
                 Text("裁剪")
                     .font(.system(size: 10, weight: .medium))
-                    .foregroundColor(Color.labelSecondary)
+                    .foregroundColor(Color.labelSecondary.opacity(0.7))
                     .tracking(0.4)
                 Spacer()
                 Button {
@@ -491,8 +495,9 @@ private struct ImageInspector: View {
                 .buttonStyle(.plain)
                 .disabled(!hasCrop)
             }
+            .padding(.top, 16)
 
-            VStack(spacing: 12) {
+            VStack(spacing: 14) {
                 cropSlider(label: "上", value: $cropTop, edge: 0)
                 cropSlider(label: "下", value: $cropBottom, edge: 1)
                 cropSlider(label: "左", value: $cropLeft, edge: 2)
@@ -511,6 +516,10 @@ private struct ImageInspector: View {
         .onChange(of: clip.cropBottom) { v in if abs(v - cropBottom) > 0.001 { cropBottom = v } }
         .onChange(of: clip.cropLeft)   { v in if abs(v - cropLeft)   > 0.001 { cropLeft   = v } }
         .onChange(of: clip.cropRight)  { v in if abs(v - cropRight)  > 0.001 { cropRight  = v } }
+    }
+
+    private var hasOffset: Bool {
+        abs(offsetX) > 0.001 || abs(offsetY) > 0.001
     }
 
     private var hasCrop: Bool {
@@ -766,14 +775,15 @@ struct ISection<Content: View>: View {
             if let t = title {
                 Text(t)
                     .font(.system(size: 10, weight: .medium))
-                    .foregroundColor(Color.labelSecondary)
+                    .foregroundColor(Color.labelSecondary.opacity(0.7))
                     .tracking(0.4)
                     .textCase(.uppercase)
             }
             content
         }
         .padding(.horizontal, 14)
-        .padding(.vertical, 12)
+        .padding(.top, 16)
+        .padding(.bottom, 4)
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
@@ -786,7 +796,7 @@ struct IField<Content: View>: View {
     let label: String
     @ViewBuilder let content: Content
     var body: some View {
-        VStack(alignment: .leading, spacing: 3) {
+        VStack(alignment: .leading, spacing: 2) {
             Text(label)
                 .font(.system(size: 10))
                 .foregroundColor(Color.labelSecondary)

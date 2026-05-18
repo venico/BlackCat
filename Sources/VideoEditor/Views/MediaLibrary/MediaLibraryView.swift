@@ -23,6 +23,13 @@ struct MediaLibraryView: View {
                     .foregroundColor(Color.labelSecondary)
                     .textCase(.uppercase)
                 Spacer()
+                Button { project.refreshMediaLibrary() } label: {
+                    Image(systemName: "arrow.clockwise")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundColor(Color.labelSecondary)
+                }
+                .buttonStyle(.plain)
+                .help("刷新素材库")
             }
             .padding(.leading, 10)
             .padding(.trailing, 8)

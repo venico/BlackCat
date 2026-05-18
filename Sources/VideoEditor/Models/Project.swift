@@ -2,6 +2,7 @@ import SwiftUI
 import AVFoundation
 import MediaToolbox
 import Accelerate
+import Combine
 
 // MARK: - Asset Type
 
@@ -214,6 +215,21 @@ final class ProjectState: ObservableObject {
     @Published var exportSettings  = ExportSettings()
     @Published var showExportSheet = false
 
+    // Preview resolution (for subtitle/image scaling to match export)
+    @Published var previewResolution: String = "1080p  1920×1080"
+    static let previewResolutions = ["4K  3840×2160", "1080p  1920×1080", "720p  1280×720", "480p  854×480"]
+
+    var previewRenderSize: CGSize {
+        let pattern = #"(\d{3,5})\s*[×xX]\s*(\d{3,5})"#
+        guard let regex = try? NSRegularExpression(pattern: pattern),
+              let match = regex.firstMatch(in: previewResolution, range: NSRange(previewResolution.startIndex..., in: previewResolution)),
+              let wRange = Range(match.range(at: 1), in: previewResolution),
+              let hRange = Range(match.range(at: 2), in: previewResolution),
+              let w = Int(previewResolution[wRange]), let h = Int(previewResolution[hRange])
+        else { return CGSize(width: 1920, height: 1080) }
+        return CGSize(width: w, height: h)
+    }
+
     // Undo / Redo
     @Published var undoCount: Int = 0
     @Published var redoCount: Int = 0
@@ -237,6 +253,91 @@ final class ProjectState: ObservableObject {
         "한국어","Français","Deutsch","Español",
         "Русский","العربية","Português","Italiano"
     ]
+
+    private var cancellables = Set<AnyCancellable>()
+
+    private static let mediaLibraryKey = "savedMediaAssetPaths"
+
+    init() {
+        loadSavedMediaLibrary()
+        $mediaAssets
+            .dropFirst()
+            .debounce(for: .milliseconds(500), scheduler: RunLoop.main)
+            .sink { [weak self] assets in
+                self?.saveMediaLibrary(assets)
+            }
+            .store(in: &cancellables)
+    }
+
+    private func saveMediaLibrary(_ assets: [MediaAsset]) {
+        let paths = assets.map { $0.url.path }
+        UserDefaults.standard.set(paths, forKey: Self.mediaLibraryKey)
+    }
+
+    private func loadSavedMediaLibrary() {
+        guard let paths = UserDefaults.standard.stringArray(forKey: Self.mediaLibraryKey) else { return }
+        for path in paths {
+            let url = URL(fileURLWithPath: path)
+            let ext = url.pathExtension.lowercased()
+            let type: AssetType
+            switch ext {
+            case "mp4","mov","mkv","avi","m4v": type = .video
+            case "mp3","wav","aac","m4a","flac": type = .audio
+            case "srt","ass","vtt": type = .subtitle
+            case "png","jpg","jpeg","gif","bmp","tiff","tif","webp","heic": type = .image
+            default: continue
+            }
+            guard !mediaAssets.contains(where: { $0.url == url }) else { continue }
+            let asset = MediaAsset(url: url, name: url.lastPathComponent, type: type)
+            mediaAssets.append(asset)
+            if asset.fileExists {
+                loadMediaResources(asset)
+            }
+        }
+    }
+
+    func refreshMediaLibrary() {
+        var copy = mediaAssets
+        for i in copy.indices {
+            if copy[i].fileExists && mediaThumbnails[copy[i].id] == nil {
+                loadMediaResources(copy[i])
+            }
+        }
+        mediaAssets = copy
+    }
+
+    private func loadMediaResources(_ asset: MediaAsset) {
+        let aid = asset.id
+        let url = asset.url
+        switch asset.type {
+        case .video:
+            loadMediaThumbnail(assetID: aid, url: url)
+            loadTimelineThumbnails(assetID: aid, url: url)
+            Task {
+                if let d = try? await AVURLAsset(url: url).load(.duration) {
+                    await MainActor.run {
+                        if let i = self.mediaAssets.firstIndex(where: { $0.id == aid }) {
+                            self.mediaAssets[i].duration = d.seconds
+                        }
+                    }
+                }
+            }
+        case .audio:
+            loadWaveform(assetID: aid, url: url)
+            Task {
+                if let d = try? await AVURLAsset(url: url).load(.duration) {
+                    await MainActor.run {
+                        if let i = self.mediaAssets.firstIndex(where: { $0.id == aid }) {
+                            self.mediaAssets[i].duration = d.seconds
+                        }
+                    }
+                }
+            }
+        case .image:
+            loadImageThumbnail(assetID: aid, url: url)
+        case .subtitle: break
+        }
+    }
 
     // MARK: - Helpers
 
@@ -941,6 +1042,7 @@ final class ProjectState: ObservableObject {
     // MARK: - Import
 
     func importFile(_ url: URL) {
+        guard !mediaAssets.contains(where: { $0.url == url }) else { return }
         let ext = url.pathExtension.lowercased()
         let type: AssetType
         switch ext {

@@ -226,13 +226,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func showAbout() {
-        let credits = NSAttributedString(string: "视频编辑器 v1.8.0", attributes: [
+        let credits = NSAttributedString(string: "视频编辑器 v1.8.5", attributes: [
             .font: NSFont.systemFont(ofSize: 11),
             .foregroundColor: NSColor.secondaryLabelColor
         ])
         NSApp.orderFrontStandardAboutPanel(options: [
             .applicationName: "黑猫剪辑",
-            .applicationVersion: "1.8.0",
+            .applicationVersion: "1.8.5",
             .credits: credits
         ])
     }

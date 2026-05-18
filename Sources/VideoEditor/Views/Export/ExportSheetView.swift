@@ -254,9 +254,10 @@ struct ExportSheetView: View {
                                 let panel = NSOpenPanel()
                                 panel.canChooseFiles = false
                                 panel.canChooseDirectories = true
+                                panel.canCreateDirectories = true
                                 panel.prompt = "选择"
-                                panel.begin { r in
-                                    if r == .OK { project.exportSettings.outputPath = panel.url }
+                                if panel.runModal() == .OK {
+                                    project.exportSettings.outputPath = panel.url
                                 }
                             } label: {
                                 Text("选择")
@@ -652,13 +653,12 @@ actor TimelineExporter {
                 !imageCompTracks.contains(where: { $0.track.trackID == ct.trackID })
             }
 
+            // Step 1: 图片合成 / 分辨率帧率变更
             if hasImageTracks {
-                // Build time-segmented instructions for image layers on top of video
                 let vc = AVMutableVideoComposition()
                 vc.renderSize = renderSize
                 vc.frameDuration = frameDuration
 
-                // 使用 CMTime 量化后的值避免精度偏差
                 let ts: CMTimeScale = 600
                 let imageClipCMRanges = imageCompTracks.map { entry -> (start: CMTime, end: CMTime) in
                     let s = CMTime(seconds: entry.clip.startTime, preferredTimescale: ts)
@@ -713,16 +713,7 @@ actor TimelineExporter {
                 }
                 if !instructions.isEmpty { vc.instructions = instructions }
                 videoComposition = vc
-            } else if !visibleSubs.isEmpty, let sourceVTrack = composition.tracks(withMediaType: .video).first {
-                videoComposition = self.buildVideoCompositionWithSubtitles(
-                    composition: composition,
-                    videoTrack: sourceVTrack,
-                    renderSize: renderSize,
-                    frameDuration: frameDuration,
-                    subtitleTracks: input.subtitleTracks,
-                    subtitleStyles: input.subtitleStyles)
             } else if renderSize != sourceVideoSize || fps != Int(1.0 / sourceFrameDuration.seconds) {
-                // 即使没字幕，分辨率或帧率变了也需要 videoComposition
                 if let sourceVTrack = composition.tracks(withMediaType: .video).first {
                     let vc = AVMutableVideoComposition()
                     vc.renderSize = renderSize
@@ -736,6 +727,63 @@ actor TimelineExporter {
                     instr.layerInstructions = [li]
                     vc.instructions = [instr]
                     videoComposition = vc
+                }
+            }
+
+            // Step 2: 字幕烧录 — 独立于图片/分辨率，只要有可见字幕就叠加
+            if !visibleSubs.isEmpty {
+                // 如果还没有 videoComposition，先创建一个基础的
+                if videoComposition == nil {
+                    let vc = AVMutableVideoComposition()
+                    vc.renderSize = renderSize
+                    vc.frameDuration = frameDuration
+                    let instr = AVMutableVideoCompositionInstruction()
+                    instr.timeRange = CMTimeRange(start: .zero, duration: composition.duration)
+                    instr.layerInstructions = composition.tracks(withMediaType: .video).map { vt in
+                        let li = AVMutableVideoCompositionLayerInstruction(assetTrack: vt)
+                        li.setOpacity(1.0, at: .zero)
+                        return li
+                    }
+                    vc.instructions = [instr]
+                    videoComposition = vc
+                }
+
+                if let vc = videoComposition {
+                    // 所有 instruction 开启 enablePostProcessing
+                    for case let instr as AVMutableVideoCompositionInstruction in vc.instructions {
+                        instr.enablePostProcessing = true
+                    }
+
+                    let videoLayer = CALayer()
+                    videoLayer.frame = CGRect(origin: .zero, size: renderSize)
+                    let parentLayer = CALayer()
+                    parentLayer.frame = CGRect(origin: .zero, size: renderSize)
+                    parentLayer.isGeometryFlipped = true
+                    parentLayer.addSublayer(videoLayer)
+
+                    let visibleTrackData: [(track: Track<SubtitleClip>, style: SubtitleStyle, idx: Int)] =
+                        input.subtitleTracks.enumerated().compactMap { i, t in
+                            guard t.isVisible && !t.clips.isEmpty else { return nil }
+                            let s = i < input.subtitleStyles.count ? input.subtitleStyles[i] : SubtitleStyle()
+                            return (t, s, i)
+                        }
+                    let baseStyle = visibleTrackData.first?.style ?? SubtitleStyle()
+                    let totalDuration = composition.duration.seconds
+
+                    for td in visibleTrackData {
+                        let trackOffset = CGFloat(td.idx) * (td.style.fontSize + CGFloat(baseStyle.lineSpacing) + 12)
+                        for clip in td.track.clips {
+                            let layer = self.makeSubtitleTextLayer(
+                                text: clip.text, style: td.style, renderSize: renderSize,
+                                startTime: clip.startTime, endTime: clip.endTime,
+                                totalDuration: totalDuration, trackOffset: trackOffset)
+                            parentLayer.addSublayer(layer)
+                        }
+                    }
+
+                    vc.animationTool = AVVideoCompositionCoreAnimationTool(
+                        postProcessingAsVideoLayer: videoLayer,
+                        in: parentLayer)
                 }
             }
         }
@@ -759,14 +807,17 @@ actor TimelineExporter {
         try? FileManager.default.removeItem(at: input.outputURL)
 
         let progressTask = Task {
-            while !Task.isCancelled,
-                  exporter.status == .waiting || exporter.status == .exporting {
+            while !Task.isCancelled {
+                let st = exporter.status
+                if st == .completed || st == .failed || st == .cancelled { break }
                 progress(Double(exporter.progress))
                 try? await Task.sleep(nanoseconds: 200_000_000)
             }
         }
 
-        await exporter.export()
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            exporter.exportAsynchronously { continuation.resume() }
+        }
         progressTask.cancel()
 
         switch exporter.status {
@@ -850,9 +901,11 @@ actor TimelineExporter {
         let instruction = AVMutableVideoCompositionInstruction()
         instruction.timeRange = CMTimeRange(start: .zero, duration: composition.duration)
         instruction.enablePostProcessing = true
-        let layerInstr = AVMutableVideoCompositionLayerInstruction(assetTrack: videoTrack)
-        layerInstr.setOpacity(1.0, at: .zero)
-        instruction.layerInstructions = [layerInstr]
+        instruction.layerInstructions = composition.tracks(withMediaType: .video).map { vt in
+            let li = AVMutableVideoCompositionLayerInstruction(assetTrack: vt)
+            li.setOpacity(1.0, at: .zero)
+            return li
+        }
         videoComp.instructions = [instruction]
 
         // Layer hierarchy:  parentLayer → [ videoLayer (where frames go) , textLayers… ]
@@ -862,11 +915,9 @@ actor TimelineExporter {
         videoLayer.frame = CGRect(origin: .zero, size: renderSize)
         let parentLayer = CALayer()
         parentLayer.frame = CGRect(origin: .zero, size: renderSize)
-        parentLayer.isGeometryFlipped = false      // y-up: matches CGContext and our yOrig calculation
-        parentLayer.beginTime = AVCoreAnimationBeginTimeAtZero
+        parentLayer.isGeometryFlipped = true
         parentLayer.addSublayer(videoLayer)
 
-        // 收集可见轨道，计算每个轨道的 Y 偏移（track 0 在最下，track 1 在上面）
         let visibleTrackData: [(track: Track<SubtitleClip>, style: SubtitleStyle, idx: Int)] =
             subtitleTracks.enumerated().compactMap { i, t in
                 guard t.isVisible else { return nil }
@@ -876,29 +927,16 @@ actor TimelineExporter {
 
         let baseStyle = visibleTrackData.first?.style ?? SubtitleStyle()
         let spacing   = baseStyle.lineSpacing
+        let totalDuration = composition.duration.seconds
 
-        for clip in self.allTimeSlots(tracks: visibleTrackData.map(\.track)) {
-            // 对于每个时间段，找出各轨道在这个时间段有字幕的
-            var layersForSlot: [(text: String, style: SubtitleStyle)] = []
-            for td in visibleTrackData {
-                if let c = td.track.clips.first(where: {
-                    $0.startTime <= clip.start && $0.endTime > clip.start
-                }) {
-                    layersForSlot.append((c.text, td.style))
-                }
-            }
-
-            // 从下往上堆叠
-            var yAccum = renderSize.height * baseStyle.bottomMargin / 100
-            for (text, style) in layersForSlot {
-                let layer = makeSubtitleLayer(text: text,
-                                              style: style,
-                                              renderSize: renderSize,
-                                              startTime: clip.start,
-                                              endTime:   clip.end,
-                                              yOrigin: yAccum)
+        for td in visibleTrackData {
+            let trackOffset = CGFloat(td.idx) * (td.style.fontSize + CGFloat(spacing) + 12)
+            for clip in td.track.clips {
+                let layer = self.makeSubtitleTextLayer(
+                    text: clip.text, style: td.style, renderSize: renderSize,
+                    startTime: clip.startTime, endTime: clip.endTime,
+                    totalDuration: totalDuration, trackOffset: trackOffset)
                 parentLayer.addSublayer(layer)
-                yAccum += layer.frame.height + spacing
             }
         }
 
@@ -907,6 +945,114 @@ actor TimelineExporter {
             in: parentLayer)
 
         return videoComp
+    }
+
+    private func makeSubtitleTextLayer(
+        text: String, style: SubtitleStyle, renderSize: CGSize,
+        startTime: Double, endTime: Double,
+        totalDuration: Double, trackOffset: CGFloat
+    ) -> CALayer {
+        let maxWidth = renderSize.width * style.widthPercent / 100
+        let padH: CGFloat = 16, padV: CGFloat = 8
+
+        // 解析颜色
+        let tc = NSColor(style.textColor).usingColorSpace(.sRGB) ?? .white
+        var tr: CGFloat = 1, tg: CGFloat = 1, tb: CGFloat = 1, ta: CGFloat = 1
+        tc.getRed(&tr, green: &tg, blue: &tb, alpha: &ta)
+        let textCGColor = CGColor(red: tr, green: tg, blue: tb, alpha: ta)
+
+        let ctFont = CTFontCreateWithName(style.fontName as CFString, style.fontSize, nil)
+
+        var alignment: CTTextAlignment
+        switch style.alignment {
+        case "left":  alignment = .left
+        case "right": alignment = .right
+        default:      alignment = .center
+        }
+        let ctPS: CTParagraphStyle = withUnsafeBytes(of: &alignment) { ptr in
+            var setting = CTParagraphStyleSetting(
+                spec: .alignment,
+                valueSize: MemoryLayout<CTTextAlignment>.size,
+                value: ptr.baseAddress!)
+            return CTParagraphStyleCreate(&setting, 1)
+        }
+
+        let attrs: [NSAttributedString.Key: Any] = [
+            .init(kCTFontAttributeName as String): ctFont,
+            .init(kCTForegroundColorAttributeName as String): textCGColor,
+            .init(kCTParagraphStyleAttributeName as String): ctPS
+        ]
+        let attrStr = NSAttributedString(string: text, attributes: attrs)
+        let setter = CTFramesetterCreateWithAttributedString(attrStr)
+        let constraint = CGSize(width: maxWidth - padH * 2, height: CGFloat.greatestFiniteMagnitude)
+        let textSize = CTFramesetterSuggestFrameSizeWithConstraints(setter, CFRange(), nil, constraint, nil)
+
+        let layerW = ceil(textSize.width) + padH * 2
+        let layerH = ceil(textSize.height) + padV * 2
+        let w = Int(layerW), h = Int(layerH)
+
+        // 渲染背景+文字到 CGImage（y-down 坐标系，匹配 isGeometryFlipped=true）
+        var cgImage: CGImage? = nil
+        if w > 0 && h > 0 {
+            let space = CGColorSpaceCreateDeviceRGB()
+            if let ctx = CGContext(data: nil, width: w, height: h,
+                                   bitsPerComponent: 8, bytesPerRow: 0, space: space,
+                                   bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue
+                                             | CGBitmapInfo.byteOrder32Little.rawValue) {
+                // 翻转为 y-down，和 parentLayer 坐标系一致
+                ctx.translateBy(x: 0, y: CGFloat(h))
+                ctx.scaleBy(x: 1.0, y: -1.0)
+
+                // 背景
+                if style.backgroundOpacity > 0 {
+                    let nc = NSColor(style.backgroundColor).usingColorSpace(.sRGB) ?? .black
+                    var br: CGFloat = 0, bg: CGFloat = 0, bb: CGFloat = 0, ba: CGFloat = 0
+                    nc.getRed(&br, green: &bg, blue: &bb, alpha: &ba)
+                    ctx.setFillColor(CGColor(red: br, green: bg, blue: bb,
+                                             alpha: CGFloat(style.backgroundOpacity)))
+                    ctx.addPath(CGPath(roundedRect: CGRect(origin: .zero, size: CGSize(width: layerW, height: layerH)),
+                                       cornerWidth: 4, cornerHeight: 4, transform: nil))
+                    ctx.fillPath()
+                }
+
+                // 文字（CoreText 需要 y-up，再翻回来）
+                ctx.saveGState()
+                ctx.translateBy(x: 0, y: CGFloat(h))
+                ctx.scaleBy(x: 1.0, y: -1.0)
+                let textRect = CGRect(x: padH, y: padV,
+                                      width: CGFloat(w) - padH * 2,
+                                      height: CGFloat(h) - padV * 2)
+                let ctFrame = CTFramesetterCreateFrame(setter, CFRange(), CGPath(rect: textRect, transform: nil), nil)
+                CTFrameDraw(ctFrame, ctx)
+                ctx.restoreGState()
+
+                cgImage = ctx.makeImage()
+            }
+        }
+
+        let layer = CALayer()
+        let xOrig = (renderSize.width - layerW) / 2
+        let yOrig = renderSize.height - renderSize.height * CGFloat(style.bottomMargin) / 100
+                    - layerH - trackOffset
+        layer.frame = CGRect(x: xOrig, y: yOrig, width: layerW, height: layerH)
+        layer.contentsGravity = .resize
+        layer.contentsScale = 1.0
+        if let img = cgImage { layer.contents = img }
+
+        layer.opacity = 0
+        let t = max(totalDuration, endTime + 0.1)
+        let anim = CAKeyframeAnimation(keyPath: "opacity")
+        anim.beginTime = AVCoreAnimationBeginTimeAtZero
+        anim.duration = t
+        anim.calculationMode = .discrete
+        anim.fillMode = .both
+        anim.isRemovedOnCompletion = false
+        anim.keyTimes = [0, NSNumber(value: max(0, startTime) / t),
+                         NSNumber(value: endTime / t), 1]
+        anim.values = [0, 1, 0, 0]
+        layer.add(anim, forKey: "visibility")
+
+        return layer
     }
 
     // Compute all unique time slots from subtitle tracks. Each slot is a
@@ -943,6 +1089,7 @@ actor TimelineExporter {
                                    renderSize: CGSize,
                                    startTime: Double,
                                    endTime: Double,
+                                   totalDuration: Double,
                                    yOrigin: CGFloat? = nil) -> CALayer {
         let maxWidthPx = renderSize.width * style.widthPercent / 100
         let padH: CGFloat = 16   // horizontal padding around text
@@ -977,23 +1124,24 @@ actor TimelineExporter {
 
         layer.opacity = 0
 
-        let show = CABasicAnimation(keyPath: "opacity")
-        show.fromValue = NSNumber(value: 0.0)
-        show.toValue   = NSNumber(value: 1.0)
-        show.beginTime = startTime > 0 ? startTime : AVCoreAnimationBeginTimeAtZero
-        show.duration  = 0.001
-        show.fillMode  = .forwards
-        show.isRemovedOnCompletion = false
-        layer.add(show, forKey: "show")
-
-        let hide = CABasicAnimation(keyPath: "opacity")
-        hide.fromValue = NSNumber(value: 1.0)
-        hide.toValue   = NSNumber(value: 0.0)
-        hide.beginTime = endTime > 0 ? endTime : AVCoreAnimationBeginTimeAtZero
-        hide.duration  = 0.001
-        hide.fillMode  = .forwards
-        hide.isRemovedOnCompletion = false
-        layer.add(hide, forKey: "hide")
+        // AVVideoCompositionCoreAnimationTool samples each frame individually —
+        // CABasicAnimation fill modes are not applied. A CAKeyframeAnimation that
+        // spans the full composition is the reliable way to control per-frame opacity.
+        let t = max(totalDuration, endTime + 0.1)
+        let s0 = max(0.0, startTime)
+        let e0 = min(t, endTime)
+        let anim = CAKeyframeAnimation(keyPath: "opacity")
+        anim.beginTime       = AVCoreAnimationBeginTimeAtZero
+        anim.duration        = t
+        anim.calculationMode = .discrete
+        anim.fillMode        = .both
+        anim.isRemovedOnCompletion = false
+        anim.keyTimes = [0,
+                         NSNumber(value: s0 / t),
+                         NSNumber(value: e0 / t),
+                         1]
+        anim.values   = [0, 1, 0, 0]
+        layer.add(anim, forKey: "visibility")
 
         return layer
     }

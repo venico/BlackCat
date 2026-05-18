@@ -147,9 +147,14 @@ struct TimelineView: View {
     }()
 
     var body: some View {
-        HStack(spacing: 0) {
-            labelColumn
-            clipArea
+        GeometryReader { outerGeo in
+            ScrollView(.vertical, showsIndicators: true) {
+                HStack(alignment: .top, spacing: 0) {
+                    labelColumn
+                    clipArea
+                }
+                .frame(minHeight: outerGeo.size.height)
+            }
         }
         .onAppear { setupMonitors() }
         .onDisappear { teardownMonitors() }
@@ -292,9 +297,9 @@ struct TimelineView: View {
                            onDel:  { project.subtitleTracks.remove(at:i) })
                     .frame(height: trackH)
             }
-            Spacer()
         }
         .frame(width: labelW)
+        .frame(maxHeight: .infinity, alignment: .top)
         .background(Color(red:0.09,green:0.09,blue:0.10))
     }
 
@@ -302,21 +307,17 @@ struct TimelineView: View {
 
     private var clipArea: some View {
         let totalW = max(project.duration * project.pixelsPerSecond + 300, 800)
-        return GeometryReader { geo in
-            ScrollView(.horizontal, showsIndicators: false) {
+        return ScrollView(.horizontal, showsIndicators: false) {
                 ZStack(alignment: .topLeading) {
-                    // Ruler — visual only; seeking is handled by the unified drag gesture below.
                     TimelineRuler(pps: project.pixelsPerSecond, duration: project.duration)
                         .frame(height: rulerH)
                         .allowsHitTesting(false)
 
-                    // Track rows (push down past ruler with a non-hit-testing spacer)
                     VStack(spacing: 0) {
                         Color.clear.frame(height: rulerH).allowsHitTesting(false)
                         trackRows
                     }
 
-                    // Box-select rectangle overlay — drawn above clips, doesn't block input.
                     if let s = boxStart, let e = boxEnd {
                         let rect = CGRect(x: min(s.x, e.x), y: min(s.y, e.y),
                                           width: abs(e.x - s.x), height: abs(e.y - s.y))
@@ -329,7 +330,6 @@ struct TimelineView: View {
                             .allowsHitTesting(false)
                     }
 
-                    // Drag ghost overlay
                     if let gPos = dragGhostPos, let ghostInfo = dragGhostInfo() {
                         let cr: CGFloat = ghostInfo.isSubtitle ? 3 : 4
                         RoundedRectangle(cornerRadius: cr)
@@ -353,12 +353,10 @@ struct TimelineView: View {
                             .allowsHitTesting(false)
                     }
 
-                    // Playhead (draggable)
                     DraggablePlayhead(pps: project.pixelsPerSecond)
                 }
-                .frame(width: totalW,
-                       height: max(geo.size.height, totalContentH()),
-                       alignment: .topLeading)
+                .frame(width: totalW, alignment: .topLeading)
+                .frame(minHeight: totalContentH())
                 .contentShape(Rectangle())
                 // Single tap on empty track area (below ruler, not on a clip) → seek.
                 .simultaneousGesture(
@@ -388,7 +386,6 @@ struct TimelineView: View {
                 .simultaneousGesture(unifiedDragGesture)
             }
             .scrollClipDisabled(true)
-        }
     }
 
     // MARK: Unified drag (clip move + box select)
@@ -539,6 +536,7 @@ struct TimelineView: View {
             switch (hit, trimEdge) {
             case (.video(let id, let s, let d), nil):
                 project.selectedVideoClipID    = id
+                project.selectedImageClipID    = nil
                 project.selectedAudioClipID    = nil
                 project.selectedSubtitleClipID = nil
                 let ti = project.videoTracks.firstIndex { $0.clips.contains { $0.id == id } } ?? 0
@@ -578,6 +576,7 @@ struct TimelineView: View {
             case (.audio(let id, let s, let d), nil):
                 project.selectedAudioClipID    = id
                 project.selectedVideoClipID    = nil
+                project.selectedImageClipID    = nil
                 project.selectedSubtitleClipID = nil
                 let ti = project.audioTracks.firstIndex { $0.clips.contains { $0.id == id } } ?? 0
                 draggingClipID = id
@@ -586,18 +585,21 @@ struct TimelineView: View {
                 let ts = project.audioTracks.flatMap(\.clips).first(where: { $0.id == id })?.trimStart ?? 0
                 project.selectedAudioClipID    = id
                 project.selectedVideoClipID    = nil
+                project.selectedImageClipID    = nil
                 project.selectedSubtitleClipID = nil
                 dragOp = .trimAudioLeft(id: id, originStart: s, originEnd: s + d, originTrimStart: ts)
                 Self.trimLeftCursor.set()
             case (.audio(let id, let s, let d), .right):
                 project.selectedAudioClipID    = id
                 project.selectedVideoClipID    = nil
+                project.selectedImageClipID    = nil
                 project.selectedSubtitleClipID = nil
                 dragOp = .trimAudioRight(id: id, originStart: s, originEnd: s + d)
                 Self.trimRightCursor.set()
             case (.subtitle(let id, let s, let d), nil):
                 project.selectedSubtitleClipID = id
                 project.selectedVideoClipID    = nil
+                project.selectedImageClipID    = nil
                 project.selectedAudioClipID    = nil
                 let ti = project.subtitleTracks.firstIndex { $0.clips.contains { $0.id == id } } ?? 0
                 draggingClipID = id
@@ -605,12 +607,14 @@ struct TimelineView: View {
             case (.subtitle(let id, let s, let d), .left):
                 project.selectedSubtitleClipID = id
                 project.selectedVideoClipID    = nil
+                project.selectedImageClipID    = nil
                 project.selectedAudioClipID    = nil
                 dragOp = .trimSubtitleLeft(id: id, originStart: s, originEnd: s + d)
                 Self.trimLeftCursor.set()
             case (.subtitle(let id, let s, let d), .right):
                 project.selectedSubtitleClipID = id
                 project.selectedVideoClipID    = nil
+                project.selectedImageClipID    = nil
                 project.selectedAudioClipID    = nil
                 dragOp = .trimSubtitleRight(id: id, originStart: s, originEnd: s + d)
                 Self.trimRightCursor.set()
@@ -628,6 +632,7 @@ struct TimelineView: View {
 
     private func selectVideoAndLoad(id: UUID) {
         project.selectedVideoClipID    = id
+        project.selectedImageClipID    = nil
         project.selectedAudioClipID    = nil
         project.selectedSubtitleClipID = nil
         if let clip = project.videoTracks.flatMap(\.clips).first(where: { $0.id == id }) {
@@ -1159,6 +1164,7 @@ private struct VideoClipView: View {
         .simultaneousGesture(TapGesture().onEnded {
             guard !NSEvent.modifierFlags.contains(.shift) else { return }
             project.selectedVideoClipID    = clip.id
+            project.selectedImageClipID    = nil
             project.selectedAudioClipID    = nil
             project.selectedSubtitleClipID = nil
             project.selectedClipIDs.removeAll()
@@ -1307,6 +1313,7 @@ private struct AudioClipView: View {
             guard !NSEvent.modifierFlags.contains(.shift) else { return }
             project.selectedAudioClipID    = clip.id
             project.selectedVideoClipID    = nil
+            project.selectedImageClipID    = nil
             project.selectedSubtitleClipID = nil
             project.selectedClipIDs.removeAll()
         })
@@ -1407,6 +1414,7 @@ private struct SubtitleClipView: View {
             guard !NSEvent.modifierFlags.contains(.shift) else { return }
             project.selectedSubtitleClipID = clip.id
             project.selectedVideoClipID    = nil
+            project.selectedImageClipID    = nil
             project.selectedAudioClipID    = nil
             project.selectedClipIDs.removeAll()
         })
@@ -1487,7 +1495,7 @@ struct TimelineToolbar: View {
                 TBtn(icon:"arrow.uturn.backward", help:"撤销", enabled: project.undoCount > 0) { project.undo() }
                 TBtn(icon:"arrow.uturn.forward",  help:"重做", enabled: project.redoCount > 0) { project.redo() }
                 Divider().frame(height:16).padding(.horizontal,4)
-                TBtn(icon:"scissors",         help:"在播放头分割片段") { project.splitAtPlayhead() }
+                TBtn(icon:"scissors",         help:"在播放头分割片段", enabled: project.selectedImageClipID == nil) { project.splitAtPlayhead() }
                 TBtn(icon:"trash",            help:"删除选中片段")   { project.deleteSelected() }
                 TBtn(icon:"text.alignleft",   help:"将选中片段对齐到播放头") { project.alignSelectedToPlayhead() }
                 TBtn(icon:"character.bubble", help:"在当前字幕轨道插入字幕")  { project.insertSubtitleAtPlayhead() }
