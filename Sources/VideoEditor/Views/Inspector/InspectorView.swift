@@ -144,9 +144,8 @@ private struct SubtitleInspector: View {
                     IField(label: "字号") {
                         MiniStepper(value: Binding(
                             get: { Double(ls.fontSize) },
-                            set: { ls.fontSize = CGFloat($0) }
-                        ), step: 1, decimals: 0)
-                        .onChange(of: ls.fontSize) { writeStyle() }
+                            set: { ls.fontSize = CGFloat($0); writeStyle() }
+                        ), step: 1, decimals: 0, minValue: 8, maxValue: 200)
                     }
                     .frame(width: 92)
                 }
@@ -858,6 +857,8 @@ struct MiniStepper: View {
     @Binding var value: Double
     var step: Double = 1
     var decimals: Int = 0
+    var minValue: Double = 0
+    var maxValue: Double = .infinity
 
     var body: some View {
         HStack(spacing: 0) {
@@ -870,20 +871,22 @@ struct MiniStepper: View {
             Rectangle().fill(Color.white.opacity(0.12)).frame(width: 1, height: 18)
 
             VStack(spacing: 0) {
-                Button { value += step } label: {
+                Button { value = min(maxValue, value + step) } label: {
                     Image(systemName: "chevron.up")
                         .font(.system(size: 6, weight: .bold))
                         .foregroundColor(Color.labelSecondary)
                         .frame(width: 18, height: 12)
+                        .contentShape(Rectangle())
                 }.buttonStyle(.plain)
 
                 Rectangle().fill(Color.white.opacity(0.12)).frame(width: 18, height: 1)
 
-                Button { value = max(0, value - step) } label: {
+                Button { value = max(minValue, value - step) } label: {
                     Image(systemName: "chevron.down")
                         .font(.system(size: 6, weight: .bold))
                         .foregroundColor(Color.labelSecondary)
                         .frame(width: 18, height: 12)
+                        .contentShape(Rectangle())
                 }.buttonStyle(.plain)
             }
             .padding(.trailing, 1)

@@ -161,8 +161,8 @@ struct TimelineView: View {
         // (an NSTextView acting as field editor inside an NSTextField).
         // Inspector panels contain TextFields but only block delete while focused.
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
-            // 文本编辑中不拦截
-            if let tv = NSApp.keyWindow?.firstResponder as? NSTextView, tv.isFieldEditor {
+            // 文本编辑中不拦截（包括 NSTextField 的 field editor 和 SwiftUI TextEditor 的独立 NSTextView）
+            if let tv = NSApp.keyWindow?.firstResponder as? NSTextView {
                 return event
             }
 
@@ -465,6 +465,30 @@ struct TimelineView: View {
                     default: break
                     }
                 }
+                // 重叠检测：移动/trim 结束后检查是否与同轨片段重叠
+                if let op = dragOp {
+                    switch op {
+                    case .moveVideo(let id, _, _, _), .trimVideoLeft(let id, _, _, _), .trimVideoRight(let id, _, _):
+                        project.resolveVideoOverlap(id: id)
+                    case .moveImage(let id, _, _, _), .trimImageLeft(let id, _, _), .trimImageRight(let id, _, _):
+                        project.resolveImageOverlap(id: id)
+                    case .moveAudio(let id, _, _, _), .trimAudioLeft(let id, _, _, _), .trimAudioRight(let id, _, _):
+                        project.resolveAudioOverlap(id: id)
+                    case .moveSubtitle(let id, _, _, _), .trimSubtitleLeft(let id, _, _), .trimSubtitleRight(let id, _, _):
+                        project.resolveSubtitleOverlap(id: id)
+                    case .moveMulti(let items):
+                        for it in items {
+                            switch it.kind {
+                            case .video:    project.resolveVideoOverlap(id: it.id)
+                            case .image:    project.resolveImageOverlap(id: it.id)
+                            case .audio:    project.resolveAudioOverlap(id: it.id)
+                            case .subtitle: project.resolveSubtitleOverlap(id: it.id)
+                            }
+                        }
+                    default: break
+                    }
+                }
+
                 switch dragOp {
                 case .trimVideoLeft, .trimVideoRight,
                      .trimImageLeft, .trimImageRight,
@@ -642,28 +666,76 @@ struct TimelineView: View {
         return items
     }
 
+    /// 收集所有片段的起止时间作为吸附点（排除指定 ID）
+    private func collectSnapPoints(excluding ids: Set<UUID>) -> [Double] {
+        var pts: [Double] = [0] // 轨道起始位置
+        for t in project.videoTracks {
+            for c in t.clips where !ids.contains(c.id) { pts.append(c.startTime); pts.append(c.endTime) }
+        }
+        for t in project.imageTracks {
+            for c in t.clips where !ids.contains(c.id) { pts.append(c.startTime); pts.append(c.endTime) }
+        }
+        for t in project.audioTracks {
+            for c in t.clips where !ids.contains(c.id) { pts.append(c.startTime); pts.append(c.endTime) }
+        }
+        for t in project.subtitleTracks {
+            for c in t.clips where !ids.contains(c.id) { pts.append(c.startTime); pts.append(c.endTime) }
+        }
+        return pts
+    }
+
+    /// 对片段的 start 和 end 做吸附，返回吸附后的 start
+    private func snapStart(_ rawStart: Double, duration: Double, excluding ids: Set<UUID>) -> Double {
+        guard project.snapEnabled else { return rawStart }
+        let threshold = 8.0 / project.pixelsPerSecond  // 8 像素阈值
+        let pts = collectSnapPoints(excluding: ids)
+        var best = rawStart
+        var bestDist = Double.infinity
+        let rawEnd = rawStart + duration
+        // 片段起点吸附
+        for p in pts {
+            let d = abs(rawStart - p)
+            if d < threshold && d < bestDist { bestDist = d; best = p }
+        }
+        // 片段终点吸附
+        for p in pts {
+            let d = abs(rawEnd - p)
+            if d < threshold && d < bestDist { bestDist = d; best = p - duration }
+        }
+        return max(0, best)
+    }
+
     private func applyDrag(op: DragOp, totalTranslation: CGSize, current: CGPoint) {
         let pps = project.pixelsPerSecond
         let dt  = Double(totalTranslation.width) / pps
         switch op {
         case .moveVideo(let id, let s, let d, _):
-            let ns = max(0, s + dt)
+            let raw = max(0, s + dt)
+            let ns = snapStart(raw, duration: d, excluding: [id])
             project.updateVideoClip(id: id) { $0.startTime = ns; $0.endTime = ns + d }
         case .moveImage(let id, let s, let d, _):
-            let ns = max(0, s + dt)
+            let raw = max(0, s + dt)
+            let ns = snapStart(raw, duration: d, excluding: [id])
             project.updateImageClip(id: id) { $0.startTime = ns; $0.endTime = ns + d }
         case .moveAudio(let id, let s, let d, _):
-            let ns = max(0, s + dt)
+            let raw = max(0, s + dt)
+            let ns = snapStart(raw, duration: d, excluding: [id])
             project.updateAudioClip(id: id) { $0.startTime = ns; $0.endTime = ns + d }
         case .moveSubtitle(let id, let s, let d, _):
-            let ns = max(0, s + dt)
+            let raw = max(0, s + dt)
+            let ns = snapStart(raw, duration: d, excluding: [id])
             project.updateSubtitleTime(id: id, start: ns, end: ns + d)
         case .moveMulti(let items):
-            // Clamp delta so the leftmost clip in the group stays at >= 0.
             let minOrig = items.map(\.originStart).min() ?? 0
             let clampedDt = max(dt, -minOrig)
+            let excludeIDs = Set(items.map(\.id))
+            // 用第一个 item 做吸附计算
+            let firstRaw = (items.first?.originStart ?? 0) + clampedDt
+            let firstDur = items.first?.originDur ?? 0
+            let snapped = snapStart(firstRaw, duration: firstDur, excluding: excludeIDs)
+            let snapDelta = snapped - firstRaw
             for it in items {
-                let ns = it.originStart + clampedDt
+                let ns = it.originStart + clampedDt + snapDelta
                 let ne = ns + it.originDur
                 switch it.kind {
                 case .video:    project.updateVideoClip(id: it.id) { $0.startTime = ns; $0.endTime = ne }
@@ -1337,7 +1409,6 @@ private struct SubtitleClipView: View {
             project.selectedVideoClipID    = nil
             project.selectedAudioClipID    = nil
             project.selectedClipIDs.removeAll()
-            project.currentTime = clip.startTime
         })
         .contextMenu {
             Button { project.selectLeftOf(clip.id) } label: { Label("向左全选", systemImage: "arrow.left.to.line") }
@@ -1428,6 +1499,19 @@ struct TimelineToolbar: View {
             }.padding(.leading,8)
 
             Spacer()
+
+            // 吸附开关
+            Button { project.snapEnabled.toggle() } label: {
+                Image(systemName: "arrow.right.and.line.vertical.and.arrow.left")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundColor(project.snapEnabled ? Color.accent : Color.labelSecondary)
+                    .frame(width: 28, height: 24)
+                    .background(project.snapEnabled ? Color.accent.opacity(0.15) : Color.clear)
+                    .cornerRadius(5)
+            }
+            .buttonStyle(.plain)
+            .help("自动吸附")
+            .padding(.trailing, 8)
 
             // 右侧：缩放
             HStack(spacing:6) {

@@ -189,6 +189,7 @@ final class ProjectState: ObservableObject {
 
     // Timeline
     @Published var pixelsPerSecond: Double = 30
+    @Published var snapEnabled: Bool = false
 
     // Selection (single — used by Inspector)
     @Published var selectedVideoClipID: UUID?    = nil
@@ -418,6 +419,135 @@ final class ProjectState: ObservableObject {
         guard let idx = subtitleTracks[from].clips.firstIndex(where: { $0.id == id }) else { return }
         let clip = subtitleTracks[from].clips.remove(at: idx)
         subtitleTracks[to].clips.append(clip)
+    }
+
+    // MARK: - Overlap resolution
+
+    /// 检查片段是否与同轨道其他片段重叠，如果重叠则自动新建轨道并移过去
+    func resolveVideoOverlap(id: UUID) {
+        for ti in videoTracks.indices {
+            guard let ci = videoTracks[ti].clips.firstIndex(where: { $0.id == id }) else { continue }
+            let clip = videoTracks[ti].clips[ci]
+            let hasOverlap = videoTracks[ti].clips.contains {
+                $0.id != id && $0.startTime < clip.endTime - 0.001 && $0.endTime > clip.startTime + 0.001
+            }
+            if hasOverlap {
+                let removed = videoTracks[ti].clips.remove(at: ci)
+                // 尝试找一个没有重叠的已有轨道
+                var placed = false
+                for dti in videoTracks.indices {
+                    if dti == ti { continue }
+                    let noOverlap = !videoTracks[dti].clips.contains {
+                        $0.startTime < removed.endTime - 0.001 && $0.endTime > removed.startTime + 0.001
+                    }
+                    if noOverlap {
+                        videoTracks[dti].clips.append(removed)
+                        placed = true
+                        break
+                    }
+                }
+                if !placed {
+                    var newTrack = Track<VideoClip>(label: "视频")
+                    newTrack.clips.append(removed)
+                    videoTracks.append(newTrack)
+                }
+            }
+            return
+        }
+    }
+
+    func resolveImageOverlap(id: UUID) {
+        for ti in imageTracks.indices {
+            guard let ci = imageTracks[ti].clips.firstIndex(where: { $0.id == id }) else { continue }
+            let clip = imageTracks[ti].clips[ci]
+            let hasOverlap = imageTracks[ti].clips.contains {
+                $0.id != id && $0.startTime < clip.endTime - 0.001 && $0.endTime > clip.startTime + 0.001
+            }
+            if hasOverlap {
+                let removed = imageTracks[ti].clips.remove(at: ci)
+                var placed = false
+                for dti in imageTracks.indices {
+                    if dti == ti { continue }
+                    let noOverlap = !imageTracks[dti].clips.contains {
+                        $0.startTime < removed.endTime - 0.001 && $0.endTime > removed.startTime + 0.001
+                    }
+                    if noOverlap {
+                        imageTracks[dti].clips.append(removed)
+                        placed = true
+                        break
+                    }
+                }
+                if !placed {
+                    var newTrack = Track<ImageClip>(label: "图片")
+                    newTrack.clips.append(removed)
+                    imageTracks.append(newTrack)
+                }
+            }
+            return
+        }
+    }
+
+    func resolveAudioOverlap(id: UUID) {
+        for ti in audioTracks.indices {
+            guard let ci = audioTracks[ti].clips.firstIndex(where: { $0.id == id }) else { continue }
+            let clip = audioTracks[ti].clips[ci]
+            let hasOverlap = audioTracks[ti].clips.contains {
+                $0.id != id && $0.startTime < clip.endTime - 0.001 && $0.endTime > clip.startTime + 0.001
+            }
+            if hasOverlap {
+                let removed = audioTracks[ti].clips.remove(at: ci)
+                var placed = false
+                for dti in audioTracks.indices {
+                    if dti == ti { continue }
+                    let noOverlap = !audioTracks[dti].clips.contains {
+                        $0.startTime < removed.endTime - 0.001 && $0.endTime > removed.startTime + 0.001
+                    }
+                    if noOverlap {
+                        audioTracks[dti].clips.append(removed)
+                        placed = true
+                        break
+                    }
+                }
+                if !placed {
+                    var newTrack = Track<AudioClip>(label: "音频")
+                    newTrack.clips.append(removed)
+                    audioTracks.append(newTrack)
+                }
+            }
+            return
+        }
+    }
+
+    func resolveSubtitleOverlap(id: UUID) {
+        for ti in subtitleTracks.indices {
+            guard let ci = subtitleTracks[ti].clips.firstIndex(where: { $0.id == id }) else { continue }
+            let clip = subtitleTracks[ti].clips[ci]
+            let hasOverlap = subtitleTracks[ti].clips.contains {
+                $0.id != id && $0.startTime < clip.endTime - 0.001 && $0.endTime > clip.startTime + 0.001
+            }
+            if hasOverlap {
+                let removed = subtitleTracks[ti].clips.remove(at: ci)
+                var placed = false
+                for dti in subtitleTracks.indices {
+                    if dti == ti { continue }
+                    let noOverlap = !subtitleTracks[dti].clips.contains {
+                        $0.startTime < removed.endTime - 0.001 && $0.endTime > removed.startTime + 0.001
+                    }
+                    if noOverlap {
+                        subtitleTracks[dti].clips.append(removed)
+                        placed = true
+                        break
+                    }
+                }
+                if !placed {
+                    var newTrack = Track<SubtitleClip>(label: "字幕")
+                    newTrack.clips.append(removed)
+                    subtitleTracks.append(newTrack)
+                    subtitleStyles.append(SubtitleStyle())
+                }
+            }
+            return
+        }
     }
 
     // MARK: - Multi-select helpers
