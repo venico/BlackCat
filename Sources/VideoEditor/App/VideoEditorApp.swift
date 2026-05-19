@@ -226,7 +226,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func showAbout() {
-        let credits = NSAttributedString(string: "视频编辑器 v1.8.5", attributes: [
+        let credits = NSAttributedString(string: "视频编辑器 v1.8.6", attributes: [
             .font: NSFont.systemFont(ofSize: 11),
             .foregroundColor: NSColor.secondaryLabelColor
         ])

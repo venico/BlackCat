@@ -7,6 +7,7 @@ struct TimelineView: View {
     @EnvironmentObject private var project: ProjectState
     private let labelW: CGFloat = 84
     private let trackH: CGFloat = 52
+    private let subtitleTrackH: CGFloat = 28
     private let rulerH: CGFloat = 26
 
     // Unified drag state
@@ -282,9 +283,9 @@ struct TimelineView: View {
             ForEach(project.audioTracks.indices, id:\.self) { i in
                 TrackLabel(icon:"music.note", title: project.audioTracks[i].label,
                            count: project.audioTracks[i].clips.count, hasMute: true,
-                           isMuted: project.audioTracks[i].isMuted, isVis: project.audioTracks[i].isVisible,
+                           isMuted: project.audioTracks[i].isMuted, isVis: true, hasVis: false,
                            onMute: { project.audioTracks[i].isMuted.toggle(); project.rebuildTimelinePreview() },
-                           onVis:  { project.audioTracks[i].isVisible.toggle(); project.rebuildTimelinePreview() },
+                           onVis:  {},
                            onDel:  { project.audioTracks.remove(at:i) })
                     .frame(height: trackH)
             }
@@ -295,7 +296,7 @@ struct TimelineView: View {
                            onMute: nil,
                            onVis:  { project.subtitleTracks[i].isVisible.toggle() },
                            onDel:  { project.subtitleTracks.remove(at:i) })
-                    .frame(height: trackH)
+                    .frame(height: subtitleTrackH)
             }
         }
         .frame(width: labelW)
@@ -527,7 +528,7 @@ struct TimelineView: View {
                 let pps = project.pixelsPerSecond
                 let clipCenterX = hit.start * pps + hit.duration * pps / 2
                 let trackRow = trackRowForClip(hit)
-                let clipCenterY = rulerH + (CGFloat(trackRow) + 0.5) * trackH
+                let clipCenterY = trackCenterY(row: trackRow)
                 dragGhostOffset = CGSize(width: pt.x - clipCenterX, height: pt.y - clipCenterY)
             }
 
@@ -847,7 +848,7 @@ struct TimelineView: View {
             rowTop += trackH
         }
         for ti in project.subtitleTracks.indices {
-            if pt.y >= rowTop && pt.y < rowTop + trackH {
+            if pt.y >= rowTop && pt.y < rowTop + subtitleTrackH {
                 for c in project.subtitleTracks[ti].clips {
                     let xMin = CGFloat(c.startTime * pps) + 1
                     let xMax = CGFloat(c.endTime   * pps) + 1
@@ -858,7 +859,7 @@ struct TimelineView: View {
                 }
                 return nil
             }
-            rowTop += trackH
+            rowTop += subtitleTrackH
         }
         return nil
     }
@@ -893,12 +894,12 @@ struct TimelineView: View {
             rowTop += trackH
         }
         for ti in project.subtitleTracks.indices {
-            let yRange = rowTop ... (rowTop + trackH)
+            let yRange = rowTop ... (rowTop + subtitleTrackH)
             for c in project.subtitleTracks[ti].clips {
                 let xRange = (c.startTime*pps) ... (c.endTime*pps)
                 if rectIntersects(rect, xRange: xRange, yRange: yRange) { ids.insert(c.id) }
             }
-            rowTop += trackH
+            rowTop += subtitleTrackH
         }
 
         project.selectedClipIDs = ids
@@ -917,8 +918,8 @@ struct TimelineView: View {
     private func totalContentH() -> CGFloat {
         rulerH + trackH * CGFloat(project.videoTracks.count
                                   + project.imageTracks.count
-                                  + project.audioTracks.count
-                                  + project.subtitleTracks.count)
+                                  + project.audioTracks.count)
+             + subtitleTrackH * CGFloat(project.subtitleTracks.count)
     }
 
     @ViewBuilder
@@ -942,7 +943,7 @@ struct TimelineView: View {
             }
         }
         ForEach(project.audioTracks.indices, id:\.self) { i in
-            trackRow(height: trackH, hidden: !project.audioTracks[i].isVisible, tint: Color(hex: "#5DB85D")) {
+            trackRow(height: trackH, hidden: !project.audioTracks[i].isVisible, muted: project.audioTracks[i].isMuted, tint: Color(hex: "#5DB85D")) {
                 ForEach(project.audioTracks[i].clips) { clip in
                     AudioClipView(clip: clip, pps: project.pixelsPerSecond, h: trackH,
                                   sel: isSelected(clip.id, primary: project.selectedAudioClipID),
@@ -951,9 +952,9 @@ struct TimelineView: View {
             }
         }
         ForEach(project.subtitleTracks.indices, id:\.self) { i in
-            trackRow(height: trackH, hidden: !project.subtitleTracks[i].isVisible, tint: Color(hex: "#7B6FC4")) {
+            trackRow(height: subtitleTrackH, hidden: !project.subtitleTracks[i].isVisible, tint: Color(hex: "#7B6FC4")) {
                 ForEach(project.subtitleTracks[i].clips) { clip in
-                    SubtitleClipView(clip: clip, pps: project.pixelsPerSecond, h: trackH,
+                    SubtitleClipView(clip: clip, pps: project.pixelsPerSecond, h: subtitleTrackH,
                                      sel: isSelected(clip.id, primary: project.selectedSubtitleClipID),
                                      isDragging: draggingClipID == clip.id)
                 }
@@ -1019,32 +1020,50 @@ struct TimelineView: View {
         }
     }
 
-    private func trackIndexFromY(_ y: CGFloat) -> TrackTarget {
-        let row = Int((y - rulerH) / trackH)
+    private func trackCenterY(row: Int) -> CGFloat {
         let iCount = project.imageTracks.count
         let vCount = project.videoTracks.count
         let aCount = project.audioTracks.count
-        let sCount = project.subtitleTracks.count
-        if row < iCount {
-            return TrackTarget(imageIndex: row)
-        } else if row < iCount + vCount {
-            return TrackTarget(videoIndex: row - iCount)
-        } else if row < iCount + vCount + aCount {
-            return TrackTarget(audioIndex: row - iCount - vCount)
-        } else if row < iCount + vCount + aCount + sCount {
-            return TrackTarget(subtitleIndex: row - iCount - vCount - aCount)
+        var top = rulerH
+        for r in 0..<row {
+            if r < iCount { top += trackH }
+            else if r < iCount + vCount { top += trackH }
+            else if r < iCount + vCount + aCount { top += trackH }
+            else { top += subtitleTrackH }
+        }
+        let h: CGFloat = row >= iCount + vCount + aCount ? subtitleTrackH : trackH
+        return top + h / 2
+    }
+
+    private func trackIndexFromY(_ y: CGFloat) -> TrackTarget {
+        var top = rulerH
+        for i in project.imageTracks.indices {
+            if y < top + trackH { return TrackTarget(imageIndex: i) }
+            top += trackH
+        }
+        for i in project.videoTracks.indices {
+            if y < top + trackH { return TrackTarget(videoIndex: i) }
+            top += trackH
+        }
+        for i in project.audioTracks.indices {
+            if y < top + trackH { return TrackTarget(audioIndex: i) }
+            top += trackH
+        }
+        for i in project.subtitleTracks.indices {
+            if y < top + subtitleTrackH { return TrackTarget(subtitleIndex: i) }
+            top += subtitleTrackH
         }
         return TrackTarget()
     }
 
     @ViewBuilder
-    private func trackRow<C: View>(height: CGFloat, hidden: Bool = false, tint: Color = .white, @ViewBuilder clips: () -> C) -> some View {
+    private func trackRow<C: View>(height: CGFloat, hidden: Bool = false, muted: Bool = false, tint: Color = .white, @ViewBuilder clips: () -> C) -> some View {
         ZStack(alignment: .leading) {
             Rectangle().fill(tint.opacity(0.03)).allowsHitTesting(false)
             clips()
         }
         .frame(height: height)
-        .opacity(hidden ? 0.32 : 1.0)
+        .opacity(hidden ? 0.32 : (muted ? 0.4 : 1.0))
     }
 }
 
@@ -1053,6 +1072,7 @@ struct TimelineView: View {
 private struct TrackLabel: View {
     let icon: String; let title: String; let count: Int
     let hasMute: Bool; let isMuted: Bool; let isVis: Bool
+    var hasVis: Bool = true
     let onMute: (() -> Void)?
     let onVis: () -> Void; let onDel: () -> Void
 
@@ -1080,8 +1100,10 @@ private struct TrackLabel: View {
                         OverlayBtn(icon: isMuted ? "speaker.slash" : "speaker.wave.2",
                                    action: onMute)
                     }
-                    OverlayBtn(icon: isVis ? "eye" : "eye.slash",
-                               action: onVis)
+                    if hasVis {
+                        OverlayBtn(icon: isVis ? "eye" : "eye.slash",
+                                   action: onVis)
+                    }
                     OverlayBtn(icon: "trash", destructive: true,
                                action: onDel)
                 }
@@ -1392,7 +1414,7 @@ private struct SubtitleClipView: View {
 
     var body: some View {
         let w = max(clip.duration*pps, 4)
-        let clipH = (h - 4) / 2  // half height
+        let clipH = h - 6
         ZStack(alignment:.leading) {
             RoundedRectangle(cornerRadius:3).fill(Color(hex:"#7B6FC4").opacity(0.85))
                 .overlay(RoundedRectangle(cornerRadius:3)
