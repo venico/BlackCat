@@ -112,25 +112,7 @@ private struct SubtitleInspector: View {
 
             // ── 字幕文字 ──────────────────────────────────
             ISection(title: "字幕文字") {
-                ZStack(alignment: .topLeading) {
-                    if text.isEmpty {
-                        Text("输入字幕内容…")
-                            .font(.system(size: 12))
-                            .foregroundColor(Color.labelSecondary.opacity(0.4))
-                            .padding(.top, 8).padding(.leading, 6)
-                    }
-                    TextEditor(text: $text)
-                        .font(.system(size: 12))
-                        .foregroundColor(Color.labelPrimary)
-                        .scrollContentBackground(.hidden)
-                        .padding(.horizontal, 4)
-                        .padding(.vertical, 4)
-                        .onChange(of: text) { project.updateSubtitleText(id: clip.id, text: text) }
-                }
-                .frame(minHeight: 72, maxHeight: 100)
-                .background(Color.white.opacity(0.05))
-                .cornerRadius(5)
-                .overlay(RoundedRectangle(cornerRadius: 5).stroke(Color.white.opacity(0.10)))
+                SubtitleTextBox(text: $text, clipID: clip.id)
             }
 
             // ── 字体 ──────────────────────────────────────
@@ -870,13 +852,23 @@ struct MiniStepper: View {
     var minValue: Double = 0
     var maxValue: Double = .infinity
 
+    @State private var editText: String = ""
+    @FocusState private var isFocused: Bool
+
     var body: some View {
-        HStack(spacing: 0) {
-            Text(formatted)
+        HStack(spacing: 4) {
+            TextField("", text: $editText)
                 .font(.system(size: 12).monospacedDigit())
                 .foregroundColor(Color.labelPrimary)
-                .frame(maxWidth: .infinity, alignment: .trailing)
+                .multilineTextAlignment(.trailing)
+                .textFieldStyle(.plain)
+                .frame(maxWidth: .infinity)
                 .padding(.leading, 6)
+                .focused($isFocused)
+                .onAppear { editText = formatted }
+                .onChange(of: value) { editText = formatted }
+                .onSubmit { applyText() }
+                .onChange(of: isFocused) { if !isFocused { applyText() } }
 
             Rectangle().fill(Color.white.opacity(0.12)).frame(width: 1, height: 18)
 
@@ -902,13 +894,20 @@ struct MiniStepper: View {
             .padding(.trailing, 1)
         }
         .frame(height: 26)
-        .background(Color.white.opacity(0.06))
+        .background(Color.white.opacity(0.08))
         .cornerRadius(5)
-        .overlay(RoundedRectangle(cornerRadius: 5).stroke(Color.white.opacity(0.10)))
+        .overlay(RoundedRectangle(cornerRadius: 5).stroke(isFocused ? Color.accent : Color.white.opacity(0.10)))
     }
 
     private var formatted: String {
         decimals > 0 ? String(format: "%.\(decimals)f", value) : "\(Int(value))"
+    }
+
+    private func applyText() {
+        if let v = Double(editText) {
+            value = max(minValue, min(maxValue, v))
+        }
+        editText = formatted
     }
 }
 
@@ -974,6 +973,82 @@ final class IPickerItemHandler: NSObject {
     var actions: [Int: () -> Void] = [:]
     @objc func pick(_ sender: NSMenuItem) {
         actions[sender.tag]?()
+    }
+}
+
+// MARK: - SubtitleTextBox
+
+private struct SubtitleTextBox: View {
+    @Binding var text: String
+    let clipID: UUID
+    @EnvironmentObject private var project: ProjectState
+    @FocusState private var isFocused: Bool
+    @State private var boxHeight: CGFloat = 72
+    @State private var isDragging = false
+
+    private let minH: CGFloat = 48
+    private let maxH: CGFloat = 300
+
+    var body: some View {
+        VStack(spacing: 0) {
+            ZStack(alignment: .topLeading) {
+                if text.isEmpty {
+                    Text("输入字幕内容…")
+                        .font(.system(size: 12))
+                        .foregroundColor(Color.labelSecondary.opacity(0.4))
+                        .padding(.top, 8).padding(.leading, 6)
+                }
+                TextEditor(text: $text)
+                    .font(.system(size: 12))
+                    .foregroundColor(Color.labelPrimary)
+                    .scrollContentBackground(.hidden)
+                    .padding(.horizontal, 4)
+                    .padding(.vertical, 4)
+                    .focused($isFocused)
+                    .onChange(of: text) { project.updateSubtitleText(id: clipID, text: text) }
+            }
+            .frame(height: boxHeight)
+
+            // Drag handle
+            HStack {
+                Spacer()
+                Image(systemName: "line.3.horizontal")
+                    .font(.system(size: 8, weight: .medium))
+                    .foregroundColor(Color.labelSecondary.opacity(0.4))
+                    .frame(width: 20, height: 10)
+            }
+            .padding(.trailing, 4)
+            .padding(.bottom, 2)
+            .contentShape(Rectangle())
+            .gesture(
+                DragGesture(minimumDistance: 1)
+                    .onChanged { val in
+                        if !isDragging { isDragging = true }
+                        let newH = boxHeight + val.translation.height
+                        boxHeight = min(maxH, max(minH, newH))
+                    }
+                    .onEnded { val in
+                        isDragging = false
+                        let newH = boxHeight + val.translation.height
+                        boxHeight = min(maxH, max(minH, newH))
+                    }
+            )
+            .cursor(.resizeUpDown)
+        }
+        .background(Color.white.opacity(0.08))
+        .cornerRadius(5)
+        .overlay(
+            RoundedRectangle(cornerRadius: 5)
+                .stroke(isFocused ? Color.accent : Color.white.opacity(0.10), lineWidth: 1)
+        )
+    }
+}
+
+private extension View {
+    func cursor(_ cursor: NSCursor) -> some View {
+        onHover { inside in
+            if inside { cursor.push() } else { NSCursor.pop() }
+        }
     }
 }
 

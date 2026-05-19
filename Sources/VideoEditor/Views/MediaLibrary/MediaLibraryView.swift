@@ -34,7 +34,7 @@ struct MediaLibraryView: View {
             .padding(.leading, 10)
             .padding(.trailing, 8)
             .padding(.top, 8)
-            .padding(.bottom, 4)
+            .padding(.bottom, 8)
 
             // Tab bar — Finder-style segmented icons
             HStack(spacing: 0) {
@@ -56,6 +56,16 @@ struct MediaLibraryView: View {
                     ScrollView(showsIndicators: false) {
                         if selectedTab == .image {
                             // 2-column grid for images
+                            LazyVGrid(columns: [GridItem(.flexible(), spacing: 4),
+                                                GridItem(.flexible(), spacing: 4)], spacing: 4) {
+                                ForEach(filteredAssets) { asset in
+                                    AssetRow(assetID: asset.id)
+                                }
+                            }
+                            .padding(.horizontal, 8)
+                            .padding(.bottom, 8)
+                        } else if selectedTab == .video {
+                            // 2-column grid for videos
                             LazyVGrid(columns: [GridItem(.flexible(), spacing: 4),
                                                 GridItem(.flexible(), spacing: 4)], spacing: 4) {
                                 ForEach(filteredAssets) { asset in
@@ -193,7 +203,7 @@ private struct AssetRow: View {
                 if let thumb = project.mediaThumbnails[asset.id] {
                     Color.clear
                         .frame(maxWidth: .infinity)
-                        .frame(height: 90)
+                        .aspectRatio(4.0/3.0, contentMode: .fit)
                         .overlay(
                             Image(nsImage: thumb)
                                 .resizable()
@@ -203,7 +213,7 @@ private struct AssetRow: View {
                 } else {
                     RoundedRectangle(cornerRadius: 6)
                         .fill(Color.white.opacity(0.06))
-                        .frame(height: 90)
+                        .aspectRatio(4.0/3.0, contentMode: .fit)
                         .overlay(
                             Image(systemName: asset.type == .image ? "photo" : "film")
                                 .font(.system(size: 22, weight: .ultraLight))
@@ -225,7 +235,6 @@ private struct AssetRow: View {
                 if !asset.fileExists {
                     RoundedRectangle(cornerRadius: 6)
                         .fill(Color.black.opacity(0.5))
-                        .frame(height: 90)
                         .overlay(
                             VStack(spacing: 4) {
                                 Image(systemName: "exclamationmark.triangle.fill")
@@ -237,7 +246,8 @@ private struct AssetRow: View {
                             }
                         )
                 }
-                // Hover action buttons — white 80%
+            }
+            .overlay(alignment: .bottomTrailing) {
                 if hovered {
                     HStack(spacing: 2) {
                         if asset.fileExists {
@@ -248,7 +258,6 @@ private struct AssetRow: View {
                         videoMiniBtn(icon: "trash") { project.mediaAssets.removeAll { $0.id == asset.id } }
                     }
                     .padding(4)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
                 }
             }
 
@@ -375,11 +384,10 @@ private struct VideoMiniBtnView: View {
     var body: some View {
         Button(action: action) {
             Image(systemName: icon)
-                .font(.system(size: 12, weight: .light))
-                .foregroundColor(Color.white.opacity(0.80))
+                .font(.system(size: 12, weight: hovering ? .medium : .light))
+                .foregroundColor(Color.white.opacity(hovering ? 1.0 : 0.80))
                 .frame(width: 26, height: 26)
-                .background(hovering ? Color.black.opacity(0.4) : Color.black.opacity(0.25))
-                .clipShape(RoundedRectangle(cornerRadius: 5))
+                .shadow(color: .black.opacity(0.6), radius: 3, x: 0, y: 1)
         }
         .buttonStyle(.plain)
         .onHover { hovering = $0 }

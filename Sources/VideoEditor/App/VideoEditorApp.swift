@@ -83,8 +83,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let editMenu = NSMenu(title: "编辑")
         editMenu.delegate = self  // 每次打开前清理
         let editItem = NSMenuItem(); editItem.submenu = editMenu
-        editMenu.addItem(withTitle: "撤销", action: Selector(("undo:")), keyEquivalent: "z")
-        let redoItem = NSMenuItem(title: "重做", action: Selector(("redo:")), keyEquivalent: "z")
+        let undoItem = NSMenuItem(title: "撤销", action: #selector(doUndo), keyEquivalent: "z")
+        editMenu.addItem(undoItem)
+        let redoItem = NSMenuItem(title: "重做", action: #selector(doRedo), keyEquivalent: "z")
         redoItem.keyEquivalentModifierMask = [.command, .shift]
         editMenu.addItem(redoItem)
         editMenu.addItem(.separator())
@@ -98,7 +99,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let viewMenu = NSMenu(title: "显示")
         viewMenu.delegate = self  // 每次打开前清理
         let viewItem = NSMenuItem(); viewItem.submenu = viewMenu
-        let fullScreen = NSMenuItem(title: "进入全屏幕", action: #selector(NSWindow.toggleFullScreen(_:)), keyEquivalent: "f")
+        let fullScreen = NSMenuItem(title: "进入全屏幕", action: #selector(doToggleFullScreen), keyEquivalent: "f")
         fullScreen.keyEquivalentModifierMask = [.command, .control]
         viewMenu.addItem(fullScreen)
         mainMenu.addItem(viewItem)
@@ -119,6 +120,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // MARK: - NSMenuDelegate — 菜单打开前清理
 
     func menuNeedsUpdate(_ menu: NSMenu) {
+        cleanupMenu(menu)
+    }
+
+    func menuWillOpen(_ menu: NSMenu) {
         cleanupMenu(menu)
     }
 
@@ -173,6 +178,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // 2) 翻译
         for item in menu.items {
             if let cn = translate[item.title] { item.title = cn }
+            // 按 action selector 强制翻译系统注入项
+            let sel = item.action?.description ?? ""
+            if sel == "undo:" && item.title != "撤销" { item.title = "撤销" }
+            if sel == "redo:" && item.title != "重做" { item.title = "重做" }
+            if sel == "toggleFullScreen:" && !item.title.hasSuffix("全屏幕") {
+                item.title = "进入全屏幕"
+            }
+            // 前缀匹配兜底
+            if item.title.hasPrefix("Undo") { item.title = "撤销" }
+            if item.title.hasPrefix("Redo") { item.title = "重做" }
+            if item.title.hasPrefix("Enter Full Screen") { item.title = "进入全屏幕" }
+            if item.title.hasPrefix("Exit Full Screen") { item.title = "退出全屏幕" }
             if item.title.hasPrefix("Move to ") {
                 item.title = "移动到 " + item.title.dropFirst(8)
             }
@@ -206,6 +223,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // MARK: - 菜单动作
 
+    @objc private func doUndo() {
+        NSApp.keyWindow?.undoManager?.undo()
+    }
+
+    @objc private func doRedo() {
+        NSApp.keyWindow?.undoManager?.redo()
+    }
+
+    @objc private func doToggleFullScreen() {
+        NSApp.keyWindow?.toggleFullScreen(nil)
+    }
+
     @objc private func importMedia() {
         let panel = NSOpenPanel()
         panel.allowsMultipleSelection = true
@@ -226,13 +255,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func showAbout() {
-        let credits = NSAttributedString(string: "视频编辑器 v1.8.6", attributes: [
+        let credits = NSAttributedString(string: "视频编辑器 v1.9.0", attributes: [
             .font: NSFont.systemFont(ofSize: 11),
             .foregroundColor: NSColor.secondaryLabelColor
         ])
         NSApp.orderFrontStandardAboutPanel(options: [
             .applicationName: "黑猫剪辑",
-            .applicationVersion: "1.8.5",
+            .applicationVersion: "1.9.0",
             .credits: credits
         ])
     }

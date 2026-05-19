@@ -191,6 +191,10 @@ final class ProjectState: ObservableObject {
     // Timeline
     @Published var pixelsPerSecond: Double = 30
     @Published var snapEnabled: Bool = false
+    @Published var showImageTracks: Bool = true
+    @Published var showVideoTracks: Bool = true
+    @Published var showAudioTracks: Bool = true
+    @Published var showSubtitleTracks: Bool = true
 
     // Selection (single — used by Inspector)
     @Published var selectedVideoClipID: UUID?    = nil

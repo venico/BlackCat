@@ -17,6 +17,7 @@ struct TimelineView: View {
     @State private var dragGhostPos: CGPoint? = nil  // ghost center position during clip drag
     @State private var dragGhostOffset: CGSize = .zero // offset from mouse to clip center at drag start
     @State private var draggingClipID: UUID? = nil   // hide original while dragging
+    @State private var activeSnapTime: Double? = nil  // 吸附指示线位置
 
     // Global event monitors
     @State private var keyMonitor:    Any? = nil
@@ -262,41 +263,49 @@ struct TimelineView: View {
             .menuIndicator(.hidden)
             .frame(height: rulerH)
 
-            ForEach(project.imageTracks.indices, id:\.self) { i in
-                TrackLabel(icon:"photo", title: project.imageTracks[i].label,
-                           count: project.imageTracks[i].clips.count, hasMute: false,
-                           isMuted: false, isVis: project.imageTracks[i].isVisible,
-                           onMute: nil,
-                           onVis:  { project.imageTracks[i].isVisible.toggle(); project.rebuildTimelinePreview() },
-                           onDel:  { project.imageTracks.remove(at:i) })
-                    .frame(height: trackH)
+            if project.showImageTracks {
+                ForEach(project.imageTracks.indices, id:\.self) { i in
+                    TrackLabel(icon:"photo", title: project.imageTracks[i].label,
+                               count: project.imageTracks[i].clips.count, hasMute: false,
+                               isMuted: false, isVis: project.imageTracks[i].isVisible,
+                               onMute: nil,
+                               onVis:  { project.imageTracks[i].isVisible.toggle(); project.rebuildTimelinePreview() },
+                               onDel:  { project.imageTracks.remove(at:i) })
+                        .frame(height: trackH)
+                }
             }
-            ForEach(project.videoTracks.indices, id:\.self) { i in
-                TrackLabel(icon:"film", title: project.videoTracks[i].label,
-                           count: project.videoTracks[i].clips.count, hasMute: true,
-                           isMuted: project.videoTracks[i].isMuted, isVis: project.videoTracks[i].isVisible,
-                           onMute: { project.videoTracks[i].isMuted.toggle(); project.rebuildTimelinePreview() },
-                           onVis:  { project.videoTracks[i].isVisible.toggle(); project.rebuildTimelinePreview() },
-                           onDel:  { project.videoTracks.remove(at:i) })
-                    .frame(height: trackH)
+            if project.showVideoTracks {
+                ForEach(project.videoTracks.indices, id:\.self) { i in
+                    TrackLabel(icon:"film", title: project.videoTracks[i].label,
+                               count: project.videoTracks[i].clips.count, hasMute: true,
+                               isMuted: project.videoTracks[i].isMuted, isVis: project.videoTracks[i].isVisible,
+                               onMute: { project.videoTracks[i].isMuted.toggle(); project.rebuildTimelinePreview() },
+                               onVis:  { project.videoTracks[i].isVisible.toggle(); project.rebuildTimelinePreview() },
+                               onDel:  { project.videoTracks.remove(at:i) })
+                        .frame(height: trackH)
+                }
             }
-            ForEach(project.audioTracks.indices, id:\.self) { i in
-                TrackLabel(icon:"music.note", title: project.audioTracks[i].label,
-                           count: project.audioTracks[i].clips.count, hasMute: true,
-                           isMuted: project.audioTracks[i].isMuted, isVis: true, hasVis: false,
-                           onMute: { project.audioTracks[i].isMuted.toggle(); project.rebuildTimelinePreview() },
-                           onVis:  {},
-                           onDel:  { project.audioTracks.remove(at:i) })
-                    .frame(height: trackH)
+            if project.showAudioTracks {
+                ForEach(project.audioTracks.indices, id:\.self) { i in
+                    TrackLabel(icon:"music.note", title: project.audioTracks[i].label,
+                               count: project.audioTracks[i].clips.count, hasMute: true,
+                               isMuted: project.audioTracks[i].isMuted, isVis: true, hasVis: false,
+                               onMute: { project.audioTracks[i].isMuted.toggle(); project.rebuildTimelinePreview() },
+                               onVis:  {},
+                               onDel:  { project.audioTracks.remove(at:i) })
+                        .frame(height: trackH)
+                }
             }
-            ForEach(project.subtitleTracks.indices, id:\.self) { i in
-                TrackLabel(icon:"text.bubble", title: project.subtitleTracks[i].label,
-                           count: project.subtitleTracks[i].clips.count, hasMute: false,
-                           isMuted: false, isVis: project.subtitleTracks[i].isVisible,
-                           onMute: nil,
-                           onVis:  { project.subtitleTracks[i].isVisible.toggle() },
-                           onDel:  { project.subtitleTracks.remove(at:i) })
-                    .frame(height: subtitleTrackH)
+            if project.showSubtitleTracks {
+                ForEach(project.subtitleTracks.indices, id:\.self) { i in
+                    TrackLabel(icon:"text.bubble", title: project.subtitleTracks[i].label,
+                               count: project.subtitleTracks[i].clips.count, hasMute: false,
+                               isMuted: false, isVis: project.subtitleTracks[i].isVisible,
+                               onMute: nil,
+                               onVis:  { project.subtitleTracks[i].isVisible.toggle() },
+                               onDel:  { project.subtitleTracks.remove(at:i) })
+                        .frame(height: subtitleTrackH)
+                }
             }
         }
         .frame(width: labelW)
@@ -351,6 +360,17 @@ struct TimelineView: View {
                             .frame(width: max(ghostInfo.duration * project.pixelsPerSecond, 30),
                                    height: ghostInfo.height)
                             .position(x: gPos.x, y: gPos.y)
+                            .allowsHitTesting(false)
+                    }
+
+                    // 吸附指示线
+                    if let snapT = activeSnapTime {
+                        let snapX = snapT * project.pixelsPerSecond
+                        Rectangle()
+                            .fill(Color.accent)
+                            .frame(width: 1)
+                            .position(x: snapX, y: totalContentH() / 2)
+                            .frame(height: totalContentH())
                             .allowsHitTesting(false)
                     }
 
@@ -504,6 +524,7 @@ struct TimelineView: View {
                 dragGhostPos = nil
                 dragGhostOffset = .zero
                 draggingClipID = nil
+                activeSnapTime = nil
             }
     }
 
@@ -690,25 +711,41 @@ struct TimelineView: View {
         return pts
     }
 
-    /// 对片段的 start 和 end 做吸附，返回吸附后的 start
-    private func snapStart(_ rawStart: Double, duration: Double, excluding ids: Set<UUID>) -> Double {
-        guard project.snapEnabled else { return rawStart }
+    /// 对片段的 start 和 end 做吸附，返回 (吸附后的 start, 吸附点时间)
+    private func snapStart(_ rawStart: Double, duration: Double, excluding ids: Set<UUID>) -> (Double, Double?) {
+        guard project.snapEnabled else { return (rawStart, nil) }
         let threshold = 8.0 / project.pixelsPerSecond  // 8 像素阈值
         let pts = collectSnapPoints(excluding: ids)
         var best = rawStart
         var bestDist = Double.infinity
+        var snapPt: Double? = nil
         let rawEnd = rawStart + duration
         // 片段起点吸附
         for p in pts {
             let d = abs(rawStart - p)
-            if d < threshold && d < bestDist { bestDist = d; best = p }
+            if d < threshold && d < bestDist { bestDist = d; best = p; snapPt = p }
         }
         // 片段终点吸附
         for p in pts {
             let d = abs(rawEnd - p)
-            if d < threshold && d < bestDist { bestDist = d; best = p - duration }
+            if d < threshold && d < bestDist { bestDist = d; best = p - duration; snapPt = p }
         }
-        return max(0, best)
+        return (max(0, best), snapPt)
+    }
+
+    /// 对单个边（trim 时）做吸附，返回 (吸附后的值, 吸附点时间)
+    private func snapEdge(_ rawTime: Double, excluding ids: Set<UUID>) -> (Double, Double?) {
+        guard project.snapEnabled else { return (rawTime, nil) }
+        let threshold = 8.0 / project.pixelsPerSecond
+        let pts = collectSnapPoints(excluding: ids)
+        var best = rawTime
+        var bestDist = Double.infinity
+        var snapPt: Double? = nil
+        for p in pts {
+            let d = abs(rawTime - p)
+            if d < threshold && d < bestDist { bestDist = d; best = p; snapPt = p }
+        }
+        return (best, snapPt)
     }
 
     private func applyDrag(op: DragOp, totalTranslation: CGSize, current: CGPoint) {
@@ -717,19 +754,23 @@ struct TimelineView: View {
         switch op {
         case .moveVideo(let id, let s, let d, _):
             let raw = max(0, s + dt)
-            let ns = snapStart(raw, duration: d, excluding: [id])
+            let (ns, sp) = snapStart(raw, duration: d, excluding: [id])
+            activeSnapTime = sp
             project.updateVideoClip(id: id) { $0.startTime = ns; $0.endTime = ns + d }
         case .moveImage(let id, let s, let d, _):
             let raw = max(0, s + dt)
-            let ns = snapStart(raw, duration: d, excluding: [id])
+            let (ns, sp) = snapStart(raw, duration: d, excluding: [id])
+            activeSnapTime = sp
             project.updateImageClip(id: id) { $0.startTime = ns; $0.endTime = ns + d }
         case .moveAudio(let id, let s, let d, _):
             let raw = max(0, s + dt)
-            let ns = snapStart(raw, duration: d, excluding: [id])
+            let (ns, sp) = snapStart(raw, duration: d, excluding: [id])
+            activeSnapTime = sp
             project.updateAudioClip(id: id) { $0.startTime = ns; $0.endTime = ns + d }
         case .moveSubtitle(let id, let s, let d, _):
             let raw = max(0, s + dt)
-            let ns = snapStart(raw, duration: d, excluding: [id])
+            let (ns, sp) = snapStart(raw, duration: d, excluding: [id])
+            activeSnapTime = sp
             project.updateSubtitleTime(id: id, start: ns, end: ns + d)
         case .moveMulti(let items):
             let minOrig = items.map(\.originStart).min() ?? 0
@@ -738,7 +779,8 @@ struct TimelineView: View {
             // 用第一个 item 做吸附计算
             let firstRaw = (items.first?.originStart ?? 0) + clampedDt
             let firstDur = items.first?.originDur ?? 0
-            let snapped = snapStart(firstRaw, duration: firstDur, excluding: excludeIDs)
+            let (snapped, sp) = snapStart(firstRaw, duration: firstDur, excluding: excludeIDs)
+            activeSnapTime = sp
             let snapDelta = snapped - firstRaw
             for it in items {
                 let ns = it.originStart + clampedDt + snapDelta
@@ -751,42 +793,60 @@ struct TimelineView: View {
                 }
             }
         case .trimVideoLeft(let id, let originStart, let originEnd, let originTrimStart):
-            let ns = max(0, min(originStart + dt, originEnd - 0.1))
+            var ns = max(0, min(originStart + dt, originEnd - 0.1))
+            let (snapped, sp) = snapEdge(ns, excluding: [id])
+            ns = snapped; activeSnapTime = sp
             let newTrimStart = max(0, originTrimStart + (ns - originStart))
             project.updateVideoClip(id: id) { $0.startTime = ns; $0.trimStart = newTrimStart }
         case .trimVideoRight(let id, let originStart, let originEnd):
-            let ne = max(originStart + 0.1, originEnd + dt)
+            var ne = max(originStart + 0.1, originEnd + dt)
+            let (snapped, sp) = snapEdge(ne, excluding: [id])
+            ne = snapped; activeSnapTime = sp
             project.updateVideoClip(id: id) { $0.endTime = ne }
             if ne > project.duration { project.duration = ne }
         case .trimImageLeft(let id, let originStart, let originEnd):
-            let ns = max(0, min(originStart + dt, originEnd - 0.1))
+            var ns = max(0, min(originStart + dt, originEnd - 0.1))
+            let (snapped, sp) = snapEdge(ns, excluding: [id])
+            ns = snapped; activeSnapTime = sp
             project.updateImageClip(id: id) { $0.startTime = ns }
         case .trimImageRight(let id, let originStart, let originEnd):
-            let ne = max(originStart + 0.1, originEnd + dt)
+            var ne = max(originStart + 0.1, originEnd + dt)
+            let (snapped, sp) = snapEdge(ne, excluding: [id])
+            ne = snapped; activeSnapTime = sp
             project.updateImageClip(id: id) { $0.endTime = ne }
             if ne > project.duration { project.duration = ne }
         case .trimAudioLeft(let id, let originStart, let originEnd, let originTrimStart):
-            let ns = max(0, min(originStart + dt, originEnd - 0.1))
+            var ns = max(0, min(originStart + dt, originEnd - 0.1))
+            let (snapped, sp) = snapEdge(ns, excluding: [id])
+            ns = snapped; activeSnapTime = sp
             let newTrimStart = max(0, originTrimStart + (ns - originStart))
             project.updateAudioClip(id: id) { $0.startTime = ns; $0.trimStart = newTrimStart }
         case .trimAudioRight(let id, let originStart, let originEnd):
-            let ne = max(originStart + 0.1, originEnd + dt)
+            var ne = max(originStart + 0.1, originEnd + dt)
+            let (snapped, sp) = snapEdge(ne, excluding: [id])
+            ne = snapped; activeSnapTime = sp
             project.updateAudioClip(id: id) { $0.endTime = ne }
             if ne > project.duration { project.duration = ne }
         case .trimSubtitleLeft(let id, let originStart, let originEnd):
-            let ns = max(0, min(originStart + dt, originEnd - 0.1))
+            var ns = max(0, min(originStart + dt, originEnd - 0.1))
+            let (snapped, sp) = snapEdge(ns, excluding: [id])
+            ns = snapped; activeSnapTime = sp
             project.updateSubtitleTime(id: id, start: ns)
         case .trimSubtitleRight(let id, let originStart, let originEnd):
-            let ne = max(originStart + 0.1, originEnd + dt)
+            var ne = max(originStart + 0.1, originEnd + dt)
+            let (snapped, sp) = snapEdge(ne, excluding: [id])
+            ne = snapped; activeSnapTime = sp
             project.updateSubtitleTime(id: id, end: ne)
             if ne > project.duration { project.duration = ne }
         case .movingPlayhead:
+            activeSnapTime = nil
             let t = (Double(current.x) / pps).clamped(to: 0...project.duration)
             project.requestSeek(to: t)
         case .box:
+            activeSnapTime = nil
             boxEnd = current
         case .ignored:
-            break
+            activeSnapTime = nil
         }
     }
 
@@ -805,61 +865,69 @@ struct TimelineView: View {
             return nil
         }
 
-        for ti in project.imageTracks.indices {
-            if pt.y >= rowTop && pt.y < rowTop + trackH {
-                for c in project.imageTracks[ti].clips {
-                    let xMin = CGFloat(c.startTime * pps) + 1
-                    let xMax = CGFloat(c.endTime   * pps) + 1
-                    if pt.x >= xMin - threshold && pt.x <= xMax + threshold {
-                        let hit = ClipHit.image(id: c.id, start: c.startTime, dur: c.duration)
-                        return (hit, edge(x: pt.x, xMin: xMin, xMax: xMax))
+        if project.showImageTracks {
+            for ti in project.imageTracks.indices {
+                if pt.y >= rowTop && pt.y < rowTop + trackH {
+                    for c in project.imageTracks[ti].clips {
+                        let xMin = CGFloat(c.startTime * pps) + 1
+                        let xMax = CGFloat(c.endTime   * pps) + 1
+                        if pt.x >= xMin - threshold && pt.x <= xMax + threshold {
+                            let hit = ClipHit.image(id: c.id, start: c.startTime, dur: c.duration)
+                            return (hit, edge(x: pt.x, xMin: xMin, xMax: xMax))
+                        }
                     }
+                    return nil
                 }
-                return nil
+                rowTop += trackH
             }
-            rowTop += trackH
         }
-        for ti in project.videoTracks.indices {
-            if pt.y >= rowTop && pt.y < rowTop + trackH {
-                for c in project.videoTracks[ti].clips {
-                    let xMin = CGFloat(c.startTime * pps) + 1
-                    let xMax = CGFloat(c.endTime   * pps) + 1
-                    if pt.x >= xMin - threshold && pt.x <= xMax + threshold {
-                        let hit = ClipHit.video(id: c.id, start: c.startTime, dur: c.duration)
-                        return (hit, edge(x: pt.x, xMin: xMin, xMax: xMax))
+        if project.showVideoTracks {
+            for ti in project.videoTracks.indices {
+                if pt.y >= rowTop && pt.y < rowTop + trackH {
+                    for c in project.videoTracks[ti].clips {
+                        let xMin = CGFloat(c.startTime * pps) + 1
+                        let xMax = CGFloat(c.endTime   * pps) + 1
+                        if pt.x >= xMin - threshold && pt.x <= xMax + threshold {
+                            let hit = ClipHit.video(id: c.id, start: c.startTime, dur: c.duration)
+                            return (hit, edge(x: pt.x, xMin: xMin, xMax: xMax))
+                        }
                     }
+                    return nil
                 }
-                return nil
+                rowTop += trackH
             }
-            rowTop += trackH
         }
-        for ti in project.audioTracks.indices {
-            if pt.y >= rowTop && pt.y < rowTop + trackH {
-                for c in project.audioTracks[ti].clips {
-                    let xMin = CGFloat(c.startTime * pps) + 1
-                    let xMax = CGFloat(c.endTime   * pps) + 1
-                    if pt.x >= xMin - threshold && pt.x <= xMax + threshold {
-                        let hit = ClipHit.audio(id: c.id, start: c.startTime, dur: c.duration)
-                        return (hit, edge(x: pt.x, xMin: xMin, xMax: xMax))
+        if project.showAudioTracks {
+            for ti in project.audioTracks.indices {
+                if pt.y >= rowTop && pt.y < rowTop + trackH {
+                    for c in project.audioTracks[ti].clips {
+                        let xMin = CGFloat(c.startTime * pps) + 1
+                        let xMax = CGFloat(c.endTime   * pps) + 1
+                        if pt.x >= xMin - threshold && pt.x <= xMax + threshold {
+                            let hit = ClipHit.audio(id: c.id, start: c.startTime, dur: c.duration)
+                            return (hit, edge(x: pt.x, xMin: xMin, xMax: xMax))
+                        }
                     }
+                    return nil
                 }
-                return nil
+                rowTop += trackH
             }
-            rowTop += trackH
         }
-        for ti in project.subtitleTracks.indices {
-            if pt.y >= rowTop && pt.y < rowTop + subtitleTrackH {
-                for c in project.subtitleTracks[ti].clips {
-                    let xMin = CGFloat(c.startTime * pps) + 1
-                    let xMax = CGFloat(c.endTime   * pps) + 1
-                    if pt.x >= xMin - threshold && pt.x <= xMax + threshold {
-                        let hit = ClipHit.subtitle(id: c.id, start: c.startTime, dur: c.duration)
-                        return (hit, edge(x: pt.x, xMin: xMin, xMax: xMax))
+        if project.showSubtitleTracks {
+            for ti in project.subtitleTracks.indices {
+                if pt.y >= rowTop && pt.y < rowTop + subtitleTrackH {
+                    for c in project.subtitleTracks[ti].clips {
+                        let xMin = CGFloat(c.startTime * pps) + 1
+                        let xMax = CGFloat(c.endTime   * pps) + 1
+                        if pt.x >= xMin - threshold && pt.x <= xMax + threshold {
+                            let hit = ClipHit.subtitle(id: c.id, start: c.startTime, dur: c.duration)
+                            return (hit, edge(x: pt.x, xMin: xMin, xMax: xMax))
+                        }
                     }
+                    return nil
                 }
-                return nil
+                rowTop += subtitleTrackH
             }
-            rowTop += subtitleTrackH
         }
         return nil
     }
@@ -869,37 +937,45 @@ struct TimelineView: View {
         var ids: Set<UUID> = []
         var rowTop = rulerH
 
-        for ti in project.imageTracks.indices {
-            let yRange = rowTop ... (rowTop + trackH)
-            for c in project.imageTracks[ti].clips {
-                let xRange = (c.startTime*pps) ... (c.endTime*pps)
-                if rectIntersects(rect, xRange: xRange, yRange: yRange) { ids.insert(c.id) }
+        if project.showImageTracks {
+            for ti in project.imageTracks.indices {
+                let yRange = rowTop ... (rowTop + trackH)
+                for c in project.imageTracks[ti].clips {
+                    let xRange = (c.startTime*pps) ... (c.endTime*pps)
+                    if rectIntersects(rect, xRange: xRange, yRange: yRange) { ids.insert(c.id) }
+                }
+                rowTop += trackH
             }
-            rowTop += trackH
         }
-        for ti in project.videoTracks.indices {
-            let yRange = rowTop ... (rowTop + trackH)
-            for c in project.videoTracks[ti].clips {
-                let xRange = (c.startTime*pps) ... (c.endTime*pps)
-                if rectIntersects(rect, xRange: xRange, yRange: yRange) { ids.insert(c.id) }
+        if project.showVideoTracks {
+            for ti in project.videoTracks.indices {
+                let yRange = rowTop ... (rowTop + trackH)
+                for c in project.videoTracks[ti].clips {
+                    let xRange = (c.startTime*pps) ... (c.endTime*pps)
+                    if rectIntersects(rect, xRange: xRange, yRange: yRange) { ids.insert(c.id) }
+                }
+                rowTop += trackH
             }
-            rowTop += trackH
         }
-        for ti in project.audioTracks.indices {
-            let yRange = rowTop ... (rowTop + trackH)
-            for c in project.audioTracks[ti].clips {
-                let xRange = (c.startTime*pps) ... (c.endTime*pps)
-                if rectIntersects(rect, xRange: xRange, yRange: yRange) { ids.insert(c.id) }
+        if project.showAudioTracks {
+            for ti in project.audioTracks.indices {
+                let yRange = rowTop ... (rowTop + trackH)
+                for c in project.audioTracks[ti].clips {
+                    let xRange = (c.startTime*pps) ... (c.endTime*pps)
+                    if rectIntersects(rect, xRange: xRange, yRange: yRange) { ids.insert(c.id) }
+                }
+                rowTop += trackH
             }
-            rowTop += trackH
         }
-        for ti in project.subtitleTracks.indices {
-            let yRange = rowTop ... (rowTop + subtitleTrackH)
-            for c in project.subtitleTracks[ti].clips {
-                let xRange = (c.startTime*pps) ... (c.endTime*pps)
-                if rectIntersects(rect, xRange: xRange, yRange: yRange) { ids.insert(c.id) }
+        if project.showSubtitleTracks {
+            for ti in project.subtitleTracks.indices {
+                let yRange = rowTop ... (rowTop + subtitleTrackH)
+                for c in project.subtitleTracks[ti].clips {
+                    let xRange = (c.startTime*pps) ... (c.endTime*pps)
+                    if rectIntersects(rect, xRange: xRange, yRange: yRange) { ids.insert(c.id) }
+                }
+                rowTop += subtitleTrackH
             }
-            rowTop += subtitleTrackH
         }
 
         project.selectedClipIDs = ids
@@ -916,47 +992,57 @@ struct TimelineView: View {
     }
 
     private func totalContentH() -> CGFloat {
-        rulerH + trackH * CGFloat(project.videoTracks.count
-                                  + project.imageTracks.count
-                                  + project.audioTracks.count)
-             + subtitleTrackH * CGFloat(project.subtitleTracks.count)
+        var h = rulerH
+        if project.showImageTracks    { h += trackH * CGFloat(project.imageTracks.count) }
+        if project.showVideoTracks    { h += trackH * CGFloat(project.videoTracks.count) }
+        if project.showAudioTracks    { h += trackH * CGFloat(project.audioTracks.count) }
+        if project.showSubtitleTracks { h += subtitleTrackH * CGFloat(project.subtitleTracks.count) }
+        return h
     }
 
     @ViewBuilder
     private var trackRows: some View {
-        ForEach(project.imageTracks.indices, id:\.self) { i in
-            trackRow(height: trackH, hidden: !project.imageTracks[i].isVisible, tint: Color(hex: "#E8A54B")) {
-                ForEach(project.imageTracks[i].clips) { clip in
-                    ImageClipView(clip: clip, pps: project.pixelsPerSecond, h: trackH,
-                                  sel: isSelected(clip.id, primary: project.selectedImageClipID),
-                                  isDragging: draggingClipID == clip.id)
+        if project.showImageTracks {
+            ForEach(project.imageTracks.indices, id:\.self) { i in
+                trackRow(height: trackH, hidden: !project.imageTracks[i].isVisible, tint: Color(hex: "#E8A54B")) {
+                    ForEach(project.imageTracks[i].clips) { clip in
+                        ImageClipView(clip: clip, pps: project.pixelsPerSecond, h: trackH,
+                                      sel: isSelected(clip.id, primary: project.selectedImageClipID),
+                                      isDragging: draggingClipID == clip.id)
+                    }
                 }
             }
         }
-        ForEach(project.videoTracks.indices, id:\.self) { i in
-            trackRow(height: trackH, hidden: !project.videoTracks[i].isVisible, tint: Color(hex: "#3DBFBA")) {
-                ForEach(project.videoTracks[i].clips) { clip in
-                    VideoClipView(clip: clip, pps: project.pixelsPerSecond, h: trackH,
-                                  sel: isSelected(clip.id, primary: project.selectedVideoClipID),
-                                  isDragging: draggingClipID == clip.id)
+        if project.showVideoTracks {
+            ForEach(project.videoTracks.indices, id:\.self) { i in
+                trackRow(height: trackH, hidden: !project.videoTracks[i].isVisible, tint: Color(hex: "#3DBFBA")) {
+                    ForEach(project.videoTracks[i].clips) { clip in
+                        VideoClipView(clip: clip, pps: project.pixelsPerSecond, h: trackH,
+                                      sel: isSelected(clip.id, primary: project.selectedVideoClipID),
+                                      isDragging: draggingClipID == clip.id)
+                    }
                 }
             }
         }
-        ForEach(project.audioTracks.indices, id:\.self) { i in
-            trackRow(height: trackH, hidden: !project.audioTracks[i].isVisible, muted: project.audioTracks[i].isMuted, tint: Color(hex: "#5DB85D")) {
-                ForEach(project.audioTracks[i].clips) { clip in
-                    AudioClipView(clip: clip, pps: project.pixelsPerSecond, h: trackH,
-                                  sel: isSelected(clip.id, primary: project.selectedAudioClipID),
-                                  isDragging: draggingClipID == clip.id)
+        if project.showAudioTracks {
+            ForEach(project.audioTracks.indices, id:\.self) { i in
+                trackRow(height: trackH, hidden: !project.audioTracks[i].isVisible, muted: project.audioTracks[i].isMuted, tint: Color(hex: "#5DB85D")) {
+                    ForEach(project.audioTracks[i].clips) { clip in
+                        AudioClipView(clip: clip, pps: project.pixelsPerSecond, h: trackH,
+                                      sel: isSelected(clip.id, primary: project.selectedAudioClipID),
+                                      isDragging: draggingClipID == clip.id)
+                    }
                 }
             }
         }
-        ForEach(project.subtitleTracks.indices, id:\.self) { i in
-            trackRow(height: subtitleTrackH, hidden: !project.subtitleTracks[i].isVisible, tint: Color(hex: "#7B6FC4")) {
-                ForEach(project.subtitleTracks[i].clips) { clip in
-                    SubtitleClipView(clip: clip, pps: project.pixelsPerSecond, h: subtitleTrackH,
-                                     sel: isSelected(clip.id, primary: project.selectedSubtitleClipID),
-                                     isDragging: draggingClipID == clip.id)
+        if project.showSubtitleTracks {
+            ForEach(project.subtitleTracks.indices, id:\.self) { i in
+                trackRow(height: subtitleTrackH, hidden: !project.subtitleTracks[i].isVisible, tint: Color(hex: "#7B6FC4")) {
+                    ForEach(project.subtitleTracks[i].clips) { clip in
+                        SubtitleClipView(clip: clip, pps: project.pixelsPerSecond, h: subtitleTrackH,
+                                         sel: isSelected(clip.id, primary: project.selectedSubtitleClipID),
+                                         isDragging: draggingClipID == clip.id)
+                    }
                 }
             }
         }
@@ -1021,9 +1107,9 @@ struct TimelineView: View {
     }
 
     private func trackCenterY(row: Int) -> CGFloat {
-        let iCount = project.imageTracks.count
-        let vCount = project.videoTracks.count
-        let aCount = project.audioTracks.count
+        let iCount = project.showImageTracks ? project.imageTracks.count : 0
+        let vCount = project.showVideoTracks ? project.videoTracks.count : 0
+        let aCount = project.showAudioTracks ? project.audioTracks.count : 0
         var top = rulerH
         for r in 0..<row {
             if r < iCount { top += trackH }
@@ -1037,21 +1123,29 @@ struct TimelineView: View {
 
     private func trackIndexFromY(_ y: CGFloat) -> TrackTarget {
         var top = rulerH
-        for i in project.imageTracks.indices {
-            if y < top + trackH { return TrackTarget(imageIndex: i) }
-            top += trackH
+        if project.showImageTracks {
+            for i in project.imageTracks.indices {
+                if y < top + trackH { return TrackTarget(imageIndex: i) }
+                top += trackH
+            }
         }
-        for i in project.videoTracks.indices {
-            if y < top + trackH { return TrackTarget(videoIndex: i) }
-            top += trackH
+        if project.showVideoTracks {
+            for i in project.videoTracks.indices {
+                if y < top + trackH { return TrackTarget(videoIndex: i) }
+                top += trackH
+            }
         }
-        for i in project.audioTracks.indices {
-            if y < top + trackH { return TrackTarget(audioIndex: i) }
-            top += trackH
+        if project.showAudioTracks {
+            for i in project.audioTracks.indices {
+                if y < top + trackH { return TrackTarget(audioIndex: i) }
+                top += trackH
+            }
         }
-        for i in project.subtitleTracks.indices {
-            if y < top + subtitleTrackH { return TrackTarget(subtitleIndex: i) }
-            top += subtitleTrackH
+        if project.showSubtitleTracks {
+            for i in project.subtitleTracks.indices {
+                if y < top + subtitleTrackH { return TrackTarget(subtitleIndex: i) }
+                top += subtitleTrackH
+            }
         }
         return TrackTarget()
     }
@@ -1080,15 +1174,17 @@ private struct TrackLabel: View {
 
     var body: some View {
         ZStack {
-            // 默认：图标 + 数量
-            HStack(spacing: 3) {
+            // 默认：图标左对齐 + 数量右对齐
+            HStack {
                 Image(systemName: icon)
                     .font(.system(size: 10, weight: .light))
                     .foregroundColor(Color.labelSecondary)
+                Spacer()
                 Text("\(count)")
                     .font(.system(size: 9, weight: .medium).monospacedDigit())
                     .foregroundColor(Color.labelSecondary.opacity(0.6))
             }
+            .padding(.horizontal, 8)
             .opacity(isHovered ? 0 : 1)
 
             // hover 时：操作按钮
@@ -1112,6 +1208,22 @@ private struct TrackLabel: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color.white.opacity(0.02))
         .onHover { isHovered = $0 }
+    }
+}
+
+private struct TrackToggleBtn: View {
+    let icon: String
+    @Binding var on: Bool
+    let help: String
+    var body: some View {
+        Button { on.toggle() } label: {
+            Image(systemName: icon)
+                .font(.system(size: 10, weight: .medium))
+                .foregroundColor(on ? Color.accent : Color.labelSecondary.opacity(0.4))
+                .frame(width: 24, height: 24)
+        }
+        .buttonStyle(.plain)
+        .help(help)
     }
 }
 
@@ -1530,14 +1642,21 @@ struct TimelineToolbar: View {
 
             Spacer()
 
+            // 轨道显示开关
+            HStack(spacing: 2) {
+                TrackToggleBtn(icon: "photo", on: $project.showImageTracks, help: "图片轨道")
+                TrackToggleBtn(icon: "film", on: $project.showVideoTracks, help: "视频轨道")
+                TrackToggleBtn(icon: "music.note", on: $project.showAudioTracks, help: "音频轨道")
+                TrackToggleBtn(icon: "captions.bubble", on: $project.showSubtitleTracks, help: "字幕轨道")
+            }
+            .padding(.trailing, 4)
+
             // 吸附开关
             Button { project.snapEnabled.toggle() } label: {
                 Image(systemName: "arrow.right.and.line.vertical.and.arrow.left")
                     .font(.system(size: 11, weight: .medium))
-                    .foregroundColor(project.snapEnabled ? Color.accent : Color.labelSecondary)
-                    .frame(width: 28, height: 24)
-                    .background(project.snapEnabled ? Color.accent.opacity(0.15) : Color.clear)
-                    .cornerRadius(5)
+                    .foregroundColor(project.snapEnabled ? Color.accent : Color.labelSecondary.opacity(0.4))
+                    .frame(width: 24, height: 24)
             }
             .buttonStyle(.plain)
             .help("自动吸附")
@@ -1563,36 +1682,19 @@ private struct TranslateToolGroup: View {
     var body: some View {
         HStack(spacing: 2) {
             // 目标语言下拉
-            Menu {
-                ForEach(ProjectState.supportedLanguages, id: \.self) { lang in
-                    Button {
-                        project.translationTargetLang = lang
-                    } label: {
-                        HStack {
-                            Text(lang)
-                            if lang == project.translationTargetLang {
-                                Image(systemName: "checkmark")
-                            }
-                        }
-                    }
-                }
-            } label: {
+            Button { showLangMenu() } label: {
                 HStack(spacing: 3) {
-                    Image(systemName: "globe")
-                        .font(.system(size: 11, weight: .light))
                     Text(shortLang(project.translationTargetLang))
                         .font(.system(size: 10, weight: .medium))
+                        .foregroundColor(Color.labelSecondary)
                     Image(systemName: "chevron.down")
                         .font(.system(size: 7, weight: .semibold))
+                        .foregroundColor(Color.labelSecondary)
                 }
-                .foregroundColor(Color.labelSecondary)
                 .padding(.horizontal, 6)
                 .frame(height: 28)
-                .background(Color.white.opacity(0.06))
-                .cornerRadius(5)
             }
-            .menuStyle(.borderlessButton)
-            .fixedSize()
+            .buttonStyle(.plain)
 
             TBtn(icon: "translate", help: "翻译当前字幕",
                  enabled: project.selectedSubtitleClip != nil) { translateCurrent() }
@@ -1617,6 +1719,23 @@ private struct TranslateToolGroup: View {
         case "Português": return "PT"
         case "Italiano":  return "IT"
         default:          return String(lang.prefix(2))
+        }
+    }
+
+    private func showLangMenu() {
+        let menu = NSMenu()
+        for lang in ProjectState.supportedLanguages {
+            let item = NSMenuItem(title: lang, action: nil, keyEquivalent: "")
+            item.target = LangMenuHandler.shared
+            item.action = #selector(LangMenuHandler.pick(_:))
+            item.tag = ProjectState.supportedLanguages.firstIndex(of: lang) ?? 0
+            if lang == project.translationTargetLang { item.state = .on }
+            menu.addItem(item)
+        }
+        LangMenuHandler.shared.project = project
+        let view = NSApp.keyWindow?.contentView ?? NSView()
+        if let event = NSApp.currentEvent {
+            NSMenu.popUpContextMenu(menu, with: event, for: view)
         }
     }
 
@@ -1702,4 +1821,14 @@ private struct TBtn: View {
 private func fmtT(_ t:Double)->String {
     let m=Int(t)/60%60; let s=Int(t)%60; let ms=Int((t-Double(Int(t)))*1000)
     return String(format:"%02d:%02d.%03d",m,s,ms)
+}
+
+final class LangMenuHandler: NSObject {
+    static let shared = LangMenuHandler()
+    weak var project: ProjectState?
+    @objc func pick(_ sender: NSMenuItem) {
+        let langs = ProjectState.supportedLanguages
+        guard langs.indices.contains(sender.tag) else { return }
+        project?.translationTargetLang = langs[sender.tag]
+    }
 }
