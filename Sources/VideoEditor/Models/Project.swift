@@ -379,7 +379,7 @@ final class ProjectState: ObservableObject {
             let av = AVURLAsset(url: url)
             let gen = AVAssetImageGenerator(asset: av)
             gen.appliesPreferredTrackTransform = true
-            gen.maximumSize = CGSize(width: 200, height: 200)
+            gen.maximumSize = CGSize(width: 400, height: 400)
             if let cg = try? gen.copyCGImage(at: .zero, actualTime: nil) {
                 let img = NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
                 await MainActor.run { self.mediaThumbnails[id] = img }
@@ -397,7 +397,7 @@ final class ProjectState: ObservableObject {
             guard dur > 0.1 else { return }
             let gen = AVAssetImageGenerator(asset: av)
             gen.appliesPreferredTrackTransform = true
-            gen.maximumSize = CGSize(width: 80, height: 52)
+            gen.maximumSize = CGSize(width: 160, height: 104)
             gen.requestedTimeToleranceBefore = CMTime(seconds: 0.5, preferredTimescale: 600)
             gen.requestedTimeToleranceAfter  = CMTime(seconds: 0.5, preferredTimescale: 600)
 
@@ -770,7 +770,7 @@ final class ProjectState: ObservableObject {
         rebuildTask = Task {
             let composition = AVMutableComposition()
             var audioParams: [(trackID: CMPersistentTrackID, volume: Float, left: Float, right: Float)] = []
-            var videoCompTracks: [AVMutableCompositionTrack] = []  // from video clips
+            var videoCompTracks: [(track: AVMutableCompositionTrack, startTime: Double, endTime: Double)] = []  // from video clips
             var imageCompTracks: [(track: AVMutableCompositionTrack, clip: ImageClip)] = []  // from image clips (on top)
             var renderSize = CGSize(width: 1920, height: 1080)
 
@@ -792,7 +792,7 @@ final class ProjectState: ObservableObject {
                        let vt = composition.addMutableTrack(withMediaType: .video,
                                                             preferredTrackID: kCMPersistentTrackID_Invalid) {
                         try? vt.insertTimeRange(range, of: vAsset, at: at)
-                        videoCompTracks.append(vt)
+                        videoCompTracks.append((vt, clip.startTime, clip.startTime + useDur.seconds))
                         // Detect render size from first video
                         if let natSize = try? await vAsset.load(.naturalSize) {
                             if natSize.width > 0 && natSize.height > 0 {
@@ -920,7 +920,7 @@ final class ProjectState: ObservableObject {
             // Build AVVideoComposition to layer image tracks on top of video tracks.
             // We need time-segmented instructions so image layers only appear during
             // their clip range and disappear afterwards (letting video show through).
-            let allVideoTracks = videoCompTracks + imageCompTracks.map(\.track)
+            let allVideoTracks = videoCompTracks.map(\.track) + imageCompTracks.map(\.track)
             var videoComposition: AVMutableVideoComposition? = nil
             if !allVideoTracks.isEmpty && composition.duration.seconds > 0.01 {
                 let vc = AVMutableVideoComposition()
@@ -935,9 +935,17 @@ final class ProjectState: ObservableObject {
                     return (s, e)
                 }
 
+                // Collect video clip time ranges
+                let videoClipCMRanges = videoCompTracks.map { entry -> (start: CMTime, end: CMTime) in
+                    let s = CMTime(seconds: entry.startTime, preferredTimescale: ts)
+                    let e = CMTime(seconds: entry.endTime, preferredTimescale: ts)
+                    return (s, e)
+                }
+
                 // Collect all time boundaries (CMTime)
                 var cmBoundaries: [CMTime] = [.zero, composition.duration]
                 for r in imageClipCMRanges { cmBoundaries.append(r.start); cmBoundaries.append(r.end) }
+                for r in videoClipCMRanges { cmBoundaries.append(r.start); cmBoundaries.append(r.end) }
                 // 去重 + 排序
                 let sortedCM = Array(Set(cmBoundaries.map { $0.value })).sorted().map { CMTime(value: $0, timescale: ts) }
 
@@ -975,8 +983,14 @@ final class ProjectState: ObservableObject {
                         }
                         layerInstructions.append(li)
                     }
-                    for track in videoCompTracks {
-                        let li = AVMutableVideoCompositionLayerInstruction(assetTrack: track)
+                    for (idx, entry) in videoCompTracks.enumerated() {
+                        let li = AVMutableVideoCompositionLayerInstruction(assetTrack: entry.track)
+                        let clipStart = videoClipCMRanges[idx].start
+                        let clipEnd   = videoClipCMRanges[idx].end
+                        let active = segStartCM >= clipStart && segStartCM < clipEnd
+                        if !active {
+                            li.setOpacity(0, at: .zero)
+                        }
                         layerInstructions.append(li)
                     }
                     instruction.layerInstructions = layerInstructions
@@ -1119,7 +1133,13 @@ final class ProjectState: ObservableObject {
                 }
             }
         case .subtitle:
-            let clips = parseSRT(url: asset.url)
+            let ext = asset.url.pathExtension.lowercased()
+            let clips: [SubtitleClip]
+            switch ext {
+            case "ass": clips = parseASS(url: asset.url)
+            case "vtt": clips = parseVTT(url: asset.url)
+            default:    clips = parseSRT(url: asset.url)
+            }
             // Use the first empty subtitle track if available; otherwise create
             // a brand-new track so each imported subtitle file lives on its own
             // line (so bilingual / multi-language workflows don't merge).
@@ -1248,6 +1268,100 @@ final class ProjectState: ObservableObject {
         let p = c.components(separatedBy: ":"); guard p.count == 3 else { return nil }
         guard let h = Double(p[0]), let m = Double(p[1]), let sec = Double(p[2]) else { return nil }
         return h * 3600 + m * 60 + sec
+    }
+
+    // MARK: - ASS 解析
+
+    func parseASS(url: URL) -> [SubtitleClip] {
+        let raw: String
+        if let s = try? String(contentsOf: url, encoding: .utf8) { raw = s }
+        else if let s = try? String(contentsOf: url, encoding: .utf16) { raw = s }
+        else { return [] }
+        var clips: [SubtitleClip] = []
+        var inEvents = false
+        var formatFields: [String] = []
+        for line in raw.components(separatedBy: .newlines) {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.lowercased().hasPrefix("[events]") { inEvents = true; continue }
+            if trimmed.hasPrefix("[") && !trimmed.lowercased().hasPrefix("[events]") { inEvents = false; continue }
+            guard inEvents else { continue }
+            if trimmed.lowercased().hasPrefix("format:") {
+                let fields = trimmed.dropFirst(7).components(separatedBy: ",").map { $0.trimmingCharacters(in: .whitespaces).lowercased() }
+                formatFields = fields
+                continue
+            }
+            guard trimmed.hasPrefix("Dialogue:") || trimmed.hasPrefix("dialogue:") else { continue }
+            let content = String(trimmed.drop(while: { $0 != ":" }).dropFirst())
+                .trimmingCharacters(in: .whitespaces)
+            // ASS Dialogue 字段用逗号分隔，但 Text 字段可能包含逗号
+            let parts = content.components(separatedBy: ",")
+            let fieldCount = max(formatFields.count, 10)
+            guard parts.count >= fieldCount else { continue }
+            let startIdx = formatFields.firstIndex(of: "start") ?? 1
+            let endIdx = formatFields.firstIndex(of: "end") ?? 2
+            let textIdx = formatFields.firstIndex(of: "text") ?? (fieldCount - 1)
+            guard startIdx < parts.count, endIdx < parts.count, textIdx < parts.count else { continue }
+            guard let s = assTime(parts[startIdx].trimmingCharacters(in: .whitespaces)),
+                  let e = assTime(parts[endIdx].trimmingCharacters(in: .whitespaces)) else { continue }
+            // Text 是最后一个字段，可能包含逗号，所以取 textIdx 之后的所有内容
+            let text = parts[textIdx...].joined(separator: ",")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                // 去除 ASS 样式标签 {\xxx}
+                .replacingOccurrences(of: "\\{[^}]*\\}", with: "", options: .regularExpression)
+                // \N 换行符
+                .replacingOccurrences(of: "\\N", with: "\n")
+                .replacingOccurrences(of: "\\n", with: "\n")
+            if !text.isEmpty { clips.append(SubtitleClip(text: text, startTime: s, endTime: e)) }
+        }
+        return clips
+    }
+
+    private func assTime(_ s: String) -> Double? {
+        // ASS 时间格式: H:MM:SS.cc (百分之一秒)
+        let p = s.components(separatedBy: ":"); guard p.count == 3 else { return nil }
+        guard let h = Double(p[0]), let m = Double(p[1]), let sec = Double(p[2]) else { return nil }
+        return h * 3600 + m * 60 + sec
+    }
+
+    // MARK: - VTT 解析
+
+    func parseVTT(url: URL) -> [SubtitleClip] {
+        let raw: String
+        if let s = try? String(contentsOf: url, encoding: .utf8) { raw = s }
+        else if let s = try? String(contentsOf: url, encoding: .utf16) { raw = s }
+        else { return [] }
+        var clips: [SubtitleClip] = []
+        let blocks = raw.components(separatedBy: "\n\n")
+        for block in blocks {
+            let lines = block.trimmingCharacters(in: .whitespacesAndNewlines).components(separatedBy: "\n")
+            guard let tsLine = lines.first(where: { $0.contains("-->") }) else { continue }
+            let parts = tsLine.components(separatedBy: "-->")
+            guard parts.count == 2 else { continue }
+            // VTT 时间戳可能有位置信息在 --> 后面，去掉
+            let endPart = parts[1].trimmingCharacters(in: .whitespaces).components(separatedBy: " ").first ?? parts[1]
+            guard let s = vttTime(parts[0].trimmingCharacters(in: .whitespaces)),
+                  let e = vttTime(endPart.trimmingCharacters(in: .whitespaces)) else { continue }
+            let idx = lines.firstIndex(where: { $0.contains("-->") }) ?? 0
+            let text = lines.dropFirst(idx + 1).joined(separator: "\n")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                // 去除 VTT 标签 <b> <i> 等
+                .replacingOccurrences(of: "<[^>]*>", with: "", options: .regularExpression)
+            if !text.isEmpty { clips.append(SubtitleClip(text: text, startTime: s, endTime: e)) }
+        }
+        return clips
+    }
+
+    private func vttTime(_ s: String) -> Double? {
+        // VTT 时间格式: HH:MM:SS.mmm 或 MM:SS.mmm
+        let p = s.components(separatedBy: ":")
+        if p.count == 3 {
+            guard let h = Double(p[0]), let m = Double(p[1]), let sec = Double(p[2]) else { return nil }
+            return h * 3600 + m * 60 + sec
+        } else if p.count == 2 {
+            guard let m = Double(p[0]), let sec = Double(p[1]) else { return nil }
+            return m * 60 + sec
+        }
+        return nil
     }
 
     /// User-initiated playhead move — updates `currentTime` AND tells the

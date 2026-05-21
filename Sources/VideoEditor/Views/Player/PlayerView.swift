@@ -1,4 +1,5 @@
 import SwiftUI
+import Combine
 import AVKit
 import AVFoundation
 
@@ -6,7 +7,6 @@ struct PlayerView: View {
     @EnvironmentObject private var project: ProjectState
     @StateObject private var ctrl = PlayerController()
     @State private var hoveringPlayer = false
-    @State private var keyMonitor: Any? = nil
 
     var body: some View {
         // Playback bar OVERLAID on the video, only visible while hovering.
@@ -57,16 +57,9 @@ struct PlayerView: View {
             ctrl.onTime     = { t in project.currentTime = t }
             ctrl.getTime    = { project.currentTime }
             ctrl.getDuration = { project.duration }
-
-            keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
-                guard event.keyCode == 49 else { return event }
-                if NSApp.keyWindow?.firstResponder is NSTextView { return event }
-                ctrl.toggle()
-                return nil
-            }
         }
-        .onDisappear {
-            if let m = keyMonitor { NSEvent.removeMonitor(m); keyMonitor = nil }
+        .onReceive(NotificationCenter.default.publisher(for: .togglePlayback)) { _ in
+            ctrl.toggle()
         }
     }
 }

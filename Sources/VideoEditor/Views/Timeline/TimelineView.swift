@@ -29,12 +29,12 @@ struct TimelineView: View {
         case moveAudio(id: UUID, originStart: Double, originDur: Double, srcTrack: Int)
         case moveSubtitle(id: UUID, originStart: Double, originDur: Double, srcTrack: Int)
         case moveMulti(items: [DragItem])
-        case trimVideoLeft(id: UUID, originStart: Double, originEnd: Double, originTrimStart: Double)
-        case trimVideoRight(id: UUID, originStart: Double, originEnd: Double)
+        case trimVideoLeft(id: UUID, originStart: Double, originEnd: Double, originTrimStart: Double, assetDur: Double)
+        case trimVideoRight(id: UUID, originStart: Double, originEnd: Double, originTrimStart: Double, assetDur: Double)
         case trimImageLeft(id: UUID, originStart: Double, originEnd: Double)
         case trimImageRight(id: UUID, originStart: Double, originEnd: Double)
-        case trimAudioLeft(id: UUID, originStart: Double, originEnd: Double, originTrimStart: Double)
-        case trimAudioRight(id: UUID, originStart: Double, originEnd: Double)
+        case trimAudioLeft(id: UUID, originStart: Double, originEnd: Double, originTrimStart: Double, assetDur: Double)
+        case trimAudioRight(id: UUID, originStart: Double, originEnd: Double, originTrimStart: Double, assetDur: Double)
         case trimSubtitleLeft(id: UUID, originStart: Double, originEnd: Double)
         case trimSubtitleRight(id: UUID, originStart: Double, originEnd: Double)
         case movingPlayhead
@@ -214,6 +214,12 @@ struct TimelineView: View {
             if event.modifierFlags.contains(.command)
                 && event.charactersIgnoringModifiers?.lowercased() == "z" {
                 project.undo()
+                return nil
+            }
+
+            // 空格键 → 播放/暂停
+            if event.keyCode == 49 {
+                NotificationCenter.default.post(name: .togglePlayback, object: nil)
                 return nil
             }
 
@@ -486,11 +492,11 @@ struct TimelineView: View {
                 // 重叠检测：移动/trim 结束后检查是否与同轨片段重叠
                 if let op = dragOp {
                     switch op {
-                    case .moveVideo(let id, _, _, _), .trimVideoLeft(let id, _, _, _), .trimVideoRight(let id, _, _):
+                    case .moveVideo(let id, _, _, _), .trimVideoLeft(let id, _, _, _, _), .trimVideoRight(let id, _, _, _, _):
                         project.resolveVideoOverlap(id: id)
                     case .moveImage(let id, _, _, _), .trimImageLeft(let id, _, _), .trimImageRight(let id, _, _):
                         project.resolveImageOverlap(id: id)
-                    case .moveAudio(let id, _, _, _), .trimAudioLeft(let id, _, _, _), .trimAudioRight(let id, _, _):
+                    case .moveAudio(let id, _, _, _), .trimAudioLeft(let id, _, _, _, _), .trimAudioRight(let id, _, _, _, _):
                         project.resolveAudioOverlap(id: id)
                     case .moveSubtitle(let id, _, _, _), .trimSubtitleLeft(let id, _, _), .trimSubtitleRight(let id, _, _):
                         project.resolveSubtitleOverlap(id: id)
@@ -565,13 +571,18 @@ struct TimelineView: View {
                 draggingClipID = id
                 dragOp = .moveVideo(id: id, originStart: s, originDur: d, srcTrack: ti)
             case (.video(let id, let s, let d), .left):
-                let ts = project.videoTracks.flatMap(\.clips).first(where: { $0.id == id })?.trimStart ?? 0
+                let clip = project.videoTracks.flatMap(\.clips).first(where: { $0.id == id })
+                let ts = clip?.trimStart ?? 0
+                let ad = project.mediaAssets.first(where: { $0.id == clip?.assetID })?.duration ?? Double.infinity
                 selectVideoAndLoad(id: id)
-                dragOp = .trimVideoLeft(id: id, originStart: s, originEnd: s + d, originTrimStart: ts)
+                dragOp = .trimVideoLeft(id: id, originStart: s, originEnd: s + d, originTrimStart: ts, assetDur: ad)
                 Self.trimLeftCursor.set()
             case (.video(let id, let s, let d), .right):
+                let clip = project.videoTracks.flatMap(\.clips).first(where: { $0.id == id })
+                let ts = clip?.trimStart ?? 0
+                let ad = project.mediaAssets.first(where: { $0.id == clip?.assetID })?.duration ?? Double.infinity
                 selectVideoAndLoad(id: id)
-                dragOp = .trimVideoRight(id: id, originStart: s, originEnd: s + d)
+                dragOp = .trimVideoRight(id: id, originStart: s, originEnd: s + d, originTrimStart: ts, assetDur: ad)
                 Self.trimRightCursor.set()
             case (.image(let id, let s, let d), nil):
                 project.selectedImageClipID    = id
@@ -609,14 +620,19 @@ struct TimelineView: View {
                 project.selectedVideoClipID    = nil
                 project.selectedImageClipID    = nil
                 project.selectedSubtitleClipID = nil
-                dragOp = .trimAudioLeft(id: id, originStart: s, originEnd: s + d, originTrimStart: ts)
+                let aClip = project.audioTracks.flatMap(\.clips).first(where: { $0.id == id })
+                let ad = project.mediaAssets.first(where: { $0.id == aClip?.assetID })?.duration ?? Double.infinity
+                dragOp = .trimAudioLeft(id: id, originStart: s, originEnd: s + d, originTrimStart: ts, assetDur: ad)
                 Self.trimLeftCursor.set()
             case (.audio(let id, let s, let d), .right):
                 project.selectedAudioClipID    = id
                 project.selectedVideoClipID    = nil
                 project.selectedImageClipID    = nil
                 project.selectedSubtitleClipID = nil
-                dragOp = .trimAudioRight(id: id, originStart: s, originEnd: s + d)
+                let aClip = project.audioTracks.flatMap(\.clips).first(where: { $0.id == id })
+                let ts = aClip?.trimStart ?? 0
+                let ad = project.mediaAssets.first(where: { $0.id == aClip?.assetID })?.duration ?? Double.infinity
+                dragOp = .trimAudioRight(id: id, originStart: s, originEnd: s + d, originTrimStart: ts, assetDur: ad)
                 Self.trimRightCursor.set()
             case (.subtitle(let id, let s, let d), nil):
                 project.selectedSubtitleClipID = id
@@ -792,16 +808,22 @@ struct TimelineView: View {
                 case .subtitle: project.updateSubtitleTime(id: it.id, start: ns, end: ne)
                 }
             }
-        case .trimVideoLeft(let id, let originStart, let originEnd, let originTrimStart):
+        case .trimVideoLeft(let id, let originStart, let originEnd, let originTrimStart, let assetDur):
             var ns = max(0, min(originStart + dt, originEnd - 0.1))
+            // 不能左移超过素材起点
+            let minStart = originStart - originTrimStart
+            ns = max(minStart, ns)
             let (snapped, sp) = snapEdge(ns, excluding: [id])
-            ns = snapped; activeSnapTime = sp
+            ns = max(minStart, snapped); activeSnapTime = sp
             let newTrimStart = max(0, originTrimStart + (ns - originStart))
             project.updateVideoClip(id: id) { $0.startTime = ns; $0.trimStart = newTrimStart }
-        case .trimVideoRight(let id, let originStart, let originEnd):
+        case .trimVideoRight(let id, let originStart, let originEnd, let originTrimStart, let assetDur):
             var ne = max(originStart + 0.1, originEnd + dt)
+            // 不能超过素材总时长
+            let maxEnd = originStart + (assetDur - originTrimStart)
+            ne = min(ne, maxEnd)
             let (snapped, sp) = snapEdge(ne, excluding: [id])
-            ne = snapped; activeSnapTime = sp
+            ne = min(snapped, maxEnd); activeSnapTime = sp
             project.updateVideoClip(id: id) { $0.endTime = ne }
             if ne > project.duration { project.duration = ne }
         case .trimImageLeft(let id, let originStart, let originEnd):
@@ -815,16 +837,20 @@ struct TimelineView: View {
             ne = snapped; activeSnapTime = sp
             project.updateImageClip(id: id) { $0.endTime = ne }
             if ne > project.duration { project.duration = ne }
-        case .trimAudioLeft(let id, let originStart, let originEnd, let originTrimStart):
+        case .trimAudioLeft(let id, let originStart, let originEnd, let originTrimStart, let assetDur):
             var ns = max(0, min(originStart + dt, originEnd - 0.1))
+            let minStart = originStart - originTrimStart
+            ns = max(minStart, ns)
             let (snapped, sp) = snapEdge(ns, excluding: [id])
-            ns = snapped; activeSnapTime = sp
+            ns = max(minStart, snapped); activeSnapTime = sp
             let newTrimStart = max(0, originTrimStart + (ns - originStart))
             project.updateAudioClip(id: id) { $0.startTime = ns; $0.trimStart = newTrimStart }
-        case .trimAudioRight(let id, let originStart, let originEnd):
+        case .trimAudioRight(let id, let originStart, let originEnd, let originTrimStart, let assetDur):
             var ne = max(originStart + 0.1, originEnd + dt)
+            let maxEnd = originStart + (assetDur - originTrimStart)
+            ne = min(ne, maxEnd)
             let (snapped, sp) = snapEdge(ne, excluding: [id])
-            ne = snapped; activeSnapTime = sp
+            ne = min(snapped, maxEnd); activeSnapTime = sp
             project.updateAudioClip(id: id) { $0.endTime = ne }
             if ne > project.duration { project.duration = ne }
         case .trimSubtitleLeft(let id, let originStart, let originEnd):
@@ -1318,7 +1344,9 @@ private struct VideoClipView: View {
 
     @ViewBuilder
     private func thumbnailStrip(frames: [ThumbnailFrame], clipWidth: CGFloat) -> some View {
-        let thumbW = h - 4  // roughly square tiles
+        let thumbH = h - 4
+        let ratio: CGFloat = frames.first.map { CGFloat($0.image.size.width) / max(CGFloat($0.image.size.height), 1) } ?? 1.0
+        let thumbW = thumbH * ratio
         let count = max(1, Int(ceil(clipWidth / thumbW)))
         HStack(spacing: 0) {
             ForEach(0..<count, id: \.self) { i in
@@ -1328,11 +1356,11 @@ private struct VideoClipView: View {
                     .resizable()
                     .aspectRatio(contentMode: .fill)
                     .frame(width: i == count - 1 ? clipWidth - thumbW * CGFloat(count - 1) : thumbW,
-                           height: h - 4)
+                           height: thumbH)
                     .clipped()
             }
         }
-        .frame(width: clipWidth, height: h - 4)
+        .frame(width: clipWidth, height: thumbH)
         .clipShape(RoundedRectangle(cornerRadius: 4))
     }
 
@@ -1664,9 +1692,9 @@ struct TimelineToolbar: View {
 
             // 右侧：缩放
             HStack(spacing:6) {
-                TBtn(icon:"minus.magnifyingglass") { project.pixelsPerSecond = max(2, project.pixelsPerSecond/1.5) }
-                Slider(value:$project.pixelsPerSecond, in:2...150).frame(width:100).accentColor(Color.accent)
-                TBtn(icon:"plus.magnifyingglass")  { project.pixelsPerSecond = min(150, project.pixelsPerSecond*1.5) }
+                TBtn(icon:"minus.magnifyingglass", help:"缩小") { project.pixelsPerSecond = max(2, project.pixelsPerSecond/1.5) }
+                Slider(value:$project.pixelsPerSecond, in:2...150).frame(width:100).accentColor(Color.accent).help("时间轴缩放")
+                TBtn(icon:"plus.magnifyingglass", help:"放大")  { project.pixelsPerSecond = min(150, project.pixelsPerSecond*1.5) }
             }.padding(.trailing,12)
         }
         .frame(height:36)

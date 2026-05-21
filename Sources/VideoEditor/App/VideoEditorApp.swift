@@ -257,7 +257,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func showAbout() {
         NSApp.orderFrontStandardAboutPanel(options: [
             .applicationName: "黑猫剪辑",
-            .applicationVersion: "v1.9.0",
+            .applicationVersion: "v1.0.0",
             .version: "",
             .credits: NSAttributedString(string: "")
         ])
@@ -269,4 +269,5 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 extension Notification.Name {
     static let menuImportFiles = Notification.Name("menuImportFiles")
     static let menuExportVideo = Notification.Name("menuExportVideo")
+    static let togglePlayback  = Notification.Name("togglePlayback")
 }
