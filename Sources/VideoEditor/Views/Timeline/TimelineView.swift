@@ -299,8 +299,8 @@ struct TimelineView: View {
                                count: project.imageTracks[i].clips.count, hasMute: false,
                                isMuted: false, isVis: project.imageTracks[i].isVisible,
                                onMute: nil,
-                               onVis:  { project.imageTracks[i].isVisible.toggle(); project.rebuildTimelinePreview() },
-                               onDel:  { project.imageTracks.remove(at:i) })
+                               onVis:  { project.pushUndo(); project.imageTracks[i].isVisible.toggle(); project.rebuildTimelinePreview() },
+                               onDel:  { project.pushUndo(); project.imageTracks.remove(at:i) })
                         .frame(height: imgH(i))
                 }
             }
@@ -309,9 +309,9 @@ struct TimelineView: View {
                     TrackLabel(icon:"film", title: project.videoTracks[i].label,
                                count: project.videoTracks[i].clips.count, hasMute: true,
                                isMuted: project.videoTracks[i].isMuted, isVis: project.videoTracks[i].isVisible,
-                               onMute: { project.videoTracks[i].isMuted.toggle(); project.rebuildTimelinePreview() },
-                               onVis:  { project.videoTracks[i].isVisible.toggle(); project.rebuildTimelinePreview() },
-                               onDel:  { project.videoTracks.remove(at:i) })
+                               onMute: { project.pushUndo(); project.videoTracks[i].isMuted.toggle(); project.rebuildTimelinePreview() },
+                               onVis:  { project.pushUndo(); project.videoTracks[i].isVisible.toggle(); project.rebuildTimelinePreview() },
+                               onDel:  { project.pushUndo(); project.videoTracks.remove(at:i) })
                         .frame(height: vidH(i))
                 }
             }
@@ -320,9 +320,9 @@ struct TimelineView: View {
                     TrackLabel(icon:"music.note", title: project.audioTracks[i].label,
                                count: project.audioTracks[i].clips.count, hasMute: true,
                                isMuted: project.audioTracks[i].isMuted, isVis: true, hasVis: false,
-                               onMute: { project.audioTracks[i].isMuted.toggle(); project.rebuildTimelinePreview() },
+                               onMute: { project.pushUndo(); project.audioTracks[i].isMuted.toggle(); project.rebuildTimelinePreview() },
                                onVis:  {},
-                               onDel:  { project.audioTracks.remove(at:i) })
+                               onDel:  { project.pushUndo(); project.audioTracks.remove(at:i) })
                         .frame(height: audH(i))
                 }
             }
@@ -332,8 +332,8 @@ struct TimelineView: View {
                                count: project.subtitleTracks[i].clips.count, hasMute: false,
                                isMuted: false, isVis: project.subtitleTracks[i].isVisible,
                                onMute: nil,
-                               onVis:  { project.subtitleTracks[i].isVisible.toggle() },
-                               onDel:  { project.subtitleTracks.remove(at:i) })
+                               onVis:  { project.pushUndo(); project.subtitleTracks[i].isVisible.toggle() },
+                               onDel:  { project.pushUndo(); project.subtitleTracks.remove(at:i) })
                         .frame(height: subH(i))
                 }
             }

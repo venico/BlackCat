@@ -227,6 +227,7 @@ struct ProjectSnapshot {
     var imageTracks: [Track<ImageClip>]
     var subtitleTracks: [Track<SubtitleClip>]
     var subtitleStyles: [SubtitleStyle]
+    var duration: Double
 }
 
 // MARK: - Project State
@@ -716,6 +717,7 @@ final class ProjectState: ObservableObject {
     func moveVideoClipToTrack(id: UUID, from: Int, to: Int) {
         guard videoTracks.indices.contains(from), videoTracks.indices.contains(to) else { return }
         guard let idx = videoTracks[from].clips.firstIndex(where: { $0.id == id }) else { return }
+        pushUndoThrottled()
         let clip = videoTracks[from].clips.remove(at: idx)
         videoTracks[to].clips.append(clip)
     }
@@ -723,6 +725,7 @@ final class ProjectState: ObservableObject {
     func moveImageClipToTrack(id: UUID, from: Int, to: Int) {
         guard imageTracks.indices.contains(from), imageTracks.indices.contains(to) else { return }
         guard let idx = imageTracks[from].clips.firstIndex(where: { $0.id == id }) else { return }
+        pushUndoThrottled()
         let clip = imageTracks[from].clips.remove(at: idx)
         imageTracks[to].clips.append(clip)
     }
@@ -730,6 +733,7 @@ final class ProjectState: ObservableObject {
     func moveAudioClipToTrack(id: UUID, from: Int, to: Int) {
         guard audioTracks.indices.contains(from), audioTracks.indices.contains(to) else { return }
         guard let idx = audioTracks[from].clips.firstIndex(where: { $0.id == id }) else { return }
+        pushUndoThrottled()
         let clip = audioTracks[from].clips.remove(at: idx)
         audioTracks[to].clips.append(clip)
     }
@@ -737,6 +741,7 @@ final class ProjectState: ObservableObject {
     func moveSubtitleClipToTrack(id: UUID, from: Int, to: Int) {
         guard subtitleTracks.indices.contains(from), subtitleTracks.indices.contains(to) else { return }
         guard let idx = subtitleTracks[from].clips.firstIndex(where: { $0.id == id }) else { return }
+        pushUndoThrottled()
         let clip = subtitleTracks[from].clips.remove(at: idx)
         subtitleTracks[to].clips.append(clip)
     }
@@ -1374,6 +1379,7 @@ final class ProjectState: ObservableObject {
     }
 
     func addToTimeline(_ asset: MediaAsset) {
+        pushUndo()
         switch asset.type {
         case .video:
             // 每条视频放到独立的视频轨道，方便多轨编辑
@@ -1484,6 +1490,7 @@ final class ProjectState: ObservableObject {
     // MARK: - Mutation helpers
 
     func updateSubtitleText(id: UUID, text: String) {
+        pushUndoThrottled()
         for i in subtitleTracks.indices {
             if let j = subtitleTracks[i].clips.firstIndex(where:{ $0.id == id }) {
                 subtitleTracks[i].clips[j].text = text; return
@@ -1492,6 +1499,7 @@ final class ProjectState: ObservableObject {
     }
 
     func updateSubtitleTime(id: UUID, start: Double? = nil, end: Double? = nil) {
+        pushUndoThrottled()
         for i in subtitleTracks.indices {
             if let j = subtitleTracks[i].clips.firstIndex(where:{ $0.id == id }) {
                 if let s = start { subtitleTracks[i].clips[j].startTime = s }
@@ -1502,6 +1510,7 @@ final class ProjectState: ObservableObject {
     }
 
     func updateVideoClip(id: UUID, _ modify: (inout VideoClip) -> Void) {
+        pushUndoThrottled()
         for i in videoTracks.indices {
             if let j = videoTracks[i].clips.firstIndex(where:{ $0.id == id }) {
                 modify(&videoTracks[i].clips[j]); return
@@ -1510,6 +1519,7 @@ final class ProjectState: ObservableObject {
     }
 
     func updateImageClip(id: UUID, _ modify: (inout ImageClip) -> Void) {
+        pushUndoThrottled()
         for i in imageTracks.indices {
             if let j = imageTracks[i].clips.firstIndex(where:{ $0.id == id }) {
                 modify(&imageTracks[i].clips[j]); return
@@ -1518,6 +1528,7 @@ final class ProjectState: ObservableObject {
     }
 
     func updateAudioClip(id: UUID, _ modify: (inout AudioClip) -> Void) {
+        pushUndoThrottled()
         for i in audioTracks.indices {
             if let j = audioTracks[i].clips.firstIndex(where:{ $0.id == id }) {
                 modify(&audioTracks[i].clips[j]); return
@@ -1656,12 +1667,22 @@ final class ProjectState: ObservableObject {
 
     // MARK: - Undo / Redo
 
+    private var lastUndoPushTime: Date = .distantPast
+
     func pushUndo() {
         undoStack.append(currentSnapshot())
         if undoStack.count > 50 { undoStack.removeFirst() }
         redoStack.removeAll()
         undoCount = undoStack.count
         redoCount = 0
+        lastUndoPushTime = Date()
+    }
+
+    /// 节流版 pushUndo — 1秒内连续编辑只记录一次（适合滑块、步进器等高频操作）
+    func pushUndoThrottled() {
+        if Date().timeIntervalSince(lastUndoPushTime) > 1.0 {
+            pushUndo()
+        }
     }
 
     func undo() {
@@ -1683,7 +1704,8 @@ final class ProjectState: ObservableObject {
     private func currentSnapshot() -> ProjectSnapshot {
         ProjectSnapshot(videoTracks: videoTracks, audioTracks: audioTracks,
                         imageTracks: imageTracks,
-                        subtitleTracks: subtitleTracks, subtitleStyles: subtitleStyles)
+                        subtitleTracks: subtitleTracks, subtitleStyles: subtitleStyles,
+                        duration: duration)
     }
     private func applySnapshot(_ s: ProjectSnapshot) {
         videoTracks    = s.videoTracks
@@ -1691,6 +1713,7 @@ final class ProjectState: ObservableObject {
         imageTracks    = s.imageTracks
         subtitleTracks = s.subtitleTracks
         subtitleStyles = s.subtitleStyles
+        duration       = s.duration
         rebuildTimelinePreview()
     }
 

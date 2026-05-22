@@ -205,6 +205,7 @@ private struct SubtitleInspector: View {
     private func writeStyle() {
         let i = trackIndex
         guard project.subtitleStyles.indices.contains(i) else { return }
+        project.pushUndoThrottled()
         project.subtitleStyles[i] = ls
     }
 
