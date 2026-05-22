@@ -8,25 +8,43 @@ struct PlayerView: View {
     @StateObject private var ctrl = PlayerController()
     @State private var hoveringPlayer = false
 
+    /// 时间轴上是否有任何可见的视频或图片片段
+    private var hasAnyVisibleClips: Bool {
+        let hasVideo = project.videoTracks.contains { $0.isVisible && !$0.clips.isEmpty }
+        let hasImage = project.imageTracks.contains { $0.isVisible && !$0.clips.isEmpty }
+        return hasVideo || hasImage
+    }
+
     var body: some View {
         // Playback bar OVERLAID on the video, only visible while hovering.
         ZStack(alignment: .bottom) {
             ZStack {
                 Color.previewBg
                 AVPlayerNSView(player: ctrl.player)
-                // Black out the preview when playhead is past all video content.
-                if project.lastVideoEndTime > 0 && project.currentTime >= project.lastVideoEndTime {
+                // Black out the preview when no content or playhead is past all video content.
+                if !hasAnyVisibleClips
+                    || (project.lastVideoEndTime > 0 && project.currentTime >= project.lastVideoEndTime) {
                     Color.black
                 }
                 SubtitleOverlay()
+                VideoTransformOverlay()
                 ImageTransformOverlay()
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .overlay(alignment: .topTrailing) {
+            .overlay(alignment: .top) {
                 if hoveringPlayer {
-                    PreviewResolutionPicker()
-                        .padding(8)
-                        .transition(.opacity)
+                    HStack {
+                        Text(project.projectName)
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundColor(.white)
+                            .shadow(color: .black.opacity(0.8), radius: 3, x: 0, y: 1)
+                            .shadow(color: .black.opacity(0.5), radius: 6, x: 0, y: 2)
+                        Spacer()
+                        PreviewResolutionPicker()
+                    }
+                    .padding(.horizontal, 8)
+                    .padding(.top, 8)
+                    .transition(.opacity)
                 }
             }
 
@@ -156,11 +174,9 @@ private struct PreviewResolutionPicker: View {
         } label: {
             Text(shortLabel(project.previewResolution))
                 .font(.system(size: 10, weight: .medium).monospacedDigit())
-                .foregroundColor(Color.labelPrimary)
-                .padding(.horizontal, 8)
-                .padding(.vertical, 4)
-                .background(Color.black.opacity(0.55))
-                .cornerRadius(4)
+                .foregroundColor(.white)
+                .shadow(color: .black.opacity(0.8), radius: 3, x: 0, y: 1)
+                .shadow(color: .black.opacity(0.5), radius: 6, x: 0, y: 2)
         }
         .menuStyle(.borderlessButton)
         .fixedSize()
@@ -221,6 +237,284 @@ private struct PlaybackBar: View {
 /// When an image clip is selected, shows a bounding box with corner handles
 /// for scaling, edge bars for cropping, and allows drag-to-move.
 /// Cropping one edge keeps the opposite edge fixed.
+// MARK: - Video Transform Overlay (绿色)
+
+private struct VideoTransformOverlay: View {
+    @EnvironmentObject private var project: ProjectState
+
+    enum DragMode { case none, move, scale, crop }
+    @State private var dragMode: DragMode = .none
+    @State private var didPushUndo = false
+    @State private var dragStartOffset: CGPoint = .zero
+    @State private var scaleStartValues: (sx: Double, sy: Double) = (1, 1)
+    @State private var cropEdge: Int = 0
+    @State private var cropStartClip: VideoClip?
+    @State private var isHovering = false
+
+    private let accentColor = Color(hex: "#3DBFBA")
+
+    var body: some View {
+        GeometryReader { geo in
+            if let clip = project.selectedVideoClip,
+               clip.videoWidth > 0, clip.videoHeight > 0,
+               clip.startTime <= project.currentTime,
+               clip.endTime > project.currentTime {
+                let info = computeRenderInfo(viewSize: geo.size)
+                let vidRect = computeVideoRect(clip: clip, info: info)
+
+                ZStack {
+                    // 移动区域
+                    Color.clear
+                        .frame(width: max(vidRect.width, 1), height: max(vidRect.height, 1))
+                        .position(x: vidRect.midX, y: vidRect.midY)
+                        .contentShape(Rectangle())
+                        .onHover { h in
+                            isHovering = h
+                            if h { NSCursor.openHand.set() } else { NSCursor.arrow.set() }
+                        }
+                        .gesture(moveDrag(clip: clip, info: info))
+
+                    // 边框
+                    Rectangle()
+                        .stroke(accentColor, lineWidth: 1.5)
+                        .frame(width: max(vidRect.width, 1), height: max(vidRect.height, 1))
+                        .position(x: vidRect.midX, y: vidRect.midY)
+                        .allowsHitTesting(false)
+
+                    // 四边裁剪手柄 — 绿色长细条
+                    ForEach(0..<4, id: \.self) { edge in
+                        let pos = edgeMidPos(edge, vidRect)
+                        let isH = edge < 2
+                        let barLen = isH ? max(min(vidRect.width * 0.35, 50), 20) : max(min(vidRect.height * 0.35, 50), 20)
+                        VideoCropEdgeBar(isHorizontal: isH, length: barLen, color: accentColor)
+                            .position(x: pos.x, y: pos.y)
+                            .gesture(cropDrag(clip: clip, info: info, edge: edge))
+                    }
+
+                    // 四角缩放手柄 — 白色圆点绿色边
+                    ForEach(0..<4, id: \.self) { corner in
+                        let pos = cornerPos(corner, vidRect)
+                        VideoScaleHandleDot(color: accentColor)
+                            .position(x: pos.x, y: pos.y)
+                            .gesture(scaleDrag(clip: clip, info: info, corner: corner))
+                    }
+                }
+            }
+        }
+    }
+
+    private func moveDrag(clip: VideoClip, info: RenderInfo) -> some Gesture {
+        DragGesture(minimumDistance: 1)
+            .onChanged { value in
+                if dragMode == .none {
+                    pushUndoOnce()
+                    dragMode = .move
+                    NSCursor.closedHand.set()
+                    dragStartOffset = CGPoint(x: clip.offsetX, y: clip.offsetY)
+                }
+                guard dragMode == .move else { return }
+                let dx = value.translation.width / info.renderArea.width
+                let dy = value.translation.height / info.renderArea.height
+                project.updateVideoClip(id: clip.id) {
+                    $0.offsetX = dragStartOffset.x + dx
+                    $0.offsetY = dragStartOffset.y + dy
+                }
+                project.rebuildTimelinePreviewDebounced()
+            }
+            .onEnded { _ in
+                dragMode = .none; didPushUndo = false
+                NSCursor.openHand.set()
+                project.rebuildTimelinePreview()
+            }
+    }
+
+    private func scaleDrag(clip: VideoClip, info: RenderInfo, corner: Int) -> some Gesture {
+        DragGesture(minimumDistance: 1)
+            .onChanged { value in
+                if dragMode == .none {
+                    pushUndoOnce()
+                    dragMode = .scale
+                    scaleStartValues = (clip.scaleX, clip.scaleY)
+                }
+                guard dragMode == .scale else { return }
+                let vidRect = computeVideoRect(clip: clip, info: info)
+                let center = CGPoint(x: vidRect.midX, y: vidRect.midY)
+                let startDist = hypot(value.startLocation.x - center.x,
+                                      value.startLocation.y - center.y)
+                let curDist = hypot(value.location.x - center.x,
+                                    value.location.y - center.y)
+                guard startDist > 1 else { return }
+                let ratio = curDist / startDist
+                project.updateVideoClip(id: clip.id) {
+                    $0.scaleX = max(0.05, scaleStartValues.sx * ratio)
+                    $0.scaleY = max(0.05, scaleStartValues.sy * ratio)
+                }
+                project.rebuildTimelinePreviewDebounced()
+            }
+            .onEnded { _ in
+                dragMode = .none; didPushUndo = false
+                project.rebuildTimelinePreview()
+            }
+    }
+
+    private func cropDrag(clip: VideoClip, info: RenderInfo, edge: Int) -> some Gesture {
+        DragGesture(minimumDistance: 1)
+            .onChanged { value in
+                if dragMode == .none {
+                    pushUndoOnce()
+                    dragMode = .crop
+                    cropEdge = edge
+                    cropStartClip = clip
+                }
+                guard dragMode == .crop, let startClip = cropStartClip else { return }
+                let vidRect = computeVideoRect(clip: startClip, info: info)
+                var delta: Double = 0
+                switch edge {
+                case 0: delta =  value.translation.height / vidRect.height
+                case 1: delta = -value.translation.height / vidRect.height
+                case 2: delta =  value.translation.width  / vidRect.width
+                case 3: delta = -value.translation.width  / vidRect.width
+                default: break
+                }
+                let startVal: Double
+                switch edge {
+                case 0: startVal = startClip.cropTop
+                case 1: startVal = startClip.cropBottom
+                case 2: startVal = startClip.cropLeft
+                case 3: startVal = startClip.cropRight
+                default: startVal = 0
+                }
+                let newCrop = (startVal + delta).clamped(to: 0...0.99)
+                project.updateVideoClip(id: clip.id) {
+                    switch edge {
+                    case 0: $0.cropTop    = newCrop
+                    case 1: $0.cropBottom = newCrop
+                    case 2: $0.cropLeft   = newCrop
+                    case 3: $0.cropRight  = newCrop
+                    default: break
+                    }
+                }
+                project.rebuildTimelinePreviewDebounced()
+            }
+            .onEnded { _ in
+                dragMode = .none; didPushUndo = false; cropStartClip = nil
+                project.rebuildTimelinePreview()
+            }
+    }
+
+    private func pushUndoOnce() {
+        guard !didPushUndo else { return }
+        project.pushUndo()
+        didPushUndo = true
+    }
+
+    // MARK: - 手柄
+
+    private struct VideoScaleHandleDot: View {
+        let color: Color
+        var body: some View {
+            ZStack {
+                Circle().fill(Color.white).frame(width: 10, height: 10)
+                Circle().stroke(color, lineWidth: 1.5).frame(width: 10, height: 10)
+            }
+            .shadow(color: .black.opacity(0.3), radius: 2, x: 0, y: 1)
+            .frame(width: 22, height: 22)
+            .contentShape(Rectangle())
+            .onHover { h in
+                if h { NSCursor.crosshair.set() } else { NSCursor.arrow.set() }
+            }
+        }
+    }
+
+    private struct VideoCropEdgeBar: View {
+        let isHorizontal: Bool
+        let length: CGFloat
+        let color: Color
+        var body: some View {
+            RoundedRectangle(cornerRadius: 1.5)
+                .fill(color)
+                .frame(width: isHorizontal ? length : 3,
+                       height: isHorizontal ? 3 : length)
+                .shadow(color: .black.opacity(0.4), radius: 2, x: 0, y: 1)
+                .frame(width: isHorizontal ? length + 16 : 28,
+                       height: isHorizontal ? 28 : length + 16)
+                .contentShape(Rectangle())
+                .onHover { h in
+                    if h { (isHorizontal ? NSCursor.resizeUpDown : NSCursor.resizeLeftRight).set() }
+                    else { NSCursor.arrow.set() }
+                }
+        }
+    }
+
+    // MARK: - 位置计算
+
+    private func cornerPos(_ corner: Int, _ r: CGRect) -> CGPoint {
+        switch corner {
+        case 0: return CGPoint(x: r.minX, y: r.minY)
+        case 1: return CGPoint(x: r.maxX, y: r.minY)
+        case 2: return CGPoint(x: r.minX, y: r.maxY)
+        case 3: return CGPoint(x: r.maxX, y: r.maxY)
+        default: return r.origin
+        }
+    }
+
+    private func edgeMidPos(_ edge: Int, _ r: CGRect) -> CGPoint {
+        switch edge {
+        case 0: return CGPoint(x: r.midX, y: r.minY)
+        case 1: return CGPoint(x: r.midX, y: r.maxY)
+        case 2: return CGPoint(x: r.minX, y: r.midY)
+        case 3: return CGPoint(x: r.maxX, y: r.midY)
+        default: return r.origin
+        }
+    }
+
+    struct RenderInfo {
+        var renderArea: CGRect
+        var videoSize: CGSize
+    }
+
+    private func computeRenderInfo(viewSize: CGSize) -> RenderInfo {
+        let videoW = project.previewRenderSize.width
+        let videoH = project.previewRenderSize.height
+        let s = min(viewSize.width / videoW, viewSize.height / videoH)
+        let w = videoW * s; let h = videoH * s
+        return RenderInfo(
+            renderArea: CGRect(x: (viewSize.width - w)/2, y: (viewSize.height - h)/2, width: w, height: h),
+            videoSize: CGSize(width: videoW, height: videoH))
+    }
+
+    private func computeVideoRect(clip: VideoClip, info: RenderInfo) -> CGRect {
+        let natW = CGFloat(clip.videoWidth)
+        let natH = CGFloat(clip.videoHeight)
+        guard natW > 0, natH > 0 else { return .zero }
+
+        let baseScale = min(info.videoSize.width / natW, info.videoSize.height / natH)
+        let finalSX = baseScale * CGFloat(clip.scaleX)
+        let finalSY = baseScale * CGFloat(clip.scaleY)
+
+        let fullW = natW * finalSX
+        let fullH = natH * finalSY
+        let cx = info.videoSize.width / 2 + CGFloat(clip.offsetX) * info.videoSize.width
+        let cy = info.videoSize.height / 2 + CGFloat(clip.offsetY) * info.videoSize.height
+        let fullLeft = cx - fullW / 2
+        let fullTop  = cy - fullH / 2
+
+        let cropX = fullLeft + natW * CGFloat(clip.cropLeft) * finalSX
+        let cropY = fullTop  + natH * CGFloat(clip.cropTop)  * finalSY
+        let cropW = natW * (1 - CGFloat(clip.cropLeft + clip.cropRight))  * finalSX
+        let cropH = natH * (1 - CGFloat(clip.cropTop  + clip.cropBottom)) * finalSY
+        guard cropW > 0, cropH > 0 else { return .zero }
+
+        let vs = info.renderArea.width / info.videoSize.width
+        return CGRect(
+            x: info.renderArea.minX + cropX * vs,
+            y: info.renderArea.minY + cropY * vs,
+            width: cropW * vs, height: cropH * vs)
+    }
+}
+
+// MARK: - Image Transform Overlay
+
 private struct ImageTransformOverlay: View {
     @EnvironmentObject private var project: ProjectState
 
@@ -250,7 +544,10 @@ private struct ImageTransformOverlay: View {
                         .frame(width: max(imgRect.width, 1), height: max(imgRect.height, 1))
                         .position(x: imgRect.midX, y: imgRect.midY)
                         .contentShape(Rectangle())
-                        .onHover { isHoveringImage = $0 }
+                        .onHover { h in
+                            isHoveringImage = h
+                            if h { NSCursor.openHand.set() } else { NSCursor.arrow.set() }
+                        }
                         .gesture(moveDrag(clip: clip, info: info))
 
                     // 边框（不接受事件）
@@ -278,18 +575,7 @@ private struct ImageTransformOverlay: View {
                             .gesture(scaleDrag(clip: clip, info: info, corner: corner))
                     }
                 }
-                .cursor(cursorForState)
             }
-        }
-    }
-
-    // MARK: - 鼠标样式
-    private var cursorForState: NSCursor {
-        switch dragMode {
-        case .move:  return .closedHand
-        case .scale: return .crosshair
-        case .crop:  return cropEdge < 2 ? .resizeUpDown : .resizeLeftRight
-        case .none:  return isHoveringImage ? .openHand : .arrow
         }
     }
 
@@ -300,6 +586,7 @@ private struct ImageTransformOverlay: View {
                 if dragMode == .none {
                     pushUndoOnce()
                     dragMode = .move
+                    NSCursor.closedHand.set()
                     dragStartOffset = CGPoint(x: clip.offsetX, y: clip.offsetY)
                 }
                 guard dragMode == .move else { return }
@@ -313,6 +600,7 @@ private struct ImageTransformOverlay: View {
             }
             .onEnded { _ in
                 dragMode = .none; didPushUndo = false
+                NSCursor.openHand.set()
                 project.rebuildTimelinePreview()
             }
     }
@@ -416,6 +704,9 @@ private struct ImageTransformOverlay: View {
             .shadow(color: .black.opacity(0.3), radius: 2, x: 0, y: 1)
             .frame(width: 22, height: 22)
             .contentShape(Rectangle())
+            .onHover { h in
+                if h { NSCursor.crosshair.set() } else { NSCursor.arrow.set() }
+            }
         }
     }
 
@@ -429,10 +720,13 @@ private struct ImageTransformOverlay: View {
                 .frame(width: isHorizontal ? length : 3,
                        height: isHorizontal ? 3 : length)
                 .shadow(color: .black.opacity(0.4), radius: 2, x: 0, y: 1)
-                // 点击区域比视觉大很多，防止误触到移动或缩放
                 .frame(width: isHorizontal ? length + 16 : 28,
                        height: isHorizontal ? 28 : length + 16)
                 .contentShape(Rectangle())
+                .onHover { h in
+                    if h { (isHorizontal ? NSCursor.resizeUpDown : NSCursor.resizeLeftRight).set() }
+                    else { NSCursor.arrow.set() }
+                }
         }
     }
 
@@ -464,7 +758,8 @@ private struct ImageTransformOverlay: View {
     }
 
     private func computeRenderInfo(viewSize: CGSize) -> RenderInfo {
-        let videoW: CGFloat = 1920; let videoH: CGFloat = 1080
+        let videoW = project.previewRenderSize.width
+        let videoH = project.previewRenderSize.height
         let s = min(viewSize.width / videoW, viewSize.height / videoH)
         let w = videoW * s; let h = videoH * s
         return RenderInfo(

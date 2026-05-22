@@ -435,7 +435,7 @@ struct ExportSheetView: View {
     private func defaultFilename() -> String {
         let f = DateFormatter()
         f.dateFormat = "yyyyMMdd_HHmm"
-        return "VideoEditor_\(f.string(from: Date()))"
+        return "BlackCat_\(f.string(from: Date()))"
     }
 
     private func contentIcon(_ c: ExportContent) -> String {
@@ -507,6 +507,13 @@ actor TimelineExporter {
             return try exportSRT(input: input, progress: progress)
         }
 
+        // 计算所有轨道的最大结束时间（包括字幕）
+        let vEnd = input.videoTracks.flatMap(\.clips).map(\.endTime).max() ?? 0
+        let iEnd = input.imageTracks.flatMap(\.clips).map(\.endTime).max() ?? 0
+        let aEnd = input.audioTracks.flatMap(\.clips).map(\.endTime).max() ?? 0
+        let sEnd = input.subtitleTracks.flatMap(\.clips).map(\.endTime).max() ?? 0
+        let globalEndTime = max(vEnd, max(iEnd, max(aEnd, sEnd)))
+
         let composition = AVMutableComposition()
         var audioMixParams: [(trackID: CMPersistentTrackID, volume: Float, left: Float, right: Float)] = []
         var sourceVideoSize: CGSize = CGSize(width: 1920, height: 1080)
@@ -514,6 +521,7 @@ actor TimelineExporter {
         let includeVideo = settings.content == .video
         let includeAudio = true  // video 和 audioOnly 都需要音频
 
+        var videoCompTracks: [(track: AVMutableCompositionTrack, clip: VideoClip, startTime: Double, endTime: Double)] = []
         // ── 视频轨道 ──
         for track in input.videoTracks {
             for (idx, clip) in track.clips.sorted(by: { $0.startTime < $1.startTime }).enumerated() {
@@ -532,6 +540,9 @@ actor TimelineExporter {
                     let vt = composition.addMutableTrack(withMediaType: .video,
                                                          preferredTrackID: kCMPersistentTrackID_Invalid)
                     try vt?.insertTimeRange(range, of: vAsset, at: at)
+                    if let vt {
+                        videoCompTracks.append((track: vt, clip: clip, startTime: clip.startTime, endTime: clip.startTime + useDur.seconds))
+                    }
                     if idx == 0 {
                         sourceVideoSize = try await vAsset.load(.naturalSize)
                         let mfd = try await vAsset.load(.minFrameDuration)
@@ -576,7 +587,7 @@ actor TimelineExporter {
         // ── 图片轨道（上层）──
         var imageCompTracks: [(track: AVMutableCompositionTrack, clip: ImageClip)] = []
         if includeVideo {
-            let endTime = composition.duration.seconds
+            let endTime = globalEndTime
             for track in input.imageTracks {
                 guard track.isVisible else { continue }
                 for clip in track.clips {
@@ -621,6 +632,21 @@ actor TimelineExporter {
             }
         }
 
+        // 如果字幕/图片超出音视频长度，扩展 composition 到 globalEndTime
+        let globalEndCM = CMTime(seconds: globalEndTime, preferredTimescale: 600)
+        if globalEndCM > composition.duration {
+            let gap = globalEndCM - composition.duration
+            if let vt = composition.tracks(withMediaType: .video).first as? AVMutableCompositionTrack {
+                vt.insertEmptyTimeRange(CMTimeRange(start: composition.duration, duration: gap))
+            } else if let at = composition.tracks(withMediaType: .audio).first as? AVMutableCompositionTrack {
+                at.insertEmptyTimeRange(CMTimeRange(start: composition.duration, duration: gap))
+            } else {
+                // 没有任何轨道时，添加空视频轨道
+                let empty = composition.addMutableTrack(withMediaType: .video, preferredTrackID: kCMPersistentTrackID_Invalid)
+                empty?.insertEmptyTimeRange(CMTimeRange(start: .zero, duration: globalEndCM))
+            }
+        }
+
         // ── AudioMix（音量 + 声道）──
         let audioMix = AVMutableAudioMix()
         audioMix.inputParameters = audioMixParams.map { param in
@@ -650,12 +676,10 @@ actor TimelineExporter {
             }
 
             let hasImageTracks = !imageCompTracks.isEmpty
-            let videoTracksList = composition.tracks(withMediaType: .video).filter { ct in
-                !imageCompTracks.contains(where: { $0.track.trackID == ct.trackID })
-            }
+            let hasVideoClipTransforms = !videoCompTracks.isEmpty
 
-            // Step 1: 图片合成 / 分辨率帧率变更
-            if hasImageTracks {
+            // Step 1: 图片/视频合成 / 分辨率帧率变更
+            if hasImageTracks || hasVideoClipTransforms {
                 let vc = AVMutableVideoComposition()
                 vc.renderSize = renderSize
                 vc.frameDuration = frameDuration
@@ -666,9 +690,15 @@ actor TimelineExporter {
                     let e = CMTime(seconds: entry.clip.endTime, preferredTimescale: ts)
                     return (s, e)
                 }
+                let videoClipCMRanges = videoCompTracks.map { entry -> (start: CMTime, end: CMTime) in
+                    let s = CMTime(seconds: entry.startTime, preferredTimescale: ts)
+                    let e = CMTime(seconds: entry.endTime, preferredTimescale: ts)
+                    return (s, e)
+                }
 
                 var cmBoundaries: [CMTime] = [.zero, composition.duration]
                 for r in imageClipCMRanges { cmBoundaries.append(r.start); cmBoundaries.append(r.end) }
+                for r in videoClipCMRanges { cmBoundaries.append(r.start); cmBoundaries.append(r.end) }
                 let sortedCM = Array(Set(cmBoundaries.map { $0.value })).sorted().map { CMTime(value: $0, timescale: ts) }
 
                 var instructions: [AVMutableVideoCompositionInstruction] = []
@@ -702,11 +732,23 @@ actor TimelineExporter {
                         }
                         layerInstructions.append(li)
                     }
-                    for vt in videoTracksList {
-                        let li = AVMutableVideoCompositionLayerInstruction(assetTrack: vt)
-                        let scaleX = renderSize.width / sourceVideoSize.width
-                        let scaleY = renderSize.height / sourceVideoSize.height
-                        li.setTransform(CGAffineTransform(scaleX: scaleX, y: scaleY), at: .zero)
+                    for (idx, entry) in videoCompTracks.enumerated() {
+                        let li = AVMutableVideoCompositionLayerInstruction(assetTrack: entry.track)
+                        let clipStart = videoClipCMRanges[idx].start
+                        let clipEnd   = videoClipCMRanges[idx].end
+                        let active = segStartCM >= clipStart && segStartCM < clipEnd
+                        if active {
+                            if let natSize = try? await entry.track.load(.naturalSize), natSize.width > 0, natSize.height > 0 {
+                                let t = ProjectState.videoTransform(clip: entry.clip, natSize: natSize, renderSize: renderSize)
+                                li.setTransform(t, at: .zero)
+                                let c = entry.clip
+                                if c.cropTop > 0.001 || c.cropBottom > 0.001 || c.cropLeft > 0.001 || c.cropRight > 0.001 {
+                                    li.setCropRectangle(ProjectState.videoCropRect(clip: c, natSize: natSize), at: .zero)
+                                }
+                            }
+                        } else {
+                            li.setOpacity(0, at: .zero)
+                        }
                         layerInstructions.append(li)
                     }
                     instruction.layerInstructions = layerInstructions
@@ -875,78 +917,6 @@ actor TimelineExporter {
     }
 
     // MARK: - Subtitle burn-in
-    //
-    // Build an AVVideoComposition with a CALayer-based animation tool so that
-    // every subtitle clip becomes a CATextLayer whose opacity animates between
-    // its `startTime` and `endTime`. AVAssetExportSession then renders the
-    // composed CALayer hierarchy on top of every video frame.
-
-    private func buildVideoCompositionWithSubtitles(
-        composition: AVMutableComposition,
-        videoTrack: AVCompositionTrack,
-        renderSize: CGSize,
-        frameDuration: CMTime,
-        subtitleTracks: [Track<SubtitleClip>],
-        subtitleStyles: [SubtitleStyle]
-    ) -> AVMutableVideoComposition {
-
-        let videoComp = AVMutableVideoComposition()
-        videoComp.renderSize = renderSize
-        videoComp.frameDuration = frameDuration
-
-        // Single instruction covering the whole composition.
-        // CRITICAL: enablePostProcessing must be true for the animationTool's
-        // CALayer hierarchy to actually be composited on top of each frame.
-        // Apple's default for manually-built AVMutableVideoCompositionInstruction
-        // is NO; without this, the subtitle layers are silently ignored.
-        let instruction = AVMutableVideoCompositionInstruction()
-        instruction.timeRange = CMTimeRange(start: .zero, duration: composition.duration)
-        instruction.enablePostProcessing = true
-        instruction.layerInstructions = composition.tracks(withMediaType: .video).map { vt in
-            let li = AVMutableVideoCompositionLayerInstruction(assetTrack: vt)
-            li.setOpacity(1.0, at: .zero)
-            return li
-        }
-        videoComp.instructions = [instruction]
-
-        // Layer hierarchy:  parentLayer → [ videoLayer (where frames go) , textLayers… ]
-        // Setting parentLayer.beginTime = AVCoreAnimationBeginTimeAtZero so child
-        // animation beginTimes are interpreted in composition time (not "now").
-        let videoLayer  = CALayer()
-        videoLayer.frame = CGRect(origin: .zero, size: renderSize)
-        let parentLayer = CALayer()
-        parentLayer.frame = CGRect(origin: .zero, size: renderSize)
-        parentLayer.isGeometryFlipped = true
-        parentLayer.addSublayer(videoLayer)
-
-        let visibleTrackData: [(track: Track<SubtitleClip>, style: SubtitleStyle, idx: Int)] =
-            subtitleTracks.enumerated().compactMap { i, t in
-                guard t.isVisible else { return nil }
-                let s = i < subtitleStyles.count ? subtitleStyles[i] : SubtitleStyle()
-                return (t, s, i)
-            }
-
-        let baseStyle = visibleTrackData.first?.style ?? SubtitleStyle()
-        let spacing   = baseStyle.lineSpacing
-        let totalDuration = composition.duration.seconds
-
-        for td in visibleTrackData {
-            let trackOffset = CGFloat(td.idx) * (td.style.fontSize + CGFloat(spacing) + 12)
-            for clip in td.track.clips {
-                let layer = self.makeSubtitleTextLayer(
-                    text: clip.text, style: td.style, renderSize: renderSize,
-                    startTime: clip.startTime, endTime: clip.endTime,
-                    totalDuration: totalDuration, trackOffset: trackOffset)
-                parentLayer.addSublayer(layer)
-            }
-        }
-
-        videoComp.animationTool = AVVideoCompositionCoreAnimationTool(
-            postProcessingAsVideoLayer: videoLayer,
-            in: parentLayer)
-
-        return videoComp
-    }
 
     private func makeSubtitleTextLayer(
         text: String, style: SubtitleStyle, renderSize: CGSize,
@@ -1056,167 +1026,6 @@ actor TimelineExporter {
         return layer
     }
 
-    // Compute all unique time slots from subtitle tracks. Each slot is a
-    // (start, end) interval defined by the union of all clip boundaries.
-    private func allTimeSlots(tracks: [Track<SubtitleClip>]) -> [(start: Double, end: Double)] {
-        var edges = Set<Double>()
-        for track in tracks {
-            for clip in track.clips {
-                edges.insert(clip.startTime)
-                edges.insert(clip.endTime)
-            }
-        }
-        let sorted = edges.sorted()
-        guard sorted.count >= 2 else { return [] }
-
-        var slots: [(start: Double, end: Double)] = []
-        for i in 0..<(sorted.count - 1) {
-            let s = sorted[i], e = sorted[i + 1]
-            // Only keep this slot if at least one track has a subtitle here
-            let hasContent = tracks.contains { track in
-                track.clips.contains { $0.startTime <= s && $0.endTime > s }
-            }
-            if hasContent {
-                slots.append((s, e))
-            }
-        }
-        return slots
-    }
-
-    // Pre-render text + background into a plain CALayer whose `contents` is a
-    // CGImage drawn with CoreText. Background tightly wraps the text (not full width).
-    private func makeSubtitleLayer(text: String,
-                                   style: SubtitleStyle,
-                                   renderSize: CGSize,
-                                   startTime: Double,
-                                   endTime: Double,
-                                   totalDuration: Double,
-                                   yOrigin: CGFloat? = nil) -> CALayer {
-        let maxWidthPx = renderSize.width * style.widthPercent / 100
-        let padH: CGFloat = 16   // horizontal padding around text
-        let padV: CGFloat = 6    // vertical padding around text
-
-        // Measure actual text size with CoreText
-        let ctFont = CTFontCreateWithName(style.fontName as CFString, style.fontSize, nil)
-        let attrs: [NSAttributedString.Key: Any] = [
-            .init(kCTFontAttributeName as String): ctFont
-        ]
-        let attrStr = NSAttributedString(string: text, attributes: attrs)
-        let setter  = CTFramesetterCreateWithAttributedString(attrStr)
-        let constraint = CGSize(width: maxWidthPx - padH * 2, height: CGFloat.greatestFiniteMagnitude)
-        let textSize = CTFramesetterSuggestFrameSizeWithConstraints(setter, CFRange(location: 0, length: 0), nil, constraint, nil)
-
-        // Layer size = text + padding, not full video width
-        let layerW = ceil(textSize.width) + padH * 2
-        let layerH = ceil(textSize.height) + padV * 2
-        let xOrig  = (renderSize.width - layerW) / 2
-        let yOrig: CGFloat = yOrigin ?? (renderSize.height * CGFloat(style.bottomMargin) / 100)
-
-        let layer = CALayer()
-        layer.frame = CGRect(x: xOrig, y: yOrig, width: layerW, height: layerH)
-        layer.contentsGravity = .resize
-        layer.contentsScale = 1.0
-
-        if let img = renderSubtitleImage(text: text, style: style,
-                                         size: CGSize(width: layerW, height: layerH),
-                                         padH: padH, padV: padV) {
-            layer.contents = img
-        }
-
-        layer.opacity = 0
-
-        // AVVideoCompositionCoreAnimationTool samples each frame individually —
-        // CABasicAnimation fill modes are not applied. A CAKeyframeAnimation that
-        // spans the full composition is the reliable way to control per-frame opacity.
-        let t = max(totalDuration, endTime + 0.1)
-        let s0 = max(0.0, startTime)
-        let e0 = min(t, endTime)
-        let anim = CAKeyframeAnimation(keyPath: "opacity")
-        anim.beginTime       = AVCoreAnimationBeginTimeAtZero
-        anim.duration        = t
-        anim.calculationMode = .discrete
-        anim.fillMode        = .both
-        anim.isRemovedOnCompletion = false
-        anim.keyTimes = [0,
-                         NSNumber(value: s0 / t),
-                         NSNumber(value: e0 / t),
-                         1]
-        anim.values   = [0, 1, 0, 0]
-        layer.add(anim, forKey: "visibility")
-
-        return layer
-    }
-
-    // Render subtitle text into a CGImage using CoreText. Background tightly
-    // wraps text with the given padding.
-    private func renderSubtitleImage(text: String,
-                                     style: SubtitleStyle,
-                                     size: CGSize,
-                                     padH: CGFloat = 16,
-                                     padV: CGFloat = 6) -> CGImage? {
-        let w = Int(size.width); let h = Int(size.height)
-        guard w > 0 && h > 0 else { return nil }
-
-        let space = CGColorSpaceCreateDeviceRGB()
-        guard let ctx = CGContext(
-            data: nil, width: w, height: h,
-            bitsPerComponent: 8, bytesPerRow: 0, space: space,
-            bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue
-                      | CGBitmapInfo.byteOrder32Little.rawValue)
-        else { return nil }
-
-        // Background rounded rect — tightly wraps text
-        if style.backgroundOpacity > 0 {
-            let nc = NSColor(style.backgroundColor).usingColorSpace(.sRGB) ?? .black
-            var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
-            nc.getRed(&r, green: &g, blue: &b, alpha: &a)
-            ctx.setFillColor(CGColor(red: r, green: g, blue: b,
-                                     alpha: CGFloat(style.backgroundOpacity)))
-            ctx.addPath(CGPath(roundedRect: CGRect(origin: .zero, size: size),
-                               cornerWidth: 4, cornerHeight: 4, transform: nil))
-            ctx.fillPath()
-        }
-
-        ctx.saveGState()
-
-        // Resolve text color
-        let tc = NSColor(style.textColor).usingColorSpace(.sRGB) ?? .white
-        var tr: CGFloat = 1, tg: CGFloat = 1, tb: CGFloat = 1, ta: CGFloat = 1
-        tc.getRed(&tr, green: &tg, blue: &tb, alpha: &ta)
-        let textCG = CGColor(red: tr, green: tg, blue: tb, alpha: ta)
-
-        let ctFont = CTFontCreateWithName(style.fontName as CFString, style.fontSize, nil)
-
-        var alignment: CTTextAlignment
-        switch style.alignment {
-        case "left":  alignment = .left
-        case "right": alignment = .right
-        default:      alignment = .center
-        }
-        let ctPS: CTParagraphStyle = withUnsafeBytes(of: &alignment) { ptr in
-            var setting = CTParagraphStyleSetting(
-                spec: .alignment,
-                valueSize: MemoryLayout<CTTextAlignment>.size,
-                value: ptr.baseAddress!)
-            return CTParagraphStyleCreate(&setting, 1)
-        }
-
-        let attrs: [NSAttributedString.Key: Any] = [
-            .init(kCTFontAttributeName as String):            ctFont,
-            .init(kCTForegroundColorAttributeName as String): textCG,
-            .init(kCTParagraphStyleAttributeName as String):  ctPS
-        ]
-        let attrStr = NSAttributedString(string: text, attributes: attrs)
-        let setter  = CTFramesetterCreateWithAttributedString(attrStr)
-        let textRect = CGRect(x: padH, y: padV,
-                              width: size.width - padH * 2, height: size.height - padV * 2)
-        let ctFrame = CTFramesetterCreateFrame(setter, CFRange(location: 0, length: 0),
-                                               CGPath(rect: textRect, transform: nil), nil)
-        CTFrameDraw(ctFrame, ctx)
-        ctx.restoreGState()
-
-        return ctx.makeImage()
-    }
 }
 
 private struct BitratePreset {

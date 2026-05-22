@@ -73,6 +73,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // ── 文件 ──
         let fileMenu = NSMenu(title: "文件")
         let fileItem = NSMenuItem(); fileItem.submenu = fileMenu
+        fileMenu.addItem(NSMenuItem(title: "新建项目…", action: #selector(newProject), keyEquivalent: "n"))
+        fileMenu.addItem(NSMenuItem(title: "打开项目…", action: #selector(openProjectFile), keyEquivalent: "o"))
+        fileMenu.addItem(.separator())
+        fileMenu.addItem(NSMenuItem(title: "保存", action: #selector(saveProject), keyEquivalent: "s"))
+        fileMenu.addItem(.separator())
         fileMenu.addItem(NSMenuItem(title: "导入素材…", action: #selector(importMedia), keyEquivalent: "i"))
         fileMenu.addItem(NSMenuItem(title: "导出…", action: #selector(exportMedia), keyEquivalent: "e"))
         fileMenu.addItem(.separator())
@@ -235,6 +240,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NSApp.keyWindow?.toggleFullScreen(nil)
     }
 
+    @objc private func newProject() {
+        NotificationCenter.default.post(name: .menuNewProject, object: nil)
+    }
+
+    @objc private func openProjectFile() {
+        NotificationCenter.default.post(name: .menuOpenProject, object: nil)
+    }
+
+    @objc private func saveProject() {
+        NotificationCenter.default.post(name: .menuSaveProject, object: nil)
+    }
+
     @objc private func importMedia() {
         let panel = NSOpenPanel()
         panel.allowsMultipleSelection = true
@@ -264,10 +281,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+
+    // 处理 Finder 双击 .bcj 文件打开
+    func application(_ application: NSApplication, open urls: [URL]) {
+        for url in urls {
+            if url.pathExtension.lowercased() == "bcj" {
+                NotificationCenter.default.post(name: .menuOpenProjectFile, object: url)
+                break
+            }
+        }
+    }
 }
 
 extension Notification.Name {
     static let menuImportFiles = Notification.Name("menuImportFiles")
     static let menuExportVideo = Notification.Name("menuExportVideo")
-    static let togglePlayback  = Notification.Name("togglePlayback")
+    static let menuNewProject  = Notification.Name("menuNewProject")
+    static let menuOpenProject = Notification.Name("menuOpenProject")
+    static let menuSaveProject   = Notification.Name("menuSaveProject")
+    static let menuOpenProjectFile = Notification.Name("menuOpenProjectFile")
+    static let togglePlayback    = Notification.Name("togglePlayback")
 }

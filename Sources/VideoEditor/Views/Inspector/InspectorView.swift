@@ -224,7 +224,6 @@ enum Translator {
         guard !trimmed.isEmpty else { return text }
 
         let targetCode = languageCode(targetLang)
-        let targetBase = String(targetCode.split(separator: "-").first ?? Substring(targetCode))
 
         let lines = text.components(separatedBy: .newlines)
             .map { $0.trimmingCharacters(in: .whitespaces) }
@@ -238,23 +237,48 @@ enum Translator {
         for line in lines {
             recognizer.reset()
             recognizer.processString(line)
-            let lang = recognizer.dominantLanguage?.rawValue ?? ""
-            let base = String(lang.split(separator: "-").first ?? Substring(lang))
-            if base == targetBase { targetLines.append(line) }
-            else                   { otherLines.append(line) }
+            let detectedRaw = recognizer.dominantLanguage?.rawValue ?? ""
+            // NLLanguageRecognizer 用 zh-Hans / zh-Hant，而目标用 zh-CN / zh-TW
+            // 需要精确匹配：zh-Hans ↔ zh-CN，zh-Hant ↔ zh-TW
+            if isExactMatch(detected: detectedRaw, target: targetCode) {
+                targetLines.append(line)
+            } else {
+                otherLines.append(line)
+            }
         }
 
         if !targetLines.isEmpty {
-            // Already contains target-language line(s) — keep those, drop the rest.
             return targetLines.joined(separator: "\n")
         }
 
-        // No target-language line — translate everything.
         var translated: [String] = []
         for line in otherLines {
             translated.append(await translate(line, to: targetLang))
         }
         return translated.joined(separator: "\n")
+    }
+
+    /// 精确语言匹配，区分简繁体中文
+    private static func isExactMatch(detected: String, target: String) -> Bool {
+        // 中文特殊处理：zh-Hans = zh-CN（简体），zh-Hant = zh-TW（繁体）
+        let normalizedDetected = normalizeChineseLang(detected)
+        let normalizedTarget = normalizeChineseLang(target)
+        // 如果都是中文子类型，需要完整匹配
+        if normalizedDetected.hasPrefix("zh-") && normalizedTarget.hasPrefix("zh-") {
+            return normalizedDetected == normalizedTarget
+        }
+        // 非中文：比较 base（en, ja, ko...）
+        let detectedBase = String(detected.split(separator: "-").first ?? Substring(detected))
+        let targetBase = String(target.split(separator: "-").first ?? Substring(target))
+        return detectedBase == targetBase
+    }
+
+    private static func normalizeChineseLang(_ code: String) -> String {
+        switch code {
+        case "zh-Hans", "zh-CN": return "zh-CN"
+        case "zh-Hant", "zh-TW": return "zh-TW"
+        default: return code
+        }
     }
 
     /// Plain translation of a single text via Google Translate's public endpoint.
@@ -592,6 +616,17 @@ private struct VideoInspector: View {
     @State private var sourceBitrate: String = "—"
     @State private var sourceCodec: String = "—"
 
+    @State private var scaleX: Double = 1.0
+    @State private var scaleY: Double = 1.0
+    @State private var lockAspect: Bool = true
+    @State private var offsetX: Double = 0
+    @State private var offsetY: Double = 0
+    @State private var cropTop: Double = 0
+    @State private var cropBottom: Double = 0
+    @State private var cropLeft: Double = 0
+    @State private var cropRight: Double = 0
+    @State private var hasPushedUndo = false
+
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             ISection(title: "片段信息") {
@@ -630,11 +665,211 @@ private struct VideoInspector: View {
                         project.updateVideoClip(id: clip.id) { $0.volume = Float(v / 100) }
                         project.rebuildTimelinePreview()
                     }
-                ), range: 0...200, unit: "%")
+                ), range: 0...400, unit: "%")
             }
         }
-        .onAppear { loadMeta() }
-        .onChange(of: clip.id) { loadMeta() }
+
+        // 位置
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text("位置")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundColor(Color.labelSecondary.opacity(0.7))
+                    .tracking(0.4)
+                Spacer()
+                Button {
+                    offsetX = 0; offsetY = 0
+                    applyTransform()
+                } label: {
+                    Text("居中")
+                        .font(.system(size: 9, weight: .medium))
+                        .foregroundColor(hasOffset ? .black : Color.labelSecondary)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(hasOffset ? Color(hex: "#E8A54B") : Color.white.opacity(0.08))
+                        .clipShape(RoundedRectangle(cornerRadius: 4))
+                }
+                .buttonStyle(.plain)
+                .disabled(!hasOffset)
+            }
+            .padding(.top, 16)
+
+            HStack(spacing: 8) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("X").font(.system(size: 9)).foregroundColor(Color.labelSecondary)
+                    HStack(spacing: 2) {
+                        Slider(value: $offsetX, in: -1.0...1.0)
+                            .frame(width: 80)
+                            .onChange(of: offsetX) { _ in applyTransform() }
+                        Text("\(Int(offsetX * 100))")
+                            .font(.system(size: 10).monospacedDigit())
+                            .foregroundColor(Color.labelPrimary)
+                            .frame(width: 30)
+                    }
+                }
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Y").font(.system(size: 9)).foregroundColor(Color.labelSecondary)
+                    HStack(spacing: 2) {
+                        Slider(value: $offsetY, in: -1.0...1.0)
+                            .frame(width: 80)
+                            .onChange(of: offsetY) { _ in applyTransform() }
+                        Text("\(Int(offsetY * 100))")
+                            .font(.system(size: 10).monospacedDigit())
+                            .foregroundColor(Color.labelPrimary)
+                            .frame(width: 30)
+                    }
+                }
+            }
+
+            // 缩放
+            HStack {
+                Text("缩放")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundColor(Color.labelSecondary.opacity(0.7))
+                    .tracking(0.4)
+                Spacer()
+                Button { lockAspect.toggle(); syncLock() } label: {
+                    Image(systemName: lockAspect ? "lock.fill" : "lock.open")
+                        .font(.system(size: 10))
+                        .foregroundColor(lockAspect ? Color.accent : Color.labelSecondary)
+                }
+                .buttonStyle(.plain)
+            }
+            .padding(.top, 16)
+
+            HStack(spacing: 8) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("宽").font(.system(size: 9)).foregroundColor(Color.labelSecondary)
+                    HStack(spacing: 2) {
+                        Slider(value: $scaleX, in: 0.1...3.0)
+                            .frame(width: 80)
+                            .onChange(of: scaleX) { v in
+                                if lockAspect { scaleY = v }
+                                applyTransform()
+                            }
+                        Text("\(Int(scaleX * 100))%")
+                            .font(.system(size: 10).monospacedDigit())
+                            .foregroundColor(Color.labelPrimary)
+                            .frame(width: 36)
+                    }
+                }
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("高").font(.system(size: 9)).foregroundColor(Color.labelSecondary)
+                    HStack(spacing: 2) {
+                        Slider(value: $scaleY, in: 0.1...3.0)
+                            .frame(width: 80)
+                            .onChange(of: scaleY) { v in
+                                if lockAspect { scaleX = v }
+                                applyTransform()
+                            }
+                        Text("\(Int(scaleY * 100))%")
+                            .font(.system(size: 10).monospacedDigit())
+                            .foregroundColor(Color.labelPrimary)
+                            .frame(width: 36)
+                    }
+                }
+            }
+
+            // 裁剪
+            HStack {
+                Text("裁剪")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundColor(Color.labelSecondary.opacity(0.7))
+                    .tracking(0.4)
+                Spacer()
+                Button {
+                    cropTop = 0; cropBottom = 0; cropLeft = 0; cropRight = 0
+                    applyTransform()
+                } label: {
+                    Text("重置")
+                        .font(.system(size: 9, weight: .medium))
+                        .foregroundColor(hasCrop ? .black : Color.labelSecondary)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(hasCrop ? Color(hex: "#E8A54B") : Color.white.opacity(0.08))
+                        .clipShape(RoundedRectangle(cornerRadius: 4))
+                }
+                .buttonStyle(.plain)
+                .disabled(!hasCrop)
+            }
+            .padding(.top, 16)
+
+            VStack(spacing: 14) {
+                videoCropSlider(label: "上", value: $cropTop, edge: 0)
+                videoCropSlider(label: "下", value: $cropBottom, edge: 1)
+                videoCropSlider(label: "左", value: $cropLeft, edge: 2)
+                videoCropSlider(label: "右", value: $cropRight, edge: 3)
+            }
+        }
+        .padding(14)
+        .onAppear { loadMeta(); syncFromClip() }
+        .onChange(of: clip.id) { _ in loadMeta(); syncFromClip() }
+        .onChange(of: clip.offsetX)    { v in if abs(v - offsetX) > 0.001 { offsetX = v } }
+        .onChange(of: clip.offsetY)    { v in if abs(v - offsetY) > 0.001 { offsetY = v } }
+        .onChange(of: clip.scaleX)     { v in if abs(v - scaleX)  > 0.001 { scaleX  = v } }
+        .onChange(of: clip.scaleY)     { v in if abs(v - scaleY)  > 0.001 { scaleY  = v } }
+        .onChange(of: clip.cropTop)    { v in if abs(v - cropTop)    > 0.001 { cropTop    = v } }
+        .onChange(of: clip.cropBottom) { v in if abs(v - cropBottom) > 0.001 { cropBottom = v } }
+        .onChange(of: clip.cropLeft)   { v in if abs(v - cropLeft)   > 0.001 { cropLeft   = v } }
+        .onChange(of: clip.cropRight)  { v in if abs(v - cropRight)  > 0.001 { cropRight  = v } }
+    }
+
+    private var hasOffset: Bool {
+        abs(offsetX) > 0.001 || abs(offsetY) > 0.001
+    }
+
+    private var hasCrop: Bool {
+        cropTop > 0.001 || cropBottom > 0.001 || cropLeft > 0.001 || cropRight > 0.001
+    }
+
+    @ViewBuilder
+    private func videoCropSlider(label: String, value: Binding<Double>, edge: Int) -> some View {
+        HStack(spacing: 6) {
+            Text(label).font(.system(size: 9)).foregroundColor(Color.labelSecondary).frame(width: 14)
+            Slider(value: value, in: 0...0.99)
+                .onChange(of: value.wrappedValue) { _ in applyTransform() }
+            Text("\(Int(value.wrappedValue * 100))%")
+                .font(.system(size: 10).monospacedDigit())
+                .foregroundColor(Color.labelPrimary)
+                .frame(width: 30)
+        }
+    }
+
+    private func syncFromClip() {
+        scaleX = clip.scaleX
+        scaleY = clip.scaleY
+        lockAspect = clip.lockAspect
+        offsetX = clip.offsetX
+        offsetY = clip.offsetY
+        cropTop = clip.cropTop
+        cropBottom = clip.cropBottom
+        cropLeft = clip.cropLeft
+        cropRight = clip.cropRight
+        hasPushedUndo = false
+    }
+
+    private func syncLock() {
+        project.updateVideoClip(id: clip.id) { $0.lockAspect = lockAspect }
+    }
+
+    private func applyTransform() {
+        if !hasPushedUndo {
+            project.pushUndo()
+            hasPushedUndo = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { hasPushedUndo = false }
+        }
+        project.updateVideoClip(id: clip.id) {
+            $0.scaleX = scaleX
+            $0.scaleY = scaleY
+            $0.lockAspect = lockAspect
+            $0.offsetX = offsetX
+            $0.offsetY = offsetY
+            $0.cropTop = cropTop
+            $0.cropBottom = cropBottom
+            $0.cropLeft = cropLeft
+            $0.cropRight = cropRight
+        }
+        project.rebuildTimelinePreviewDebounced()
     }
 
     private func loadMeta() {
@@ -704,7 +939,7 @@ private struct AudioInspector: View {
             }
 
             ISection(title: "音量") {
-                ISlider(label: "整体音量", value: dbl(\.volume, scale: 100), range: 0...200, unit: "%")
+                ISlider(label: "整体音量", value: dbl(\.volume, scale: 100), range: 0...400, unit: "%")
                 ISlider(label: "左声道",  value: dbl(\.leftChannel,  scale: 100), range: 0...100, unit: "%")
                 ISlider(label: "右声道",  value: dbl(\.rightChannel, scale: 100), range: 0...100, unit: "%")
             }

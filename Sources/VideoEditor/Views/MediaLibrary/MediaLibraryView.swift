@@ -418,8 +418,10 @@ private struct ImportButton: View {
     private func openPicker() {
         let panel = NSOpenPanel()
         panel.allowsMultipleSelection = true
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = true
         panel.allowedContentTypes = [
-            .movie, .audio, .image,
+            .movie, .audio, .image, .folder,
             UTType(filenameExtension: "srt") ?? .plainText,
             UTType(filenameExtension: "ass") ?? .plainText,
             UTType(filenameExtension: "vtt") ?? .plainText

@@ -6,7 +6,7 @@ import Combine
 
 // MARK: - Asset Type
 
-enum AssetType {
+enum AssetType: String, Codable {
     case video, audio, subtitle, image
     var label: String {
         switch self { case .video: return "视频"; case .audio: return "音频"; case .subtitle: return "字幕"; case .image: return "图片" }
@@ -21,7 +21,7 @@ enum AssetType {
 
 // MARK: - Media Asset
 
-struct MediaAsset: Identifiable, Equatable {
+struct MediaAsset: Identifiable, Equatable, Codable {
     let id = UUID()
     var url: URL
     var name: String
@@ -33,9 +33,9 @@ struct MediaAsset: Identifiable, Equatable {
 
 // MARK: - Subtitle Style
 
-struct SubtitleStyle: Equatable {
+struct SubtitleStyle: Equatable, Codable {
     var fontName: String  = "PingFang SC"
-    var fontSize: CGFloat = 23
+    var fontSize: CGFloat = 48
     var bold: Bool        = false
     var italic: Bool      = false
     var textColor: Color      = .white
@@ -45,11 +45,49 @@ struct SubtitleStyle: Equatable {
     var widthPercent: Double  = 95
     var alignment: String     = "center" // "left" / "center" / "right"
     var lineSpacing: Double   = 6      // px between bilingual lines
+
+    enum CodingKeys: String, CodingKey {
+        case fontName, fontSize, bold, italic
+        case textColorHex, backgroundColorHex, backgroundOpacity
+        case bottomMargin, widthPercent, alignment, lineSpacing
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(fontName, forKey: .fontName)
+        try c.encode(fontSize, forKey: .fontSize)
+        try c.encode(bold, forKey: .bold)
+        try c.encode(italic, forKey: .italic)
+        try c.encode(textColor.toHex(), forKey: .textColorHex)
+        try c.encode(backgroundColor.toHex(), forKey: .backgroundColorHex)
+        try c.encode(backgroundOpacity, forKey: .backgroundOpacity)
+        try c.encode(bottomMargin, forKey: .bottomMargin)
+        try c.encode(widthPercent, forKey: .widthPercent)
+        try c.encode(alignment, forKey: .alignment)
+        try c.encode(lineSpacing, forKey: .lineSpacing)
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        fontName = try c.decode(String.self, forKey: .fontName)
+        fontSize = try c.decode(CGFloat.self, forKey: .fontSize)
+        bold = try c.decode(Bool.self, forKey: .bold)
+        italic = try c.decode(Bool.self, forKey: .italic)
+        textColor = Color(hex: try c.decode(String.self, forKey: .textColorHex))
+        backgroundColor = Color(hex: try c.decode(String.self, forKey: .backgroundColorHex))
+        backgroundOpacity = try c.decode(Double.self, forKey: .backgroundOpacity)
+        bottomMargin = try c.decode(Double.self, forKey: .bottomMargin)
+        widthPercent = try c.decode(Double.self, forKey: .widthPercent)
+        alignment = try c.decode(String.self, forKey: .alignment)
+        lineSpacing = try c.decode(Double.self, forKey: .lineSpacing)
+    }
+
+    init() {}
 }
 
 // MARK: - Clips
 
-struct SubtitleClip: Identifiable, Equatable {
+struct SubtitleClip: Identifiable, Equatable, Codable {
     let id = UUID()
     var text: String
     var startTime: Double
@@ -57,7 +95,7 @@ struct SubtitleClip: Identifiable, Equatable {
     var duration: Double { endTime - startTime }
 }
 
-struct VideoClip: Identifiable, Equatable {
+struct VideoClip: Identifiable, Equatable, Codable {
     let id = UUID()
     var assetID: UUID
     var name: String   = ""
@@ -71,9 +109,23 @@ struct VideoClip: Identifiable, Equatable {
     var overrideFPS: Int           = 0
     var overrideBitrate: Int       = 0   // kbps
     var volume: Float              = 1.0
+    // Transform
+    var scaleX: Double   = 1.0
+    var scaleY: Double   = 1.0
+    var lockAspect: Bool = true
+    var offsetX: Double  = 0    // normalized offset (-1...1), 0 = centered
+    var offsetY: Double  = 0
+    // Crop: normalized 0...1, fraction to remove from each edge
+    var cropTop: Double    = 0
+    var cropBottom: Double = 0
+    var cropLeft: Double   = 0
+    var cropRight: Double  = 0
+    // 源视频原始尺寸（用于预览裁剪框计算）
+    var videoWidth: Double  = 0
+    var videoHeight: Double = 0
 }
 
-struct AudioClip: Identifiable, Equatable {
+struct AudioClip: Identifiable, Equatable, Codable {
     let id = UUID()
     var assetID: UUID
     var name: String   = ""
@@ -89,7 +141,7 @@ struct AudioClip: Identifiable, Equatable {
     var format: String = "AAC"
 }
 
-struct ImageClip: Identifiable, Equatable {
+struct ImageClip: Identifiable, Equatable, Codable {
     let id = UUID()
     var assetID: UUID
     var name: String   = ""
@@ -112,7 +164,7 @@ struct ImageClip: Identifiable, Equatable {
     var cropRight: Double  = 0
 }
 
-struct Track<Clip: Identifiable & Equatable>: Identifiable {
+struct Track<Clip: Identifiable & Equatable & Codable>: Identifiable, Codable {
     let id = UUID()
     var clips: [Clip]   = []
     var label: String   = ""
@@ -122,7 +174,7 @@ struct Track<Clip: Identifiable & Equatable>: Identifiable {
 
 // MARK: - Export Settings
 
-enum ExportContent: String, CaseIterable {
+enum ExportContent: String, CaseIterable, Codable {
     case video        // full video + audio + burned-in subtitles
     case audioOnly    // export audio track only (m4a)
     case subtitleOnly // export subtitles as SRT
@@ -151,6 +203,22 @@ struct WaveformData {
     let samples: [Float]  // normalized 0..1 peak values
 }
 
+// MARK: - Project Document (for .bcj file)
+
+struct ProjectDocument: Codable {
+    var name: String
+    var videoTracks: [Track<VideoClip>]
+    var audioTracks: [Track<AudioClip>]
+    var imageTracks: [Track<ImageClip>]
+    var subtitleTracks: [Track<SubtitleClip>]
+    var subtitleStyles: [SubtitleStyle]
+    var mediaAssets: [MediaAsset]
+    var exportSettings: ExportSettings
+    var previewResolution: String
+}
+
+extension ExportSettings: Codable {}
+
 // MARK: - Snapshot (for undo/redo)
 
 struct ProjectSnapshot {
@@ -169,7 +237,7 @@ final class ProjectState: ObservableObject {
 
     // Tracks
     @Published var videoTracks: [Track<VideoClip>]    = [Track(label: "视频")]
-    @Published var audioTracks: [Track<AudioClip>]    = []
+    @Published var audioTracks: [Track<AudioClip>]    = [Track(label: "音频")]
     @Published var imageTracks: [Track<ImageClip>]       = []
     @Published var subtitleTracks: [Track<SubtitleClip>] = [Track(label: "字幕")]
     @Published var subtitleStyles: [SubtitleStyle]    = [SubtitleStyle(), SubtitleStyle()]
@@ -190,7 +258,7 @@ final class ProjectState: ObservableObject {
 
     // Timeline
     @Published var pixelsPerSecond: Double = 30
-    @Published var snapEnabled: Bool = false
+    @Published var snapEnabled: Bool = true
     @Published var showImageTracks: Bool = true
     @Published var showVideoTracks: Bool = true
     @Published var showAudioTracks: Bool = true
@@ -214,6 +282,11 @@ final class ProjectState: ObservableObject {
     var clipboard: ClipboardItem?
     @Published var clipboardIsCut: Bool = false
     @Published var clipboardSourceID: UUID?
+
+    // Project file management
+    @Published var projectName: String = "未命名项目"
+    @Published var projectFileURL: URL? = nil
+    @Published var showWelcome: Bool = true
 
     // Export
     @Published var exportSettings  = ExportSettings()
@@ -252,6 +325,12 @@ final class ProjectState: ObservableObject {
 
     // Translation
     @Published var translationTargetLang: String = "中文（简体）"
+    @Published var translatingTrackIndices: Set<Int> = []  // 正在翻译中的轨道 index
+    @Published var translationProgress: Double = 0         // 0...1
+    @Published var translationTotal: Int = 0               // 总字幕数
+    @Published var translationDone: Int = 0                // 已完成数
+    /// 占位字幕 ID 集合（翻译中显示呼吸效果）
+    @Published var placeholderClipIDs: Set<UUID> = []
     static let supportedLanguages = [
         "中文（简体）","中文（繁体）","English","日本語",
         "한국어","Français","Deutsch","Español",
@@ -260,7 +339,9 @@ final class ProjectState: ObservableObject {
 
     private var cancellables = Set<AnyCancellable>()
 
-    private static let mediaLibraryKey = "savedMediaAssetPaths"
+    private static let mediaLibraryKey = "savedMediaBookmarks"
+    /// 正在访问安全范围的 URL（app 退出时需要 stop）
+    private var accessedURLs: [URL] = []
 
     init() {
         loadSavedMediaLibrary()
@@ -273,41 +354,175 @@ final class ProjectState: ObservableObject {
             .store(in: &cancellables)
     }
 
+    deinit {
+        for url in accessedURLs {
+            url.stopAccessingSecurityScopedResource()
+        }
+    }
+
+    // MARK: - Project File (.bcj)
+
+    func createNewProject(name: String, directory: URL) {
+        projectName = name
+        let fileURL = directory.appendingPathComponent("\(name).bcj")
+        projectFileURL = fileURL
+        // 重置到空项目状态（素材库保留，不清空）
+        videoTracks = [Track(label: "视频")]
+        audioTracks = [Track(label: "音频")]
+        imageTracks = []
+        subtitleTracks = [Track(label: "字幕")]
+        subtitleStyles = [SubtitleStyle(), SubtitleStyle()]
+        undoStack.removeAll(); redoStack.removeAll()
+        undoCount = 0; redoCount = 0
+        currentTime = 0; duration = 60
+        selectedVideoClipID = nil; selectedAudioClipID = nil
+        selectedImageClipID = nil; selectedSubtitleClipID = nil
+        selectedClipIDs.removeAll()
+        assetThumbnails.removeAll()
+        waveformCache.removeAll()
+        imageVideoCache.removeAll()
+        playerItem = nil
+        showWelcome = false
+        // 为保留的素材重新生成缩略图
+        for asset in mediaAssets {
+            if mediaThumbnails[asset.id] == nil {
+                loadMediaResources(asset)
+            }
+        }
+        saveProject()
+    }
+
+    func openProject(url: URL) {
+        guard url.startAccessingSecurityScopedResource() else { return }
+        accessedURLs.append(url)
+        defer { /* keep access alive */ }
+
+        guard let data = try? Data(contentsOf: url) else { return }
+        guard let doc = try? JSONDecoder().decode(ProjectDocument.self, from: data) else { return }
+
+        projectName = doc.name
+        projectFileURL = url
+        videoTracks = doc.videoTracks
+        audioTracks = doc.audioTracks
+        imageTracks = doc.imageTracks
+        subtitleTracks = doc.subtitleTracks
+        subtitleStyles = doc.subtitleStyles
+        exportSettings = doc.exportSettings
+        previewResolution = doc.previewResolution
+
+        // 恢复媒体资源（合并到全局素材库，不替换）
+        for asset in doc.mediaAssets {
+            if !mediaAssets.contains(where: { $0.url == asset.url }) {
+                if asset.url.startAccessingSecurityScopedResource() {
+                    accessedURLs.append(asset.url)
+                }
+                mediaAssets.append(asset)
+                loadMediaResources(asset)
+            }
+        }
+
+        // 重建时间轴缩略图和波形
+        for track in videoTracks {
+            for clip in track.clips {
+                if let url = clip.url {
+                    loadTimelineThumbnails(assetID: clip.assetID, url: url)
+                }
+            }
+        }
+        for track in audioTracks {
+            for clip in track.clips {
+                if let url = clip.url {
+                    loadWaveform(assetID: clip.assetID, url: url)
+                }
+            }
+        }
+
+        undoStack.removeAll(); redoStack.removeAll()
+        undoCount = 0; redoCount = 0
+        currentTime = 0
+        showWelcome = false
+        rebuildTimelinePreview()
+    }
+
+    func saveProject() {
+        guard let fileURL = projectFileURL else { return }
+        let doc = ProjectDocument(
+            name: projectName,
+            videoTracks: videoTracks,
+            audioTracks: audioTracks,
+            imageTracks: imageTracks,
+            subtitleTracks: subtitleTracks,
+            subtitleStyles: subtitleStyles,
+            mediaAssets: mediaAssets,
+            exportSettings: exportSettings,
+            previewResolution: previewResolution
+        )
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        guard let data = try? encoder.encode(doc) else { return }
+        try? data.write(to: fileURL, options: .atomic)
+    }
+
     private func saveMediaLibrary(_ assets: [MediaAsset]) {
-        let paths = assets.map { $0.url.path }
-        UserDefaults.standard.set(paths, forKey: Self.mediaLibraryKey)
+        let bookmarks: [Data] = assets.compactMap { asset in
+            try? asset.url.bookmarkData(
+                options: .withSecurityScope,
+                includingResourceValuesForKeys: nil,
+                relativeTo: nil)
+        }
+        UserDefaults.standard.set(bookmarks, forKey: Self.mediaLibraryKey)
     }
 
     private func loadSavedMediaLibrary() {
-        guard let paths = UserDefaults.standard.stringArray(forKey: Self.mediaLibraryKey) else { return }
-        for path in paths {
-            let url = URL(fileURLWithPath: path)
-            let ext = url.pathExtension.lowercased()
-            let type: AssetType
-            switch ext {
-            case "mp4","mov","mkv","avi","m4v": type = .video
-            case "mp3","wav","aac","m4a","flac": type = .audio
-            case "srt","ass","vtt": type = .subtitle
-            case "png","jpg","jpeg","gif","bmp","tiff","tif","webp","heic": type = .image
-            default: continue
+        // 兼容旧版纯路径格式，自动迁移
+        if let paths = UserDefaults.standard.stringArray(forKey: "savedMediaAssetPaths") {
+            for path in paths {
+                let url = URL(fileURLWithPath: path)
+                importFileFromRestore(url)
             }
-            guard !mediaAssets.contains(where: { $0.url == url }) else { continue }
-            let asset = MediaAsset(url: url, name: url.lastPathComponent, type: type)
-            mediaAssets.append(asset)
-            if asset.fileExists {
-                loadMediaResources(asset)
-            }
+            UserDefaults.standard.removeObject(forKey: "savedMediaAssetPaths")
+            saveMediaLibrary(mediaAssets)
+            return
+        }
+
+        guard let dataArray = UserDefaults.standard.array(forKey: Self.mediaLibraryKey) as? [Data] else { return }
+        for data in dataArray {
+            var isStale = false
+            guard let url = try? URL(resolvingBookmarkData: data,
+                                      options: .withSecurityScope,
+                                      relativeTo: nil,
+                                      bookmarkDataIsStale: &isStale) else { continue }
+            guard url.startAccessingSecurityScopedResource() else { continue }
+            accessedURLs.append(url)
+            importFileFromRestore(url)
+        }
+    }
+
+    /// 从持久化数据恢复素材（不触发重复保存）
+    private func importFileFromRestore(_ url: URL) {
+        let ext = url.pathExtension.lowercased()
+        let type: AssetType
+        switch ext {
+        case "mp4","mov","mkv","avi","m4v": type = .video
+        case "mp3","wav","aac","m4a","flac": type = .audio
+        case "srt","ass","vtt": type = .subtitle
+        case "png","jpg","jpeg","gif","bmp","tiff","tif","webp","heic": type = .image
+        default: return
+        }
+        guard !mediaAssets.contains(where: { $0.url == url }) else { return }
+        let asset = MediaAsset(url: url, name: url.lastPathComponent, type: type)
+        mediaAssets.append(asset)
+        if asset.fileExists {
+            loadMediaResources(asset)
         }
     }
 
     func refreshMediaLibrary() {
-        var copy = mediaAssets
-        for i in copy.indices {
-            if copy[i].fileExists && mediaThumbnails[copy[i].id] == nil {
-                loadMediaResources(copy[i])
+        for asset in mediaAssets {
+            if asset.fileExists && mediaThumbnails[asset.id] == nil {
+                loadMediaResources(asset)
             }
         }
-        mediaAssets = copy
     }
 
     private func loadMediaResources(_ asset: MediaAsset) {
@@ -770,9 +985,9 @@ final class ProjectState: ObservableObject {
         rebuildTask = Task {
             let composition = AVMutableComposition()
             var audioParams: [(trackID: CMPersistentTrackID, volume: Float, left: Float, right: Float)] = []
-            var videoCompTracks: [(track: AVMutableCompositionTrack, startTime: Double, endTime: Double)] = []  // from video clips
+            var videoCompTracks: [(track: AVMutableCompositionTrack, clip: VideoClip, startTime: Double, endTime: Double)] = []  // from video clips
             var imageCompTracks: [(track: AVMutableCompositionTrack, clip: ImageClip)] = []  // from image clips (on top)
-            var renderSize = CGSize(width: 1920, height: 1080)
+            let renderSize = previewRenderSize
 
             // 视频轨道
             for track in vTracks {
@@ -792,13 +1007,7 @@ final class ProjectState: ObservableObject {
                        let vt = composition.addMutableTrack(withMediaType: .video,
                                                             preferredTrackID: kCMPersistentTrackID_Invalid) {
                         try? vt.insertTimeRange(range, of: vAsset, at: at)
-                        videoCompTracks.append((vt, clip.startTime, clip.startTime + useDur.seconds))
-                        // Detect render size from first video
-                        if let natSize = try? await vAsset.load(.naturalSize) {
-                            if natSize.width > 0 && natSize.height > 0 {
-                                renderSize = natSize
-                            }
-                        }
+                        videoCompTracks.append((vt, clip, clip.startTime, clip.startTime + useDur.seconds))
                     }
                     if !track.isMuted,
                        let aAsset = try? await asset.loadTracks(withMediaType: .audio).first,
@@ -960,7 +1169,6 @@ final class ProjectState: ObservableObject {
                     instruction.timeRange = CMTimeRange(start: segStartCM, duration: segDur)
                     instruction.backgroundColor = CGColor(gray: 0, alpha: 1)
 
-                    let segStart = segStartCM.seconds
                     var layerInstructions: [AVMutableVideoCompositionLayerInstruction] = []
                     // 所有 image track 都有 sample（填充了整个时间线），
                     // 不活跃的 clip 用 opacity=0 隐藏。
@@ -988,7 +1196,16 @@ final class ProjectState: ObservableObject {
                         let clipStart = videoClipCMRanges[idx].start
                         let clipEnd   = videoClipCMRanges[idx].end
                         let active = segStartCM >= clipStart && segStartCM < clipEnd
-                        if !active {
+                        if active {
+                            if let natSize = try? await entry.track.load(.naturalSize), natSize.width > 0, natSize.height > 0 {
+                                let t = Self.videoTransform(clip: entry.clip, natSize: natSize, renderSize: renderSize)
+                                li.setTransform(t, at: .zero)
+                                let c = entry.clip
+                                if c.cropTop > 0.001 || c.cropBottom > 0.001 || c.cropLeft > 0.001 || c.cropRight > 0.001 {
+                                    li.setCropRectangle(Self.videoCropRect(clip: c, natSize: natSize), at: .zero)
+                                }
+                            }
+                        } else {
                             li.setOpacity(0, at: .zero)
                         }
                         layerInstructions.append(li)
@@ -1006,10 +1223,10 @@ final class ProjectState: ObservableObject {
             guard !Task.isCancelled else { return }
             await MainActor.run {
                 self.lastVideoEndTime = endTime
+                self.duration = max(endTime, 0.01)
                 self.pendingSeekTime = restoreTime
                 if composition.tracks.isEmpty && endTime < 0.01 {
                     self.playerItem = nil
-                    NSLog("[Rebuild] playerItem = nil (empty)")
                 } else {
                     let item = AVPlayerItem(asset: composition)
                     item.audioMix = audioMix
@@ -1017,7 +1234,6 @@ final class ProjectState: ObservableObject {
                         item.videoComposition = vc
                     }
                     self.playerItem = item
-                    NSLog("[Rebuild] playerItem set, tracks=%d", composition.tracks.count)
                 }
             }
         }
@@ -1052,6 +1268,29 @@ final class ProjectState: ObservableObject {
         return CGRect(x: x, y: y, width: max(w, 1), height: max(h, 1))
     }
 
+    // MARK: - Video transform helpers
+
+    static func videoTransform(clip: VideoClip, natSize: CGSize, renderSize: CGSize) -> CGAffineTransform {
+        guard natSize.width > 0, natSize.height > 0 else {
+            return CGAffineTransform(scaleX: 0, y: 0)
+        }
+        let baseScale = min(renderSize.width / natSize.width, renderSize.height / natSize.height)
+        let finalSX = baseScale * CGFloat(clip.scaleX)
+        let finalSY = baseScale * CGFloat(clip.scaleY)
+        let tx = (renderSize.width  - natSize.width  * finalSX) / 2 + CGFloat(clip.offsetX) * renderSize.width
+        let ty = (renderSize.height - natSize.height * finalSY) / 2 + CGFloat(clip.offsetY) * renderSize.height
+        return CGAffineTransform(scaleX: finalSX, y: finalSY)
+            .concatenating(CGAffineTransform(translationX: tx, y: ty))
+    }
+
+    static func videoCropRect(clip: VideoClip, natSize: CGSize) -> CGRect {
+        let x = natSize.width  * CGFloat(clip.cropLeft)
+        let y = natSize.height * CGFloat(clip.cropTop)
+        let w = natSize.width  * (1 - CGFloat(clip.cropLeft + clip.cropRight))
+        let h = natSize.height * (1 - CGFloat(clip.cropTop  + clip.cropBottom))
+        return CGRect(x: x, y: y, width: max(w, 1), height: max(h, 1))
+    }
+
     /// Select a clip for preview and seek to its start so the user sees it.
     func loadClipForPreview(_ clip: VideoClip) {
         rebuildTimelinePreview(seekTo: clip.startTime)
@@ -1059,17 +1298,41 @@ final class ProjectState: ObservableObject {
 
     // MARK: - Import
 
+    /// 支持的素材扩展名
+    private static let supportedExtensions: Set<String> = [
+        "mp4","mov","mkv","avi","m4v",
+        "mp3","wav","aac","m4a","flac",
+        "srt","ass","vtt",
+        "png","jpg","jpeg","gif","bmp","tiff","tif","webp","heic"
+    ]
+
+    private static func assetType(for ext: String) -> AssetType? {
+        switch ext {
+        case "mp4","mov","mkv","avi","m4v": return .video
+        case "mp3","wav","aac","m4a","flac": return .audio
+        case "srt","ass","vtt": return .subtitle
+        case "png","jpg","jpeg","gif","bmp","tiff","tif","webp","heic": return .image
+        default: return nil
+        }
+    }
+
+    /// 导入文件或文件夹（文件夹会递归扫描）
     func importFile(_ url: URL) {
+        // 确保沙盒环境下有访问权限
+        if url.startAccessingSecurityScopedResource() {
+            accessedURLs.append(url)
+        }
+
+        // 如果是文件夹，递归扫描
+        var isDir: ObjCBool = false
+        if FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir), isDir.boolValue {
+            importFolder(url)
+            return
+        }
+
         guard !mediaAssets.contains(where: { $0.url == url }) else { return }
         let ext = url.pathExtension.lowercased()
-        let type: AssetType
-        switch ext {
-        case "mp4","mov","mkv","avi","m4v": type = .video
-        case "mp3","wav","aac","m4a","flac": type = .audio
-        case "srt","ass","vtt": type = .subtitle
-        case "png","jpg","jpeg","gif","bmp","tiff","tif","webp","heic": type = .image
-        default: return
-        }
+        guard let type = Self.assetType(for: ext) else { return }
         let asset = MediaAsset(url: url, name: url.lastPathComponent, type: type)
         let aid = asset.id
         mediaAssets.append(asset)
@@ -1096,6 +1359,20 @@ final class ProjectState: ObservableObject {
         }
     }
 
+    /// 递归扫描文件夹，导入所有支持的素材
+    private func importFolder(_ folderURL: URL) {
+        let fm = FileManager.default
+        guard let enumerator = fm.enumerator(at: folderURL,
+                                              includingPropertiesForKeys: [.isDirectoryKey],
+                                              options: [.skipsHiddenFiles]) else { return }
+        for case let fileURL as URL in enumerator {
+            let ext = fileURL.pathExtension.lowercased()
+            if Self.supportedExtensions.contains(ext) {
+                importFile(fileURL)
+            }
+        }
+    }
+
     func addToTimeline(_ asset: MediaAsset) {
         switch asset.type {
         case .video:
@@ -1108,11 +1385,17 @@ final class ProjectState: ObservableObject {
                 trackIdx = videoTracks.count - 1
             }
             Task {
-                let dur = (try? await AVURLAsset(url: asset.url).load(.duration))?.seconds ?? 30
+                let avAsset = AVURLAsset(url: asset.url)
+                let dur = (try? await avAsset.load(.duration))?.seconds ?? 30
+                var natW: Double = 0, natH: Double = 0
+                if let vTrack = try? await avAsset.loadTracks(withMediaType: .video).first,
+                   let sz = try? await vTrack.load(.naturalSize) {
+                    natW = sz.width; natH = sz.height
+                }
                 await MainActor.run {
                     self.videoTracks[trackIdx].clips.append(
                         VideoClip(assetID: asset.id, name: asset.name, url: asset.url,
-                                  startTime: 0, endTime: dur))
+                                  startTime: 0, endTime: dur, videoWidth: natW, videoHeight: natH))
                     self.duration = max(self.duration, dur)
                     if let i = self.mediaAssets.firstIndex(where:{ $0.id == asset.id }) { self.mediaAssets[i].duration = dur }
                     self.rebuildTimelinePreview()
@@ -1367,7 +1650,7 @@ final class ProjectState: ObservableObject {
     /// User-initiated playhead move — updates `currentTime` AND tells the
     /// player to seek (via `seekRequest` counter observed by PlayerView).
     func requestSeek(to t: Double) {
-        currentTime = t.clamped(to: 0...max(duration, 0))
+        currentTime = max(t, 0)
         seekRequest &+= 1
     }
 
@@ -1425,13 +1708,19 @@ final class ProjectState: ObservableObject {
                     let c = videoTracks[ti].clips[ci]
                     if c.startTime + 0.01 < t && c.endTime - 0.01 > t {
                         videoTracks[ti].clips[ci].endTime = t
-                        let newClip = VideoClip(
+                        var newClip = VideoClip(
                             assetID: c.assetID, name: c.name, url: c.url,
                             startTime: t, endTime: c.endTime,
                             trimStart: c.trimStart + (t - c.startTime),
                             overrideResolution: c.overrideResolution,
                             overrideFPS: c.overrideFPS,
                             overrideBitrate: c.overrideBitrate)
+                        newClip.volume = c.volume
+                        newClip.scaleX = c.scaleX; newClip.scaleY = c.scaleY
+                        newClip.lockAspect = c.lockAspect
+                        newClip.offsetX = c.offsetX; newClip.offsetY = c.offsetY
+                        newClip.cropTop = c.cropTop; newClip.cropBottom = c.cropBottom
+                        newClip.cropLeft = c.cropLeft; newClip.cropRight = c.cropRight
                         videoTracks[ti].clips.insert(newClip, at: ci + 1)
                         changed = true
                     }
@@ -1647,6 +1936,11 @@ final class ProjectState: ObservableObject {
             newClip.overrideResolution = clip.overrideResolution
             newClip.overrideFPS = clip.overrideFPS
             newClip.overrideBitrate = clip.overrideBitrate
+            newClip.scaleX = clip.scaleX; newClip.scaleY = clip.scaleY
+            newClip.lockAspect = clip.lockAspect
+            newClip.offsetX = clip.offsetX; newClip.offsetY = clip.offsetY
+            newClip.cropTop = clip.cropTop; newClip.cropBottom = clip.cropBottom
+            newClip.cropLeft = clip.cropLeft; newClip.cropRight = clip.cropRight
             let idx = videoTracks.indices.contains(trackIdx) ? trackIdx : 0
             if videoTracks.indices.contains(idx) {
                 videoTracks[idx].clips.append(newClip)
@@ -1656,8 +1950,14 @@ final class ProjectState: ObservableObject {
             }
 
         case .image(let clip, let trackIdx):
-            let newClip = ImageClip(assetID: clip.assetID, name: clip.name, imageURL: clip.imageURL,
-                                     videoURL: clip.videoURL, startTime: t, endTime: t + clip.duration)
+            var newClip = ImageClip(assetID: clip.assetID, name: clip.name, imageURL: clip.imageURL,
+                                     videoURL: clip.videoURL, startTime: t, endTime: t + clip.duration,
+                                     imageWidth: clip.imageWidth, imageHeight: clip.imageHeight)
+            newClip.scaleX = clip.scaleX; newClip.scaleY = clip.scaleY
+            newClip.lockAspect = clip.lockAspect
+            newClip.offsetX = clip.offsetX; newClip.offsetY = clip.offsetY
+            newClip.cropTop = clip.cropTop; newClip.cropBottom = clip.cropBottom
+            newClip.cropLeft = clip.cropLeft; newClip.cropRight = clip.cropRight
             let idx = imageTracks.indices.contains(trackIdx) ? trackIdx : 0
             if imageTracks.indices.contains(idx) {
                 imageTracks[idx].clips.append(newClip)
@@ -1797,16 +2097,19 @@ final class ProjectState: ObservableObject {
     /// Insert a new subtitle clip into the active subtitle track at the playhead.
     func insertSubtitleAtPlayhead() {
         let snap = currentSnapshot()
-        if subtitleTracks.isEmpty {
-            subtitleTracks.append(Track(label: "字幕"))
-            subtitleStyles.append(SubtitleStyle())
-        }
-        var trackIdx = 0
+
+        let trackIdx: Int
         if let sid = selectedSubtitleClipID {
-            for (i, t) in subtitleTracks.enumerated() {
-                if t.clips.contains(where: { $0.id == sid }) { trackIdx = i; break }
-            }
+            // 选中了字幕片段 → 在其所在轨道新建
+            trackIdx = subtitleTracks.firstIndex { $0.clips.contains { $0.id == sid } } ?? 0
+        } else {
+            // 没选中任何字幕 → 新建轨道（放在最后）
+            let newTrack = Track<SubtitleClip>(label: "字幕")
+            subtitleTracks.append(newTrack)
+            subtitleStyles.append(SubtitleStyle())
+            trackIdx = subtitleTracks.count - 1
         }
+
         let start = currentTime
         let end   = min(currentTime + 2.0, max(duration, currentTime + 2.0))
         let clip  = SubtitleClip(text: "新字幕", startTime: start, endTime: end)
@@ -1829,6 +2132,13 @@ extension Color {
         let h = hex.trimmingCharacters(in: CharacterSet.alphanumerics.inverted)
         var v: UInt64 = 0; Scanner(string: h).scanHexInt64(&v)
         self.init(red: Double((v>>16)&0xFF)/255, green: Double((v>>8)&0xFF)/255, blue: Double(v&0xFF)/255)
+    }
+
+    func toHex() -> String {
+        let nc = NSColor(self).usingColorSpace(.sRGB) ?? .white
+        var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
+        nc.getRed(&r, green: &g, blue: &b, alpha: &a)
+        return String(format: "#%02X%02X%02X", Int(r * 255), Int(g * 255), Int(b * 255))
     }
 }
 

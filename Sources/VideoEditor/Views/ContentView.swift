@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import UniformTypeIdentifiers
 
 struct ContentView: View {
     @StateObject private var project = ProjectState()
@@ -9,6 +10,10 @@ struct ContentView: View {
     @State private var sidebarVisible = true
     @State private var sidebarWidth: CGFloat = 220
     @State private var inspectorWidth: CGFloat = 280
+    // Drag origin tracking (prevents cumulative translation bug)
+    @State private var dragOriginSidebar: CGFloat = 220
+    @State private var dragOriginInspector: CGFloat = 280
+    @State private var dragOriginTop: CGFloat = 420
 
     // Height of the shared "title-bar" row that contains traffic lights + toggle
     private let toolbarH: CGFloat = 28
@@ -53,7 +58,8 @@ struct ContentView: View {
                         .onHover { h in if h { NSCursor.resizeLeftRight.set() } else { NSCursor.arrow.set() } }
                         .gesture(DragGesture(minimumDistance: 1)
                             .onChanged { v in
-                                sidebarWidth = (sidebarWidth + v.translation.width)
+                                if v.translation == .zero { dragOriginSidebar = sidebarWidth }
+                                sidebarWidth = (dragOriginSidebar + v.translation.width)
                                     .clamped(to: 160...400)
                             }
                             .onEnded { _ in NSCursor.arrow.set() }
@@ -88,7 +94,8 @@ struct ContentView: View {
                                         .onHover { h in if h { NSCursor.resizeLeftRight.set() } else { NSCursor.arrow.set() } }
                                         .gesture(DragGesture(minimumDistance: 1)
                                             .onChanged { v in
-                                                inspectorWidth = (inspectorWidth - v.translation.width)
+                                                if v.translation == .zero { dragOriginInspector = inspectorWidth }
+                                                inspectorWidth = (dragOriginInspector - v.translation.width)
                                                     .clamped(to: 200...450)
                                             }
                                             .onEnded { _ in NSCursor.arrow.set() }
@@ -106,9 +113,10 @@ struct ContentView: View {
                             .onHover { h in if h { NSCursor.resizeUpDown.set() } else { NSCursor.arrow.set() } }
                             .gesture(DragGesture(minimumDistance: 1)
                                 .onChanged { v in
+                                    if !isDraggingH { dragOriginTop = topHeight }
                                     isDraggingH = true
                                     let avail = geo.size.height - 24
-                                    topHeight = (topHeight + v.translation.height)
+                                    topHeight = (dragOriginTop + v.translation.height)
                                         .clamped(to: 180...(avail - 130))
                                 }
                                 .onEnded { _ in isDraggingH = false; NSCursor.arrow.set() }
@@ -117,7 +125,9 @@ struct ContentView: View {
                         // Timeline card
                         VStack(spacing: 0) {
                             TimelineToolbar()
+                                .fixedSize(horizontal: false, vertical: true)
                             TimelineView()
+                                .frame(maxHeight: .infinity)
                         }
                         .frame(maxHeight: .infinity)
                         .background(Color.timelineBg)
@@ -153,6 +163,16 @@ struct ContentView: View {
         .sheet(isPresented: $project.showExportSheet) {
             ExportSheetView().environmentObject(project)
         }
+        .overlay {
+            if project.showWelcome {
+                Color.black.opacity(0.5)
+                    .ignoresSafeArea()
+                WelcomeView()
+                    .environmentObject(project)
+                    .transition(.opacity.combined(with: .scale(scale: 0.95)))
+            }
+        }
+        .animation(.easeOut(duration: 0.25), value: project.showWelcome)
         .onReceive(NotificationCenter.default.publisher(for: .menuImportFiles)) { note in
             if let urls = note.object as? [URL] {
                 urls.forEach { project.importFile($0) }
@@ -160,6 +180,28 @@ struct ContentView: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: .menuExportVideo)) { _ in
             project.showExportSheet = true
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .menuSaveProject)) { _ in
+            project.saveProject()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .menuNewProject)) { _ in
+            project.showWelcome = true
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .menuOpenProject)) { _ in
+            let panel = NSOpenPanel()
+            panel.canChooseFiles = true
+            panel.canChooseDirectories = false
+            panel.allowsMultipleSelection = false
+            panel.allowedContentTypes = [.init(filenameExtension: "bcj") ?? .json]
+            panel.prompt = "打开"
+            if panel.runModal() == .OK, let url = panel.url {
+                project.openProject(url: url)
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .menuOpenProjectFile)) { note in
+            if let url = note.object as? URL {
+                project.openProject(url: url)
+            }
         }
     }
 
