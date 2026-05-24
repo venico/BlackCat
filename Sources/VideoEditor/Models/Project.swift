@@ -22,7 +22,7 @@ enum AssetType: String, Codable {
 // MARK: - Media Asset
 
 struct MediaAsset: Identifiable, Equatable, Codable {
-    let id = UUID()
+    var id = UUID()
     var url: URL
     var name: String
     var type: AssetType
@@ -88,7 +88,7 @@ struct SubtitleStyle: Equatable, Codable {
 // MARK: - Clips
 
 struct SubtitleClip: Identifiable, Equatable, Codable {
-    let id = UUID()
+    var id = UUID()
     var text: String
     var startTime: Double
     var endTime: Double
@@ -96,7 +96,7 @@ struct SubtitleClip: Identifiable, Equatable, Codable {
 }
 
 struct VideoClip: Identifiable, Equatable, Codable {
-    let id = UUID()
+    var id = UUID()
     var assetID: UUID
     var name: String   = ""
     var url: URL?      = nil
@@ -126,7 +126,7 @@ struct VideoClip: Identifiable, Equatable, Codable {
 }
 
 struct AudioClip: Identifiable, Equatable, Codable {
-    let id = UUID()
+    var id = UUID()
     var assetID: UUID
     var name: String   = ""
     var url: URL?      = nil
@@ -147,7 +147,7 @@ struct AudioClip: Identifiable, Equatable, Codable {
 }
 
 struct ImageClip: Identifiable, Equatable, Codable {
-    let id = UUID()
+    var id = UUID()
     var assetID: UUID
     var name: String   = ""
     var imageURL: URL?  = nil   // original image
@@ -170,7 +170,7 @@ struct ImageClip: Identifiable, Equatable, Codable {
 }
 
 struct Track<Clip: Identifiable & Equatable & Codable>: Identifiable, Codable {
-    let id = UUID()
+    var id = UUID()
     var clips: [Clip]   = []
     var label: String   = ""
     var isMuted: Bool   = false
@@ -297,6 +297,11 @@ final class ProjectState: ObservableObject {
     @Published var showVideoTracks: Bool = true
     @Published var showAudioTracks: Bool = true
     @Published var showSubtitleTracks: Bool = true
+
+    // 删除确认
+    @Published var showDeleteConfirm: Bool = false
+    @Published var showAssetDeleteConfirm: Bool = false
+    var pendingDeleteAssetID: UUID? = nil
 
     // Selection (single — used by Inspector)
     @Published var selectedVideoClipID: UUID?    = nil
@@ -492,15 +497,15 @@ final class ProjectState: ObservableObject {
         exportSettings = doc.exportSettings
         previewResolution = doc.previewResolution
 
-        // 恢复媒体资源（合并到全局素材库，不替换）
+        // 恢复媒体资源（以项目文件为准，完全替换）
+        mediaAssets.removeAll()
+        mediaThumbnails.removeAll()
         for asset in doc.mediaAssets {
-            if !mediaAssets.contains(where: { $0.url == asset.url }) {
-                if asset.url.startAccessingSecurityScopedResource() {
-                    accessedURLs.append(asset.url)
-                }
-                mediaAssets.append(asset)
-                loadMediaResources(asset)
+            if asset.url.startAccessingSecurityScopedResource() {
+                accessedURLs.append(asset.url)
             }
+            mediaAssets.append(asset)
+            loadMediaResources(asset)
         }
 
         // 重建时间轴缩略图和波形
@@ -864,6 +869,38 @@ final class ProjectState: ObservableObject {
     // MARK: - Relink missing asset
 
     /// Update all timeline clips that reference a given asset to use a new URL.
+    /// 删除素材并移除时间轴上所有引用该素材的片段
+    func removeAssetAndClips(assetID: UUID) {
+        let snap = currentSnapshot()
+        mediaAssets.removeAll { $0.id == assetID }
+        for i in videoTracks.indices {
+            videoTracks[i].clips.removeAll { $0.assetID == assetID }
+        }
+        for i in audioTracks.indices {
+            audioTracks[i].clips.removeAll { $0.assetID == assetID }
+        }
+        for i in imageTracks.indices {
+            imageTracks[i].clips.removeAll { $0.assetID == assetID }
+        }
+        mediaThumbnails.removeValue(forKey: assetID)
+        undoStack.append(snap)
+        if undoStack.count > 50 { undoStack.removeFirst() }
+        redoStack.removeAll()
+        undoCount = undoStack.count
+        redoCount = 0
+        rebuildTimelinePreview()
+        scheduleAutoSave()
+    }
+
+    /// 统计素材在时间轴上被引用的片段数
+    func clipCountForAsset(_ assetID: UUID) -> Int {
+        var count = 0
+        for t in videoTracks { count += t.clips.filter { $0.assetID == assetID }.count }
+        for t in audioTracks { count += t.clips.filter { $0.assetID == assetID }.count }
+        for t in imageTracks { count += t.clips.filter { $0.assetID == assetID }.count }
+        return count
+    }
+
     func relinkAsset(id: UUID, newURL: URL) {
         for ti in videoTracks.indices {
             for ci in videoTracks[ti].clips.indices where videoTracks[ti].clips[ci].assetID == id {
@@ -1558,6 +1595,15 @@ final class ProjectState: ObservableObject {
 
         // 需要转码的视频格式，先转为 MP4 再导入
         if type == .video && Self.needsTranscodeExtensions.contains(ext) {
+            // 检查转码后的文件是否已在素材库中（防止同一源文件重复导入）
+            let fileName = url.deletingPathExtension().lastPathComponent
+            let outputURL = FileManager.default.temporaryDirectory
+                .appendingPathComponent("BlackCatTranscode", isDirectory: true)
+                .appendingPathComponent("\(fileName).mp4")
+            if mediaAssets.contains(where: { $0.url == outputURL }) {
+                showImportToast("「\(url.lastPathComponent)」已在素材库中，已跳过")
+                return
+            }
             transcodeAndImport(url: url)
             return
         }
@@ -1567,6 +1613,8 @@ final class ProjectState: ObservableObject {
 
     /// 直接导入（原生格式或转码完成后的文件）
     private func importFileDirectly(url: URL, type: AssetType) {
+        // 兜底去重：防止任何路径绕过前置检查
+        guard !mediaAssets.contains(where: { $0.url == url }) else { return }
         let asset = MediaAsset(url: url, name: url.lastPathComponent, type: type)
         let aid = asset.id
         mediaAssets.append(asset)
@@ -1617,9 +1665,13 @@ final class ProjectState: ObservableObject {
         try? FileManager.default.createDirectory(at: outputDir, withIntermediateDirectories: true)
         let outputURL = outputDir.appendingPathComponent("\(fileName).mp4")
 
-        // 如果已处理过，直接导入
+        // 如果已处理过，检查是否已在素材库中
         if FileManager.default.fileExists(atPath: outputURL.path) {
-            importFileDirectly(url: outputURL, type: .video)
+            if !mediaAssets.contains(where: { $0.url == outputURL }) {
+                importFileDirectly(url: outputURL, type: .video)
+            } else {
+                showImportToast("「\(url.lastPathComponent)」已在素材库中，已跳过")
+            }
             return
         }
 
@@ -1632,10 +1684,11 @@ final class ProjectState: ObservableObject {
         transcodingOutputURL = outputURL
 
         Task.detached { [weak self] in
-            // ═══════ 第一步：快速 remux（-c copy，不重新编码，秒完成） ═══════
+            // ═══════ 第一步：快速 remux（视频 copy，音频转 AAC 兼容 MP4） ═══════
             let remuxOK = Self.runFFmpegSync(ffmpeg: ffmpeg, arguments: [
                 "-i", url.path,
-                "-c", "copy",
+                "-c:v", "copy",
+                "-c:a", "aac", "-b:a", "192k",
                 "-movflags", "+faststart",
                 "-y", outputURL.path
             ])
@@ -2388,6 +2441,7 @@ final class ProjectState: ObservableObject {
             undoCount = undoStack.count
             redoCount = 0
             rebuildTimelinePreview()
+            scheduleAutoSave()
         }
     }
 

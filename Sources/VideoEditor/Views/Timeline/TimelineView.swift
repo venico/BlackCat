@@ -163,11 +163,14 @@ struct TimelineView: View {
     }()
 
     var body: some View {
+        GeometryReader { outerGeo in
         ScrollView(.vertical, showsIndicators: true) {
             HStack(alignment: .top, spacing: 0) {
                 labelColumn
                 clipArea
             }
+            .frame(minHeight: outerGeo.size.height)
+        }
         }
         .clipped()
         .overlay(alignment: .bottomTrailing) {
@@ -206,7 +209,7 @@ struct TimelineView: View {
                 return nil
             }
 
-            // ⌫ or ⌦ → 删除
+            // ⌫ or ⌦ → 删除（有撤销兜底，无需确认）
             if event.keyCode == 51 || event.keyCode == 117 {
                 project.deleteSelected()
                 return nil
@@ -355,9 +358,11 @@ struct TimelineView: View {
     private var clipArea: some View {
         GeometryReader { visibleGeo in
             let visibleW = visibleGeo.size.width
+            let visibleH = visibleGeo.size.height
             let _ = updateVisibleWidth(visibleW)
             let contentW = project.duration * project.pixelsPerSecond + 300
             let totalW = max(contentW, max(visibleW, 800))
+            let effectiveH = max(totalContentH(), visibleH)
             ScrollView(.horizontal, showsIndicators: false) {
                 ZStack(alignment: .topLeading) {
                     TimelineRuler(pps: project.pixelsPerSecond, duration: project.duration)
@@ -404,35 +409,22 @@ struct TimelineView: View {
                             .allowsHitTesting(false)
                     }
 
-                    // 吸附指示线
+                    // 吸附指示线（延伸到视口底部）
                     if let snapT = activeSnapTime {
                         let snapX = snapT * project.pixelsPerSecond
                         Rectangle()
                             .fill(Color.accent)
                             .frame(width: 1)
-                            .position(x: snapX, y: totalContentH() / 2)
-                            .frame(height: totalContentH())
+                            .position(x: snapX, y: effectiveH / 2)
+                            .frame(height: effectiveH)
                             .allowsHitTesting(false)
                     }
 
-                    DraggablePlayhead(pps: project.pixelsPerSecond)
+                    DraggablePlayhead(pps: project.pixelsPerSecond, fullHeight: effectiveH)
                 }
                 .frame(width: totalW, alignment: .topLeading)
-                .frame(minHeight: totalContentH())
+                .frame(minHeight: effectiveH)
                 .contentShape(Rectangle())
-                // Single tap on empty track area (below ruler, not on a clip) → seek.
-                .simultaneousGesture(
-                    SpatialTapGesture()
-                        .onEnded { value in
-                            let loc = value.location
-                            guard loc.y >= rulerH else { return }
-                            guard findClipTarget(at: loc) == nil else { return }
-                            let maxT = max(project.duration, totalW / project.pixelsPerSecond)
-                            let t = (loc.x / project.pixelsPerSecond)
-                                .clamped(to: 0...maxT)
-                            project.requestSeek(to: t)
-                        }
-                )
                 .onContinuousHover { phase in
                     guard dragOp == nil else { return }
                     switch phase {
@@ -492,7 +484,7 @@ struct TimelineView: View {
                 applyDrag(op: op, totalTranslation: v.translation, current: v.location)
             }
             .onEnded { v in
-                // 点击空白处（没有拖动）→ 取消所有选择
+                // 点击空白处（没有拖动）→ 取消所有选择 + 定位播放头
                 if dragOp == nil && v.startLocation.y >= rulerH {
                     if findClipTarget(at: v.startLocation) == nil {
                         project.selectedClipIDs.removeAll()
@@ -500,6 +492,9 @@ struct TimelineView: View {
                         project.selectedImageClipID    = nil
                         project.selectedAudioClipID    = nil
                         project.selectedSubtitleClipID = nil
+                        // 点击空白区域同时定位播放头
+                        let t = max(0, Double(v.startLocation.x) / project.pixelsPerSecond)
+                        project.requestSeek(to: t)
                     }
                 }
                 if case .box = dragOp, let s = boxStart, let e = boxEnd {
@@ -1880,22 +1875,22 @@ private struct TimelineRuler: View {
 private struct DraggablePlayhead: View {
     @EnvironmentObject private var project: ProjectState
     let pps: Double
+    let fullHeight: CGFloat
 
     var body: some View {
-        GeometryReader { geo in
-            let x = project.currentTime * pps
-            ZStack(alignment: .topLeading) {
-                Path { p in
-                    p.move(to: CGPoint(x: x,   y: 16))
-                    p.addLine(to: CGPoint(x: x-5, y: 6))
-                    p.addLine(to: CGPoint(x: x+5, y: 6))
-                    p.closeSubpath()
-                }.fill(Color.accent)
-                Rectangle().fill(Color.accent.opacity(0.7))
-                    .frame(width: 1, height: geo.size.height - 16)
-                    .offset(x: x - 0.5, y: 16)
-            }
+        let x = project.currentTime * pps
+        ZStack(alignment: .topLeading) {
+            Path { p in
+                p.move(to: CGPoint(x: x,   y: 16))
+                p.addLine(to: CGPoint(x: x-5, y: 6))
+                p.addLine(to: CGPoint(x: x+5, y: 6))
+                p.closeSubpath()
+            }.fill(Color.accent)
+            Rectangle().fill(Color.accent.opacity(0.7))
+                .frame(width: 1, height: fullHeight - 16)
+                .offset(x: x - 0.5, y: 16)
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .allowsHitTesting(false)
     }
 }

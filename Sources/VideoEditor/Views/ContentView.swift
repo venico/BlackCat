@@ -3,7 +3,13 @@ import AppKit
 import UniformTypeIdentifiers
 
 struct ContentView: View {
-    @StateObject private var project = ProjectState()
+    @StateObject private var project: ProjectState = {
+        let p = ProjectState()
+        if AppDelegate.pendingOpenURL != nil {
+            p.showWelcome = false
+        }
+        return p
+    }()
     @StateObject private var exportManager = ExportManager.shared
     @State private var topHeight: CGFloat = 420
     @State private var isDraggingH = false
@@ -157,6 +163,12 @@ struct ContentView: View {
         .overlay(alignment: .bottomTrailing) {
             ExportProgressOverlay(manager: exportManager)
         }
+        .overlay(alignment: .bottomTrailing) {
+            SaveToastStack()
+                .environmentObject(project)
+                .padding(.trailing, 16)
+                .padding(.bottom, 48)
+        }
         .environmentObject(project)
         .ignoresSafeArea()
         .animation(.spring(response: 0.28, dampingFraction: 0.82), value: sidebarVisible)
@@ -203,6 +215,34 @@ struct ContentView: View {
                 project.openProject(url: url)
             }
         }
+        .alert("确认移除素材", isPresented: $project.showAssetDeleteConfirm) {
+            Button("移除", role: .destructive) {
+                if let id = project.pendingDeleteAssetID {
+                    project.removeAssetAndClips(assetID: id)
+                    project.pendingDeleteAssetID = nil
+                }
+            }
+            Button("取消", role: .cancel) { project.pendingDeleteAssetID = nil }
+        } message: {
+            if let id = project.pendingDeleteAssetID {
+                let count = project.clipCountForAsset(id)
+                let name = project.mediaAssets.first(where: { $0.id == id })?.name ?? ""
+                if count > 0 {
+                    Text("「\(name)」在时间轴上有 \(count) 个片段引用，移除素材将同时删除这些片段。")
+                } else {
+                    Text("确定要移除「\(name)」吗？")
+                }
+            } else {
+                Text("确定要移除该素材吗？")
+            }
+        }
+        .onAppear {
+            if let url = AppDelegate.pendingOpenURL {
+                AppDelegate.pendingOpenURL = nil
+                project.showWelcome = false
+                project.openProject(url: url)
+            }
+        }
     }
 
     private var toggleButton: some View {
@@ -230,4 +270,32 @@ extension Color {
 
 extension Comparable {
     func clamped(to r: ClosedRange<Self>) -> Self { min(max(self, r.lowerBound), r.upperBound) }
+}
+
+// MARK: - Save Toast Stack
+
+struct SaveToastStack: View {
+    @EnvironmentObject private var project: ProjectState
+
+    var body: some View {
+        VStack(spacing: 6) {
+            ForEach(project.saveToasts, id: \.self) { _ in
+                HStack(spacing: 6) {
+                    Image(systemName: "checkmark.circle.fill")
+                        .font(.system(size: 12))
+                        .foregroundColor(.green)
+                    Text("已保存")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundColor(.white)
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 8)
+                .background(Color(white: 0.15).opacity(0.95))
+                .clipShape(RoundedRectangle(cornerRadius: 8))
+                .shadow(color: .black.opacity(0.3), radius: 4, y: 2)
+                .transition(.move(edge: .trailing).combined(with: .opacity))
+            }
+        }
+        .animation(.easeInOut(duration: 0.25), value: project.saveToasts.count)
+    }
 }

@@ -34,7 +34,7 @@ struct PlayerView: View {
             .overlay(alignment: .top) {
                 if hoveringPlayer {
                     HStack {
-                        Text(project.projectName)
+                        Text(project.projectName + (project.isSaved ? "（已保存）" : ""))
                             .font(.system(size: 11, weight: .medium))
                             .foregroundColor(.white)
                             .shadow(color: .black.opacity(0.8), radius: 3, x: 0, y: 1)

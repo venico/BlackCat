@@ -6,6 +6,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var window: NSWindow!
     private var isCleaningMenus = false
     private var cleanupTimer: Timer?
+    /// Finder 双击 bcj 文件时暂存 URL，等 view 就绪后再打开
+    static var pendingOpenURL: URL?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         setupMenuBar()
@@ -286,6 +288,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func application(_ application: NSApplication, open urls: [URL]) {
         for url in urls {
             if url.pathExtension.lowercased() == "bcj" {
+                AppDelegate.pendingOpenURL = url
                 NotificationCenter.default.post(name: .menuOpenProjectFile, object: url)
                 break
             }

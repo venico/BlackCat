@@ -200,7 +200,7 @@ private struct AssetRow: View {
                 Button("重新关联文件…") { relinkAsset() }
             }
             Divider()
-            Button("移除", role: .destructive) { project.mediaAssets.removeAll { $0.id == asset.id } }
+            Button("移除", role: .destructive) { confirmDeleteAsset() }
         }
     }
 
@@ -265,7 +265,7 @@ private struct AssetRow: View {
                         } else {
                             videoMiniBtn(icon: "arrow.triangle.2.circlepath") { relinkAsset() }
                         }
-                        videoMiniBtn(icon: "trash") { project.mediaAssets.removeAll { $0.id == asset.id } }
+                        videoMiniBtn(icon: "trash") { confirmDeleteAsset() }
                     }
                     .padding(4)
                 }
@@ -328,12 +328,17 @@ private struct AssetRow: View {
                     } else {
                         miniBtn(icon: "arrow.triangle.2.circlepath") { relinkAsset() }
                     }
-                    miniBtn(icon: "trash") { project.mediaAssets.removeAll { $0.id == asset.id } }
+                    miniBtn(icon: "trash") { confirmDeleteAsset() }
                 }
             }
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 7)
+    }
+
+    private func confirmDeleteAsset() {
+        project.pendingDeleteAssetID = asset.id
+        project.showAssetDeleteConfirm = true
     }
 
     private func relinkAsset() {
