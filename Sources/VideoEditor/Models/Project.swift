@@ -267,6 +267,33 @@ final class ProjectState: ObservableObject {
     @Published var pixelsPerSecond: Double = 30
     @Published var snapEnabled: Bool = true
     @Published var showImageTracks: Bool = true
+    var timelineVisibleWidth: Double = 800  // 由 GeometryReader 更新
+
+    /// 所有轨道内容的实际最大结束时间
+    var contentEndTime: Double {
+        var maxEnd: Double = 0
+        for t in videoTracks { for c in t.clips { maxEnd = max(maxEnd, c.endTime) } }
+        for t in audioTracks { for c in t.clips { maxEnd = max(maxEnd, c.endTime) } }
+        for t in imageTracks { for c in t.clips { maxEnd = max(maxEnd, c.endTime) } }
+        for t in subtitleTracks { for c in t.clips { maxEnd = max(maxEnd, c.endTime) } }
+        return maxEnd
+    }
+
+    /// 缩放下限：确保缩到最小时能完整显示所有内容并有富余
+    var minPixelsPerSecond: Double {
+        let end = contentEndTime
+        guard end > 0 else { return 0.4 }
+        // 让内容只占可见区域的 85%，留出 15% 富余
+        return (timelineVisibleWidth * 0.85) / end
+    }
+
+    /// 缩放至适合：让所有内容刚好填满时间轴可见区域
+    func zoomToFit() {
+        let end = contentEndTime
+        guard end > 0 else { return }
+        let availableWidth = max(timelineVisibleWidth - 40, 100)
+        pixelsPerSecond = availableWidth / end
+    }
     @Published var showVideoTracks: Bool = true
     @Published var showAudioTracks: Bool = true
     @Published var showSubtitleTracks: Bool = true
@@ -298,6 +325,13 @@ final class ProjectState: ObservableObject {
     @Published var saveToasts: [UUID] = []
     /// Toast message for import feedback (e.g. duplicate file skipped)
     @Published var importToastMessage: String? = nil
+
+    // 转码状态
+    @Published var isTranscoding: Bool = false
+    @Published var transcodingFileName: String = ""
+    @Published var transcodingProgress: Double = 0  // 0...1
+    private var transcodingProcess: Process?
+    private var transcodingOutputURL: URL?
 
     // Export
     @Published var exportSettings  = ExportSettings()
@@ -1477,16 +1511,24 @@ final class ProjectState: ObservableObject {
 
     /// 支持的素材扩展名
     private static let supportedExtensions: Set<String> = [
-        "mp4","mov","mkv","avi","m4v",
-        "mp3","wav","aac","m4a","flac",
+        "mp4","mov","mkv","avi","m4v","wmv","flv","ts","mts","m2ts","webm","3gp","mpg","mpeg","vob","rm","rmvb","f4v","ogv",
+        "mp3","wav","aac","m4a","flac","ogg","wma",
         "srt","ass","vtt",
         "png","jpg","jpeg","gif","bmp","tiff","tif","webp","heic"
     ]
 
+    /// AVFoundation 原生支持的视频容器，无需转码
+    private static let nativeVideoExtensions: Set<String> = ["mp4","mov","m4v"]
+
+    /// 需要 FFmpeg 转码的视频格式
+    private static let needsTranscodeExtensions: Set<String> = [
+        "mkv","avi","wmv","flv","ts","mts","m2ts","webm","3gp","mpg","mpeg","vob","rm","rmvb","f4v","ogv"
+    ]
+
     private static func assetType(for ext: String) -> AssetType? {
         switch ext {
-        case "mp4","mov","mkv","avi","m4v": return .video
-        case "mp3","wav","aac","m4a","flac": return .audio
+        case "mp4","mov","mkv","avi","m4v","wmv","flv","ts","mts","m2ts","webm","3gp","mpg","mpeg","vob","rm","rmvb","f4v","ogv": return .video
+        case "mp3","wav","aac","m4a","flac","ogg","wma": return .audio
         case "srt","ass","vtt": return .subtitle
         case "png","jpg","jpeg","gif","bmp","tiff","tif","webp","heic": return .image
         default: return nil
@@ -1513,6 +1555,18 @@ final class ProjectState: ObservableObject {
         }
         let ext = url.pathExtension.lowercased()
         guard let type = Self.assetType(for: ext) else { return }
+
+        // 需要转码的视频格式，先转为 MP4 再导入
+        if type == .video && Self.needsTranscodeExtensions.contains(ext) {
+            transcodeAndImport(url: url)
+            return
+        }
+
+        importFileDirectly(url: url, type: type)
+    }
+
+    /// 直接导入（原生格式或转码完成后的文件）
+    private func importFileDirectly(url: URL, type: AssetType) {
         let asset = MediaAsset(url: url, name: url.lastPathComponent, type: type)
         let aid = asset.id
         mediaAssets.append(asset)
@@ -1537,6 +1591,222 @@ final class ProjectState: ObservableObject {
                 }
             }
         }
+    }
+
+    // MARK: - FFmpeg Transcode
+
+    /// 取消当前转码，终止进程并清除临时文件
+    func cancelTranscoding() {
+        transcodingProcess?.terminate()
+        transcodingProcess = nil
+        isTranscoding = false
+        transcodingProgress = 0
+        transcodingFileName = ""
+        // 删除未完成的临时文件
+        if let outputURL = transcodingOutputURL {
+            try? FileManager.default.removeItem(at: outputURL)
+            transcodingOutputURL = nil
+        }
+    }
+
+    /// 将非原生视频格式转为 MP4。策略：先快速 remux（-c copy），失败再硬件转码
+    private func transcodeAndImport(url: URL) {
+        let fileName = url.deletingPathExtension().lastPathComponent
+        let outputDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("BlackCatTranscode", isDirectory: true)
+        try? FileManager.default.createDirectory(at: outputDir, withIntermediateDirectories: true)
+        let outputURL = outputDir.appendingPathComponent("\(fileName).mp4")
+
+        // 如果已处理过，直接导入
+        if FileManager.default.fileExists(atPath: outputURL.path) {
+            importFileDirectly(url: outputURL, type: .video)
+            return
+        }
+
+        // 查找 ffmpeg
+        guard let ffmpeg = Self.findFFmpeg() else {
+            showImportToast("未找到 FFmpeg，无法导入 \(url.pathExtension.uppercased()) 格式")
+            return
+        }
+
+        transcodingOutputURL = outputURL
+
+        Task.detached { [weak self] in
+            // ═══════ 第一步：快速 remux（-c copy，不重新编码，秒完成） ═══════
+            let remuxOK = Self.runFFmpegSync(ffmpeg: ffmpeg, arguments: [
+                "-i", url.path,
+                "-c", "copy",
+                "-movflags", "+faststart",
+                "-y", outputURL.path
+            ])
+
+            if remuxOK {
+                // 验证 AVFoundation 能否播放（H.264/H.265 可以，VP9/AV1 不行）
+                let asset = AVURLAsset(url: outputURL)
+                let playable = (try? await asset.load(.isPlayable)) ?? false
+                if playable {
+                    await MainActor.run {
+                        self?.importFileDirectly(url: outputURL, type: .video)
+                    }
+                    return
+                }
+                // 编码不兼容，删掉 remux 文件，走转码
+                try? FileManager.default.removeItem(at: outputURL)
+            }
+
+            // ═══════ 第二步：硬件转码（仅当 remux 不可用时） ═══════
+            await MainActor.run {
+                self?.isTranscoding = true
+                self?.transcodingFileName = url.lastPathComponent
+                self?.transcodingProgress = 0
+            }
+
+            let totalDuration = Self.probeVideoDuration(ffmpegDir: ffmpeg.deletingLastPathComponent().path, inputPath: url.path)
+
+            let process = Process()
+            await MainActor.run { self?.transcodingProcess = process }
+            process.executableURL = ffmpeg
+            process.arguments = [
+                "-hwaccel", "videotoolbox",
+                "-i", url.path,
+                "-c:v", "h264_videotoolbox",
+                "-b:v", "8000k",
+                "-profile:v", "high",
+                "-level:v", "4.2",
+                "-c:a", "aac", "-b:a", "192k",
+                "-movflags", "+faststart",
+                "-y", outputURL.path
+            ]
+
+            let pipe = Pipe()
+            process.standardError = pipe
+
+            do {
+                try process.run()
+            } catch {
+                await MainActor.run {
+                    self?.isTranscoding = false
+                    self?.showImportToast("转码失败：\(error.localizedDescription)")
+                }
+                return
+            }
+
+            // 解析进度
+            let handle = pipe.fileHandleForReading
+            var buffer = ""
+            while process.isRunning {
+                if let data = try? handle.availableData, !data.isEmpty,
+                   let str = String(data: data, encoding: .utf8) {
+                    buffer += str
+                    if let range = buffer.range(of: "time=\\d{2}:\\d{2}:\\d{2}\\.\\d+", options: .regularExpression) {
+                        let timeStr = String(buffer[range]).replacingOccurrences(of: "time=", with: "")
+                        let currentSec = Self.parseFFmpegTime(timeStr)
+                        if totalDuration > 0 {
+                            let prog = min(currentSec / totalDuration, 1.0)
+                            Task { @MainActor in self?.transcodingProgress = prog }
+                        }
+                        if let lastCR = buffer.lastIndex(of: "\r") {
+                            buffer = String(buffer[buffer.index(after: lastCR)...])
+                        }
+                    }
+                }
+                Thread.sleep(forTimeInterval: 0.1)
+            }
+            process.waitUntilExit()
+
+            await MainActor.run {
+                self?.isTranscoding = false
+                self?.transcodingProgress = 0
+                self?.transcodingProcess = nil
+                if process.terminationStatus == 0 {
+                    self?.importFileDirectly(url: outputURL, type: .video)
+                    self?.showImportToast("「\(url.lastPathComponent)」导入完成")
+                } else {
+                    self?.showImportToast("转码失败，FFmpeg 退出码: \(process.terminationStatus)")
+                }
+            }
+        }
+    }
+
+    /// 同步执行 FFmpeg 命令，返回是否成功
+    private static func runFFmpegSync(ffmpeg: URL, arguments: [String]) -> Bool {
+        let proc = Process()
+        proc.executableURL = ffmpeg
+        proc.arguments = arguments
+        proc.standardOutput = FileHandle.nullDevice
+        proc.standardError = FileHandle.nullDevice
+        do {
+            try proc.run()
+            proc.waitUntilExit()
+            return proc.terminationStatus == 0
+        } catch {
+            return false
+        }
+    }
+
+    /// 查找 FFmpeg 可执行文件
+    private static func findFFmpeg() -> URL? {
+        // 优先从 app bundle 内部查找（已内置）
+        if let bundlePath = Bundle.main.executableURL?.deletingLastPathComponent() {
+            let bundledFFmpeg = bundlePath.appendingPathComponent("ffmpeg")
+            if FileManager.default.isExecutableFile(atPath: bundledFFmpeg.path) {
+                return bundledFFmpeg
+            }
+        }
+        // 回退到系统安装的版本
+        let candidates = [
+            "/opt/homebrew/bin/ffmpeg",
+            "/usr/local/bin/ffmpeg",
+            "/usr/bin/ffmpeg"
+        ]
+        for path in candidates {
+            if FileManager.default.isExecutableFile(atPath: path) {
+                return URL(fileURLWithPath: path)
+            }
+        }
+        // 尝试通过 which 查找
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/which")
+        proc.arguments = ["ffmpeg"]
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        try? proc.run()
+        proc.waitUntilExit()
+        if let data = try? pipe.fileHandleForReading.readDataToEndOfFile(),
+           let path = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !path.isEmpty {
+            return URL(fileURLWithPath: path)
+        }
+        return nil
+    }
+
+    /// 用 ffprobe 获取视频总时长（秒）
+    private static func probeVideoDuration(ffmpegDir: String, inputPath: String) -> Double {
+        let probePath = ffmpegDir + "/ffprobe"
+        guard FileManager.default.isExecutableFile(atPath: probePath) else { return 0 }
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: probePath)
+        proc.arguments = ["-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", inputPath]
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        try? proc.run()
+        proc.waitUntilExit()
+        if let data = try? pipe.fileHandleForReading.readDataToEndOfFile(),
+           let str = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
+           let dur = Double(str) {
+            return dur
+        }
+        return 0
+    }
+
+    /// 解析 FFmpeg 的 "HH:MM:SS.xx" 时间格式为秒数
+    private static func parseFFmpegTime(_ str: String) -> Double {
+        let parts = str.split(separator: ":")
+        guard parts.count == 3,
+              let h = Double(parts[0]),
+              let m = Double(parts[1]),
+              let s = Double(parts[2]) else { return 0 }
+        return h * 3600 + m * 60 + s
     }
 
     /// 递归扫描文件夹，导入所有支持的素材

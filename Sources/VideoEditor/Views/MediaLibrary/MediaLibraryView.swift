@@ -115,6 +115,16 @@ struct MediaLibraryView: View {
 
             Spacer()
 
+            // Transcoding progress indicator
+            if project.isTranscoding {
+                TranscodingProgressView(
+                    fileName: project.transcodingFileName,
+                    progress: project.transcodingProgress
+                )
+                .padding(.horizontal, 8)
+                .padding(.bottom, 4)
+            }
+
             // Bottom actions
             VStack(spacing: 8) {
                 ImportButton()
@@ -449,5 +459,63 @@ private struct ExportButton: View {
             .clipShape(RoundedRectangle(cornerRadius: 8))
         }
         .buttonStyle(.plain)
+    }
+}
+
+// MARK: - Transcoding Progress View
+
+private struct TranscodingProgressView: View {
+    @EnvironmentObject private var project: ProjectState
+    let fileName: String
+    let progress: Double
+
+    var body: some View {
+        VStack(spacing: 6) {
+            HStack(spacing: 6) {
+                ProgressView()
+                    .controlSize(.small)
+                    .scaleEffect(0.7)
+                Text("转码中…")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundColor(Color.labelPrimary)
+                Spacer()
+                Text("\(Int(progress * 100))%")
+                    .font(.system(size: 11).monospacedDigit())
+                    .foregroundColor(Color.labelSecondary)
+                // 关闭按钮
+                Button { project.cancelTranscoding() } label: {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 9, weight: .bold))
+                        .foregroundColor(Color.labelSecondary)
+                        .frame(width: 16, height: 16)
+                        .background(Color.white.opacity(0.1))
+                        .clipShape(Circle())
+                }
+                .buttonStyle(.plain)
+                .help("取消转码")
+            }
+
+            // Progress bar
+            GeometryReader { geo in
+                ZStack(alignment: .leading) {
+                    RoundedRectangle(cornerRadius: 2)
+                        .fill(Color.white.opacity(0.1))
+                        .frame(height: 4)
+                    RoundedRectangle(cornerRadius: 2)
+                        .fill(Color.accent)
+                        .frame(width: geo.size.width * CGFloat(progress), height: 4)
+                }
+            }
+            .frame(height: 4)
+
+            Text(fileName)
+                .font(.system(size: 10))
+                .foregroundColor(Color.labelSecondary)
+                .lineLimit(1)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(10)
+        .background(Color.white.opacity(0.06))
+        .clipShape(RoundedRectangle(cornerRadius: 8))
     }
 }

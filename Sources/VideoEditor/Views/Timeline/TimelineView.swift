@@ -257,7 +257,7 @@ struct TimelineView: View {
             DispatchQueue.main.async {
                 let factor = delta > 0 ? 1.08 : 1.0 / 1.08
                 project.pixelsPerSecond = (project.pixelsPerSecond * Double(factor))
-                    .clamped(to: 0.4...3000)
+                    .clamped(to: project.minPixelsPerSecond...3000)
             }
             return nil  // consume — prevents scroll view from also scrolling
         }
@@ -344,11 +344,18 @@ struct TimelineView: View {
         .background(Color(red:0.09,green:0.09,blue:0.10))
     }
 
+    private func updateVisibleWidth(_ w: Double) {
+        if abs(project.timelineVisibleWidth - w) > 1 {
+            DispatchQueue.main.async { project.timelineVisibleWidth = w }
+        }
+    }
+
     // MARK: Clip scroll area
 
     private var clipArea: some View {
         GeometryReader { visibleGeo in
             let visibleW = visibleGeo.size.width
+            let _ = updateVisibleWidth(visibleW)
             let contentW = project.duration * project.pixelsPerSecond + 300
             let totalW = max(contentW, max(visibleW, 800))
             ScrollView(.horizontal, showsIndicators: false) {
@@ -1499,7 +1506,6 @@ private struct VideoClipView: View {
             project.selectedAudioClipID    = nil
             project.selectedSubtitleClipID = nil
             project.selectedClipIDs.removeAll()
-            project.loadClipForPreview(clip)
         })
         .contextMenu {
             Button { project.selectLeftOf(clip.id) } label: { Label("向左全选", systemImage: "arrow.left.to.line") }
@@ -1960,8 +1966,9 @@ struct TimelineToolbar: View {
 
             // 右侧：缩放
             HStack(spacing:6) {
-                TBtn(icon:"minus.magnifyingglass", help:"缩小") { project.pixelsPerSecond = max(0.4, project.pixelsPerSecond/1.5) }
-                LogSlider(value: $project.pixelsPerSecond, range: 0.4...3000).frame(width:100).help("时间轴缩放")
+                TBtn(icon:"arrow.left.and.right.square", help:"缩放至适合") { project.zoomToFit() }
+                TBtn(icon:"minus.magnifyingglass", help:"缩小") { project.pixelsPerSecond = max(project.minPixelsPerSecond, project.pixelsPerSecond/1.5) }
+                LogSlider(value: $project.pixelsPerSecond, range: project.minPixelsPerSecond...3000).frame(width:100).help("时间轴缩放")
                 TBtn(icon:"plus.magnifyingglass", help:"放大")  { project.pixelsPerSecond = min(3000, project.pixelsPerSecond*1.5) }
             }.padding(.trailing,12)
         }
