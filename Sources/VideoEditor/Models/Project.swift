@@ -139,6 +139,11 @@ struct AudioClip: Identifiable, Equatable, Codable {
     var rightChannel: Float = 1.0
     var sampleRate: Int = 44100
     var format: String = "AAC"
+    // 淡入淡出
+    var fadeInEnabled: Bool   = false
+    var fadeOutEnabled: Bool  = false
+    var fadeInDuration: Double  = 1.0  // seconds
+    var fadeOutDuration: Double = 1.0  // seconds
 }
 
 struct ImageClip: Identifiable, Equatable, Codable {
@@ -228,6 +233,7 @@ struct ProjectSnapshot {
     var subtitleTracks: [Track<SubtitleClip>]
     var subtitleStyles: [SubtitleStyle]
     var duration: Double
+    var mediaAssets: [MediaAsset]? = nil  // optional: only saved when asset list changes (e.g. removeAsset)
 }
 
 // MARK: - Project State
@@ -288,6 +294,10 @@ final class ProjectState: ObservableObject {
     @Published var projectName: String = "未命名项目"
     @Published var projectFileURL: URL? = nil
     @Published var showWelcome: Bool = true
+    @Published var isSaved: Bool = false
+    @Published var saveToasts: [UUID] = []
+    /// Toast message for import feedback (e.g. duplicate file skipped)
+    @Published var importToastMessage: String? = nil
 
     // Export
     @Published var exportSettings  = ExportSettings()
@@ -317,6 +327,9 @@ final class ProjectState: ObservableObject {
     // Debounce timer for preview rebuild (prevents flickering during interactive edits)
     private var rebuildDebounceTimer: Timer?
     private var rebuildTask: Task<Void, Never>?
+
+    // Auto-save timer (debounced 3 seconds after last edit)
+    private var autoSaveTimer: Timer?
 
     // Thumbnail & Waveform cache
     @Published var mediaThumbnails: [UUID: NSImage] = [:]          // asset ID → single thumbnail (media library)
@@ -384,24 +397,58 @@ final class ProjectState: ObservableObject {
         imageVideoCache.removeAll()
         playerItem = nil
         showWelcome = false
+        isSaved = true
         // 为保留的素材重新生成缩略图
         for asset in mediaAssets {
             if mediaThumbnails[asset.id] == nil {
                 loadMediaResources(asset)
             }
         }
-        saveProject()
+        saveProject(silent: true)
     }
 
     func openProject(url: URL) {
+        // 检查文件是否存在
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            DispatchQueue.main.async {
+                let alert = NSAlert()
+                alert.alertStyle = .warning
+                alert.messageText = "无法打开项目"
+                alert.informativeText = "文件不存在：\(url.lastPathComponent)\n路径：\(url.path)"
+                alert.addButton(withTitle: "确定")
+                alert.runModal()
+            }
+            return
+        }
+
         guard url.startAccessingSecurityScopedResource() else { return }
         accessedURLs.append(url)
         defer { /* keep access alive */ }
 
-        guard let data = try? Data(contentsOf: url) else { return }
-        guard let doc = try? JSONDecoder().decode(ProjectDocument.self, from: data) else { return }
+        guard let data = try? Data(contentsOf: url) else {
+            DispatchQueue.main.async {
+                let alert = NSAlert()
+                alert.alertStyle = .warning
+                alert.messageText = "无法读取项目"
+                alert.informativeText = "文件可能已损坏：\(url.lastPathComponent)"
+                alert.addButton(withTitle: "确定")
+                alert.runModal()
+            }
+            return
+        }
+        guard let doc = try? JSONDecoder().decode(ProjectDocument.self, from: data) else {
+            DispatchQueue.main.async {
+                let alert = NSAlert()
+                alert.alertStyle = .warning
+                alert.messageText = "无法解析项目"
+                alert.informativeText = "文件格式不正确：\(url.lastPathComponent)"
+                alert.addButton(withTitle: "确定")
+                alert.runModal()
+            }
+            return
+        }
 
-        projectName = doc.name
+        projectName = url.deletingPathExtension().lastPathComponent
         projectFileURL = url
         videoTracks = doc.videoTracks
         audioTracks = doc.audioTracks
@@ -442,10 +489,21 @@ final class ProjectState: ObservableObject {
         undoCount = 0; redoCount = 0
         currentTime = 0
         showWelcome = false
+        isSaved = true
         rebuildTimelinePreview()
     }
 
-    func saveProject() {
+    /// Schedule auto-save after a 3-second idle period.
+    /// Each call resets the timer, so rapid edits are batched.
+    func scheduleAutoSave() {
+        autoSaveTimer?.invalidate()
+        autoSaveTimer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: false) { [weak self] _ in
+            guard let self = self, !self.isSaved, self.projectFileURL != nil else { return }
+            self.saveProject(silent: true)
+        }
+    }
+
+    func saveProject(silent: Bool = false) {
         guard let fileURL = projectFileURL else { return }
         let doc = ProjectDocument(
             name: projectName,
@@ -462,6 +520,80 @@ final class ProjectState: ObservableObject {
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         guard let data = try? encoder.encode(doc) else { return }
         try? data.write(to: fileURL, options: .atomic)
+        isSaved = true
+        guard !silent else { return }
+        let toastID = UUID()
+        if saveToasts.count >= 5 { saveToasts.removeFirst() }
+        saveToasts.append(toastID)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
+            self?.saveToasts.removeAll { $0 == toastID }
+        }
+    }
+
+    /// Show a brief import feedback toast (auto-dismiss after 3 seconds)
+    private func showImportToast(_ message: String) {
+        importToastMessage = message
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
+            if self?.importToastMessage == message {
+                self?.importToastMessage = nil
+            }
+        }
+    }
+
+    /// Remove an asset from the media library AND remove any timeline clips
+    /// referencing it (with undo support including asset restoration).
+    /// Shows a confirmation alert before proceeding.
+    func removeAsset(id: UUID) {
+        let assetName = mediaAssets.first(where: { $0.id == id })?.name ?? "未知素材"
+
+        // Count timeline clips that reference this asset
+        var clipCount = 0
+        for t in videoTracks  { clipCount += t.clips.filter { $0.assetID == id }.count }
+        for t in audioTracks  { clipCount += t.clips.filter { $0.assetID == id }.count }
+        for t in imageTracks  { clipCount += t.clips.filter { $0.assetID == id }.count }
+
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "确定移除「\(assetName)」？"
+        if clipCount > 0 {
+            alert.informativeText = "时间轴上有 \(clipCount) 个片段使用了此素材，将一并移除。"
+        } else {
+            alert.informativeText = "素材将从素材库中移除。"
+        }
+        alert.addButton(withTitle: "移除")
+        alert.addButton(withTitle: "取消")
+
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        // User confirmed — save snapshot WITH mediaAssets for undo
+        var snapshot = currentSnapshot()
+        snapshot.mediaAssets = mediaAssets
+        undoStack.append(snapshot)
+        if undoStack.count > 50 { undoStack.removeFirst() }
+        redoStack.removeAll()
+        undoCount = undoStack.count
+        redoCount = 0
+        lastUndoPushTime = Date()
+        isSaved = false
+        scheduleAutoSave()
+
+        // Remove timeline clips
+        for i in videoTracks.indices  { videoTracks[i].clips.removeAll  { $0.assetID == id } }
+        for i in audioTracks.indices  { audioTracks[i].clips.removeAll  { $0.assetID == id } }
+        for i in imageTracks.indices  { imageTracks[i].clips.removeAll  { $0.assetID == id } }
+        // Clean up caches
+        mediaThumbnails.removeValue(forKey: id)
+        assetThumbnails.removeValue(forKey: id)
+        waveformCache.removeValue(forKey: id)
+        imageVideoCache.removeValue(forKey: id)
+        // Remove from asset list
+        mediaAssets.removeAll { $0.id == id }
+        // Deselect
+        selectedVideoClipID = nil
+        selectedAudioClipID = nil
+        selectedImageClipID = nil
+        selectedClipIDs.removeAll()
+        rebuildTimelinePreview()
     }
 
     private func saveMediaLibrary(_ assets: [MediaAsset]) {
@@ -910,8 +1042,17 @@ final class ProjectState: ObservableObject {
         }
     }
 
+    /// 把当前主选中片段合并进 selectedClipIDs（用于向左/右全选等场景）
+    private func mergePrimaryIntoSelection() {
+        if let pid = selectedVideoClipID    { selectedClipIDs.insert(pid) }
+        if let pid = selectedImageClipID    { selectedClipIDs.insert(pid) }
+        if let pid = selectedAudioClipID    { selectedClipIDs.insert(pid) }
+        if let pid = selectedSubtitleClipID { selectedClipIDs.insert(pid) }
+    }
+
     /// 向左全选：选中同轨道中 startTime <= 当前片段的所有片段
     func selectLeftOf(_ id: UUID) {
+        mergePrimaryIntoSelection()
         for track in videoTracks {
             if let clip = track.clips.first(where: { $0.id == id }) {
                 selectedClipIDs.formUnion(track.clips.filter { $0.startTime <= clip.startTime }.map(\.id)); return
@@ -936,6 +1077,7 @@ final class ProjectState: ObservableObject {
 
     /// 向右全选：选中同轨道中 startTime >= 当前片段的所有片段
     func selectRightOf(_ id: UUID) {
+        mergePrimaryIntoSelection()
         for track in videoTracks {
             if let clip = track.clips.first(where: { $0.id == id }) {
                 selectedClipIDs.formUnion(track.clips.filter { $0.startTime >= clip.startTime }.map(\.id)); return
@@ -989,7 +1131,7 @@ final class ProjectState: ObservableObject {
         rebuildTask?.cancel()
         rebuildTask = Task {
             let composition = AVMutableComposition()
-            var audioParams: [(trackID: CMPersistentTrackID, volume: Float, left: Float, right: Float)] = []
+            var audioParams: [(trackID: CMPersistentTrackID, volume: Float, left: Float, right: Float, startTime: Double, duration: Double, fadeIn: Double, fadeOut: Double)] = []
             var videoCompTracks: [(track: AVMutableCompositionTrack, clip: VideoClip, startTime: Double, endTime: Double)] = []  // from video clips
             var imageCompTracks: [(track: AVMutableCompositionTrack, clip: ImageClip)] = []  // from image clips (on top)
             let renderSize = previewRenderSize
@@ -1019,7 +1161,7 @@ final class ProjectState: ObservableObject {
                        let at2 = composition.addMutableTrack(withMediaType: .audio,
                                                              preferredTrackID: kCMPersistentTrackID_Invalid) {
                         try? at2.insertTimeRange(range, of: aAsset, at: at)
-                        audioParams.append((at2.trackID, clip.volume, 1.0, 1.0))
+                        audioParams.append((at2.trackID, clip.volume, 1.0, 1.0, clip.startTime, useDur.seconds, 0, 0))
                     }
                 }
             }
@@ -1100,7 +1242,9 @@ final class ProjectState: ObservableObject {
                     if let at2 = composition.addMutableTrack(withMediaType: .audio,
                                                              preferredTrackID: kCMPersistentTrackID_Invalid) {
                         try? at2.insertTimeRange(range, of: aAsset, at: at)
-                        audioParams.append((at2.trackID, clip.volume, clip.leftChannel, clip.rightChannel))
+                        let fadeIn  = clip.fadeInEnabled  ? min(clip.fadeInDuration,  clip.duration) : 0
+                        let fadeOut = clip.fadeOutEnabled ? min(clip.fadeOutDuration, clip.duration) : 0
+                        audioParams.append((at2.trackID, clip.volume, clip.leftChannel, clip.rightChannel, clip.startTime, useDur.seconds, fadeIn, fadeOut))
                     }
                 }
             }
@@ -1116,12 +1260,40 @@ final class ProjectState: ObservableObject {
                 }
             }
 
-            // 构建 AudioMix — 音量 + 左右声道
+            // 构建 AudioMix — 音量 + 淡入淡出 + 左右声道
             let audioMix = AVMutableAudioMix()
             audioMix.inputParameters = audioParams.map { param in
                 let p = AVMutableAudioMixInputParameters(track: composition.track(withTrackID: param.trackID))
                 p.trackID = param.trackID
-                p.setVolume(param.volume, at: .zero)
+                let ts: CMTimeScale = 600
+                let clipStart = CMTime(seconds: param.startTime, preferredTimescale: ts)
+                let clipDur   = param.duration
+                if param.fadeIn > 0 {
+                    // 淡入：从 0 → volume
+                    p.setVolumeRamp(fromStartVolume: 0, toEndVolume: param.volume,
+                                    timeRange: CMTimeRange(start: clipStart,
+                                                           duration: CMTime(seconds: param.fadeIn, preferredTimescale: ts)))
+                }
+                if param.fadeOut > 0 {
+                    // 淡出：从 volume → 0
+                    let fadeOutStart = CMTime(seconds: param.startTime + clipDur - param.fadeOut, preferredTimescale: ts)
+                    p.setVolumeRamp(fromStartVolume: param.volume, toEndVolume: 0,
+                                    timeRange: CMTimeRange(start: fadeOutStart,
+                                                           duration: CMTime(seconds: param.fadeOut, preferredTimescale: ts)))
+                }
+                // 中间段保持基准音量（淡入结束到淡出开始）
+                if param.fadeIn > 0 || param.fadeOut > 0 {
+                    let midStart = CMTime(seconds: param.startTime + param.fadeIn, preferredTimescale: ts)
+                    let midEnd   = param.startTime + clipDur - param.fadeOut
+                    let midDur   = midEnd - (param.startTime + param.fadeIn)
+                    if midDur > 0 {
+                        p.setVolumeRamp(fromStartVolume: param.volume, toEndVolume: param.volume,
+                                        timeRange: CMTimeRange(start: midStart,
+                                                               duration: CMTime(seconds: midDur, preferredTimescale: ts)))
+                    }
+                } else {
+                    p.setVolume(param.volume, at: .zero)
+                }
                 // 左右声道不全是 1.0 时，用 MTAudioProcessingTap 处理
                 if param.left != 1.0 || param.right != 1.0 {
                     if let tap = makeChannelTap(left: param.left, right: param.right) {
@@ -1335,7 +1507,10 @@ final class ProjectState: ObservableObject {
             return
         }
 
-        guard !mediaAssets.contains(where: { $0.url == url }) else { return }
+        guard !mediaAssets.contains(where: { $0.url == url }) else {
+            showImportToast("「\(url.lastPathComponent)」已在素材库中，已跳过")
+            return
+        }
         let ext = url.pathExtension.lowercased()
         guard let type = Self.assetType(for: ext) else { return }
         let asset = MediaAsset(url: url, name: url.lastPathComponent, type: type)
@@ -1398,10 +1573,11 @@ final class ProjectState: ObservableObject {
                    let sz = try? await vTrack.load(.naturalSize) {
                     natW = sz.width; natH = sz.height
                 }
+                let finalW = natW, finalH = natH
                 await MainActor.run {
                     self.videoTracks[trackIdx].clips.append(
                         VideoClip(assetID: asset.id, name: asset.name, url: asset.url,
-                                  startTime: 0, endTime: dur, videoWidth: natW, videoHeight: natH))
+                                  startTime: 0, endTime: dur, videoWidth: finalW, videoHeight: finalH))
                     self.duration = max(self.duration, dur)
                     if let i = self.mediaAssets.firstIndex(where:{ $0.id == asset.id }) { self.mediaAssets[i].duration = dur }
                     self.rebuildTimelinePreview()
@@ -1484,6 +1660,92 @@ final class ProjectState: ObservableObject {
             } else {
                 rebuildTimelinePreview()
             }
+        }
+    }
+
+    /// Add asset to timeline at a specific time position (used for drag-drop from media library)
+    func addToTimelineAt(_ asset: MediaAsset, time: Double) {
+        pushUndo()
+        let insertTime = max(0, time)
+        switch asset.type {
+        case .video:
+            let trackIdx: Int
+            if let emptyIdx = videoTracks.firstIndex(where: { $0.clips.isEmpty }) {
+                trackIdx = emptyIdx
+            } else {
+                videoTracks.append(Track(label: "视频"))
+                trackIdx = videoTracks.count - 1
+            }
+            Task {
+                let avAsset = AVURLAsset(url: asset.url)
+                let dur = (try? await avAsset.load(.duration))?.seconds ?? 30
+                var natW: Double = 0, natH: Double = 0
+                if let vTrack = try? await avAsset.loadTracks(withMediaType: .video).first,
+                   let sz = try? await vTrack.load(.naturalSize) {
+                    natW = sz.width; natH = sz.height
+                }
+                let finalW = natW, finalH = natH
+                await MainActor.run {
+                    self.videoTracks[trackIdx].clips.append(
+                        VideoClip(assetID: asset.id, name: asset.name, url: asset.url,
+                                  startTime: insertTime, endTime: insertTime + dur,
+                                  videoWidth: finalW, videoHeight: finalH))
+                    self.duration = max(self.duration, insertTime + dur)
+                    if let i = self.mediaAssets.firstIndex(where: { $0.id == asset.id }) { self.mediaAssets[i].duration = dur }
+                    self.rebuildTimelinePreview()
+                }
+            }
+        case .audio:
+            if audioTracks.isEmpty { audioTracks.append(Track(label: "音频")) }
+            Task {
+                let dur = (try? await AVURLAsset(url: asset.url).load(.duration))?.seconds ?? 30
+                await MainActor.run {
+                    self.audioTracks[0].clips.append(
+                        AudioClip(assetID: asset.id, name: asset.name, url: asset.url,
+                                  startTime: insertTime, endTime: insertTime + dur))
+                    self.duration = max(self.duration, insertTime + dur)
+                    if let i = self.mediaAssets.firstIndex(where: { $0.id == asset.id }) { self.mediaAssets[i].duration = dur }
+                    self.rebuildTimelinePreview()
+                }
+            }
+        case .image:
+            let trackIdx: Int
+            if let emptyIdx = imageTracks.firstIndex(where: { $0.clips.isEmpty }) {
+                trackIdx = emptyIdx
+            } else {
+                imageTracks.append(Track(label: "图片"))
+                trackIdx = imageTracks.count - 1
+            }
+            let dur = 5.0
+            let videoURL = imageVideoCache[asset.id]
+            var imgW = 0, imgH = 0
+            if let img = NSImage(contentsOf: asset.url),
+               let cg = img.cgImage(forProposedRect: nil, context: nil, hints: nil) {
+                imgW = cg.width; imgH = cg.height
+            }
+            imageTracks[trackIdx].clips.append(
+                ImageClip(assetID: asset.id, name: asset.name, imageURL: asset.url,
+                          videoURL: videoURL, startTime: insertTime, endTime: insertTime + dur,
+                          imageWidth: imgW, imageHeight: imgH))
+            duration = max(duration, insertTime + dur)
+            if videoURL == nil {
+                let aid = asset.id; let imgURL = asset.url; let ti = trackIdx
+                Task {
+                    guard let vURL = await Self.createVideoFromImage(imageURL: imgURL, duration: dur) else { return }
+                    await MainActor.run {
+                        self.imageVideoCache[aid] = vURL
+                        for ci in self.imageTracks[ti].clips.indices where self.imageTracks[ti].clips[ci].assetID == aid {
+                            self.imageTracks[ti].clips[ci].videoURL = vURL
+                        }
+                        self.rebuildTimelinePreview()
+                    }
+                }
+            } else {
+                rebuildTimelinePreview()
+            }
+        case .subtitle:
+            // Subtitles use parsed timing, not drop position — delegate to normal add
+            addToTimeline(asset)
         }
     }
 
@@ -1676,10 +1938,14 @@ final class ProjectState: ObservableObject {
         undoCount = undoStack.count
         redoCount = 0
         lastUndoPushTime = Date()
+        isSaved = false
+        scheduleAutoSave()
     }
 
     /// 节流版 pushUndo — 1秒内连续编辑只记录一次（适合滑块、步进器等高频操作）
     func pushUndoThrottled() {
+        isSaved = false
+        scheduleAutoSave()
         if Date().timeIntervalSince(lastUndoPushTime) > 1.0 {
             pushUndo()
         }
@@ -1691,6 +1957,8 @@ final class ProjectState: ObservableObject {
         applySnapshot(s)
         undoCount = undoStack.count
         redoCount = redoStack.count
+        isSaved = false
+        scheduleAutoSave()
     }
 
     func redo() {
@@ -1699,6 +1967,8 @@ final class ProjectState: ObservableObject {
         applySnapshot(s)
         undoCount = undoStack.count
         redoCount = redoStack.count
+        isSaved = false
+        scheduleAutoSave()
     }
 
     private func currentSnapshot() -> ProjectSnapshot {
@@ -1714,6 +1984,13 @@ final class ProjectState: ObservableObject {
         subtitleTracks = s.subtitleTracks
         subtitleStyles = s.subtitleStyles
         duration       = s.duration
+        if let assets = s.mediaAssets {
+            mediaAssets = assets
+            // Regenerate thumbnails for restored assets
+            for asset in assets {
+                if asset.fileExists { loadMediaResources(asset) }
+            }
+        }
         rebuildTimelinePreview()
     }
 

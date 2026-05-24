@@ -95,7 +95,7 @@ private struct SubtitleInspector: View {
                 HStack(spacing: 8) {
                     IField(label: "开始") {
                         MiniStepper(value: $startTime, step: 0.1, decimals: 2)
-                            .onChange(of: startTime) { project.updateSubtitleTime(id: clip.id, start: startTime) }
+                            .onChange(of: startTime) { _ in project.updateSubtitleTime(id: clip.id, start: startTime) }
                     }
                     IField(label: "持续") {
                         MiniStepper(
@@ -105,7 +105,7 @@ private struct SubtitleInspector: View {
                             ),
                             step: 0.1, decimals: 2
                         )
-                        .onChange(of: endTime) { project.updateSubtitleTime(id: clip.id, end: endTime) }
+                        .onChange(of: endTime) { _ in project.updateSubtitleTime(id: clip.id, end: endTime) }
                     }
                 }
             }
@@ -121,7 +121,7 @@ private struct SubtitleInspector: View {
                     IField(label: "字体") {
                         IPicker(selection: $ls.fontName,
                                 options: ["PingFang SC","思源黑体","Helvetica Neue","Arial","Times New Roman"].map { ($0, $0) })
-                            .onChange(of: ls.fontName) { writeStyle() }
+                            .onChange(of: ls.fontName) { _ in writeStyle() }
                     }
                     IField(label: "字号") {
                         MiniStepper(value: Binding(
@@ -141,7 +141,7 @@ private struct SubtitleInspector: View {
                         .foregroundColor(Color.labelSecondary)
                         .frame(width: 76, alignment: .leading)
                     ColorPicker("", selection: $ls.textColor).labelsHidden()
-                        .onChange(of: ls.textColor) { writeStyle() }
+                        .onChange(of: ls.textColor) { _ in writeStyle() }
                     Spacer(minLength: 0)
                 }
                 HStack(spacing: 12) {
@@ -150,24 +150,24 @@ private struct SubtitleInspector: View {
                         .foregroundColor(Color.labelSecondary)
                         .frame(width: 76, alignment: .leading)
                     ColorPicker("", selection: $ls.backgroundColor).labelsHidden()
-                        .onChange(of: ls.backgroundColor) { writeStyle() }
+                        .onChange(of: ls.backgroundColor) { _ in writeStyle() }
                     Spacer(minLength: 0)
                 }
 
                 ISlider(label: "背景不透明度",
                         value: Binding(get:{ls.backgroundOpacity*100}, set:{ls.backgroundOpacity=$0/100}),
                         range: 0...100, unit: "%")
-                    .onChange(of: ls.backgroundOpacity) { writeStyle() }
+                    .onChange(of: ls.backgroundOpacity) { _ in writeStyle() }
             }
 
             // ── 布局 ──────────────────────────────────────
             ISection(title: "布局") {
                 ISlider(label: "字幕宽度",  value: $ls.widthPercent,  range: 30...100, unit: "%")
-                    .onChange(of: ls.widthPercent)  { writeStyle() }
+                    .onChange(of: ls.widthPercent)  { _ in writeStyle() }
                 ISlider(label: "距下边缘",  value: $ls.bottomMargin,  range: 0...50,   unit: "%")
-                    .onChange(of: ls.bottomMargin)  { writeStyle() }
+                    .onChange(of: ls.bottomMargin)  { _ in writeStyle() }
                 ISlider(label: "双语间距",  value: $ls.lineSpacing,   range: 0...60,   unit: "pt")
-                    .onChange(of: ls.lineSpacing)   { writeStyle() }
+                    .onChange(of: ls.lineSpacing)   { _ in writeStyle() }
 
                 HStack(spacing: 12) {
                     Text("对齐方式")
@@ -191,7 +191,7 @@ private struct SubtitleInspector: View {
             }
         }
         .onAppear { syncAll() }
-        .onChange(of: clip.id) { syncAll() }
+        .onChange(of: clip.id) { _ in syncAll() }
     }
 
     // MARK: Helpers
@@ -944,9 +944,64 @@ private struct AudioInspector: View {
                 ISlider(label: "左声道",  value: dbl(\.leftChannel,  scale: 100), range: 0...100, unit: "%")
                 ISlider(label: "右声道",  value: dbl(\.rightChannel, scale: 100), range: 0...100, unit: "%")
             }
+
+            ISection(title: "淡入淡出") {
+                HStack(spacing: 12) {
+                    Text("淡入")
+                        .font(.system(size: 11))
+                        .foregroundColor(Color.labelSecondary)
+                        .frame(width: 76, alignment: .leading)
+                    Toggle("", isOn: Binding(
+                        get: { clip.fadeInEnabled },
+                        set: { v in
+                            project.updateAudioClip(id: clip.id) { $0.fadeInEnabled = v }
+                            project.rebuildTimelinePreview()
+                        }
+                    ))
+                    .toggleStyle(.switch)
+                    .scaleEffect(0.7, anchor: .leading)
+                    .labelsHidden()
+                    Spacer()
+                }
+                if clip.fadeInEnabled {
+                    ISlider(label: "淡入时长", value: Binding(
+                        get: { clip.fadeInDuration },
+                        set: { v in
+                            project.updateAudioClip(id: clip.id) { $0.fadeInDuration = max(0.1, min(v, $0.duration)) }
+                            project.rebuildTimelinePreview()
+                        }
+                    ), range: 0.1...10, unit: "秒")
+                }
+                HStack(spacing: 12) {
+                    Text("淡出")
+                        .font(.system(size: 11))
+                        .foregroundColor(Color.labelSecondary)
+                        .frame(width: 76, alignment: .leading)
+                    Toggle("", isOn: Binding(
+                        get: { clip.fadeOutEnabled },
+                        set: { v in
+                            project.updateAudioClip(id: clip.id) { $0.fadeOutEnabled = v }
+                            project.rebuildTimelinePreview()
+                        }
+                    ))
+                    .toggleStyle(.switch)
+                    .scaleEffect(0.7, anchor: .leading)
+                    .labelsHidden()
+                    Spacer()
+                }
+                if clip.fadeOutEnabled {
+                    ISlider(label: "淡出时长", value: Binding(
+                        get: { clip.fadeOutDuration },
+                        set: { v in
+                            project.updateAudioClip(id: clip.id) { $0.fadeOutDuration = max(0.1, min(v, $0.duration)) }
+                            project.rebuildTimelinePreview()
+                        }
+                    ), range: 0.1...10, unit: "秒")
+                }
+            }
         }
         .onAppear { loadMeta() }
-        .onChange(of: clip.id) { loadMeta() }
+        .onChange(of: clip.id) { _ in loadMeta() }
     }
 
     private func loadMeta() {
@@ -1102,9 +1157,9 @@ struct MiniStepper: View {
                 .padding(.leading, 6)
                 .focused($isFocused)
                 .onAppear { editText = formatted }
-                .onChange(of: value) { editText = formatted }
+                .onChange(of: value) { _ in editText = formatted }
                 .onSubmit { applyText() }
-                .onChange(of: isFocused) { if !isFocused { applyText() } }
+                .onChange(of: isFocused) { _ in if !isFocused { applyText() } }
 
             Rectangle().fill(Color.white.opacity(0.12)).frame(width: 1, height: 18)
 
@@ -1241,7 +1296,7 @@ private struct SubtitleTextBox: View {
                     .padding(.horizontal, 4)
                     .padding(.vertical, 4)
                     .focused($isFocused)
-                    .onChange(of: text) { project.updateSubtitleText(id: clipID, text: text) }
+                    .onChange(of: text) { _ in project.updateSubtitleText(id: clipID, text: text) }
             }
             .frame(height: boxHeight)
 
