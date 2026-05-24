@@ -4,4 +4,10 @@
 xcuserdata/
 DerivedData/
 .DS_Store
-*.app/
+
+# App bundle: 只跟踪骨架，排除编译产物和大二进制
+黑猫剪辑.app/Contents/MacOS/VideoEditor
+黑猫剪辑.app/Contents/MacOS/ffmpeg
+黑猫剪辑.app/Contents/MacOS/ffprobe
+黑猫剪辑.app/Contents/_CodeSignature/
+黑猫剪辑.app/Contents/Frameworks/
