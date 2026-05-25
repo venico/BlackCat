@@ -89,6 +89,7 @@ struct SubtitleStyle: Equatable, Codable {
 
 struct SubtitleClip: Identifiable, Equatable, Codable {
     var id = UUID()
+    var assetID: UUID?     // 关联的素材库 ID，手动添加的字幕可为 nil
     var text: String
     var startTime: Double
     var endTime: Double
@@ -587,9 +588,10 @@ final class ProjectState: ObservableObject {
 
         // Count timeline clips that reference this asset
         var clipCount = 0
-        for t in videoTracks  { clipCount += t.clips.filter { $0.assetID == id }.count }
-        for t in audioTracks  { clipCount += t.clips.filter { $0.assetID == id }.count }
-        for t in imageTracks  { clipCount += t.clips.filter { $0.assetID == id }.count }
+        for t in videoTracks    { clipCount += t.clips.filter { $0.assetID == id }.count }
+        for t in audioTracks    { clipCount += t.clips.filter { $0.assetID == id }.count }
+        for t in imageTracks    { clipCount += t.clips.filter { $0.assetID == id }.count }
+        for t in subtitleTracks { clipCount += t.clips.filter { $0.assetID == id }.count }
 
         let alert = NSAlert()
         alert.alertStyle = .warning
@@ -616,10 +618,11 @@ final class ProjectState: ObservableObject {
         isSaved = false
         scheduleAutoSave()
 
-        // Remove timeline clips
-        for i in videoTracks.indices  { videoTracks[i].clips.removeAll  { $0.assetID == id } }
-        for i in audioTracks.indices  { audioTracks[i].clips.removeAll  { $0.assetID == id } }
-        for i in imageTracks.indices  { imageTracks[i].clips.removeAll  { $0.assetID == id } }
+        // Remove timeline clips (all track types including subtitle)
+        for i in videoTracks.indices    { videoTracks[i].clips.removeAll    { $0.assetID == id } }
+        for i in audioTracks.indices    { audioTracks[i].clips.removeAll    { $0.assetID == id } }
+        for i in imageTracks.indices    { imageTracks[i].clips.removeAll    { $0.assetID == id } }
+        for i in subtitleTracks.indices { subtitleTracks[i].clips.removeAll { $0.assetID == id } }
         // Clean up caches
         mediaThumbnails.removeValue(forKey: id)
         assetThumbnails.removeValue(forKey: id)
@@ -631,6 +634,7 @@ final class ProjectState: ObservableObject {
         selectedVideoClipID = nil
         selectedAudioClipID = nil
         selectedImageClipID = nil
+        selectedSubtitleClipID = nil
         selectedClipIDs.removeAll()
         rebuildTimelinePreview()
     }
@@ -882,6 +886,9 @@ final class ProjectState: ObservableObject {
         for i in imageTracks.indices {
             imageTracks[i].clips.removeAll { $0.assetID == assetID }
         }
+        for i in subtitleTracks.indices {
+            subtitleTracks[i].clips.removeAll { $0.assetID == assetID }
+        }
         mediaThumbnails.removeValue(forKey: assetID)
         undoStack.append(snap)
         if undoStack.count > 50 { undoStack.removeFirst() }
@@ -895,9 +902,10 @@ final class ProjectState: ObservableObject {
     /// 统计素材在时间轴上被引用的片段数
     func clipCountForAsset(_ assetID: UUID) -> Int {
         var count = 0
-        for t in videoTracks { count += t.clips.filter { $0.assetID == assetID }.count }
-        for t in audioTracks { count += t.clips.filter { $0.assetID == assetID }.count }
-        for t in imageTracks { count += t.clips.filter { $0.assetID == assetID }.count }
+        for t in videoTracks    { count += t.clips.filter { $0.assetID == assetID }.count }
+        for t in audioTracks    { count += t.clips.filter { $0.assetID == assetID }.count }
+        for t in imageTracks    { count += t.clips.filter { $0.assetID == assetID }.count }
+        for t in subtitleTracks { count += t.clips.filter { $0.assetID == assetID }.count }
         return count
     }
 
@@ -1922,12 +1930,14 @@ final class ProjectState: ObservableObject {
             }
         case .subtitle:
             let ext = asset.url.pathExtension.lowercased()
-            let clips: [SubtitleClip]
+            var clips: [SubtitleClip]
             switch ext {
             case "ass": clips = parseASS(url: asset.url)
             case "vtt": clips = parseVTT(url: asset.url)
             default:    clips = parseSRT(url: asset.url)
             }
+            // 给每个字幕片段打上素材 ID，供级联删除使用
+            for i in clips.indices { clips[i].assetID = asset.id }
             // Use the first empty subtitle track if available; otherwise create
             // a brand-new track so each imported subtitle file lives on its own
             // line (so bilingual / multi-language workflows don't merge).
@@ -2121,15 +2131,75 @@ final class ProjectState: ObservableObject {
         }
     }
 
+    // MARK: - 字幕文件读取（编码检测 + 换行符统一）
+
+    /// 尝试多种编码读取字幕文件，统一换行符为 \n，去除 BOM
+    private func readSubtitleFile(url: URL) -> String? {
+        guard let data = try? Data(contentsOf: url) else { return nil }
+
+        var content: String?
+
+        // ── 第一步：用 macOS 内置引擎自动检测编码 ──
+        // NSString.stringEncoding(for:) 能准确区分 Big5 / GBK / UTF-8 等
+        let big5 = CFStringConvertEncodingToNSStringEncoding(CFStringEncoding(CFStringEncodings.big5.rawValue))
+        let gb18030 = CFStringConvertEncodingToNSStringEncoding(CFStringEncoding(CFStringEncodings.GB_18030_2000.rawValue))
+        var convertedNS: NSString?
+        var usedLossy: ObjCBool = false
+        let detected = NSString.stringEncoding(
+            for: data,
+            encodingOptions: [
+                .suggestedEncodingsKey: [
+                    String.Encoding.utf8.rawValue,
+                    String.Encoding.utf16.rawValue,
+                    big5,
+                    gb18030
+                ] as [UInt],
+                .useOnlySuggestedEncodingsKey: false as NSNumber,
+                .allowLossyKey: false as NSNumber
+            ],
+            convertedString: &convertedNS,
+            usedLossyConversion: &usedLossy)
+        if detected != 0, !usedLossy.boolValue, let ns = convertedNS {
+            content = ns as String
+        }
+
+        // ── 第二步：自动检测失败则手动逐个尝试 ──
+        if content == nil {
+            let encodings: [String.Encoding] = [
+                .utf8,
+                .utf16,
+                String.Encoding(rawValue: big5),
+                String.Encoding(rawValue: gb18030)
+            ]
+            for enc in encodings {
+                if let s = String(data: data, encoding: enc), !s.isEmpty {
+                    content = s; break
+                }
+            }
+        }
+
+        guard var text = content else { return nil }
+
+        // 去除 BOM
+        if text.hasPrefix("\u{FEFF}") {
+            text = String(text.dropFirst())
+        }
+
+        // 统一换行符：\r\n → \n，单独 \r → \n
+        text = text.replacingOccurrences(of: "\r\n", with: "\n")
+        text = text.replacingOccurrences(of: "\r", with: "\n")
+
+        return text
+    }
+
     // MARK: - SRT Parser
 
     func parseSRT(url: URL) -> [SubtitleClip] {
-        let raw: String
-        if let s = try? String(contentsOf: url, encoding: .utf8) { raw = s }
-        else if let s = try? String(contentsOf: url, encoding: .utf16) { raw = s }
-        else { return [] }
+        guard let raw = readSubtitleFile(url: url) else { return [] }
         var clips: [SubtitleClip] = []
-        for block in raw.components(separatedBy: "\n\n") {
+        // 用正则切分空行块（兼容 \n\n、\r\n\r\n、混合换行）
+        let blocks = raw.components(separatedBy: "\n\n")
+        for block in blocks {
             let lines = block.trimmingCharacters(in: .whitespacesAndNewlines).components(separatedBy: "\n")
             guard lines.count >= 2, let tsLine = lines.first(where: { $0.contains("-->") }) else { continue }
             let parts = tsLine.components(separatedBy: "-->")
@@ -2152,14 +2222,11 @@ final class ProjectState: ObservableObject {
     // MARK: - ASS 解析
 
     func parseASS(url: URL) -> [SubtitleClip] {
-        let raw: String
-        if let s = try? String(contentsOf: url, encoding: .utf8) { raw = s }
-        else if let s = try? String(contentsOf: url, encoding: .utf16) { raw = s }
-        else { return [] }
+        guard let raw = readSubtitleFile(url: url) else { return [] }
         var clips: [SubtitleClip] = []
         var inEvents = false
         var formatFields: [String] = []
-        for line in raw.components(separatedBy: .newlines) {
+        for line in raw.components(separatedBy: "\n") {
             let trimmed = line.trimmingCharacters(in: .whitespaces)
             if trimmed.lowercased().hasPrefix("[events]") { inEvents = true; continue }
             if trimmed.hasPrefix("[") && !trimmed.lowercased().hasPrefix("[events]") { inEvents = false; continue }
@@ -2174,7 +2241,8 @@ final class ProjectState: ObservableObject {
                 .trimmingCharacters(in: .whitespaces)
             // ASS Dialogue 字段用逗号分隔，但 Text 字段可能包含逗号
             let parts = content.components(separatedBy: ",")
-            let fieldCount = max(formatFields.count, 10)
+            // 使用实际 Format 行定义的字段数（不强制最小值）
+            let fieldCount = formatFields.isEmpty ? 10 : formatFields.count
             guard parts.count >= fieldCount else { continue }
             let startIdx = formatFields.firstIndex(of: "start") ?? 1
             let endIdx = formatFields.firstIndex(of: "end") ?? 2
@@ -2205,10 +2273,7 @@ final class ProjectState: ObservableObject {
     // MARK: - VTT 解析
 
     func parseVTT(url: URL) -> [SubtitleClip] {
-        let raw: String
-        if let s = try? String(contentsOf: url, encoding: .utf8) { raw = s }
-        else if let s = try? String(contentsOf: url, encoding: .utf16) { raw = s }
-        else { return [] }
+        guard let raw = readSubtitleFile(url: url) else { return [] }
         var clips: [SubtitleClip] = []
         let blocks = raw.components(separatedBy: "\n\n")
         for block in blocks {
