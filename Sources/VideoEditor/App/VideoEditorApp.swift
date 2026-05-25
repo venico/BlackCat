@@ -257,12 +257,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func importMedia() {
         let panel = NSOpenPanel()
         panel.allowsMultipleSelection = true
-        panel.allowedContentTypes = [
-            .movie, .audio, .image,
-            UTType(filenameExtension: "srt") ?? .plainText,
-            UTType(filenameExtension: "ass") ?? .plainText,
-            UTType(filenameExtension: "vtt") ?? .plainText
-        ]
+        panel.allowedContentTypes = []  // 不限制，由 importFile 做格式过滤
         panel.begin { r in
             guard r == .OK else { return }
             NotificationCenter.default.post(name: .menuImportFiles, object: panel.urls)

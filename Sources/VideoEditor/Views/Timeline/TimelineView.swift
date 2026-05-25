@@ -1,5 +1,6 @@
 import SwiftUI
 import AVFoundation
+import UniformTypeIdentifiers
 
 // MARK: - Timeline root
 
@@ -21,6 +22,8 @@ struct TimelineView: View {
     private func subH(_ i: Int) -> CGFloat { subtitleTrackHeights[i] ?? defaultSubTrackH }
     // 拖动起始值
     @State private var dragOriginTrackH: CGFloat = 0
+    @State private var isLibraryDragOver = false
+    @State private var viewportH: CGFloat = 300
 
     // Unified drag state
     @State private var dragOp:   DragOp?  = nil
@@ -163,15 +166,16 @@ struct TimelineView: View {
     }()
 
     var body: some View {
-        GeometryReader { outerGeo in
         ScrollView(.vertical, showsIndicators: true) {
             HStack(alignment: .top, spacing: 0) {
                 labelColumn
                 clipArea
             }
-            .frame(minHeight: outerGeo.size.height)
         }
-        }
+        .background(GeometryReader { geo -> Color in
+            DispatchQueue.main.async { viewportH = geo.size.height }
+            return Color.clear
+        })
         .clipped()
         .overlay(alignment: .bottomTrailing) {
             if project.translationTotal > 0 {
@@ -358,11 +362,10 @@ struct TimelineView: View {
     private var clipArea: some View {
         GeometryReader { visibleGeo in
             let visibleW = visibleGeo.size.width
-            let visibleH = visibleGeo.size.height
             let _ = updateVisibleWidth(visibleW)
             let contentW = project.duration * project.pixelsPerSecond + 300
             let totalW = max(contentW, max(visibleW, 800))
-            let effectiveH = max(totalContentH(), visibleH)
+            let effectiveH = max(totalContentH(), viewportH)
             ScrollView(.horizontal, showsIndicators: false) {
                 ZStack(alignment: .topLeading) {
                     TimelineRuler(pps: project.pixelsPerSecond, duration: project.duration)
@@ -441,6 +444,20 @@ struct TimelineView: View {
                     }
                 }
                 .simultaneousGesture(unifiedDragGesture)
+                .onDrop(of: [UTType.plainText], isTargeted: $isLibraryDragOver) { providers, location in
+                    guard let provider = providers.first else { return false }
+                    _ = provider.loadObject(ofClass: NSString.self) { obj, _ in
+                        guard let idStr = obj as? String,
+                              let assetID = UUID(uuidString: idStr) else { return }
+                        DispatchQueue.main.async {
+                            let time = max(0, location.x / self.project.pixelsPerSecond)
+                            if let asset = self.project.mediaAssets.first(where: { $0.id == assetID }) {
+                                self.project.addToTimelineAt(asset, time: time)
+                            }
+                        }
+                    }
+                    return true
+                }
             }
             .scrollClipDisabled(true)
         }

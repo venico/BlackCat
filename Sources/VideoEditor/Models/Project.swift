@@ -303,6 +303,7 @@ final class ProjectState: ObservableObject {
     @Published var showDeleteConfirm: Bool = false
     @Published var showAssetDeleteConfirm: Bool = false
     var pendingDeleteAssetID: UUID? = nil
+    @Published var showClearLibraryConfirm: Bool = false
 
     // Selection (single — used by Inspector)
     @Published var selectedVideoClipID: UUID?    = nil
@@ -677,14 +678,7 @@ final class ProjectState: ObservableObject {
     /// 从持久化数据恢复素材（不触发重复保存）
     private func importFileFromRestore(_ url: URL) {
         let ext = url.pathExtension.lowercased()
-        let type: AssetType
-        switch ext {
-        case "mp4","mov","mkv","avi","m4v": type = .video
-        case "mp3","wav","aac","m4a","flac": type = .audio
-        case "srt","ass","vtt": type = .subtitle
-        case "png","jpg","jpeg","gif","bmp","tiff","tif","webp","heic": type = .image
-        default: return
-        }
+        guard let type = Self.assetType(for: ext) else { return }
         guard !mediaAssets.contains(where: { $0.url == url }) else { return }
         let asset = MediaAsset(url: url, name: url.lastPathComponent, type: type)
         mediaAssets.append(asset)
@@ -895,6 +889,20 @@ final class ProjectState: ObservableObject {
         redoStack.removeAll()
         undoCount = undoStack.count
         redoCount = 0
+        rebuildTimelinePreview()
+        scheduleAutoSave()
+    }
+
+    /// 清空素材库及时间轴上所有关联片段
+    func clearMediaLibrary() {
+        pushUndo()
+        mediaAssets.removeAll()
+        mediaThumbnails.removeAll()
+        waveformCache.removeAll()
+        for i in videoTracks.indices    { videoTracks[i].clips.removeAll() }
+        for i in audioTracks.indices    { audioTracks[i].clips.removeAll() }
+        for i in imageTracks.indices    { imageTracks[i].clips.removeAll() }
+        for i in subtitleTracks.indices { subtitleTracks[i].clips.removeAll() }
         rebuildTimelinePreview()
         scheduleAutoSave()
     }
@@ -1557,9 +1565,11 @@ final class ProjectState: ObservableObject {
     /// 支持的素材扩展名
     private static let supportedExtensions: Set<String> = [
         "mp4","mov","mkv","avi","m4v","wmv","flv","ts","mts","m2ts","webm","3gp","mpg","mpeg","vob","rm","rmvb","f4v","ogv",
-        "mp3","wav","aac","m4a","flac","ogg","wma",
+        "mp3","wav","aac","m4a","flac","aiff","aif","caf","au",
+        "ogg","wma","opus","ac3","ape","dts",
         "srt","ass","vtt",
-        "png","jpg","jpeg","gif","bmp","tiff","tif","webp","heic"
+        "png","jpg","jpeg","gif","bmp","tiff","tif","webp","heic",
+        "avif","heif","jfif","svg","dng","cr2","nef","arw","raf","orf"
     ]
 
     /// AVFoundation 原生支持的视频容器，无需转码
@@ -1570,12 +1580,19 @@ final class ProjectState: ObservableObject {
         "mkv","avi","wmv","flv","ts","mts","m2ts","webm","3gp","mpg","mpeg","vob","rm","rmvb","f4v","ogv"
     ]
 
+    /// 需要 FFmpeg 转码的音频格式（转为 m4a）
+    private static let needsTranscodeAudioExtensions: Set<String> = [
+        "ogg","wma","opus","ac3","ape","dts"
+    ]
+
     private static func assetType(for ext: String) -> AssetType? {
         switch ext {
         case "mp4","mov","mkv","avi","m4v","wmv","flv","ts","mts","m2ts","webm","3gp","mpg","mpeg","vob","rm","rmvb","f4v","ogv": return .video
-        case "mp3","wav","aac","m4a","flac","ogg","wma": return .audio
+        case "mp3","wav","aac","m4a","flac","aiff","aif","caf","au",
+             "ogg","wma","opus","ac3","ape","dts": return .audio
         case "srt","ass","vtt": return .subtitle
-        case "png","jpg","jpeg","gif","bmp","tiff","tif","webp","heic": return .image
+        case "png","jpg","jpeg","gif","bmp","tiff","tif","webp","heic",
+             "avif","heif","jfif","svg","dng","cr2","nef","arw","raf","orf": return .image
         default: return nil
         }
     }
@@ -1601,6 +1618,20 @@ final class ProjectState: ObservableObject {
         let ext = url.pathExtension.lowercased()
         guard let type = Self.assetType(for: ext) else { return }
 
+        // 需要转码的音频格式，先转为 M4A 再导入
+        if type == .audio && Self.needsTranscodeAudioExtensions.contains(ext) {
+            let fileName = url.deletingPathExtension().lastPathComponent
+            let outputURL = FileManager.default.temporaryDirectory
+                .appendingPathComponent("BlackCatTranscode", isDirectory: true)
+                .appendingPathComponent("\(fileName)_\(ext).m4a")
+            if mediaAssets.contains(where: { $0.url == outputURL }) {
+                showImportToast("「\(url.lastPathComponent)」已在素材库中，已跳过")
+                return
+            }
+            transcodeAudioAndImport(url: url, outputURL: outputURL, displayName: url.lastPathComponent)
+            return
+        }
+
         // 需要转码的视频格式，先转为 MP4 再导入
         if type == .video && Self.needsTranscodeExtensions.contains(ext) {
             // 检查转码后的文件是否已在素材库中（防止同一源文件重复导入）
@@ -1620,10 +1651,10 @@ final class ProjectState: ObservableObject {
     }
 
     /// 直接导入（原生格式或转码完成后的文件）
-    private func importFileDirectly(url: URL, type: AssetType) {
+    private func importFileDirectly(url: URL, type: AssetType, displayName: String? = nil) {
         // 兜底去重：防止任何路径绕过前置检查
         guard !mediaAssets.contains(where: { $0.url == url }) else { return }
-        let asset = MediaAsset(url: url, name: url.lastPathComponent, type: type)
+        let asset = MediaAsset(url: url, name: displayName ?? url.lastPathComponent, type: type)
         let aid = asset.id
         mediaAssets.append(asset)
         // Trigger thumbnail / waveform generation
@@ -1662,6 +1693,43 @@ final class ProjectState: ObservableObject {
         if let outputURL = transcodingOutputURL {
             try? FileManager.default.removeItem(at: outputURL)
             transcodingOutputURL = nil
+        }
+    }
+
+    /// 将不兼容的音频格式转为 M4A（AAC）再导入
+    private func transcodeAudioAndImport(url: URL, outputURL: URL, displayName: String? = nil) {
+        let name = displayName ?? url.lastPathComponent
+        if FileManager.default.fileExists(atPath: outputURL.path) {
+            if !mediaAssets.contains(where: { $0.url == outputURL }) {
+                importFileDirectly(url: outputURL, type: .audio, displayName: name)
+            } else {
+                showImportToast("「\(name)」已在素材库中，已跳过")
+            }
+            return
+        }
+
+        guard let ffmpeg = Self.findFFmpeg() else {
+            showImportToast("未找到 FFmpeg，无法导入 \(url.pathExtension.uppercased()) 格式")
+            return
+        }
+
+        let outputDir = outputURL.deletingLastPathComponent()
+        try? FileManager.default.createDirectory(at: outputDir, withIntermediateDirectories: true)
+
+        Task.detached { [weak self] in
+            let ok = Self.runFFmpegSync(ffmpeg: ffmpeg, arguments: [
+                "-i", url.path,
+                "-c:a", "aac", "-b:a", "192k",
+                "-y", outputURL.path
+            ])
+            await MainActor.run {
+                if ok {
+                    self?.importFileDirectly(url: outputURL, type: .audio, displayName: name)
+                    self?.showImportToast("「\(name)」导入完成")
+                } else {
+                    self?.showImportToast("「\(name)」转码失败")
+                }
+            }
         }
     }
 
@@ -1915,15 +1983,20 @@ final class ProjectState: ObservableObject {
                 }
             }
         case .audio:
-            if audioTracks.isEmpty { audioTracks.append(Track(label: "音频")) }
-            let st = audioTracks[0].clips.map(\.endTime).max() ?? 0
+            let trackIdx: Int
+            if let emptyIdx = audioTracks.firstIndex(where: { $0.clips.isEmpty }) {
+                trackIdx = emptyIdx
+            } else {
+                audioTracks.append(Track(label: "音频"))
+                trackIdx = audioTracks.count - 1
+            }
             Task {
                 let dur = (try? await AVURLAsset(url: asset.url).load(.duration))?.seconds ?? 30
                 await MainActor.run {
-                    self.audioTracks[0].clips.append(
+                    self.audioTracks[trackIdx].clips.append(
                         AudioClip(assetID: asset.id, name: asset.name, url: asset.url,
-                                  startTime: st, endTime: st + dur))
-                    self.duration = max(self.duration, st + dur)
+                                  startTime: 0, endTime: dur))
+                    self.duration = max(self.duration, dur)
                     if let i = self.mediaAssets.firstIndex(where:{ $0.id == asset.id }) { self.mediaAssets[i].duration = dur }
                     self.rebuildTimelinePreview()
                 }
@@ -2029,11 +2102,17 @@ final class ProjectState: ObservableObject {
                 }
             }
         case .audio:
-            if audioTracks.isEmpty { audioTracks.append(Track(label: "音频")) }
+            let audioTrackIdx: Int
+            if let emptyIdx = audioTracks.firstIndex(where: { $0.clips.isEmpty }) {
+                audioTrackIdx = emptyIdx
+            } else {
+                audioTracks.append(Track(label: "音频"))
+                audioTrackIdx = audioTracks.count - 1
+            }
             Task {
                 let dur = (try? await AVURLAsset(url: asset.url).load(.duration))?.seconds ?? 30
                 await MainActor.run {
-                    self.audioTracks[0].clips.append(
+                    self.audioTracks[audioTrackIdx].clips.append(
                         AudioClip(assetID: asset.id, name: asset.name, url: asset.url,
                                   startTime: insertTime, endTime: insertTime + dur))
                     self.duration = max(self.duration, insertTime + dur)

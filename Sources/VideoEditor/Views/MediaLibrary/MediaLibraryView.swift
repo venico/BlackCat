@@ -23,6 +23,13 @@ struct MediaLibraryView: View {
                     .foregroundColor(Color.labelSecondary)
                     .textCase(.uppercase)
                 Spacer()
+                Button { project.showClearLibraryConfirm = true } label: {
+                    Image(systemName: "trash")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundColor(Color.labelSecondary)
+                }
+                .buttonStyle(.plain)
+                .help("清空素材库")
                 Button { project.refreshMediaLibrary() } label: {
                     Image(systemName: "arrow.clockwise")
                         .font(.system(size: 11, weight: .medium))
@@ -188,6 +195,10 @@ private struct AssetRow: View {
                 .fill(hovered ? Color.white.opacity(0.08) : Color.clear)
         )
         .contentShape(RoundedRectangle(cornerRadius: 8))
+        .onDrag {
+            guard asset.fileExists else { return NSItemProvider() }
+            return NSItemProvider(object: asset.id.uuidString as NSString)
+        }
         .onHover { hovered = $0 }
         .gesture(TapGesture(count: 2).onEnded {
             if asset.fileExists { project.addToTimeline(asset) } else { relinkAsset() }
@@ -337,8 +348,12 @@ private struct AssetRow: View {
     }
 
     private func confirmDeleteAsset() {
-        project.pendingDeleteAssetID = asset.id
-        project.showAssetDeleteConfirm = true
+        if project.clipCountForAsset(asset.id) == 0 {
+            project.removeAssetAndClips(assetID: asset.id)
+        } else {
+            project.pendingDeleteAssetID = asset.id
+            project.showAssetDeleteConfirm = true
+        }
     }
 
     private func relinkAsset() {
@@ -435,12 +450,7 @@ private struct ImportButton: View {
         panel.allowsMultipleSelection = true
         panel.canChooseFiles = true
         panel.canChooseDirectories = true
-        panel.allowedContentTypes = [
-            .movie, .audio, .image, .folder,
-            UTType(filenameExtension: "srt") ?? .plainText,
-            UTType(filenameExtension: "ass") ?? .plainText,
-            UTType(filenameExtension: "vtt") ?? .plainText
-        ]
+        panel.allowedContentTypes = []  // 不限制，由 importFile 做格式过滤
         panel.begin { r in
             guard r == .OK else { return }
             panel.urls.forEach { project.importFile($0) }

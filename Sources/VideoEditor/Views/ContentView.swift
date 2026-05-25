@@ -134,6 +134,7 @@ struct ContentView: View {
                                 .fixedSize(horizontal: false, vertical: true)
                             TimelineView()
                                 .frame(maxHeight: .infinity)
+                                .clipped()
                         }
                         .frame(maxHeight: .infinity)
                         .background(Color.timelineBg)
@@ -215,6 +216,12 @@ struct ContentView: View {
                 project.openProject(url: url)
             }
         }
+        .alert("清空素材库", isPresented: $project.showClearLibraryConfirm) {
+            Button("清空", role: .destructive) { project.clearMediaLibrary() }
+            Button("取消", role: .cancel) {}
+        } message: {
+            Text("将移除所有素材，并同时删除时间轴上的所有片段，此操作可撤销。")
+        }
         .alert("确认移除素材", isPresented: $project.showAssetDeleteConfirm) {
             Button("移除", role: .destructive) {
                 if let id = project.pendingDeleteAssetID {
@@ -295,7 +302,24 @@ struct SaveToastStack: View {
                 .shadow(color: .black.opacity(0.3), radius: 4, y: 2)
                 .transition(.move(edge: .trailing).combined(with: .opacity))
             }
+            if let msg = project.importToastMessage {
+                HStack(spacing: 6) {
+                    Image(systemName: "exclamationmark.circle.fill")
+                        .font(.system(size: 12))
+                        .foregroundColor(.orange)
+                    Text(msg)
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundColor(.white)
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 8)
+                .background(Color(white: 0.15).opacity(0.95))
+                .clipShape(RoundedRectangle(cornerRadius: 8))
+                .shadow(color: .black.opacity(0.3), radius: 4, y: 2)
+                .transition(.move(edge: .trailing).combined(with: .opacity))
+            }
         }
         .animation(.easeInOut(duration: 0.25), value: project.saveToasts.count)
+        .animation(.easeInOut(duration: 0.25), value: project.importToastMessage)
     }
 }
