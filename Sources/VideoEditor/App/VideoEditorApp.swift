@@ -2,14 +2,14 @@ import SwiftUI
 import AppKit
 import UniformTypeIdentifiers
 
-final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
+public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var window: NSWindow!
     private var isCleaningMenus = false
     private var cleanupTimer: Timer?
     /// Finder 双击 bcj 文件时暂存 URL，等 view 就绪后再打开
-    static var pendingOpenURL: URL?
+    public static var pendingOpenURL: URL?
 
-    func applicationDidFinishLaunching(_ notification: Notification) {
+    public func applicationDidFinishLaunching(_ notification: Notification) {
         setupMenuBar()
         createWindow()
 
@@ -126,11 +126,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // MARK: - NSMenuDelegate — 菜单打开前清理
 
-    func menuNeedsUpdate(_ menu: NSMenu) {
+    public func menuNeedsUpdate(_ menu: NSMenu) {
         cleanupMenu(menu)
     }
 
-    func menuWillOpen(_ menu: NSMenu) {
+    public func menuWillOpen(_ menu: NSMenu) {
         cleanupMenu(menu)
     }
 
@@ -277,10 +277,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         ])
     }
 
-    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+    public func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
 
     // 处理 Finder 双击 .bcj 文件打开
-    func application(_ application: NSApplication, open urls: [URL]) {
+    public func application(_ application: NSApplication, open urls: [URL]) {
         for url in urls {
             if url.pathExtension.lowercased() == "bcj" {
                 AppDelegate.pendingOpenURL = url

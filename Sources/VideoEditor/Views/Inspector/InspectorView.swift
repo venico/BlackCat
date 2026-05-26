@@ -14,7 +14,7 @@ struct InspectorView: View {
             header
             ScrollView(showsIndicators: false) {
                 if let clip = project.selectedSubtitleClip {
-                    SubtitleInspector(clip: clip)
+                    SubtitleInspector(clip: clip).id(clip.id)
                 } else if let clip = project.selectedImageClip {
                     ImageInspector(clip: clip)
                 } else if let clip = project.selectedVideoClip {
@@ -164,10 +164,10 @@ private struct SubtitleInspector: View {
             ISection(title: "布局") {
                 ISlider(label: "字幕宽度",  value: $ls.widthPercent,  range: 30...100, unit: "%")
                     .onChange(of: ls.widthPercent)  { _ in writeStyle() }
-                ISlider(label: "距下边缘",  value: $ls.bottomMargin,  range: 0...50,   unit: "%")
-                    .onChange(of: ls.bottomMargin)  { _ in writeStyle() }
-                ISlider(label: "双语间距",  value: $ls.lineSpacing,   range: 0...60,   unit: "pt")
-                    .onChange(of: ls.lineSpacing)   { _ in writeStyle() }
+                ISlider(label: "距下边缘",  value: $project.subtitleBottomMargin,  range: 0...50,   unit: "%")
+                    .onChange(of: project.subtitleBottomMargin) { _ in project.pushUndoThrottled() }
+                ISlider(label: "字幕间距",  value: $project.subtitleLineSpacing,   range: 0...60,   unit: "pt")
+                    .onChange(of: project.subtitleLineSpacing) { _ in project.pushUndoThrottled() }
 
                 HStack(spacing: 12) {
                     Text("对齐方式")

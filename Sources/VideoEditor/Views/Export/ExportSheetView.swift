@@ -476,6 +476,8 @@ struct ExportSheetView: View {
             subtitleTracks: project.subtitleTracks,
             imageTracks: project.imageTracks,
             subtitleStyles: project.subtitleStyles,
+            subtitleBottomMargin: project.subtitleBottomMargin,
+            subtitleLineSpacing: project.subtitleLineSpacing,
             settings: project.exportSettings,
             outputURL: outputURL)
 
@@ -493,6 +495,8 @@ struct ExportInput {
     let subtitleTracks: [Track<SubtitleClip>]
     let imageTracks:    [Track<ImageClip>]
     let subtitleStyles: [SubtitleStyle]
+    let subtitleBottomMargin: Double
+    let subtitleLineSpacing:  Double
     let settings:       ExportSettings
     let outputURL:      URL
 }
@@ -633,15 +637,26 @@ actor TimelineExporter {
         }
 
         // 如果字幕/图片超出音视频长度，扩展 composition 到 globalEndTime
+        // 用循环复制源视频首帧来填充（videoComposition 会遮黑，内容不可见，但需要真实帧才能延长导出时长）
         let globalEndCM = CMTime(seconds: globalEndTime, preferredTimescale: 600)
         if globalEndCM > composition.duration {
-            let gap = globalEndCM - composition.duration
-            if let vt = composition.tracks(withMediaType: .video).first as? AVMutableCompositionTrack {
-                vt.insertEmptyTimeRange(CMTimeRange(start: composition.duration, duration: gap))
-            } else if let at = composition.tracks(withMediaType: .audio).first as? AVMutableCompositionTrack {
-                at.insertEmptyTimeRange(CMTimeRange(start: composition.duration, duration: gap))
+            let firstVideoURL = input.videoTracks.flatMap(\.clips).compactMap(\.url).first
+            if let vt = composition.tracks(withMediaType: .video).first as? AVMutableCompositionTrack,
+               let url = firstVideoURL {
+                let fillAsset = AVURLAsset(url: url)
+                if let srcTrack = try? await fillAsset.loadTracks(withMediaType: .video).first {
+                    let oneFrame = CMTime(value: 1, timescale: 30)
+                    var pos = composition.duration
+                    while pos < globalEndCM {
+                        let remaining = globalEndCM - pos
+                        let dur = CMTimeMinimum(oneFrame, remaining)
+                        try? vt.insertTimeRange(CMTimeRange(start: .zero, duration: dur), of: srcTrack, at: pos)
+                        pos = pos + dur
+                    }
+                }
+            } else if let vt = composition.tracks(withMediaType: .video).first as? AVMutableCompositionTrack {
+                vt.insertEmptyTimeRange(CMTimeRange(start: composition.duration, duration: globalEndCM - composition.duration))
             } else {
-                // 没有任何轨道时，添加空视频轨道
                 let empty = composition.addMutableTrack(withMediaType: .video, preferredTrackID: kCMPersistentTrackID_Invalid)
                 empty?.insertEmptyTimeRange(CMTimeRange(start: .zero, duration: globalEndCM))
             }
@@ -761,17 +776,35 @@ actor TimelineExporter {
                     let vc = AVMutableVideoComposition()
                     vc.renderSize = renderSize
                     vc.frameDuration = frameDuration
+                    let visualEnd = max(vEnd, iEnd)
+                    let visualEndCM = CMTime(seconds: visualEnd, preferredTimescale: 600)
+
                     let instr = AVMutableVideoCompositionInstruction()
-                    instr.timeRange = CMTimeRange(start: .zero, duration: composition.duration)
+                    instr.backgroundColor = CGColor(gray: 0, alpha: 1)
                     let li = AVMutableVideoCompositionLayerInstruction(assetTrack: sourceVTrack)
                     let scaleX = renderSize.width / sourceVideoSize.width
                     let scaleY = renderSize.height / sourceVideoSize.height
                     li.setTransform(CGAffineTransform(scaleX: scaleX, y: scaleY), at: .zero)
                     instr.layerInstructions = [li]
-                    vc.instructions = [instr]
+
+                    if visualEnd < globalEndTime - 0.01 {
+                        instr.timeRange = CMTimeRange(start: .zero, duration: visualEndCM)
+                        let blackInstr = AVMutableVideoCompositionInstruction()
+                        blackInstr.timeRange = CMTimeRange(start: visualEndCM, duration: composition.duration - visualEndCM)
+                        blackInstr.backgroundColor = CGColor(gray: 0, alpha: 1)
+                        let blackLi = AVMutableVideoCompositionLayerInstruction(assetTrack: sourceVTrack)
+                        blackLi.setOpacity(0, at: .zero)
+                        blackInstr.layerInstructions = [blackLi]
+                        vc.instructions = [instr, blackInstr]
+                    } else {
+                        instr.timeRange = CMTimeRange(start: .zero, duration: composition.duration)
+                        vc.instructions = [instr]
+                    }
                     videoComposition = vc
                 }
             }
+
+            let visualEnd = max(vEnd, iEnd)
 
             // Step 2: 字幕烧录 — 独立于图片/分辨率，只要有可见字幕就叠加
             if !visibleSubs.isEmpty {
@@ -780,14 +813,33 @@ actor TimelineExporter {
                     let vc = AVMutableVideoComposition()
                     vc.renderSize = renderSize
                     vc.frameDuration = frameDuration
-                    let instr = AVMutableVideoCompositionInstruction()
-                    instr.timeRange = CMTimeRange(start: .zero, duration: composition.duration)
-                    instr.layerInstructions = composition.tracks(withMediaType: .video).map { vt in
+                    let visualEndCM = CMTime(seconds: visualEnd, preferredTimescale: 600)
+
+                    var instrs: [AVMutableVideoCompositionInstruction] = []
+                    let mainInstr = AVMutableVideoCompositionInstruction()
+                    mainInstr.backgroundColor = CGColor(gray: 0, alpha: 1)
+                    mainInstr.layerInstructions = composition.tracks(withMediaType: .video).map { vt in
                         let li = AVMutableVideoCompositionLayerInstruction(assetTrack: vt)
                         li.setOpacity(1.0, at: .zero)
                         return li
                     }
-                    vc.instructions = [instr]
+                    if visualEnd < globalEndTime - 0.01 {
+                        mainInstr.timeRange = CMTimeRange(start: .zero, duration: visualEndCM)
+                        instrs.append(mainInstr)
+                        let blackInstr = AVMutableVideoCompositionInstruction()
+                        blackInstr.timeRange = CMTimeRange(start: visualEndCM, duration: composition.duration - visualEndCM)
+                        blackInstr.backgroundColor = CGColor(gray: 0, alpha: 1)
+                        blackInstr.layerInstructions = composition.tracks(withMediaType: .video).map { vt in
+                            let li = AVMutableVideoCompositionLayerInstruction(assetTrack: vt)
+                            li.setOpacity(0, at: .zero)
+                            return li
+                        }
+                        instrs.append(blackInstr)
+                    } else {
+                        mainInstr.timeRange = CMTimeRange(start: .zero, duration: composition.duration)
+                        instrs.append(mainInstr)
+                    }
+                    vc.instructions = instrs
                     videoComposition = vc
                 }
 
@@ -802,6 +854,7 @@ actor TimelineExporter {
                     let parentLayer = CALayer()
                     parentLayer.frame = CGRect(origin: .zero, size: renderSize)
                     parentLayer.isGeometryFlipped = true
+                    parentLayer.backgroundColor = CGColor(gray: 0, alpha: 1)
                     parentLayer.addSublayer(videoLayer)
 
                     let visibleTrackData: [(track: Track<SubtitleClip>, style: SubtitleStyle, idx: Int)] =
@@ -810,16 +863,45 @@ actor TimelineExporter {
                             let s = i < input.subtitleStyles.count ? input.subtitleStyles[i] : SubtitleStyle()
                             return (t, s, i)
                         }
-                    let baseStyle = visibleTrackData.first?.style ?? SubtitleStyle()
                     let totalDuration = composition.duration.seconds
 
+                    let spacing = CGFloat(input.subtitleLineSpacing)
+
+                    // 计算每轨的最大渲染高度，用于累积偏移
+                    let padH: CGFloat = 10, padV: CGFloat = 3
+                    var trackMaxHeights: [CGFloat] = []
                     for td in visibleTrackData {
-                        let trackOffset = CGFloat(td.idx) * (td.style.fontSize + CGFloat(baseStyle.lineSpacing) + 12)
+                        var maxH: CGFloat = 0
+                        let maxW = renderSize.width * td.style.widthPercent / 100
+                        let ctFont = CTFontCreateWithName(td.style.fontName as CFString, td.style.fontSize, nil)
+                        for clip in td.track.clips {
+                            let attrs: [NSAttributedString.Key: Any] = [
+                                .init(kCTFontAttributeName as String): ctFont
+                            ]
+                            let attrStr = NSAttributedString(string: clip.text, attributes: attrs)
+                            let setter = CTFramesetterCreateWithAttributedString(attrStr)
+                            let constraint = CGSize(width: maxW - padH * 2, height: CGFloat.greatestFiniteMagnitude)
+                            let textSize = CTFramesetterSuggestFrameSizeWithConstraints(setter, CFRange(), nil, constraint, nil)
+                            let h = ceil(textSize.height) + padV * 2
+                            maxH = max(maxH, h)
+                        }
+                        trackMaxHeights.append(maxH)
+                    }
+
+                    // 累积偏移：从底部往上堆叠（和 VStack 等价）
+                    var cumulativeOffsets: [CGFloat] = [0]
+                    for i in 1..<visibleTrackData.count {
+                        cumulativeOffsets.append(cumulativeOffsets[i-1] + trackMaxHeights[i-1] + spacing)
+                    }
+
+                    for (vi, td) in visibleTrackData.enumerated() {
                         for clip in td.track.clips {
                             let layer = self.makeSubtitleTextLayer(
                                 text: clip.text, style: td.style, renderSize: renderSize,
                                 startTime: clip.startTime, endTime: clip.endTime,
-                                totalDuration: totalDuration, trackOffset: trackOffset)
+                                totalDuration: totalDuration,
+                                baseBottomMargin: input.subtitleBottomMargin,
+                                trackOffset: cumulativeOffsets[vi])
                             parentLayer.addSublayer(layer)
                         }
                     }
@@ -876,18 +958,37 @@ actor TimelineExporter {
         }
     }
 
-    // ── 导出 SRT 字幕文件 ──
+    // ── 导出 SRT 字幕文件（合并多轨） ──
     private func exportSRT(input: ExportInput,
                            progress: @escaping (Double) -> Void) throws -> URL {
-        var srt = ""
-        var idx = 1
+        // 收集所有可见轨道的字幕片段
+        var allClips: [(start: Double, end: Double, text: String)] = []
         for track in input.subtitleTracks where track.isVisible {
-            for clip in track.clips.sorted(by: { $0.startTime < $1.startTime }) {
-                srt += "\(idx)\n"
-                srt += "\(srtTime(clip.startTime)) --> \(srtTime(clip.endTime))\n"
-                srt += "\(clip.text)\n\n"
-                idx += 1
+            for clip in track.clips {
+                allClips.append((clip.startTime, clip.endTime, clip.text))
             }
+        }
+        // 按开始时间排序，同一时间点按文本排序保持稳定
+        allClips.sort { $0.start != $1.start ? $0.start < $1.start : $0.text < $1.text }
+
+        // 合并时间重叠的字幕（多轨同时显示的字幕合并为一条，用换行分隔）
+        var merged: [(start: Double, end: Double, text: String)] = []
+        for clip in allClips {
+            if let lastIdx = merged.indices.last,
+               abs(merged[lastIdx].start - clip.start) < 0.05 &&
+               abs(merged[lastIdx].end - clip.end) < 0.05 {
+                // 时间几乎相同，合并文本
+                merged[lastIdx].text += "\n" + clip.text
+            } else {
+                merged.append(clip)
+            }
+        }
+
+        var srt = ""
+        for (i, clip) in merged.enumerated() {
+            srt += "\(i + 1)\n"
+            srt += "\(srtTime(clip.start)) --> \(srtTime(clip.end))\n"
+            srt += "\(clip.text)\n\n"
         }
         try? FileManager.default.removeItem(at: input.outputURL)
         try srt.write(to: input.outputURL, atomically: true, encoding: .utf8)
@@ -921,10 +1022,13 @@ actor TimelineExporter {
     private func makeSubtitleTextLayer(
         text: String, style: SubtitleStyle, renderSize: CGSize,
         startTime: Double, endTime: Double,
-        totalDuration: Double, trackOffset: CGFloat
+        totalDuration: Double,
+        baseBottomMargin: Double = 5,
+        trackOffset: CGFloat = 0
     ) -> CALayer {
         let maxWidth = renderSize.width * style.widthPercent / 100
-        let padH: CGFloat = 16, padV: CGFloat = 8
+        // 与预览 SubtitleLabel 一致: .padding(.horizontal, 10).padding(.vertical, 3)
+        let padH: CGFloat = 10, padV: CGFloat = 3
 
         // 解析颜色
         let tc = NSColor(style.textColor).usingColorSpace(.sRGB) ?? .white
@@ -982,7 +1086,7 @@ actor TimelineExporter {
                     ctx.setFillColor(CGColor(red: br, green: bg, blue: bb,
                                              alpha: CGFloat(style.backgroundOpacity)))
                     ctx.addPath(CGPath(roundedRect: CGRect(origin: .zero, size: CGSize(width: layerW, height: layerH)),
-                                       cornerWidth: 4, cornerHeight: 4, transform: nil))
+                                       cornerWidth: 3, cornerHeight: 3, transform: nil))
                     ctx.fillPath()
                 }
 
@@ -1003,12 +1107,17 @@ actor TimelineExporter {
 
         let layer = CALayer()
         let xOrig = (renderSize.width - layerW) / 2
-        let yOrig = renderSize.height - renderSize.height * CGFloat(style.bottomMargin) / 100
+        let yOrig = renderSize.height - renderSize.height * CGFloat(baseBottomMargin) / 100
                     - layerH - trackOffset
         layer.frame = CGRect(x: xOrig, y: yOrig, width: layerW, height: layerH)
         layer.contentsGravity = .resize
         layer.contentsScale = 1.0
         if let img = cgImage { layer.contents = img }
+        // 与预览 SubtitleLabel 一致的文字阴影
+        layer.shadowColor = CGColor(red: 0, green: 0, blue: 0, alpha: 0.8)
+        layer.shadowOffset = CGSize(width: 1, height: 1)
+        layer.shadowRadius = 1
+        layer.shadowOpacity = 1
 
         layer.opacity = 0
         let t = max(totalDuration, endTime + 0.1)

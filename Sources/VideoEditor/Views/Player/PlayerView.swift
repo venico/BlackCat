@@ -113,17 +113,16 @@ private struct SubtitleOverlay: View {
             }
 
             if !pairs.isEmpty {
-                let baseStyle  = pairs[0].1
-                let spacing    = CGFloat(baseStyle.lineSpacing) * scale
-                let bottomPad  = geo.size.height * baseStyle.bottomMargin / 100.0
+                let spacing    = CGFloat(project.subtitleLineSpacing) * scale
+                let bottomPad  = geo.size.height * project.subtitleBottomMargin / 100.0
 
                 VStack(spacing: spacing) {
                     ForEach(pairs.indices, id: \.self) { i in
                         SubtitleLabel(text: pairs[i].0, style: pairs[i].1, scale: scale)
+                            .frame(maxWidth: geo.size.width * pairs[i].1.widthPercent / 100)
+                            .multilineTextAlignment(align(pairs[i].1.alignment))
                     }
                 }
-                .frame(maxWidth: geo.size.width * baseStyle.widthPercent / 100)
-                .multilineTextAlignment(align(baseStyle.alignment))
                 .padding(.bottom, bottomPad)
                 .frame(width: geo.size.width, height: geo.size.height,
                        alignment: .bottom)

@@ -362,12 +362,7 @@ private struct AssetRow: View {
         panel.message = "请选择「\(asset.name)」的新位置"
         panel.begin { r in
             guard r == .OK, let url = panel.url else { return }
-            if let i = project.mediaAssets.firstIndex(where: { $0.id == asset.id }) {
-                project.mediaAssets[i].url = url
-                project.mediaAssets[i].name = url.lastPathComponent
-                // Update all timeline clips referencing this asset
-                project.relinkAsset(id: asset.id, newURL: url)
-            }
+            project.relinkAsset(id: asset.id, newURL: url)
         }
     }
 

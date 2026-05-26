@@ -221,6 +221,8 @@ struct ProjectDocument: Codable {
     var mediaAssets: [MediaAsset]
     var exportSettings: ExportSettings
     var previewResolution: String
+    var subtitleBottomMargin: Double?
+    var subtitleLineSpacing: Double?
 }
 
 extension ExportSettings: Codable {}
@@ -233,8 +235,10 @@ struct ProjectSnapshot {
     var imageTracks: [Track<ImageClip>]
     var subtitleTracks: [Track<SubtitleClip>]
     var subtitleStyles: [SubtitleStyle]
+    var subtitleBottomMargin: Double
+    var subtitleLineSpacing: Double
     var duration: Double
-    var mediaAssets: [MediaAsset]? = nil  // optional: only saved when asset list changes (e.g. removeAsset)
+    var mediaAssets: [MediaAsset]? = nil
 }
 
 // MARK: - Project State
@@ -249,6 +253,8 @@ final class ProjectState: ObservableObject {
     @Published var imageTracks: [Track<ImageClip>]       = []
     @Published var subtitleTracks: [Track<SubtitleClip>] = [Track(label: "字幕")]
     @Published var subtitleStyles: [SubtitleStyle]    = [SubtitleStyle(), SubtitleStyle()]
+    @Published var subtitleBottomMargin: Double = 5   // 全局：所有字幕整体距下边缘 %
+    @Published var subtitleLineSpacing: Double  = 6   // 全局：字幕轨道之间的间距 pt
 
     // Playback
     @Published var currentTime: Double  = 0
@@ -427,6 +433,8 @@ final class ProjectState: ObservableObject {
         imageTracks = []
         subtitleTracks = [Track(label: "字幕")]
         subtitleStyles = [SubtitleStyle(), SubtitleStyle()]
+        subtitleBottomMargin = 5
+        subtitleLineSpacing = 6
         undoStack.removeAll(); redoStack.removeAll()
         undoCount = 0; redoCount = 0
         currentTime = 0; duration = 60
@@ -496,6 +504,8 @@ final class ProjectState: ObservableObject {
         imageTracks = doc.imageTracks
         subtitleTracks = doc.subtitleTracks
         subtitleStyles = doc.subtitleStyles
+        subtitleBottomMargin = doc.subtitleBottomMargin ?? doc.subtitleStyles.first?.bottomMargin ?? 5
+        subtitleLineSpacing = doc.subtitleLineSpacing ?? doc.subtitleStyles.first?.lineSpacing ?? 6
         exportSettings = doc.exportSettings
         previewResolution = doc.previewResolution
 
@@ -555,7 +565,9 @@ final class ProjectState: ObservableObject {
             subtitleStyles: subtitleStyles,
             mediaAssets: mediaAssets,
             exportSettings: exportSettings,
-            previewResolution: previewResolution
+            previewResolution: previewResolution,
+            subtitleBottomMargin: subtitleBottomMargin,
+            subtitleLineSpacing: subtitleLineSpacing
         )
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
@@ -895,7 +907,7 @@ final class ProjectState: ObservableObject {
 
     /// 清空素材库及时间轴上所有关联片段
     func clearMediaLibrary() {
-        pushUndo()
+        pushUndoSavingAssets()
         mediaAssets.removeAll()
         mediaThumbnails.removeAll()
         waveformCache.removeAll()
@@ -918,6 +930,11 @@ final class ProjectState: ObservableObject {
     }
 
     func relinkAsset(id: UUID, newURL: URL) {
+        pushUndoSavingAssets()
+        if let i = mediaAssets.firstIndex(where: { $0.id == id }) {
+            mediaAssets[i].url = newURL
+            mediaAssets[i].name = newURL.lastPathComponent
+        }
         for ti in videoTracks.indices {
             for ci in videoTracks[ti].clips.indices where videoTracks[ti].clips[ci].assetID == id {
                 videoTracks[ti].clips[ci].url = newURL
@@ -1087,11 +1104,16 @@ final class ProjectState: ObservableObject {
                     var newTrack = Track<SubtitleClip>(label: "字幕")
                     newTrack.clips.append(removed)
                     subtitleTracks.append(newTrack)
-                    subtitleStyles.append(SubtitleStyle())
+                    subtitleStyles.append(newSubtitleStyle())
                 }
             }
             return
         }
+    }
+
+    /// 为新字幕轨自动计算 bottomMargin，避免与已有轨道重叠
+    func newSubtitleStyle() -> SubtitleStyle {
+        SubtitleStyle()
     }
 
     // MARK: - Multi-select helpers
@@ -1484,9 +1506,11 @@ final class ProjectState: ObservableObject {
                 }
             }
 
+            let visualEnd = max(vEnd, iEnd)
+
             guard !Task.isCancelled else { return }
             await MainActor.run {
-                self.lastVideoEndTime = endTime
+                self.lastVideoEndTime = visualEnd
                 self.duration = max(endTime, 0.01)
                 self.pendingSeekTime = restoreTime
                 if composition.tracks.isEmpty && endTime < 0.01 {
@@ -2017,12 +2041,12 @@ final class ProjectState: ObservableObject {
             if let idx = subtitleTracks.firstIndex(where: { $0.clips.isEmpty }) {
                 subtitleTracks[idx].clips = clips
                 if subtitleStyles.indices.contains(idx) == false {
-                    subtitleStyles.append(SubtitleStyle())
+                    subtitleStyles.append(newSubtitleStyle())
                 }
             } else {
                 subtitleTracks.append(
                     Track(clips: clips, label: "字幕"))
-                subtitleStyles.append(SubtitleStyle())
+                subtitleStyles.append(newSubtitleStyle())
             }
             if let mx = clips.map(\.endTime).max() { duration = max(duration, mx) }
             if let i = mediaAssets.firstIndex(where:{ $0.id == asset.id }) {
@@ -2409,6 +2433,19 @@ final class ProjectState: ObservableObject {
         scheduleAutoSave()
     }
 
+    private func pushUndoSavingAssets() {
+        var snap = currentSnapshot()
+        snap.mediaAssets = mediaAssets
+        undoStack.append(snap)
+        if undoStack.count > 50 { undoStack.removeFirst() }
+        redoStack.removeAll()
+        undoCount = undoStack.count
+        redoCount = 0
+        lastUndoPushTime = Date()
+        isSaved = false
+        scheduleAutoSave()
+    }
+
     /// 节流版 pushUndo — 1秒内连续编辑只记录一次（适合滑块、步进器等高频操作）
     func pushUndoThrottled() {
         isSaved = false
@@ -2442,6 +2479,8 @@ final class ProjectState: ObservableObject {
         ProjectSnapshot(videoTracks: videoTracks, audioTracks: audioTracks,
                         imageTracks: imageTracks,
                         subtitleTracks: subtitleTracks, subtitleStyles: subtitleStyles,
+                        subtitleBottomMargin: subtitleBottomMargin,
+                        subtitleLineSpacing: subtitleLineSpacing,
                         duration: duration)
     }
     private func applySnapshot(_ s: ProjectSnapshot) {
@@ -2450,6 +2489,8 @@ final class ProjectState: ObservableObject {
         imageTracks    = s.imageTracks
         subtitleTracks = s.subtitleTracks
         subtitleStyles = s.subtitleStyles
+        subtitleBottomMargin = s.subtitleBottomMargin
+        subtitleLineSpacing  = s.subtitleLineSpacing
         duration       = s.duration
         if let assets = s.mediaAssets {
             mediaAssets = assets
@@ -2874,7 +2915,7 @@ final class ProjectState: ObservableObject {
             // 没选中任何字幕 → 新建轨道（放在最后）
             let newTrack = Track<SubtitleClip>(label: "字幕")
             subtitleTracks.append(newTrack)
-            subtitleStyles.append(SubtitleStyle())
+            subtitleStyles.append(newSubtitleStyle())
             trackIdx = subtitleTracks.count - 1
         }
 
