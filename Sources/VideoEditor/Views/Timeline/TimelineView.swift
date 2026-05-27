@@ -501,15 +501,47 @@ struct TimelineView: View {
                 applyDrag(op: op, totalTranslation: v.translation, current: v.location)
             }
             .onEnded { v in
-                // 点击空白处（没有拖动）→ 取消所有选择 + 定位播放头
+                // 点击（没有拖动）→ 选中clip或取消选择
                 if dragOp == nil && v.startLocation.y >= rulerH {
-                    if findClipTarget(at: v.startLocation) == nil {
+                    let isShift = NSEvent.modifierFlags.contains(.shift)
+                    if let (hit, _) = findClipTarget(at: v.startLocation) {
+                        if isShift {
+                            switch hit {
+                            case .video(let id, _, _), .image(let id, _, _),
+                                 .audio(let id, _, _), .subtitle(let id, _, _):
+                                project.shiftToggleClip(id)
+                            }
+                        } else {
+                            project.selectedClipIDs.removeAll()
+                            switch hit {
+                            case .video(let id, _, _):
+                                project.selectedVideoClipID = id
+                                project.selectedImageClipID = nil
+                                project.selectedAudioClipID = nil
+                                project.selectedSubtitleClipID = nil
+                            case .image(let id, _, _):
+                                project.selectedImageClipID = id
+                                project.selectedVideoClipID = nil
+                                project.selectedAudioClipID = nil
+                                project.selectedSubtitleClipID = nil
+                            case .audio(let id, _, _):
+                                project.selectedAudioClipID = id
+                                project.selectedVideoClipID = nil
+                                project.selectedImageClipID = nil
+                                project.selectedSubtitleClipID = nil
+                            case .subtitle(let id, _, _):
+                                project.selectedSubtitleClipID = id
+                                project.selectedVideoClipID = nil
+                                project.selectedImageClipID = nil
+                                project.selectedAudioClipID = nil
+                            }
+                        }
+                    } else {
                         project.selectedClipIDs.removeAll()
                         project.selectedVideoClipID    = nil
                         project.selectedImageClipID    = nil
                         project.selectedAudioClipID    = nil
                         project.selectedSubtitleClipID = nil
-                        // 点击空白区域同时定位播放头
                         let t = max(0, Double(v.startLocation.x) / project.pixelsPerSecond)
                         project.requestSeek(to: t)
                     }
@@ -1503,31 +1535,11 @@ private struct VideoClipView: View {
         .clipShape(RoundedRectangle(cornerRadius: 4))
         .opacity(isDragging ? 0 : (project.clipboardIsCut && project.clipboardSourceID == clip.id ? 0.35 : 1.0))
         .offset(x: clip.startTime*pps + 1)
+        .allowsHitTesting(false)
         .onAppear {
             if let url = clip.url {
                 project.loadTimelineThumbnails(assetID: clip.assetID, url: url)
             }
-        }
-        .gesture(TapGesture().modifiers(.shift).onEnded {
-            project.shiftToggleClip(clip.id)
-        })
-        .simultaneousGesture(TapGesture().onEnded {
-            guard !NSEvent.modifierFlags.contains(.shift) else { return }
-            project.selectedVideoClipID    = clip.id
-            project.selectedImageClipID    = nil
-            project.selectedAudioClipID    = nil
-            project.selectedSubtitleClipID = nil
-            project.selectedClipIDs.removeAll()
-        })
-        .contextMenu {
-            Button { project.selectLeftOf(clip.id) } label: { Label("向左全选", systemImage: "arrow.left.to.line") }
-            Button { project.selectRightOf(clip.id) } label: { Label("向右全选", systemImage: "arrow.right.to.line") }
-            Divider()
-            Button { project.copySelected() } label: { Label("复制", systemImage: "doc.on.doc") }
-            Button { project.cutSelected() } label: { Label("剪切", systemImage: "scissors") }
-            Button { project.pasteAtPlayhead() } label: { Label("粘贴", systemImage: "doc.on.clipboard") }
-            Divider()
-            Button(role: .destructive) { project.deleteSelected() } label: { Label("删除", systemImage: "trash") }
         }
     }
 
@@ -1595,17 +1607,7 @@ private struct ImageClipView: View {
         .clipShape(RoundedRectangle(cornerRadius: 4))
         .opacity(isDragging ? 0 : (project.clipboardIsCut && project.clipboardSourceID == clip.id ? 0.35 : 1.0))
         .offset(x: clip.startTime*pps + 1)
-        .gesture(TapGesture().modifiers(.shift).onEnded {
-            project.shiftToggleClip(clip.id)
-        })
-        .simultaneousGesture(TapGesture().onEnded {
-            guard !NSEvent.modifierFlags.contains(.shift) else { return }
-            project.selectedImageClipID    = clip.id
-            project.selectedVideoClipID    = nil
-            project.selectedAudioClipID    = nil
-            project.selectedSubtitleClipID = nil
-            project.selectedClipIDs.removeAll()
-        })
+        .allowsHitTesting(false)
         .contextMenu {
             Button { project.selectLeftOf(clip.id) } label: { Label("向左全选", systemImage: "arrow.left.to.line") }
             Button { project.selectRightOf(clip.id) } label: { Label("向右全选", systemImage: "arrow.right.to.line") }
@@ -1657,27 +1659,7 @@ private struct AudioClipView: View {
                 project.loadWaveform(assetID: clip.assetID, url: url)
             }
         }
-        .gesture(TapGesture().modifiers(.shift).onEnded {
-            project.shiftToggleClip(clip.id)
-        })
-        .simultaneousGesture(TapGesture().onEnded {
-            guard !NSEvent.modifierFlags.contains(.shift) else { return }
-            project.selectedAudioClipID    = clip.id
-            project.selectedVideoClipID    = nil
-            project.selectedImageClipID    = nil
-            project.selectedSubtitleClipID = nil
-            project.selectedClipIDs.removeAll()
-        })
-        .contextMenu {
-            Button { project.selectLeftOf(clip.id) } label: { Label("向左全选", systemImage: "arrow.left.to.line") }
-            Button { project.selectRightOf(clip.id) } label: { Label("向右全选", systemImage: "arrow.right.to.line") }
-            Divider()
-            Button { project.copySelected() } label: { Label("复制", systemImage: "doc.on.doc") }
-            Button { project.cutSelected() } label: { Label("剪切", systemImage: "scissors") }
-            Button { project.pasteAtPlayhead() } label: { Label("粘贴", systemImage: "doc.on.clipboard") }
-            Divider()
-            Button(role: .destructive) { project.deleteSelected() } label: { Label("删除", systemImage: "trash") }
-        }
+        .allowsHitTesting(false)
     }
 }
 
@@ -1768,27 +1750,7 @@ private struct SubtitleClipView: View {
         .onAppear { if isPlaceholder { breathing = true } }
         .onChange(of: isPlaceholder) { ph in breathing = ph }
         .offset(x: clip.startTime*pps + 1)
-        .gesture(TapGesture().modifiers(.shift).onEnded {
-            project.shiftToggleClip(clip.id)
-        })
-        .simultaneousGesture(TapGesture().onEnded {
-            guard !NSEvent.modifierFlags.contains(.shift) else { return }
-            project.selectedSubtitleClipID = clip.id
-            project.selectedVideoClipID    = nil
-            project.selectedImageClipID    = nil
-            project.selectedAudioClipID    = nil
-            project.selectedClipIDs.removeAll()
-        })
-        .contextMenu {
-            Button { project.selectLeftOf(clip.id) } label: { Label("向左全选", systemImage: "arrow.left.to.line") }
-            Button { project.selectRightOf(clip.id) } label: { Label("向右全选", systemImage: "arrow.right.to.line") }
-            Divider()
-            Button { project.copySelected() } label: { Label("复制", systemImage: "doc.on.doc") }
-            Button { project.cutSelected() } label: { Label("剪切", systemImage: "scissors") }
-            Button { project.pasteAtPlayhead() } label: { Label("粘贴", systemImage: "doc.on.clipboard") }
-            Divider()
-            Button(role: .destructive) { project.deleteSelected() } label: { Label("删除", systemImage: "trash") }
-        }
+        .allowsHitTesting(false)
     }
 }
 

@@ -613,7 +613,10 @@ final class ProjectState: ObservableObject {
             try data.write(to: fileURL, options: .atomic)
             isSaved = true
         } catch {
-            if !silent {
+            isSaved = false
+            if silent {
+                showImportToast("自动保存失败：\(error.localizedDescription)")
+            } else {
                 let alert = NSAlert()
                 alert.alertStyle = .critical
                 alert.messageText = "保存失败"
@@ -670,8 +673,7 @@ final class ProjectState: ObservableObject {
         guard alert.runModal() == .alertFirstButtonReturn else { return }
 
         // User confirmed — save snapshot WITH mediaAssets for undo
-        var snapshot = currentSnapshot()
-        snapshot.mediaAssets = mediaAssets
+        let snapshot = currentSnapshot(includeAssets: true)
         undoStack.append(snapshot)
         if undoStack.count > 50 { undoStack.removeFirst() }
         redoStack.removeAll()
@@ -931,7 +933,7 @@ final class ProjectState: ObservableObject {
     /// Update all timeline clips that reference a given asset to use a new URL.
     /// 删除素材并移除时间轴上所有引用该素材的片段
     func removeAssetAndClips(assetID: UUID) {
-        let snap = currentSnapshot()
+        let snap = currentSnapshot(includeAssets: true)
         mediaAssets.removeAll { $0.id == assetID }
         for i in videoTracks.indices {
             videoTracks[i].clips.removeAll { $0.assetID == assetID }
@@ -1814,16 +1816,14 @@ final class ProjectState: ObservableObject {
 
     /// 取消单个转码任务
     func cancelTranscodeTask(_ taskID: UUID) {
-        if let idx = activeTasks.firstIndex(where: { $0.id == taskID }) {
-            let task = activeTasks[idx]
+        if let task = activeTasks.first(where: { $0.id == taskID }) {
             task.process?.terminate()
             task.process = nil
             try? FileManager.default.removeItem(at: task.outputURL)
-            activeTasks.remove(at: idx)
-            drainPendingTasks()
-        } else {
-            pendingTasks.removeAll { $0.id == taskID }
         }
+        activeTasks.removeAll { $0.id == taskID }
+        pendingTasks.removeAll { $0.id == taskID }
+        drainPendingTasks()
         if activeTasks.isEmpty && pendingTasks.isEmpty {
             isTranscoding = false
             transcodingProgress = 0
@@ -1859,19 +1859,16 @@ final class ProjectState: ObservableObject {
     }
 
     private func drainPendingTasks() {
-        let runningCount = activeTasks.filter { $0.isRunning }.count
-        while runningCount + (activeTasks.filter { $0.isRunning }.count - runningCount) < Self.maxConcurrentTranscodes,
+        while activeTasks.filter({ $0.isRunning }).count < Self.maxConcurrentTranscodes,
               !pendingTasks.isEmpty {
             let task = pendingTasks.removeFirst()
-            if activeTasks.contains(where: { $0.id == task.id }) {
-                task.isRunning = true
-                if task.type == .audio {
-                    runAudioTranscode(task)
-                } else {
-                    runVideoTranscode(task)
-                }
+            guard activeTasks.contains(where: { $0.id == task.id }) else { continue }
+            task.isRunning = true
+            if task.type == .audio {
+                runAudioTranscode(task)
+            } else {
+                runVideoTranscode(task)
             }
-            if activeTasks.filter({ $0.isRunning }).count >= Self.maxConcurrentTranscodes { break }
         }
     }
 
@@ -1967,7 +1964,10 @@ final class ProjectState: ObservableObject {
                         let currentSec = Self.parseFFmpegTime(timeStr)
                         if totalDuration > 0 {
                             let prog = min(currentSec / totalDuration, 1.0)
-                            Task { @MainActor in task.progress = prog }
+                            Task { @MainActor [weak self] in
+                                task.progress = prog
+                                self?.objectWillChange.send()
+                            }
                         }
                         if let lastCR = buffer.lastIndex(of: "\r") {
                             buffer = String(buffer[buffer.index(after: lastCR)...])
@@ -2618,14 +2618,14 @@ final class ProjectState: ObservableObject {
         scheduleAutoSave()
     }
 
-    private func currentSnapshot() -> ProjectSnapshot {
+    private func currentSnapshot(includeAssets: Bool = false) -> ProjectSnapshot {
         ProjectSnapshot(videoTracks: videoTracks, audioTracks: audioTracks,
                         imageTracks: imageTracks,
                         subtitleTracks: subtitleTracks, subtitleStyles: subtitleStyles,
                         subtitleBottomMargin: subtitleBottomMargin,
                         subtitleLineSpacing: subtitleLineSpacing,
                         duration: duration,
-                        mediaAssets: mediaAssets)
+                        mediaAssets: includeAssets ? mediaAssets : nil)
     }
     private func applySnapshot(_ s: ProjectSnapshot) {
         videoTracks    = s.videoTracks
