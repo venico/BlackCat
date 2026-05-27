@@ -335,16 +335,35 @@ final class ProjectState: ObservableObject {
     @Published var projectFileURL: URL? = nil
     @Published var showWelcome: Bool = true
     @Published var isSaved: Bool = false
-    @Published var saveToasts: [UUID] = []
+    struct SaveToast: Identifiable, Equatable {
+        let id = UUID()
+        let path: String
+    }
+    @Published var saveToasts: [SaveToast] = []
     /// Toast message for import feedback (e.g. duplicate file skipped)
     @Published var importToastMessage: String? = nil
 
-    // 转码状态
+    // 并发转码（最多5个同时运行，多余排队）
+    static let maxConcurrentTranscodes = 5
+    class TranscodeTask: ObservableObject, Identifiable {
+        let id = UUID()
+        let inputURL: URL
+        let outputURL: URL
+        let type: AssetType
+        let displayName: String
+        @Published var progress: Double = 0
+        var process: Process?
+        var isRunning: Bool = false
+        init(inputURL: URL, outputURL: URL, type: AssetType, displayName: String) {
+            self.inputURL = inputURL; self.outputURL = outputURL
+            self.type = type; self.displayName = displayName
+        }
+    }
+    @Published var activeTasks: [TranscodeTask] = []
+    private var pendingTasks: [TranscodeTask] = []
     @Published var isTranscoding: Bool = false
     @Published var transcodingFileName: String = ""
-    @Published var transcodingProgress: Double = 0  // 0...1
-    private var transcodingProcess: Process?
-    private var transcodingOutputURL: URL?
+    @Published var transcodingProgress: Double = 0
 
     // Export
     @Published var exportSettings  = ExportSettings()
@@ -470,7 +489,17 @@ final class ProjectState: ObservableObject {
             return
         }
 
-        guard url.startAccessingSecurityScopedResource() else { return }
+        guard url.startAccessingSecurityScopedResource() else {
+            DispatchQueue.main.async {
+                let alert = NSAlert()
+                alert.alertStyle = .warning
+                alert.messageText = "无法访问项目文件"
+                alert.informativeText = "系统安全权限不足，请重新选择文件或检查权限设置。\n路径：\(url.path)"
+                alert.addButton(withTitle: "确定")
+                alert.runModal()
+            }
+            return
+        }
         accessedURLs.append(url)
         defer { /* keep access alive */ }
 
@@ -555,6 +584,14 @@ final class ProjectState: ObservableObject {
     }
 
     func saveProject(silent: Bool = false) {
+        if projectFileURL == nil {
+            let docDir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
+                ?? FileManager.default.temporaryDirectory
+            let name = projectName.trimmingCharacters(in: .whitespaces).isEmpty ? "未命名项目" : projectName
+            let fileURL = docDir.appendingPathComponent("\(name).bcj")
+            projectName = name
+            projectFileURL = fileURL
+        }
         guard let fileURL = projectFileURL else { return }
         let doc = ProjectDocument(
             name: projectName,
@@ -572,14 +609,27 @@ final class ProjectState: ObservableObject {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         guard let data = try? encoder.encode(doc) else { return }
-        try? data.write(to: fileURL, options: .atomic)
-        isSaved = true
+        do {
+            try data.write(to: fileURL, options: .atomic)
+            isSaved = true
+        } catch {
+            if !silent {
+                let alert = NSAlert()
+                alert.alertStyle = .critical
+                alert.messageText = "保存失败"
+                alert.informativeText = error.localizedDescription
+                alert.addButton(withTitle: "确定")
+                alert.runModal()
+            }
+            return
+        }
         guard !silent else { return }
-        let toastID = UUID()
+        let toast = SaveToast(path: fileURL.path)
         if saveToasts.count >= 5 { saveToasts.removeFirst() }
-        saveToasts.append(toastID)
+        saveToasts.append(toast)
+        let tid = toast.id
         DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
-            self?.saveToasts.removeAll { $0 == toastID }
+            self?.saveToasts.removeAll { $0.id == tid }
         }
     }
 
@@ -943,6 +993,44 @@ final class ProjectState: ObservableObject {
         for ti in audioTracks.indices {
             for ci in audioTracks[ti].clips.indices where audioTracks[ti].clips[ci].assetID == id {
                 audioTracks[ti].clips[ci].url = newURL
+            }
+        }
+        // 图片轨：更新 imageURL 并清理旧缓存视频，重新生成
+        for ti in imageTracks.indices {
+            for ci in imageTracks[ti].clips.indices where imageTracks[ti].clips[ci].assetID == id {
+                imageTracks[ti].clips[ci].imageURL = newURL
+                imageTracks[ti].clips[ci].videoURL = nil
+            }
+        }
+        imageVideoCache.removeValue(forKey: id)
+        // 清理旧缓存，重新加载素材资源
+        mediaThumbnails.removeValue(forKey: id)
+        waveformCache.removeValue(forKey: id)
+        if let asset = mediaAssets.first(where: { $0.id == id }) {
+            loadMediaResources(asset)
+        }
+        // 重新加载时长和尺寸
+        Task {
+            let avAsset = AVURLAsset(url: newURL)
+            if let dur = try? await avAsset.load(.duration) {
+                await MainActor.run {
+                    if let i = self.mediaAssets.firstIndex(where: { $0.id == id }) {
+                        self.mediaAssets[i].duration = dur.seconds
+                    }
+                }
+            }
+            if let vTrack = try? await avAsset.loadTracks(withMediaType: .video).first {
+                let sz = try? await vTrack.load(.naturalSize)
+                await MainActor.run {
+                    if let sz {
+                        for ti in self.videoTracks.indices {
+                            for ci in self.videoTracks[ti].clips.indices where self.videoTracks[ti].clips[ci].assetID == id {
+                                self.videoTracks[ti].clips[ci].videoWidth = sz.width
+                                self.videoTracks[ti].clips[ci].videoHeight = sz.height
+                            }
+                        }
+                    }
+                }
             }
         }
         rebuildTimelinePreview()
@@ -1645,9 +1733,10 @@ final class ProjectState: ObservableObject {
         // 需要转码的音频格式，先转为 M4A 再导入
         if type == .audio && Self.needsTranscodeAudioExtensions.contains(ext) {
             let fileName = url.deletingPathExtension().lastPathComponent
+            let shortHash = String(url.path.hashValue, radix: 16, uppercase: false).suffix(8)
             let outputURL = FileManager.default.temporaryDirectory
                 .appendingPathComponent("BlackCatTranscode", isDirectory: true)
-                .appendingPathComponent("\(fileName)_\(ext).m4a")
+                .appendingPathComponent("\(fileName)_\(shortHash).m4a")
             if mediaAssets.contains(where: { $0.url == outputURL }) {
                 showImportToast("「\(url.lastPathComponent)」已在素材库中，已跳过")
                 return
@@ -1706,17 +1795,198 @@ final class ProjectState: ObservableObject {
 
     // MARK: - FFmpeg Transcode
 
-    /// 取消当前转码，终止进程并清除临时文件
+    /// 取消所有转码
     func cancelTranscoding() {
-        transcodingProcess?.terminate()
-        transcodingProcess = nil
+        for task in activeTasks {
+            task.process?.terminate()
+            task.process = nil
+            try? FileManager.default.removeItem(at: task.outputURL)
+        }
+        for task in pendingTasks {
+            try? FileManager.default.removeItem(at: task.outputURL)
+        }
+        activeTasks.removeAll()
+        pendingTasks.removeAll()
         isTranscoding = false
         transcodingProgress = 0
         transcodingFileName = ""
-        // 删除未完成的临时文件
-        if let outputURL = transcodingOutputURL {
-            try? FileManager.default.removeItem(at: outputURL)
-            transcodingOutputURL = nil
+    }
+
+    /// 取消单个转码任务
+    func cancelTranscodeTask(_ taskID: UUID) {
+        if let idx = activeTasks.firstIndex(where: { $0.id == taskID }) {
+            let task = activeTasks[idx]
+            task.process?.terminate()
+            task.process = nil
+            try? FileManager.default.removeItem(at: task.outputURL)
+            activeTasks.remove(at: idx)
+            drainPendingTasks()
+        } else {
+            pendingTasks.removeAll { $0.id == taskID }
+        }
+        if activeTasks.isEmpty && pendingTasks.isEmpty {
+            isTranscoding = false
+            transcodingProgress = 0
+            transcodingFileName = ""
+        }
+    }
+
+    private func enqueueTranscodeTask(_ task: TranscodeTask) {
+        isTranscoding = true
+        let runningCount = activeTasks.filter { $0.isRunning }.count
+        if runningCount < Self.maxConcurrentTranscodes {
+            activeTasks.append(task)
+            task.isRunning = true
+            if task.type == .audio {
+                runAudioTranscode(task)
+            } else {
+                runVideoTranscode(task)
+            }
+        } else {
+            pendingTasks.append(task)
+            activeTasks.append(task)
+        }
+    }
+
+    private func finishTranscodeTask(_ taskID: UUID) {
+        activeTasks.removeAll { $0.id == taskID }
+        drainPendingTasks()
+        if activeTasks.isEmpty && pendingTasks.isEmpty {
+            isTranscoding = false
+            transcodingProgress = 0
+            transcodingFileName = ""
+        }
+    }
+
+    private func drainPendingTasks() {
+        let runningCount = activeTasks.filter { $0.isRunning }.count
+        while runningCount + (activeTasks.filter { $0.isRunning }.count - runningCount) < Self.maxConcurrentTranscodes,
+              !pendingTasks.isEmpty {
+            let task = pendingTasks.removeFirst()
+            if activeTasks.contains(where: { $0.id == task.id }) {
+                task.isRunning = true
+                if task.type == .audio {
+                    runAudioTranscode(task)
+                } else {
+                    runVideoTranscode(task)
+                }
+            }
+            if activeTasks.filter({ $0.isRunning }).count >= Self.maxConcurrentTranscodes { break }
+        }
+    }
+
+    private func runAudioTranscode(_ task: TranscodeTask) {
+        guard let ffmpeg = Self.findFFmpeg() else {
+            showImportToast("未找到 FFmpeg，无法转码 \(task.displayName)")
+            finishTranscodeTask(task.id)
+            return
+        }
+        let outputDir = task.outputURL.deletingLastPathComponent()
+        try? FileManager.default.createDirectory(at: outputDir, withIntermediateDirectories: true)
+
+        Task.detached { [weak self] in
+            let ok = Self.runFFmpegSync(ffmpeg: ffmpeg, arguments: [
+                "-i", task.inputURL.path,
+                "-c:a", "aac", "-b:a", "192k",
+                "-y", task.outputURL.path
+            ])
+            await MainActor.run {
+                if ok {
+                    self?.importFileDirectly(url: task.outputURL, type: .audio, displayName: task.displayName)
+                } else {
+                    self?.showImportToast("「\(task.displayName)」转码失败")
+                }
+                self?.finishTranscodeTask(task.id)
+            }
+        }
+    }
+
+    private func runVideoTranscode(_ task: TranscodeTask) {
+        guard let ffmpeg = Self.findFFmpeg() else {
+            showImportToast("未找到 FFmpeg，无法转码 \(task.displayName)")
+            finishTranscodeTask(task.id)
+            return
+        }
+
+        Task.detached { [weak self] in
+            let remuxOK = Self.runFFmpegSync(ffmpeg: ffmpeg, arguments: [
+                "-i", task.inputURL.path,
+                "-c:v", "copy",
+                "-c:a", "aac", "-b:a", "192k",
+                "-movflags", "+faststart",
+                "-y", task.outputURL.path
+            ])
+            if remuxOK {
+                let asset = AVURLAsset(url: task.outputURL)
+                let playable = (try? await asset.load(.isPlayable)) ?? false
+                if playable {
+                    await MainActor.run {
+                        self?.importFileDirectly(url: task.outputURL, type: .video)
+                        self?.finishTranscodeTask(task.id)
+                    }
+                    return
+                }
+                try? FileManager.default.removeItem(at: task.outputURL)
+            }
+
+            let totalDuration = Self.probeVideoDuration(ffmpegDir: ffmpeg.deletingLastPathComponent().path, inputPath: task.inputURL.path)
+            let process = Process()
+            await MainActor.run { task.process = process }
+            process.executableURL = ffmpeg
+            process.arguments = [
+                "-hwaccel", "videotoolbox",
+                "-i", task.inputURL.path,
+                "-c:v", "h264_videotoolbox",
+                "-b:v", "8000k",
+                "-profile:v", "high",
+                "-level:v", "4.2",
+                "-c:a", "aac", "-b:a", "192k",
+                "-movflags", "+faststart",
+                "-y", task.outputURL.path
+            ]
+
+            let pipe = Pipe()
+            process.standardError = pipe
+
+            do { try process.run() } catch {
+                await MainActor.run {
+                    self?.showImportToast("转码失败：\(error.localizedDescription)")
+                    self?.finishTranscodeTask(task.id)
+                }
+                return
+            }
+
+            let handle = pipe.fileHandleForReading
+            var buffer = ""
+            while process.isRunning {
+                if let data = try? handle.availableData, !data.isEmpty,
+                   let str = String(data: data, encoding: .utf8) {
+                    buffer += str
+                    if let range = buffer.range(of: "time=\\d{2}:\\d{2}:\\d{2}\\.\\d+", options: .regularExpression) {
+                        let timeStr = String(buffer[range]).replacingOccurrences(of: "time=", with: "")
+                        let currentSec = Self.parseFFmpegTime(timeStr)
+                        if totalDuration > 0 {
+                            let prog = min(currentSec / totalDuration, 1.0)
+                            Task { @MainActor in task.progress = prog }
+                        }
+                        if let lastCR = buffer.lastIndex(of: "\r") {
+                            buffer = String(buffer[buffer.index(after: lastCR)...])
+                        }
+                    }
+                }
+                Thread.sleep(forTimeInterval: 0.1)
+            }
+            process.waitUntilExit()
+
+            await MainActor.run {
+                task.process = nil
+                if process.terminationStatus == 0 {
+                    self?.importFileDirectly(url: task.outputURL, type: .video)
+                } else if process.terminationStatus != 15 {
+                    self?.showImportToast("转码失败，FFmpeg 退出码: \(process.terminationStatus)")
+                }
+                self?.finishTranscodeTask(task.id)
+            }
         }
     }
 
@@ -1731,41 +2001,18 @@ final class ProjectState: ObservableObject {
             }
             return
         }
-
-        guard let ffmpeg = Self.findFFmpeg() else {
-            showImportToast("未找到 FFmpeg，无法导入 \(url.pathExtension.uppercased()) 格式")
-            return
-        }
-
-        let outputDir = outputURL.deletingLastPathComponent()
-        try? FileManager.default.createDirectory(at: outputDir, withIntermediateDirectories: true)
-
-        Task.detached { [weak self] in
-            let ok = Self.runFFmpegSync(ffmpeg: ffmpeg, arguments: [
-                "-i", url.path,
-                "-c:a", "aac", "-b:a", "192k",
-                "-y", outputURL.path
-            ])
-            await MainActor.run {
-                if ok {
-                    self?.importFileDirectly(url: outputURL, type: .audio, displayName: name)
-                    self?.showImportToast("「\(name)」导入完成")
-                } else {
-                    self?.showImportToast("「\(name)」转码失败")
-                }
-            }
-        }
+        enqueueTranscodeTask(TranscodeTask(inputURL: url, outputURL: outputURL, type: .audio, displayName: name))
     }
 
-    /// 将非原生视频格式转为 MP4。策略：先快速 remux（-c copy），失败再硬件转码
+    /// 将非原生视频格式转为 MP4
     private func transcodeAndImport(url: URL) {
         let fileName = url.deletingPathExtension().lastPathComponent
         let outputDir = FileManager.default.temporaryDirectory
             .appendingPathComponent("BlackCatTranscode", isDirectory: true)
         try? FileManager.default.createDirectory(at: outputDir, withIntermediateDirectories: true)
-        let outputURL = outputDir.appendingPathComponent("\(fileName).mp4")
+        let shortHash = String(url.path.hashValue, radix: 16, uppercase: false).suffix(8)
+        let outputURL = outputDir.appendingPathComponent("\(fileName)_\(shortHash).mp4")
 
-        // 如果已处理过，检查是否已在素材库中
         if FileManager.default.fileExists(atPath: outputURL.path) {
             if !mediaAssets.contains(where: { $0.url == outputURL }) {
                 importFileDirectly(url: outputURL, type: .video)
@@ -1774,111 +2021,7 @@ final class ProjectState: ObservableObject {
             }
             return
         }
-
-        // 查找 ffmpeg
-        guard let ffmpeg = Self.findFFmpeg() else {
-            showImportToast("未找到 FFmpeg，无法导入 \(url.pathExtension.uppercased()) 格式")
-            return
-        }
-
-        transcodingOutputURL = outputURL
-
-        Task.detached { [weak self] in
-            // ═══════ 第一步：快速 remux（视频 copy，音频转 AAC 兼容 MP4） ═══════
-            let remuxOK = Self.runFFmpegSync(ffmpeg: ffmpeg, arguments: [
-                "-i", url.path,
-                "-c:v", "copy",
-                "-c:a", "aac", "-b:a", "192k",
-                "-movflags", "+faststart",
-                "-y", outputURL.path
-            ])
-
-            if remuxOK {
-                // 验证 AVFoundation 能否播放（H.264/H.265 可以，VP9/AV1 不行）
-                let asset = AVURLAsset(url: outputURL)
-                let playable = (try? await asset.load(.isPlayable)) ?? false
-                if playable {
-                    await MainActor.run {
-                        self?.importFileDirectly(url: outputURL, type: .video)
-                    }
-                    return
-                }
-                // 编码不兼容，删掉 remux 文件，走转码
-                try? FileManager.default.removeItem(at: outputURL)
-            }
-
-            // ═══════ 第二步：硬件转码（仅当 remux 不可用时） ═══════
-            await MainActor.run {
-                self?.isTranscoding = true
-                self?.transcodingFileName = url.lastPathComponent
-                self?.transcodingProgress = 0
-            }
-
-            let totalDuration = Self.probeVideoDuration(ffmpegDir: ffmpeg.deletingLastPathComponent().path, inputPath: url.path)
-
-            let process = Process()
-            await MainActor.run { self?.transcodingProcess = process }
-            process.executableURL = ffmpeg
-            process.arguments = [
-                "-hwaccel", "videotoolbox",
-                "-i", url.path,
-                "-c:v", "h264_videotoolbox",
-                "-b:v", "8000k",
-                "-profile:v", "high",
-                "-level:v", "4.2",
-                "-c:a", "aac", "-b:a", "192k",
-                "-movflags", "+faststart",
-                "-y", outputURL.path
-            ]
-
-            let pipe = Pipe()
-            process.standardError = pipe
-
-            do {
-                try process.run()
-            } catch {
-                await MainActor.run {
-                    self?.isTranscoding = false
-                    self?.showImportToast("转码失败：\(error.localizedDescription)")
-                }
-                return
-            }
-
-            // 解析进度
-            let handle = pipe.fileHandleForReading
-            var buffer = ""
-            while process.isRunning {
-                if let data = try? handle.availableData, !data.isEmpty,
-                   let str = String(data: data, encoding: .utf8) {
-                    buffer += str
-                    if let range = buffer.range(of: "time=\\d{2}:\\d{2}:\\d{2}\\.\\d+", options: .regularExpression) {
-                        let timeStr = String(buffer[range]).replacingOccurrences(of: "time=", with: "")
-                        let currentSec = Self.parseFFmpegTime(timeStr)
-                        if totalDuration > 0 {
-                            let prog = min(currentSec / totalDuration, 1.0)
-                            Task { @MainActor in self?.transcodingProgress = prog }
-                        }
-                        if let lastCR = buffer.lastIndex(of: "\r") {
-                            buffer = String(buffer[buffer.index(after: lastCR)...])
-                        }
-                    }
-                }
-                Thread.sleep(forTimeInterval: 0.1)
-            }
-            process.waitUntilExit()
-
-            await MainActor.run {
-                self?.isTranscoding = false
-                self?.transcodingProgress = 0
-                self?.transcodingProcess = nil
-                if process.terminationStatus == 0 {
-                    self?.importFileDirectly(url: outputURL, type: .video)
-                    self?.showImportToast("「\(url.lastPathComponent)」导入完成")
-                } else {
-                    self?.showImportToast("转码失败，FFmpeg 退出码: \(process.terminationStatus)")
-                }
-            }
-        }
+        enqueueTranscodeTask(TranscodeTask(inputURL: url, outputURL: outputURL, type: .video, displayName: url.lastPathComponent))
     }
 
     /// 同步执行 FFmpeg 命令，返回是否成功
@@ -2481,7 +2624,8 @@ final class ProjectState: ObservableObject {
                         subtitleTracks: subtitleTracks, subtitleStyles: subtitleStyles,
                         subtitleBottomMargin: subtitleBottomMargin,
                         subtitleLineSpacing: subtitleLineSpacing,
-                        duration: duration)
+                        duration: duration,
+                        mediaAssets: mediaAssets)
     }
     private func applySnapshot(_ s: ProjectSnapshot) {
         videoTracks    = s.videoTracks
@@ -2524,6 +2668,7 @@ final class ProjectState: ObservableObject {
                             overrideFPS: c.overrideFPS,
                             overrideBitrate: c.overrideBitrate)
                         newClip.volume = c.volume
+                        newClip.videoWidth = c.videoWidth; newClip.videoHeight = c.videoHeight
                         newClip.scaleX = c.scaleX; newClip.scaleY = c.scaleY
                         newClip.lockAspect = c.lockAspect
                         newClip.offsetX = c.offsetX; newClip.offsetY = c.offsetY
@@ -2559,7 +2704,8 @@ final class ProjectState: ObservableObject {
                     let c = subtitleTracks[ti].clips[ci]
                     if c.startTime + 0.01 < t && c.endTime - 0.01 > t {
                         subtitleTracks[ti].clips[ci].endTime = t
-                        let newClip = SubtitleClip(text: c.text, startTime: t, endTime: c.endTime)
+                        var newClip = SubtitleClip(text: c.text, startTime: t, endTime: c.endTime)
+                        newClip.assetID = c.assetID
                         subtitleTracks[ti].clips.insert(newClip, at: ci + 1)
                         changed = true
                     }
@@ -2575,6 +2721,7 @@ final class ProjectState: ObservableObject {
             undoCount = undoStack.count
             redoCount = 0
             rebuildTimelinePreview()
+            scheduleAutoSave()
         }
     }
 
@@ -2742,6 +2889,7 @@ final class ProjectState: ObservableObject {
             var newClip = VideoClip(assetID: clip.assetID, name: clip.name, url: clip.url,
                                     startTime: t, endTime: t + clip.duration, trimStart: clip.trimStart)
             newClip.volume = clip.volume
+            newClip.videoWidth = clip.videoWidth; newClip.videoHeight = clip.videoHeight
             newClip.overrideResolution = clip.overrideResolution
             newClip.overrideFPS = clip.overrideFPS
             newClip.overrideBitrate = clip.overrideBitrate
@@ -2791,7 +2939,8 @@ final class ProjectState: ObservableObject {
             }
 
         case .subtitle(let clip, let trackIdx):
-            let newClip = SubtitleClip(text: clip.text, startTime: t, endTime: t + clip.duration)
+            var newClip = SubtitleClip(text: clip.text, startTime: t, endTime: t + clip.duration)
+            newClip.assetID = clip.assetID
             let idx = subtitleTracks.indices.contains(trackIdx) ? trackIdx : 0
             if subtitleTracks.indices.contains(idx) {
                 subtitleTracks[idx].clips.append(newClip)
@@ -2807,6 +2956,7 @@ final class ProjectState: ObservableObject {
         undoCount = undoStack.count
         redoCount = 0
         rebuildTimelinePreview()
+        scheduleAutoSave()
     }
 
     /// Move the selected clip so its start aligns with the current playhead.
@@ -2815,13 +2965,32 @@ final class ProjectState: ObservableObject {
         let snap = currentSnapshot()
         var changed = false
         if let id = selectedVideoClipID {
-            updateVideoClip(id: id) { c in
-                let d = c.duration; c.startTime = t; c.endTime = t + d
-            }; changed = true
+            for ti in videoTracks.indices {
+                if let ci = videoTracks[ti].clips.firstIndex(where: { $0.id == id }) {
+                    let d = videoTracks[ti].clips[ci].duration
+                    videoTracks[ti].clips[ci].startTime = t
+                    videoTracks[ti].clips[ci].endTime = t + d
+                    changed = true; break
+                }
+            }
         } else if let id = selectedAudioClipID {
-            updateAudioClip(id: id) { c in
-                let d = c.duration; c.startTime = t; c.endTime = t + d
-            }; changed = true
+            for ti in audioTracks.indices {
+                if let ci = audioTracks[ti].clips.firstIndex(where: { $0.id == id }) {
+                    let d = audioTracks[ti].clips[ci].duration
+                    audioTracks[ti].clips[ci].startTime = t
+                    audioTracks[ti].clips[ci].endTime = t + d
+                    changed = true; break
+                }
+            }
+        } else if let id = selectedImageClipID {
+            for ti in imageTracks.indices {
+                if let ci = imageTracks[ti].clips.firstIndex(where: { $0.id == id }) {
+                    let d = imageTracks[ti].clips[ci].duration
+                    imageTracks[ti].clips[ci].startTime = t
+                    imageTracks[ti].clips[ci].endTime = t + d
+                    changed = true; break
+                }
+            }
         } else if let id = selectedSubtitleClipID {
             for ti in subtitleTracks.indices {
                 if let ci = subtitleTracks[ti].clips.firstIndex(where:{ $0.id==id }) {
@@ -2838,6 +3007,8 @@ final class ProjectState: ObservableObject {
             redoStack.removeAll()
             undoCount = undoStack.count
             redoCount = 0
+            rebuildTimelinePreview()
+            scheduleAutoSave()
         }
     }
 

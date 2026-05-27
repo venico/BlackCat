@@ -16,11 +16,11 @@ struct InspectorView: View {
                 if let clip = project.selectedSubtitleClip {
                     SubtitleInspector(clip: clip).id(clip.id)
                 } else if let clip = project.selectedImageClip {
-                    ImageInspector(clip: clip)
+                    ImageInspector(clip: clip).id(clip.id)
                 } else if let clip = project.selectedVideoClip {
-                    VideoInspector(clip: clip)
+                    VideoInspector(clip: clip).id(clip.id)
                 } else if let clip = project.selectedAudioClip {
-                    AudioInspector(clip: clip)
+                    AudioInspector(clip: clip).id(clip.id)
                 } else {
                     EmptyInspector()
                 }

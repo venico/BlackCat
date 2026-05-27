@@ -519,7 +519,7 @@ actor TimelineExporter {
         let globalEndTime = max(vEnd, max(iEnd, max(aEnd, sEnd)))
 
         let composition = AVMutableComposition()
-        var audioMixParams: [(trackID: CMPersistentTrackID, volume: Float, left: Float, right: Float)] = []
+        var audioMixParams: [(trackID: CMPersistentTrackID, volume: Float, left: Float, right: Float, startTime: Double, duration: Double, fadeIn: Double, fadeOut: Double)] = []
         var sourceVideoSize: CGSize = CGSize(width: 1920, height: 1080)
         var sourceFrameDuration: CMTime = CMTime(value: 1, timescale: 30)
         let includeVideo = settings.content == .video
@@ -560,7 +560,7 @@ actor TimelineExporter {
                                                           preferredTrackID: kCMPersistentTrackID_Invalid)
                     if let at2 { try at2.insertTimeRange(range, of: aAsset, at: at) }
                     if let tid = at2?.trackID {
-                        audioMixParams.append((tid, clip.volume, 1.0, 1.0))
+                        audioMixParams.append((tid, clip.volume, 1.0, 1.0, clip.startTime, useDur.seconds, 0, 0))
                     }
                 }
             }
@@ -583,7 +583,9 @@ actor TimelineExporter {
                                                         preferredTrackID: kCMPersistentTrackID_Invalid)
                 if let extra { try extra.insertTimeRange(range, of: aAsset, at: at) }
                 if let tid = extra?.trackID {
-                    audioMixParams.append((tid, clip.volume, clip.leftChannel, clip.rightChannel))
+                    let fadeIn  = clip.fadeInEnabled  ? min(clip.fadeInDuration,  clip.duration) : 0
+                    let fadeOut = clip.fadeOutEnabled ? min(clip.fadeOutDuration, clip.duration) : 0
+                    audioMixParams.append((tid, clip.volume, clip.leftChannel, clip.rightChannel, clip.startTime, useDur.seconds, fadeIn, fadeOut))
                 }
             }
         }
@@ -595,7 +597,13 @@ actor TimelineExporter {
             for track in input.imageTracks {
                 guard track.isVisible else { continue }
                 for clip in track.clips {
-                    guard let url = clip.videoURL else { continue }
+                    var url = clip.videoURL
+                    // videoURL 不存在时（临时文件被清理），从 imageURL 重新生成
+                    if url == nil || !FileManager.default.fileExists(atPath: url!.path),
+                       let imgURL = clip.imageURL {
+                        url = await ProjectState.createVideoFromImage(imageURL: imgURL, duration: clip.duration)
+                    }
+                    guard let url else { continue }
                     let asset = AVURLAsset(url: url)
                     let assetDur = try await asset.load(.duration)
                     let useDur = CMTimeMinimum(CMTime(seconds: clip.duration, preferredTimescale: 600), assetDur)
@@ -662,12 +670,35 @@ actor TimelineExporter {
             }
         }
 
-        // ── AudioMix（音量 + 声道）──
+        // ── AudioMix（音量 + 淡入淡出 + 声道）──
         let audioMix = AVMutableAudioMix()
         audioMix.inputParameters = audioMixParams.map { param in
             let p = AVMutableAudioMixInputParameters(track: composition.track(withTrackID: param.trackID))
             p.trackID = param.trackID
-            p.setVolume(param.volume, at: .zero)
+            let ts: CMTimeScale = 600
+            let clipStart = CMTime(seconds: param.startTime, preferredTimescale: ts)
+            if param.fadeIn > 0 {
+                p.setVolumeRamp(fromStartVolume: 0, toEndVolume: param.volume,
+                                timeRange: CMTimeRange(start: clipStart,
+                                                       duration: CMTime(seconds: param.fadeIn, preferredTimescale: ts)))
+            }
+            if param.fadeOut > 0 {
+                let fadeOutStart = CMTime(seconds: param.startTime + param.duration - param.fadeOut, preferredTimescale: ts)
+                p.setVolumeRamp(fromStartVolume: param.volume, toEndVolume: 0,
+                                timeRange: CMTimeRange(start: fadeOutStart,
+                                                       duration: CMTime(seconds: param.fadeOut, preferredTimescale: ts)))
+            }
+            if param.fadeIn > 0 || param.fadeOut > 0 {
+                let midStart = CMTime(seconds: param.startTime + param.fadeIn, preferredTimescale: ts)
+                let midDur = param.duration - param.fadeIn - param.fadeOut
+                if midDur > 0 {
+                    p.setVolumeRamp(fromStartVolume: param.volume, toEndVolume: param.volume,
+                                    timeRange: CMTimeRange(start: midStart,
+                                                           duration: CMTime(seconds: midDur, preferredTimescale: ts)))
+                }
+            } else {
+                p.setVolume(param.volume, at: .zero)
+            }
             if param.left != 1.0 || param.right != 1.0 {
                 if let tap = makeChannelTap(left: param.left, right: param.right) {
                     p.audioTapProcessor = tap
@@ -928,6 +959,11 @@ actor TimelineExporter {
         exporter.shouldOptimizeForNetworkUse = true
         exporter.audioMix = audioMix
         if let vc = videoComposition { exporter.videoComposition = vc }
+        if !isAudioOnly && settings.bitrate > 0 {
+            let durationSec = composition.duration.seconds
+            let bytesLimit = Int64(Double(settings.bitrate) * 1000.0 / 8.0 * durationSec)
+            if bytesLimit > 0 { exporter.fileLengthLimit = bytesLimit }
+        }
 
         try? FileManager.default.removeItem(at: input.outputURL)
 

@@ -11,6 +11,23 @@ struct WelcomeView: View {
 
     var body: some View {
         VStack(spacing: 0) {
+            // 关闭按钮
+            HStack {
+                Spacer()
+                Button { project.showWelcome = false } label: {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 10, weight: .bold))
+                        .foregroundColor(Color.labelSecondary)
+                        .frame(width: 22, height: 22)
+                        .background(Color.white.opacity(0.1))
+                        .clipShape(Circle())
+                }
+                .buttonStyle(.plain)
+                .help("关闭")
+            }
+            .padding(.top, 10)
+            .padding(.trailing, 10)
+
             // Logo + 标题
             VStack(spacing: 12) {
                 if let icon = NSApplication.shared.applicationIconImage {
@@ -63,6 +80,7 @@ struct WelcomeView: View {
         .overlay(RoundedRectangle(cornerRadius: 14)
             .stroke(Color.white.opacity(0.15), lineWidth: 0.5))
         .shadow(color: .black.opacity(0.6), radius: 30, y: 10)
+        .onExitCommand { project.showWelcome = false }
     }
 
     // MARK: - Tab Button
@@ -155,13 +173,14 @@ struct WelcomeView: View {
             } label: {
                 Text("新建项目")
                     .font(.system(size: 13, weight: .semibold))
-                    .foregroundColor(.black)
+                    .foregroundColor(canCreate ? .black : Color.labelSecondary)
                     .frame(maxWidth: .infinity)
                     .frame(height: 38)
-                    .background(Color.accent)
+                    .background(canCreate ? Color.accent : Color.white.opacity(0.06))
                     .cornerRadius(8)
             }
             .buttonStyle(.plain)
+            .disabled(!canCreate)
         }
         .padding(.horizontal, 24)
         .padding(.top, 14)
@@ -194,6 +213,10 @@ struct WelcomeView: View {
             .buttonStyle(.plain)
         }
         .padding(24)
+    }
+
+    private var canCreate: Bool {
+        !newProjectName.trimmingCharacters(in: .whitespaces).isEmpty && saveDirectory != nil
     }
 
     // MARK: - Actions

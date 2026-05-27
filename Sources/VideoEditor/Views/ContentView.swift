@@ -45,7 +45,7 @@ struct ContentView: View {
                 }
                 .frame(width: sidebarWidth)
                 .frame(maxHeight: .infinity)
-                .background(Color(red: 0.15, green: 0.15, blue: 0.16))
+                .background(Color(hex: "#19191C"))
                 .clipShape(RoundedRectangle(cornerRadius: 12))
                 .overlay(
                     RoundedRectangle(cornerRadius: 12)
@@ -170,6 +170,14 @@ struct ContentView: View {
                 .padding(.trailing, 16)
                 .padding(.bottom, 48)
         }
+        .overlay(alignment: .bottomTrailing) {
+            if !project.activeTasks.isEmpty {
+                TranscodeOverlay()
+                    .environmentObject(project)
+                    .padding(.trailing, 16)
+                    .padding(.bottom, 90)
+            }
+        }
         .environmentObject(project)
         .ignoresSafeArea()
         .animation(.spring(response: 0.28, dampingFraction: 0.82), value: sidebarVisible)
@@ -180,12 +188,14 @@ struct ContentView: View {
             if project.showWelcome {
                 Color.black.opacity(0.5)
                     .ignoresSafeArea()
+                    .onTapGesture { }
                 WelcomeView()
                     .environmentObject(project)
                     .transition(.opacity.combined(with: .scale(scale: 0.95)))
             }
         }
         .animation(.easeOut(duration: 0.25), value: project.showWelcome)
+        .onAppear { setupEscMonitor() }
         .onReceive(NotificationCenter.default.publisher(for: .menuImportFiles)) { note in
             if let urls = note.object as? [URL] {
                 urls.forEach { project.importFile($0) }
@@ -252,6 +262,16 @@ struct ContentView: View {
         }
     }
 
+    private func setupEscMonitor() {
+        NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            if event.keyCode == 53 && project.showWelcome {
+                project.showWelcome = false
+                return nil
+            }
+            return event
+        }
+    }
+
     private var toggleButton: some View {
         Button { sidebarVisible.toggle() } label: {
             Image(systemName: "sidebar.left")
@@ -265,7 +285,7 @@ struct ContentView: View {
 
 // MARK: - Design Tokens
 extension Color {
-    static let panelBg        = Color(red: 0.13, green: 0.13, blue: 0.14)
+    static let panelBg        = Color(hex: "#19191C")
     static let previewBg      = Color(red: 0.07, green: 0.07, blue: 0.08)
     static let timelineBg     = Color(red: 0.10, green: 0.10, blue: 0.11)
     static let divider        = Color.white.opacity(0.08)
@@ -286,14 +306,21 @@ struct SaveToastStack: View {
 
     var body: some View {
         VStack(spacing: 6) {
-            ForEach(project.saveToasts, id: \.self) { _ in
-                HStack(spacing: 6) {
-                    Image(systemName: "checkmark.circle.fill")
-                        .font(.system(size: 12))
-                        .foregroundColor(.green)
-                    Text("已保存")
-                        .font(.system(size: 12, weight: .medium))
-                        .foregroundColor(.white)
+            ForEach(project.saveToasts) { toast in
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack(spacing: 6) {
+                        Image(systemName: "checkmark.circle.fill")
+                            .font(.system(size: 12))
+                            .foregroundColor(.green)
+                        Text("已保存")
+                            .font(.system(size: 12, weight: .medium))
+                            .foregroundColor(.white)
+                    }
+                    Text(toast.path)
+                        .font(.system(size: 10))
+                        .foregroundColor(Color.labelSecondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
                 }
                 .padding(.horizontal, 14)
                 .padding(.vertical, 8)

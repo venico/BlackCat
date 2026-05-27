@@ -307,7 +307,7 @@ struct TimelineView: View {
                                isMuted: false, isVis: project.imageTracks[i].isVisible,
                                onMute: nil,
                                onVis:  { project.pushUndo(); project.imageTracks[i].isVisible.toggle(); project.rebuildTimelinePreview() },
-                               onDel:  { project.pushUndo(); project.imageTracks.remove(at:i) })
+                               onDel:  { project.pushUndo(); project.imageTracks.remove(at:i); project.rebuildTimelinePreview() })
                         .frame(height: imgH(i))
                 }
             }
@@ -318,7 +318,7 @@ struct TimelineView: View {
                                isMuted: project.videoTracks[i].isMuted, isVis: project.videoTracks[i].isVisible,
                                onMute: { project.pushUndo(); project.videoTracks[i].isMuted.toggle(); project.rebuildTimelinePreview() },
                                onVis:  { project.pushUndo(); project.videoTracks[i].isVisible.toggle(); project.rebuildTimelinePreview() },
-                               onDel:  { project.pushUndo(); project.videoTracks.remove(at:i) })
+                               onDel:  { project.pushUndo(); project.videoTracks.remove(at:i); project.rebuildTimelinePreview() })
                         .frame(height: vidH(i))
                 }
             }
@@ -329,7 +329,7 @@ struct TimelineView: View {
                                isMuted: project.audioTracks[i].isMuted, isVis: true, hasVis: false,
                                onMute: { project.pushUndo(); project.audioTracks[i].isMuted.toggle(); project.rebuildTimelinePreview() },
                                onVis:  {},
-                               onDel:  { project.pushUndo(); project.audioTracks.remove(at:i) })
+                               onDel:  { project.pushUndo(); project.audioTracks.remove(at:i); project.rebuildTimelinePreview() })
                         .frame(height: audH(i))
                 }
             }
@@ -340,7 +340,7 @@ struct TimelineView: View {
                                isMuted: false, isVis: project.subtitleTracks[i].isVisible,
                                onMute: nil,
                                onVis:  { project.pushUndo(); project.subtitleTracks[i].isVisible.toggle() },
-                               onDel:  { project.pushUndo(); project.subtitleTracks.remove(at:i) })
+                               onDel:  { project.pushUndo(); project.subtitleTracks.remove(at:i); project.rebuildTimelinePreview() })
                         .frame(height: subH(i))
                 }
             }
@@ -1936,6 +1936,11 @@ private struct LogSlider: View {
 
 struct TimelineToolbar: View {
     @EnvironmentObject private var project: ProjectState
+    private var hasSelection: Bool {
+        project.selectedVideoClipID != nil || project.selectedImageClipID != nil ||
+        project.selectedAudioClipID != nil || project.selectedSubtitleClipID != nil ||
+        !project.selectedClipIDs.isEmpty
+    }
     var body: some View {
         HStack(spacing:0) {
             // 左侧：编辑工具
@@ -1943,9 +1948,9 @@ struct TimelineToolbar: View {
                 TBtn(icon:"arrow.uturn.backward", help:"撤销", enabled: project.undoCount > 0) { project.undo() }
                 TBtn(icon:"arrow.uturn.forward",  help:"重做", enabled: project.redoCount > 0) { project.redo() }
                 Divider().frame(height:16).padding(.horizontal,4)
-                TBtn(icon:"scissors",         help:"在播放头分割片段", enabled: project.selectedImageClipID == nil) { project.splitAtPlayhead() }
-                TBtn(icon:"trash",            help:"删除选中片段")   { project.deleteSelected() }
-                TBtn(icon:"text.alignleft",   help:"将选中片段对齐到播放头") { project.alignSelectedToPlayhead() }
+                TBtn(icon:"scissors",         help:"在播放头分割片段", enabled: hasSelection && project.selectedImageClipID == nil) { project.splitAtPlayhead() }
+                TBtn(icon:"trash",            help:"删除选中片段", enabled: hasSelection)   { project.deleteSelected() }
+                TBtn(icon:"text.alignleft",   help:"将选中片段对齐到播放头", enabled: hasSelection) { project.alignSelectedToPlayhead() }
                 TBtn(icon:"character.bubble", help:"在当前字幕轨道插入字幕")  { project.insertSubtitleAtPlayhead() }
 
                 Divider().frame(height:16).padding(.horizontal,4)

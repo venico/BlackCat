@@ -26,9 +26,10 @@ struct MediaLibraryView: View {
                 Button { project.showClearLibraryConfirm = true } label: {
                     Image(systemName: "trash")
                         .font(.system(size: 11, weight: .medium))
-                        .foregroundColor(Color.labelSecondary)
+                        .foregroundColor(project.mediaAssets.isEmpty ? Color.labelSecondary.opacity(0.3) : Color.labelSecondary)
                 }
                 .buttonStyle(.plain)
+                .disabled(project.mediaAssets.isEmpty)
                 .help("清空素材库")
                 Button { project.refreshMediaLibrary() } label: {
                     Image(systemName: "arrow.clockwise")
@@ -122,15 +123,7 @@ struct MediaLibraryView: View {
 
             Spacer()
 
-            // Transcoding progress indicator
-            if project.isTranscoding {
-                TranscodingProgressView(
-                    fileName: project.transcodingFileName,
-                    progress: project.transcodingProgress
-                )
-                .padding(.horizontal, 8)
-                .padding(.bottom, 4)
-            }
+            // 转码进度已移至右下角全局浮层
 
             // Bottom actions
             VStack(spacing: 8) {
@@ -432,13 +425,16 @@ private struct ImportButton: View {
                     .font(.system(size: 12, weight: .semibold))
                 Spacer()
             }
-            .foregroundColor(Color.labelPrimary)
+            .foregroundColor(hasProject ? Color.labelPrimary : Color.labelSecondary.opacity(0.5))
             .frame(height: 36)
-            .background(Color.white.opacity(0.08))
+            .background(Color.white.opacity(hasProject ? 0.08 : 0.04))
             .clipShape(RoundedRectangle(cornerRadius: 8))
         }
         .buttonStyle(.plain)
+        .disabled(!hasProject)
     }
+
+    private var hasProject: Bool { project.projectFileURL != nil }
 
     private func openPicker() {
         let panel = NSOpenPanel()
@@ -455,77 +451,100 @@ private struct ImportButton: View {
 
 private struct ExportButton: View {
     @EnvironmentObject private var project: ProjectState
+    private var hasProject: Bool { project.projectFileURL != nil }
     var body: some View {
         Button { project.showExportSheet = true } label: {
             HStack {
                 Spacer()
                 Text("导出 MP4")
                     .font(.system(size: 12, weight: .semibold))
-                    .foregroundColor(.black)
+                    .foregroundColor(hasProject ? .black : Color.labelSecondary.opacity(0.5))
                 Spacer()
             }
             .frame(height: 36)
-            .background(Color.accent)
+            .background(hasProject ? Color.accent : Color.white.opacity(0.04))
             .clipShape(RoundedRectangle(cornerRadius: 8))
         }
         .buttonStyle(.plain)
+        .disabled(!hasProject)
     }
 }
 
-// MARK: - Transcoding Progress View
+// MARK: - Transcode Overlay (右下角浮层)
 
-private struct TranscodingProgressView: View {
+struct TranscodeOverlay: View {
     @EnvironmentObject private var project: ProjectState
-    let fileName: String
-    let progress: Double
 
     var body: some View {
         VStack(spacing: 6) {
-            HStack(spacing: 6) {
-                ProgressView()
-                    .controlSize(.small)
-                    .scaleEffect(0.7)
-                Text("转码中…")
-                    .font(.system(size: 11, weight: .medium))
+            HStack {
+                Text("转码中 (\(project.activeTasks.count))")
+                    .font(.system(size: 11, weight: .semibold))
                     .foregroundColor(Color.labelPrimary)
                 Spacer()
-                Text("\(Int(progress * 100))%")
-                    .font(.system(size: 11).monospacedDigit())
+                if project.activeTasks.count > 1 {
+                    Button { project.cancelTranscoding() } label: {
+                        Text("全部取消")
+                            .font(.system(size: 10, weight: .medium))
+                            .foregroundColor(Color.labelSecondary)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            ForEach(project.activeTasks) { task in
+                TranscodeTaskRow(task: task)
+            }
+        }
+        .padding(10)
+        .frame(width: 280)
+        .background(Color(white: 0.12).opacity(0.95))
+        .clipShape(RoundedRectangle(cornerRadius: 10))
+        .shadow(color: .black.opacity(0.4), radius: 8, y: 4)
+    }
+}
+
+private struct TranscodeTaskRow: View {
+    @EnvironmentObject private var project: ProjectState
+    @ObservedObject var task: ProjectState.TranscodeTask
+    @State private var hovered = false
+
+    var body: some View {
+        VStack(spacing: 4) {
+            HStack(spacing: 6) {
+                ProgressView()
+                    .controlSize(.mini)
+                    .scaleEffect(0.7)
+                Text(task.displayName)
+                    .font(.system(size: 10))
+                    .foregroundColor(Color.labelPrimary)
+                    .lineLimit(1)
+                Spacer()
+                Text("\(Int(task.progress * 100))%")
+                    .font(.system(size: 10).monospacedDigit())
                     .foregroundColor(Color.labelSecondary)
-                // 关闭按钮
-                Button { project.cancelTranscoding() } label: {
+                Button { project.cancelTranscodeTask(task.id) } label: {
                     Image(systemName: "xmark")
-                        .font(.system(size: 9, weight: .bold))
-                        .foregroundColor(Color.labelSecondary)
-                        .frame(width: 16, height: 16)
-                        .background(Color.white.opacity(0.1))
+                        .font(.system(size: 8, weight: .bold))
+                        .foregroundColor(hovered ? Color.labelPrimary : Color.labelSecondary)
+                        .frame(width: 14, height: 14)
+                        .background(Color.white.opacity(hovered ? 0.15 : 0.08))
                         .clipShape(Circle())
                 }
                 .buttonStyle(.plain)
-                .help("取消转码")
+                .onHover { hovered = $0 }
             }
-
-            // Progress bar
             GeometryReader { geo in
                 ZStack(alignment: .leading) {
                     RoundedRectangle(cornerRadius: 2)
                         .fill(Color.white.opacity(0.1))
-                        .frame(height: 4)
+                        .frame(height: 3)
                     RoundedRectangle(cornerRadius: 2)
                         .fill(Color.accent)
-                        .frame(width: geo.size.width * CGFloat(progress), height: 4)
+                        .frame(width: geo.size.width * CGFloat(task.progress), height: 3)
                 }
             }
-            .frame(height: 4)
-
-            Text(fileName)
-                .font(.system(size: 10))
-                .foregroundColor(Color.labelSecondary)
-                .lineLimit(1)
-                .frame(maxWidth: .infinity, alignment: .leading)
+            .frame(height: 3)
         }
-        .padding(10)
-        .background(Color.white.opacity(0.06))
-        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .padding(.vertical, 2)
     }
 }
