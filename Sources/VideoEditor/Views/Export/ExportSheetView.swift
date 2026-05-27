@@ -478,6 +478,7 @@ struct ExportSheetView: View {
             subtitleStyles: project.subtitleStyles,
             subtitleBottomMargin: project.subtitleBottomMargin,
             subtitleLineSpacing: project.subtitleLineSpacing,
+            previewRenderSize: project.previewRenderSize,
             settings: project.exportSettings,
             outputURL: outputURL)
 
@@ -497,6 +498,7 @@ struct ExportInput {
     let subtitleStyles: [SubtitleStyle]
     let subtitleBottomMargin: Double
     let subtitleLineSpacing:  Double
+    let previewRenderSize: CGSize          // 预览分辨率，用于字幕缩放基准
     let settings:       ExportSettings
     let outputURL:      URL
 }
@@ -729,6 +731,7 @@ actor TimelineExporter {
                 let vc = AVMutableVideoComposition()
                 vc.renderSize = renderSize
                 vc.frameDuration = frameDuration
+                vc.sourceTrackIDForFrameTiming = kCMPersistentTrackID_Invalid
 
                 let ts: CMTimeScale = 600
                 let imageClipCMRanges = imageCompTracks.map { entry -> (start: CMTime, end: CMTime) in
@@ -807,6 +810,7 @@ actor TimelineExporter {
                     let vc = AVMutableVideoComposition()
                     vc.renderSize = renderSize
                     vc.frameDuration = frameDuration
+                    vc.sourceTrackIDForFrameTiming = kCMPersistentTrackID_Invalid
                     let visualEnd = max(vEnd, iEnd)
                     let visualEndCM = CMTime(seconds: visualEnd, preferredTimescale: 600)
 
@@ -835,151 +839,95 @@ actor TimelineExporter {
                 }
             }
 
+            // 如果还没有 videoComposition，创建一个基础的（确保帧率/分辨率可控）
             let visualEnd = max(vEnd, iEnd)
+            if videoComposition == nil {
+                let vc = AVMutableVideoComposition()
+                vc.renderSize = renderSize
+                vc.frameDuration = frameDuration
+                vc.sourceTrackIDForFrameTiming = kCMPersistentTrackID_Invalid
+                let visualEndCM = CMTime(seconds: visualEnd, preferredTimescale: 600)
 
-            // Step 2: 字幕烧录 — 独立于图片/分辨率，只要有可见字幕就叠加
-            if !visibleSubs.isEmpty {
-                // 如果还没有 videoComposition，先创建一个基础的
-                if videoComposition == nil {
-                    let vc = AVMutableVideoComposition()
-                    vc.renderSize = renderSize
-                    vc.frameDuration = frameDuration
-                    let visualEndCM = CMTime(seconds: visualEnd, preferredTimescale: 600)
-
-                    var instrs: [AVMutableVideoCompositionInstruction] = []
-                    let mainInstr = AVMutableVideoCompositionInstruction()
-                    mainInstr.backgroundColor = CGColor(gray: 0, alpha: 1)
-                    mainInstr.layerInstructions = composition.tracks(withMediaType: .video).map { vt in
+                var instrs: [AVMutableVideoCompositionInstruction] = []
+                let mainInstr = AVMutableVideoCompositionInstruction()
+                mainInstr.backgroundColor = CGColor(gray: 0, alpha: 1)
+                mainInstr.layerInstructions = composition.tracks(withMediaType: .video).map { vt in
+                    let li = AVMutableVideoCompositionLayerInstruction(assetTrack: vt)
+                    let scaleX = renderSize.width / sourceVideoSize.width
+                    let scaleY = renderSize.height / sourceVideoSize.height
+                    if abs(scaleX - 1.0) > 0.001 || abs(scaleY - 1.0) > 0.001 {
+                        li.setTransform(CGAffineTransform(scaleX: scaleX, y: scaleY), at: .zero)
+                    }
+                    return li
+                }
+                if visualEnd < globalEndTime - 0.01 {
+                    mainInstr.timeRange = CMTimeRange(start: .zero, duration: visualEndCM)
+                    instrs.append(mainInstr)
+                    let blackInstr = AVMutableVideoCompositionInstruction()
+                    blackInstr.timeRange = CMTimeRange(start: visualEndCM, duration: composition.duration - visualEndCM)
+                    blackInstr.backgroundColor = CGColor(gray: 0, alpha: 1)
+                    blackInstr.layerInstructions = composition.tracks(withMediaType: .video).map { vt in
                         let li = AVMutableVideoCompositionLayerInstruction(assetTrack: vt)
-                        li.setOpacity(1.0, at: .zero)
+                        li.setOpacity(0, at: .zero)
                         return li
                     }
-                    if visualEnd < globalEndTime - 0.01 {
-                        mainInstr.timeRange = CMTimeRange(start: .zero, duration: visualEndCM)
-                        instrs.append(mainInstr)
-                        let blackInstr = AVMutableVideoCompositionInstruction()
-                        blackInstr.timeRange = CMTimeRange(start: visualEndCM, duration: composition.duration - visualEndCM)
-                        blackInstr.backgroundColor = CGColor(gray: 0, alpha: 1)
-                        blackInstr.layerInstructions = composition.tracks(withMediaType: .video).map { vt in
-                            let li = AVMutableVideoCompositionLayerInstruction(assetTrack: vt)
-                            li.setOpacity(0, at: .zero)
-                            return li
-                        }
-                        instrs.append(blackInstr)
-                    } else {
-                        mainInstr.timeRange = CMTimeRange(start: .zero, duration: composition.duration)
-                        instrs.append(mainInstr)
-                    }
-                    vc.instructions = instrs
-                    videoComposition = vc
+                    instrs.append(blackInstr)
+                } else {
+                    mainInstr.timeRange = CMTimeRange(start: .zero, duration: composition.duration)
+                    instrs.append(mainInstr)
                 }
-
-                if let vc = videoComposition {
-                    // 所有 instruction 开启 enablePostProcessing
-                    for case let instr as AVMutableVideoCompositionInstruction in vc.instructions {
-                        instr.enablePostProcessing = true
-                    }
-
-                    let videoLayer = CALayer()
-                    videoLayer.frame = CGRect(origin: .zero, size: renderSize)
-                    let parentLayer = CALayer()
-                    parentLayer.frame = CGRect(origin: .zero, size: renderSize)
-                    parentLayer.isGeometryFlipped = true
-                    parentLayer.backgroundColor = CGColor(gray: 0, alpha: 1)
-                    parentLayer.addSublayer(videoLayer)
-
-                    let visibleTrackData: [(track: Track<SubtitleClip>, style: SubtitleStyle, idx: Int)] =
-                        input.subtitleTracks.enumerated().compactMap { i, t in
-                            guard t.isVisible && !t.clips.isEmpty else { return nil }
-                            let s = i < input.subtitleStyles.count ? input.subtitleStyles[i] : SubtitleStyle()
-                            return (t, s, i)
-                        }
-                    let totalDuration = composition.duration.seconds
-
-                    let spacing = CGFloat(input.subtitleLineSpacing)
-
-                    // 计算每轨的最大渲染高度，用于累积偏移
-                    let padH: CGFloat = 10, padV: CGFloat = 3
-                    var trackMaxHeights: [CGFloat] = []
-                    for td in visibleTrackData {
-                        var maxH: CGFloat = 0
-                        let maxW = renderSize.width * td.style.widthPercent / 100
-                        let ctFont = CTFontCreateWithName(td.style.fontName as CFString, td.style.fontSize, nil)
-                        for clip in td.track.clips {
-                            let attrs: [NSAttributedString.Key: Any] = [
-                                .init(kCTFontAttributeName as String): ctFont
-                            ]
-                            let attrStr = NSAttributedString(string: clip.text, attributes: attrs)
-                            let setter = CTFramesetterCreateWithAttributedString(attrStr)
-                            let constraint = CGSize(width: maxW - padH * 2, height: CGFloat.greatestFiniteMagnitude)
-                            let textSize = CTFramesetterSuggestFrameSizeWithConstraints(setter, CFRange(), nil, constraint, nil)
-                            let h = ceil(textSize.height) + padV * 2
-                            maxH = max(maxH, h)
-                        }
-                        trackMaxHeights.append(maxH)
-                    }
-
-                    // 累积偏移：从底部往上堆叠（和 VStack 等价）
-                    var cumulativeOffsets: [CGFloat] = [0]
-                    for i in 1..<visibleTrackData.count {
-                        cumulativeOffsets.append(cumulativeOffsets[i-1] + trackMaxHeights[i-1] + spacing)
-                    }
-
-                    for (vi, td) in visibleTrackData.enumerated() {
-                        for clip in td.track.clips {
-                            let layer = self.makeSubtitleTextLayer(
-                                text: clip.text, style: td.style, renderSize: renderSize,
-                                startTime: clip.startTime, endTime: clip.endTime,
-                                totalDuration: totalDuration,
-                                baseBottomMargin: input.subtitleBottomMargin,
-                                trackOffset: cumulativeOffsets[vi])
-                            parentLayer.addSublayer(layer)
-                        }
-                    }
-
-                    vc.animationTool = AVVideoCompositionCoreAnimationTool(
-                        postProcessingAsVideoLayer: videoLayer,
-                        in: parentLayer)
-                }
+                vc.instructions = instrs
+                videoComposition = vc
             }
+
+            // 收集字幕渲染数据（用于逐帧绘制）
+            let fontScale = input.previewRenderSize.width > 0
+                ? renderSize.width / input.previewRenderSize.width : 1.0
+            let subRenderInfo = SubtitleRenderInfo(
+                tracks: input.subtitleTracks.enumerated().compactMap { i, t in
+                    guard t.isVisible && !t.clips.isEmpty else { return nil }
+                    let s = i < input.subtitleStyles.count ? input.subtitleStyles[i] : SubtitleStyle()
+                    return (t, s)
+                },
+                fontScale: fontScale,
+                bottomMargin: input.subtitleBottomMargin,
+                lineSpacing: CGFloat(input.subtitleLineSpacing) * fontScale,
+                renderSize: renderSize
+            )
+
+            // ── 用 AVAssetWriter 导出（精确控制帧率）──
+            try? FileManager.default.removeItem(at: input.outputURL)
+            try await writerExport(
+                composition: composition,
+                videoComposition: videoComposition!,
+                audioMix: audioMix,
+                subtitleInfo: subRenderInfo,
+                fps: fps,
+                bitrate: settings.bitrate,
+                outputURL: input.outputURL,
+                progress: progress
+            )
+            progress(1.0)
+            return input.outputURL
         }
 
-        // ── 配置导出器 ──
-        let isAudioOnly = settings.content == .audioOnly
-        let presetName = isAudioOnly
-            ? AVAssetExportPresetAppleM4A
-            : (videoComposition != nil ? AVAssetExportPresetHighestQuality : AVAssetExportPresetPassthrough)
+        // ── 仅音频模式：用 AVAssetExportSession ──
+        let presetName = AVAssetExportPresetAppleM4A
         guard let exporter = AVAssetExportSession(asset: composition, presetName: presetName)
         else {
             throw NSError(domain: "Export", code: 1,
                           userInfo: [NSLocalizedDescriptionKey: "无法创建导出会话"])
         }
         exporter.outputURL = input.outputURL
-        exporter.outputFileType = isAudioOnly ? .m4a : .mp4
+        exporter.outputFileType = .m4a
         exporter.shouldOptimizeForNetworkUse = true
         exporter.audioMix = audioMix
-        if let vc = videoComposition { exporter.videoComposition = vc }
-        if !isAudioOnly && settings.bitrate > 0 {
-            let durationSec = composition.duration.seconds
-            let bytesLimit = Int64(Double(settings.bitrate) * 1000.0 / 8.0 * durationSec)
-            if bytesLimit > 0 { exporter.fileLengthLimit = bytesLimit }
-        }
 
         try? FileManager.default.removeItem(at: input.outputURL)
-
-        let progressTask = Task {
-            while !Task.isCancelled {
-                let st = exporter.status
-                if st == .completed || st == .failed || st == .cancelled { break }
-                progress(Double(exporter.progress))
-                try? await Task.sleep(nanoseconds: 200_000_000)
-            }
-        }
 
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
             exporter.exportAsynchronously { continuation.resume() }
         }
-        progressTask.cancel()
 
         switch exporter.status {
         case .completed:
@@ -1040,6 +988,301 @@ actor TimelineExporter {
         return String(format: "%02d:%02d:%02d,%03d", h, m, s, ms)
     }
 
+    // MARK: - AVAssetWriter 导出引擎
+
+    /// 字幕渲染数据
+    struct SubtitleRenderInfo {
+        let tracks: [(track: Track<SubtitleClip>, style: SubtitleStyle)]
+        let fontScale: CGFloat
+        let bottomMargin: Double
+        let lineSpacing: CGFloat
+        let renderSize: CGSize
+
+        var hasSubtitles: Bool { !tracks.isEmpty }
+    }
+
+    /// 用 AVAssetReader + AVAssetWriter 导出，精确控制帧率
+    private func writerExport(
+        composition: AVMutableComposition,
+        videoComposition: AVMutableVideoComposition,
+        audioMix: AVMutableAudioMix,
+        subtitleInfo: SubtitleRenderInfo,
+        fps: Int, bitrate: Int,
+        outputURL: URL,
+        progress: @escaping (Double) -> Void
+    ) async throws {
+        let renderSize = videoComposition.renderSize
+        let totalDuration = composition.duration.seconds
+
+        // ── Reader ──
+        let reader = try AVAssetReader(asset: composition)
+
+        let videoOutput = AVAssetReaderVideoCompositionOutput(
+            videoTracks: composition.tracks(withMediaType: .video),
+            videoSettings: [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA])
+        videoOutput.videoComposition = videoComposition
+        reader.add(videoOutput)
+
+        var audioOutput: AVAssetReaderAudioMixOutput? = nil
+        let audioTracks = composition.tracks(withMediaType: .audio)
+        if !audioTracks.isEmpty {
+            let ao = AVAssetReaderAudioMixOutput(audioTracks: audioTracks, audioSettings: nil)
+            ao.audioMix = audioMix
+            reader.add(ao)
+            audioOutput = ao
+        }
+
+        // ── Writer ──
+        let writer = try AVAssetWriter(outputURL: outputURL, fileType: .mp4)
+
+        let videoSettings: [String: Any] = [
+            AVVideoCodecKey: AVVideoCodecType.h264,
+            AVVideoWidthKey: Int(renderSize.width),
+            AVVideoHeightKey: Int(renderSize.height),
+            AVVideoCompressionPropertiesKey: [
+                AVVideoAverageBitRateKey: bitrate * 1000,
+                AVVideoExpectedSourceFrameRateKey: fps,
+                AVVideoMaxKeyFrameIntervalKey: fps * 2
+            ] as [String: Any]
+        ]
+        let videoInput = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
+        videoInput.expectsMediaDataInRealTime = false
+
+        let pbAttrs: [String: Any] = [
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+            kCVPixelBufferWidthKey as String: Int(renderSize.width),
+            kCVPixelBufferHeightKey as String: Int(renderSize.height)
+        ]
+        let adaptor = AVAssetWriterInputPixelBufferAdaptor(
+            assetWriterInput: videoInput, sourcePixelBufferAttributes: pbAttrs)
+        writer.add(videoInput)
+
+        var audioInput: AVAssetWriterInput? = nil
+        if audioOutput != nil {
+            let ai = AVAssetWriterInput(mediaType: .audio, outputSettings: [
+                AVFormatIDKey: kAudioFormatMPEG4AAC,
+                AVSampleRateKey: 44100,
+                AVNumberOfChannelsKey: 2,
+                AVEncoderBitRateKey: 192000
+            ] as [String: Any])
+            ai.expectsMediaDataInRealTime = false
+            writer.add(ai)
+            audioInput = ai
+        }
+
+        // ── 开始读写 ──
+        guard reader.startReading() else {
+            throw reader.error ?? NSError(domain: "Export", code: 10,
+                userInfo: [NSLocalizedDescriptionKey: "无法启动读取: \(reader.error?.localizedDescription ?? "unknown")"])
+        }
+        guard writer.startWriting() else {
+            throw writer.error ?? NSError(domain: "Export", code: 11,
+                userInfo: [NSLocalizedDescriptionKey: "无法启动写入: \(writer.error?.localizedDescription ?? "unknown")"])
+        }
+        writer.startSession(atSourceTime: .zero)
+
+        let hasSubtitles = subtitleInfo.hasSubtitles
+        let videoQueue = DispatchQueue(label: "export.video")
+        let audioQueue = DispatchQueue(label: "export.audio")
+        let targetFps = Int32(fps)
+
+        // 音视频必须并行消费，否则 AVAssetReader 内部缓冲区满会死锁
+        await withTaskGroup(of: Void.self) { group in
+            // 视频帧处理
+            group.addTask {
+                await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+                    var frameIndex: Int64 = 0
+                    videoInput.requestMediaDataWhenReady(on: videoQueue) {
+                        while videoInput.isReadyForMoreMediaData {
+                            guard let sb = videoOutput.copyNextSampleBuffer() else {
+                                videoInput.markAsFinished()
+                                cont.resume()
+                                return
+                            }
+                            // 自己生成精确的 PTS，不依赖 reader 的时间戳
+                            let exactPTS = CMTime(value: frameIndex, timescale: targetFps)
+                            let readerPTS = CMSampleBufferGetPresentationTimeStamp(sb)
+                            let timeForSubtitle = readerPTS.seconds  // 字幕用 reader 时间（对应源内容）
+
+                            if let pb = CMSampleBufferGetImageBuffer(sb) {
+                                if hasSubtitles {
+                                    self.drawSubtitlesOnPixelBuffer(pb, atTime: timeForSubtitle, info: subtitleInfo)
+                                }
+                                adaptor.append(pb, withPresentationTime: exactPTS)
+                            } else {
+                                // fallback: 直接 append sample buffer
+                                videoInput.append(sb)
+                            }
+                            frameIndex += 1
+                            let pct = min(readerPTS.seconds / max(totalDuration, 0.01), 0.99)
+                            progress(pct)
+                        }
+                    }
+                }
+            }
+
+            // 音频处理（并行）
+            if let audioOutput = audioOutput, let audioInput = audioInput {
+                group.addTask {
+                    await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+                        audioInput.requestMediaDataWhenReady(on: audioQueue) {
+                            while audioInput.isReadyForMoreMediaData {
+                                guard let sb = audioOutput.copyNextSampleBuffer() else {
+                                    audioInput.markAsFinished()
+                                    cont.resume()
+                                    return
+                                }
+                                audioInput.append(sb)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 完成写入
+        await writer.finishWriting()
+
+        guard writer.status == .completed else {
+            throw writer.error ?? NSError(domain: "Export", code: 12,
+                userInfo: [NSLocalizedDescriptionKey: "写入失败 (\(writer.status.rawValue))"])
+        }
+    }
+
+    // MARK: - 逐帧字幕绘制
+
+    /// 在 pixel buffer 上直接绘制字幕（CoreGraphics）
+    private nonisolated func drawSubtitlesOnPixelBuffer(
+        _ pixelBuffer: CVPixelBuffer, atTime time: Double, info: SubtitleRenderInfo
+    ) {
+        // 找出当前时间活跃的字幕
+        var activeItems: [(text: String, style: SubtitleStyle)] = []
+        for (track, style) in info.tracks {
+            if let clip = track.clips.first(where: { $0.startTime <= time && $0.endTime > time }) {
+                activeItems.append((clip.text, style))
+            }
+        }
+        guard !activeItems.isEmpty else { return }
+
+        CVPixelBufferLockBaseAddress(pixelBuffer, [])
+        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, []) }
+
+        let w = CVPixelBufferGetWidth(pixelBuffer)
+        let h = CVPixelBufferGetHeight(pixelBuffer)
+        let bytesPerRow = CVPixelBufferGetBytesPerRow(pixelBuffer)
+        guard let baseAddr = CVPixelBufferGetBaseAddress(pixelBuffer) else { return }
+        let space = CGColorSpaceCreateDeviceRGB()
+        guard let ctx = CGContext(
+            data: baseAddr, width: w, height: h,
+            bitsPerComponent: 8, bytesPerRow: bytesPerRow, space: space,
+            bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue
+                      | CGBitmapInfo.byteOrder32Little.rawValue
+        ) else { return }
+
+        // CGContext 默认 y-up（原点左下），视频像素是 y-down → 翻转
+        ctx.translateBy(x: 0, y: CGFloat(h))
+        ctx.scaleBy(x: 1.0, y: -1.0)
+        // 现在 (0,0) = 左上角，y 向下
+
+        let scale = info.fontScale
+        let padH: CGFloat = 10 * scale, padV: CGFloat = 3 * scale
+        let bottomPad = CGFloat(h) * CGFloat(info.bottomMargin) / 100.0
+
+        // 计算每条字幕的尺寸
+        struct SubLayout {
+            let text: String; let style: SubtitleStyle; let ctFont: CTFont
+            let layerW: CGFloat; let layerH: CGFloat
+            let setter: CTFramesetter
+        }
+
+        var layouts: [SubLayout] = []
+        for item in activeItems {
+            let scaledSize = item.style.fontSize * scale
+            var ctFont = CTFontCreateWithName(item.style.fontName as CFString, scaledSize, nil)
+            if item.style.bold,
+               let bf = CTFontCreateCopyWithSymbolicTraits(ctFont, scaledSize, nil, .boldTrait, .boldTrait) { ctFont = bf }
+            if item.style.italic,
+               let itf = CTFontCreateCopyWithSymbolicTraits(ctFont, scaledSize, nil, .italicTrait, .italicTrait) { ctFont = itf }
+
+            let tc = NSColor(item.style.textColor).usingColorSpace(.sRGB) ?? .white
+            var tr: CGFloat = 1, tg: CGFloat = 1, tb: CGFloat = 1, ta: CGFloat = 1
+            tc.getRed(&tr, green: &tg, blue: &tb, alpha: &ta)
+            let textCGColor = CGColor(red: tr, green: tg, blue: tb, alpha: ta)
+
+            var alignment: CTTextAlignment
+            switch item.style.alignment {
+            case "left":  alignment = .left
+            case "right": alignment = .right
+            default:      alignment = .center
+            }
+            let ctPS: CTParagraphStyle = withUnsafeBytes(of: &alignment) { ptr in
+                var setting = CTParagraphStyleSetting(
+                    spec: .alignment,
+                    valueSize: MemoryLayout<CTTextAlignment>.size,
+                    value: ptr.baseAddress!)
+                return CTParagraphStyleCreate(&setting, 1)
+            }
+
+            let maxW = CGFloat(w) * item.style.widthPercent / 100
+            let attrs: [NSAttributedString.Key: Any] = [
+                .init(kCTFontAttributeName as String): ctFont,
+                .init(kCTForegroundColorAttributeName as String): textCGColor,
+                .init(kCTParagraphStyleAttributeName as String): ctPS
+            ]
+            let attrStr = NSAttributedString(string: item.text, attributes: attrs)
+            let setter = CTFramesetterCreateWithAttributedString(attrStr)
+            let constraint = CGSize(width: maxW - padH * 2, height: CGFloat.greatestFiniteMagnitude)
+            let textSize = CTFramesetterSuggestFrameSizeWithConstraints(setter, CFRange(), nil, constraint, nil)
+            let layerW = ceil(textSize.width) + padH * 2
+            let layerH = ceil(textSize.height) + padV * 2
+            layouts.append(SubLayout(text: item.text, style: item.style, ctFont: ctFont,
+                                     layerW: layerW, layerH: layerH, setter: setter))
+        }
+
+        // 从底部往上堆叠绘制（y-down 坐标系）
+        var yPos = CGFloat(h) - bottomPad  // 底部起始 y
+        for layout in layouts {
+            yPos -= layout.layerH
+            let xOrig = (CGFloat(w) - layout.layerW) / 2
+
+            // 阴影（先画，在背景之前）
+            ctx.saveGState()
+            ctx.setShadow(offset: CGSize(width: 1 * scale, height: 1 * scale),
+                          blur: 1 * scale,
+                          color: CGColor(red: 0, green: 0, blue: 0, alpha: 0.8))
+
+            // 背景
+            if layout.style.backgroundOpacity > 0 {
+                let nc = NSColor(layout.style.backgroundColor).usingColorSpace(.sRGB) ?? .black
+                var br: CGFloat = 0, bg: CGFloat = 0, bb: CGFloat = 0, ba: CGFloat = 0
+                nc.getRed(&br, green: &bg, blue: &bb, alpha: &ba)
+                ctx.setFillColor(CGColor(red: br, green: bg, blue: bb,
+                                         alpha: CGFloat(layout.style.backgroundOpacity)))
+                let bgPath = CGPath(roundedRect: CGRect(x: xOrig, y: yPos, width: layout.layerW, height: layout.layerH),
+                                     cornerWidth: 3 * scale, cornerHeight: 3 * scale, transform: nil)
+                ctx.addPath(bgPath)
+                ctx.fillPath()
+            }
+            ctx.restoreGState()
+
+            // 文字（CoreText 需要 y-up，翻转后绘制再翻回来）
+            ctx.saveGState()
+            // 当前是 y-down，CoreText 需要 y-up
+            ctx.translateBy(x: 0, y: CGFloat(h))
+            ctx.scaleBy(x: 1.0, y: -1.0)
+            // 现在是 y-up，原来的 yPos（y-down）需要转换
+            let textRectYUp = CGFloat(h) - yPos - layout.layerH + padV
+            let textRect = CGRect(x: xOrig + padH, y: textRectYUp,
+                                  width: layout.layerW - padH * 2, height: layout.layerH - padV * 2)
+            let ctFrame = CTFramesetterCreateFrame(layout.setter, CFRange(),
+                                                    CGPath(rect: textRect, transform: nil), nil)
+            CTFrameDraw(ctFrame, ctx)
+            ctx.restoreGState()
+
+            yPos -= info.lineSpacing
+        }
+    }
+
     /// 解析分辨率字符串，如 "1080p  1920×1080" → CGSize(1920, 1080)
     private func parseResolution(_ str: String, fallback: CGSize) -> CGSize {
         // 匹配 "数字×数字" 或 "数字x数字"
@@ -1057,14 +1300,18 @@ actor TimelineExporter {
 
     private func makeSubtitleTextLayer(
         text: String, style: SubtitleStyle, renderSize: CGSize,
+        fontScale: CGFloat = 1.0,
         startTime: Double, endTime: Double,
         totalDuration: Double,
         baseBottomMargin: Double = 5,
         trackOffset: CGFloat = 0
     ) -> CALayer {
+        // fontScale = renderSize.width / previewRenderSize.width
+        // 确保导出字幕与预览比例一致
+        let scaledFontSize = style.fontSize * fontScale
         let maxWidth = renderSize.width * style.widthPercent / 100
         // 与预览 SubtitleLabel 一致: .padding(.horizontal, 10).padding(.vertical, 3)
-        let padH: CGFloat = 10, padV: CGFloat = 3
+        let padH: CGFloat = 10 * fontScale, padV: CGFloat = 3 * fontScale
 
         // 解析颜色
         let tc = NSColor(style.textColor).usingColorSpace(.sRGB) ?? .white
@@ -1072,7 +1319,18 @@ actor TimelineExporter {
         tc.getRed(&tr, green: &tg, blue: &tb, alpha: &ta)
         let textCGColor = CGColor(red: tr, green: tg, blue: tb, alpha: ta)
 
-        let ctFont = CTFontCreateWithName(style.fontName as CFString, style.fontSize, nil)
+        // 创建字体（支持 bold/italic，与预览 SubtitleLabel 一致）
+        var ctFont = CTFontCreateWithName(style.fontName as CFString, scaledFontSize, nil)
+        if style.bold {
+            if let boldFont = CTFontCreateCopyWithSymbolicTraits(ctFont, scaledFontSize, nil, .boldTrait, .boldTrait) {
+                ctFont = boldFont
+            }
+        }
+        if style.italic {
+            if let italicFont = CTFontCreateCopyWithSymbolicTraits(ctFont, scaledFontSize, nil, .italicTrait, .italicTrait) {
+                ctFont = italicFont
+            }
+        }
 
         var alignment: CTTextAlignment
         switch style.alignment {
@@ -1122,7 +1380,7 @@ actor TimelineExporter {
                     ctx.setFillColor(CGColor(red: br, green: bg, blue: bb,
                                              alpha: CGFloat(style.backgroundOpacity)))
                     ctx.addPath(CGPath(roundedRect: CGRect(origin: .zero, size: CGSize(width: layerW, height: layerH)),
-                                       cornerWidth: 3, cornerHeight: 3, transform: nil))
+                                       cornerWidth: 3 * fontScale, cornerHeight: 3 * fontScale, transform: nil))
                     ctx.fillPath()
                 }
 
@@ -1149,10 +1407,10 @@ actor TimelineExporter {
         layer.contentsGravity = .resize
         layer.contentsScale = 1.0
         if let img = cgImage { layer.contents = img }
-        // 与预览 SubtitleLabel 一致的文字阴影
+        // 与预览 SubtitleLabel 一致的文字阴影（缩放）
         layer.shadowColor = CGColor(red: 0, green: 0, blue: 0, alpha: 0.8)
-        layer.shadowOffset = CGSize(width: 1, height: 1)
-        layer.shadowRadius = 1
+        layer.shadowOffset = CGSize(width: 1 * fontScale, height: 1 * fontScale)
+        layer.shadowRadius = 1 * fontScale
         layer.shadowOpacity = 1
 
         layer.opacity = 0

@@ -428,6 +428,22 @@ struct TimelineView: View {
                 .frame(width: totalW, alignment: .topLeading)
                 .frame(minHeight: effectiveH)
                 .contentShape(Rectangle())
+                .contextMenu {
+                    let selID = project.selectedVideoClipID ?? project.selectedImageClipID
+                              ?? project.selectedAudioClipID ?? project.selectedSubtitleClipID
+                    if let id = selID {
+                        Button { project.selectLeftOf(id) } label: { Label("向左全选", systemImage: "arrow.left.to.line") }
+                        Button { project.selectRightOf(id) } label: { Label("向右全选", systemImage: "arrow.right.to.line") }
+                        Divider()
+                    }
+                    Button { project.copySelected() } label: { Label("复制", systemImage: "doc.on.doc") }
+                    Button { project.cutSelected() } label: { Label("剪切", systemImage: "scissors") }
+                    Button { project.pasteAtPlayhead() } label: { Label("粘贴", systemImage: "doc.on.clipboard") }
+                    if selID != nil {
+                        Divider()
+                        Button(role: .destructive) { project.deleteSelected() } label: { Label("删除", systemImage: "trash") }
+                    }
+                }
                 .onContinuousHover { phase in
                     guard dragOp == nil else { return }
                     switch phase {
@@ -1608,16 +1624,6 @@ private struct ImageClipView: View {
         .opacity(isDragging ? 0 : (project.clipboardIsCut && project.clipboardSourceID == clip.id ? 0.35 : 1.0))
         .offset(x: clip.startTime*pps + 1)
         .allowsHitTesting(false)
-        .contextMenu {
-            Button { project.selectLeftOf(clip.id) } label: { Label("向左全选", systemImage: "arrow.left.to.line") }
-            Button { project.selectRightOf(clip.id) } label: { Label("向右全选", systemImage: "arrow.right.to.line") }
-            Divider()
-            Button { project.copySelected() } label: { Label("复制", systemImage: "doc.on.doc") }
-            Button { project.cutSelected() } label: { Label("剪切", systemImage: "scissors") }
-            Button { project.pasteAtPlayhead() } label: { Label("粘贴", systemImage: "doc.on.clipboard") }
-            Divider()
-            Button(role: .destructive) { project.deleteSelected() } label: { Label("删除", systemImage: "trash") }
-        }
     }
 }
 
