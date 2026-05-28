@@ -5,6 +5,7 @@ import AVFoundation
 
 struct PlayerView: View {
     @EnvironmentObject private var project: ProjectState
+    @EnvironmentObject private var clock: PlaybackClock
     @StateObject private var ctrl = PlayerController()
     @State private var hoveringPlayer = false
 
@@ -23,7 +24,7 @@ struct PlayerView: View {
                 AVPlayerNSView(player: ctrl.player)
                 // Black out the preview when no content or playhead is past all video content.
                 if !hasAnyVisibleClips
-                    || (project.lastVideoEndTime > 0 && project.currentTime >= project.lastVideoEndTime) {
+                    || (clock.lastVideoEndTime > 0 && clock.currentTime >= clock.lastVideoEndTime) {
                     Color.black
                 }
                 SubtitleOverlay()
@@ -33,14 +34,18 @@ struct PlayerView: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .overlay(alignment: .top) {
                 if hoveringPlayer {
-                    HStack {
+                    ZStack {
+                        // 标题居中
                         Text(project.projectName + (project.isSaved ? "（已保存）" : ""))
                             .font(.system(size: 11, weight: .medium))
                             .foregroundColor(.white)
                             .shadow(color: .black.opacity(0.8), radius: 3, x: 0, y: 1)
                             .shadow(color: .black.opacity(0.5), radius: 6, x: 0, y: 2)
-                        Spacer()
-                        PreviewResolutionPicker()
+                        // 分辨率选择器靠右
+                        HStack {
+                            Spacer()
+                            PreviewResolutionPicker()
+                        }
                     }
                     .padding(.horizontal, 8)
                     .padding(.top, 8)
@@ -62,19 +67,19 @@ struct PlayerView: View {
             }
         }
         .onChange(of: project.playerItem) {
-            let seekTo = project.pendingSeekTime ?? project.currentTime
-            project.pendingSeekTime = nil
+            let seekTo = clock.pendingSeekTime ?? clock.currentTime
+            clock.pendingSeekTime = nil
             ctrl.setItem(project.playerItem, seekTo: seekTo)
         }
         // User-initiated seek (playhead/ruler drag) → tell AVPlayer to follow.
-        .onChange(of: project.seekRequest) {
-            ctrl.seek(to: project.currentTime)
+        .onChange(of: clock.seekRequest) {
+            ctrl.seek(to: clock.currentTime)
         }
         .onAppear {
             // 绑定回调：Timer 驱动 currentTime，不依赖 AVPlayer
-            ctrl.onTime     = { t in project.currentTime = t }
-            ctrl.getTime    = { project.currentTime }
-            ctrl.getDuration = { project.duration }
+            ctrl.onTime     = { t in clock.currentTime = t }
+            ctrl.getTime    = { clock.currentTime }
+            ctrl.getDuration = { clock.duration }
         }
         .onReceive(NotificationCenter.default.publisher(for: .togglePlayback)) { _ in
             ctrl.toggle()
@@ -98,6 +103,7 @@ private struct AVPlayerNSView: NSViewRepresentable {
 
 private struct SubtitleOverlay: View {
     @EnvironmentObject private var project: ProjectState
+    @EnvironmentObject private var clock: PlaybackClock
 
     var body: some View {
         GeometryReader { geo in
@@ -107,9 +113,10 @@ private struct SubtitleOverlay: View {
                 let style = project.subtitleStyles.indices.contains(i)
                     ? project.subtitleStyles[i] : SubtitleStyle()
                 guard let clip = project.subtitleTracks[i].clips.first(where: {
-                    $0.startTime <= project.currentTime && $0.endTime > project.currentTime
+                    $0.startTime <= clock.currentTime && $0.endTime > clock.currentTime
                 }) else { return nil }
-                return (clip.text, style)
+                let text = style.mergeLineBreaks ? Self.mergeBreaks(clip.text) : clip.text
+                return (text, style)
             }
 
             if !pairs.isEmpty {
@@ -133,6 +140,21 @@ private struct SubtitleOverlay: View {
 
     private func align(_ a: String) -> TextAlignment {
         switch a { case "left": return .leading; case "right": return .trailing; default: return .center }
+    }
+
+    /// 合并手动换行：中文之间直接拼接，其他用空格连接
+    static func mergeBreaks(_ text: String) -> String {
+        let lines = text.components(separatedBy: .newlines).map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+        guard lines.count > 1 else { return text }
+        var result = lines[0]
+        for i in 1..<lines.count {
+            let prev = result.unicodeScalars.last
+            let next = lines[i].unicodeScalars.first
+            let prevIsCJK = prev.map { $0.value > 0x2E80 } ?? false
+            let nextIsCJK = next.map { $0.value > 0x2E80 } ?? false
+            result += (prevIsCJK && nextIsCJK) ? lines[i] : " " + lines[i]
+        }
+        return result
     }
 }
 
@@ -193,6 +215,7 @@ private struct PreviewResolutionPicker: View {
 
 private struct PlaybackBar: View {
     @EnvironmentObject private var project: ProjectState
+    @EnvironmentObject private var clock: PlaybackClock
     @ObservedObject var ctrl: PlayerController
 
     var body: some View {
@@ -208,14 +231,14 @@ private struct PlaybackBar: View {
             }.buttonStyle(.plain)
 
             // Time
-            Text(fmtT(project.currentTime))
+            Text(fmtT(clock.currentTime))
                 .font(.system(size: 11).monospacedDigit())
                 .foregroundColor(Color.labelSecondary)
                 .frame(width: 72)
 
             // Scrubber
-            Slider(value: $project.currentTime, in: 0...max(project.duration, 1)) { editing in
-                if !editing { ctrl.seek(to: project.currentTime) }
+            Slider(value: $clock.currentTime, in: 0...max(clock.duration, 1)) { editing in
+                if !editing { ctrl.seek(to: clock.currentTime) }
             }.accentColor(Color.accent)
         }
         .padding(.horizontal, 12)
@@ -240,6 +263,7 @@ private struct PlaybackBar: View {
 
 private struct VideoTransformOverlay: View {
     @EnvironmentObject private var project: ProjectState
+    @EnvironmentObject private var clock: PlaybackClock
 
     enum DragMode { case none, move, scale, crop }
     @State private var dragMode: DragMode = .none
@@ -256,8 +280,8 @@ private struct VideoTransformOverlay: View {
         GeometryReader { geo in
             if let clip = project.selectedVideoClip,
                clip.videoWidth > 0, clip.videoHeight > 0,
-               clip.startTime <= project.currentTime,
-               clip.endTime > project.currentTime {
+               clip.startTime <= clock.currentTime,
+               clip.endTime > clock.currentTime {
                 let info = computeRenderInfo(viewSize: geo.size)
                 let vidRect = computeVideoRect(clip: clip, info: info)
 
@@ -516,6 +540,7 @@ private struct VideoTransformOverlay: View {
 
 private struct ImageTransformOverlay: View {
     @EnvironmentObject private var project: ProjectState
+    @EnvironmentObject private var clock: PlaybackClock
 
     enum DragMode { case none, move, scale, crop }
     @State private var dragMode: DragMode = .none
@@ -532,8 +557,8 @@ private struct ImageTransformOverlay: View {
     var body: some View {
         GeometryReader { geo in
             if let clip = project.selectedImageClip,
-               clip.startTime <= project.currentTime,
-               clip.endTime > project.currentTime {
+               clip.startTime <= clock.currentTime,
+               clip.endTime > clock.currentTime {
                 let info = computeRenderInfo(viewSize: geo.size)
                 let imgRect = computeImageRect(clip: clip, info: info)
 

@@ -21,11 +21,39 @@ struct InspectorView: View {
                     VideoInspector(clip: clip).id(clip.id)
                 } else if let clip = project.selectedAudioClip {
                     AudioInspector(clip: clip).id(clip.id)
+                } else if let clip = defaultClip {
+                    // 未选择时，默认显示第一个视频片段；无视频则显示第一个片段
+                    switch clip {
+                    case .video(let c):    VideoInspector(clip: c).id(c.id)
+                    case .image(let c):    ImageInspector(clip: c).id(c.id)
+                    case .audio(let c):    AudioInspector(clip: c).id(c.id)
+                    case .subtitle(let c): SubtitleInspector(clip: c).id(c.id)
+                    }
                 } else {
                     EmptyInspector()
                 }
             }
         }
+    }
+
+    /// 未选择任何片段时的默认显示：优先第一个视频片段，否则第一个任意片段
+    private var defaultClip: DefaultClipRef? {
+        // 优先视频
+        if let c = project.videoTracks.flatMap(\.clips).first { return .video(c) }
+        // 其次图片
+        if let c = project.imageTracks.flatMap(\.clips).first { return .image(c) }
+        // 其次音频
+        if let c = project.audioTracks.flatMap(\.clips).first { return .audio(c) }
+        // 最后字幕
+        if let c = project.subtitleTracks.flatMap(\.clips).first { return .subtitle(c) }
+        return nil
+    }
+
+    private enum DefaultClipRef {
+        case video(VideoClip)
+        case image(ImageClip)
+        case audio(AudioClip)
+        case subtitle(SubtitleClip)
     }
 
     private var header: some View {
@@ -48,6 +76,15 @@ struct InspectorView: View {
         if project.selectedImageClipID    != nil { return "图片片段" }
         if project.selectedVideoClipID    != nil { return "视频片段" }
         if project.selectedAudioClipID    != nil { return "音频片段" }
+        // 默认片段的标签
+        if let clip = defaultClip {
+            switch clip {
+            case .video:    return "视频片段"
+            case .image:    return "图片片段"
+            case .audio:    return "音频片段"
+            case .subtitle: return "字幕片段"
+            }
+        }
         return ""
     }
 }
@@ -113,6 +150,19 @@ private struct SubtitleInspector: View {
             // ── 字幕文字 ──────────────────────────────────
             ISection(title: "字幕文字") {
                 SubtitleTextBox(text: $text, clipID: clip.id)
+
+                HStack(spacing: 12) {
+                    Text("合并换行")
+                        .font(.system(size: 11))
+                        .foregroundColor(Color.labelSecondary)
+                        .frame(width: 76, alignment: .leading)
+                    Toggle("", isOn: $ls.mergeLineBreaks)
+                        .toggleStyle(.switch)
+                        .scaleEffect(0.7, anchor: .leading)
+                        .labelsHidden()
+                        .onChange(of: ls.mergeLineBreaks) { _ in writeStyle() }
+                    Spacer()
+                }
             }
 
             // ── 字体 ──────────────────────────────────────
@@ -188,6 +238,7 @@ private struct SubtitleInspector: View {
                         Spacer(minLength: 0)
                     }
                 }
+
             }
         }
         .onAppear { syncAll() }
@@ -616,6 +667,7 @@ private struct VideoInspector: View {
     @State private var sourceFPS: String = "—"
     @State private var sourceBitrate: String = "—"
     @State private var sourceCodec: String = "—"
+    @State private var audioTrackLabels: [String] = []  // 多音轨标签
 
     @State private var scaleX: Double = 1.0
     @State private var scaleY: Double = 1.0
@@ -667,6 +719,20 @@ private struct VideoInspector: View {
                         project.rebuildTimelinePreview()
                     }
                 ), range: 0...400, unit: "%")
+            }
+
+            // 多音轨选择（仅在有 ≥2 条音频轨道时显示）
+            if audioTrackLabels.count >= 2 {
+                ISection(title: "音轨") {
+                    IPicker(selection: Binding(
+                                get: { min(clip.audioTrackIndex, audioTrackLabels.count - 1) },
+                                set: { idx in
+                                    project.updateVideoClip(id: clip.id) { $0.audioTrackIndex = idx }
+                                    project.rebuildTimelinePreview()
+                                }
+                            ),
+                            options: audioTrackLabels.enumerated().map { ($0.offset, $0.element) })
+                }
             }
         }
 
@@ -892,6 +958,29 @@ private struct VideoInspector: View {
                     if let r = rate, r > 0 { sourceBitrate = "\(Int(r / 1000)) kbps" }
                     sourceCodec = codec ?? "—"
                 }
+            }
+            // 探测音频轨道（多音轨切换）
+            let aTracks = (try? await asset.loadTracks(withMediaType: .audio)) ?? []
+            if aTracks.count >= 2 {
+                var labels: [String] = []
+                for (i, at) in aTracks.enumerated() {
+                    var label = "音轨 \(i + 1)"
+                    // 尝试获取语言标签
+                    if let langCode = try? await at.load(.languageCode), !langCode.isEmpty {
+                        let locale = Locale(identifier: "zh-Hans")
+                        let langName = locale.localizedString(forLanguageCode: langCode) ?? langCode
+                        label = "\(langName)"
+                    }
+                    // 尝试获取编码格式
+                    if let descs = try? await at.load(.formatDescriptions), let desc = descs.first {
+                        let ext = CMFormatDescriptionGetExtensions(desc as CMFormatDescription) as? [String: Any]
+                        if let fmt = ext?["FormatName"] as? String {
+                            label += " (\(fmt))"
+                        }
+                    }
+                    labels.append(label)
+                }
+                await MainActor.run { audioTrackLabels = labels }
             }
         }
     }

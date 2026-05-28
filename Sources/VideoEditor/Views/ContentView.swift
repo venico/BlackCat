@@ -179,6 +179,7 @@ struct ContentView: View {
             }
         }
         .environmentObject(project)
+        .environmentObject(project.clock)
         .ignoresSafeArea()
         .animation(.spring(response: 0.28, dampingFraction: 0.82), value: sidebarVisible)
         .sheet(isPresented: $project.showExportSheet) {

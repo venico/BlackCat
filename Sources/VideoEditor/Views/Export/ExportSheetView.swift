@@ -204,6 +204,20 @@ struct ExportSheetView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var exportError: String?
 
+    /// 预估导出文件大小
+    private var estimatedFileSize: String {
+        let dur = project.duration
+        guard dur > 0 else { return "—" }
+        let videoBits = Double(project.exportSettings.bitrate) * 1000.0 * dur
+        let audioBits = 192_000.0 * dur  // AAC 192kbps
+        let totalBytes = (videoBits + audioBits) / 8.0
+        if totalBytes >= 1_073_741_824 {
+            return String(format: "≈ %.1f GB", totalBytes / 1_073_741_824)
+        } else {
+            return String(format: "≈ %.0f MB", totalBytes / 1_048_576)
+        }
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             // Title bar
@@ -345,12 +359,23 @@ struct ExportSheetView: View {
                                     } label: {
                                         Text(preset.label)
                                             .font(.system(size: 10))
-                                            .foregroundColor(Color.labelSecondary)
+                                            .foregroundColor(project.exportSettings.bitrate == preset.value ? .black : Color.labelSecondary)
                                             .padding(.horizontal, 8).frame(height: 24)
-                                            .background(Color.white.opacity(0.06))
+                                            .background(project.exportSettings.bitrate == preset.value ? Color(hex: "#E8A54B") : Color.white.opacity(0.06))
                                             .cornerRadius(4)
                                     }.buttonStyle(.plain)
                                 }
+                            }
+
+                            // 预估文件大小
+                            HStack {
+                                Text("预估大小")
+                                    .font(.system(size: 10))
+                                    .foregroundColor(Color.labelSecondary.opacity(0.6))
+                                Spacer()
+                                Text(estimatedFileSize)
+                                    .font(.system(size: 10).monospacedDigit())
+                                    .foregroundColor(Color.labelSecondary.opacity(0.6))
                             }
                         }
                     }
@@ -555,14 +580,17 @@ actor TimelineExporter {
                         if mfd.isValid && mfd.seconds > 0 { sourceFrameDuration = mfd }
                     }
                 }
-                // 音频（未静音才加）
-                if includeAudio && !track.isMuted,
-                   let aAsset = try? await asset.loadTracks(withMediaType: .audio).first {
-                    let at2 = composition.addMutableTrack(withMediaType: .audio,
-                                                          preferredTrackID: kCMPersistentTrackID_Invalid)
-                    if let at2 { try at2.insertTimeRange(range, of: aAsset, at: at) }
-                    if let tid = at2?.trackID {
-                        audioMixParams.append((tid, clip.volume, 1.0, 1.0, clip.startTime, useDur.seconds, 0, 0))
+                // 音频（未静音才加，支持多音轨选择）
+                if includeAudio && !track.isMuted {
+                    let allAudioTracks = (try? await asset.loadTracks(withMediaType: .audio)) ?? []
+                    let idx = min(clip.audioTrackIndex, max(allAudioTracks.count - 1, 0))
+                    if let aAsset = allAudioTracks.isEmpty ? nil : allAudioTracks[idx] {
+                        let at2 = composition.addMutableTrack(withMediaType: .audio,
+                                                              preferredTrackID: kCMPersistentTrackID_Invalid)
+                        if let at2 { try at2.insertTimeRange(range, of: aAsset, at: at) }
+                        if let tid = at2?.trackID {
+                            audioMixParams.append((tid, clip.volume, 1.0, 1.0, clip.startTime, useDur.seconds, 0, 0))
+                        }
                     }
                 }
             }
@@ -1042,7 +1070,15 @@ actor TimelineExporter {
             AVVideoCompressionPropertiesKey: [
                 AVVideoAverageBitRateKey: bitrate * 1000,
                 AVVideoExpectedSourceFrameRateKey: fps,
-                AVVideoMaxKeyFrameIntervalKey: fps * 2
+                AVVideoMaxKeyFrameIntervalKey: fps * 2,
+                AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel,  // High Profile 压缩率更高
+                AVVideoH264EntropyModeKey: AVVideoH264EntropyModeCABAC,        // CABAC 比 CAVLC 压缩率高 ~15%
+                AVVideoAllowFrameReorderingKey: true                            // 允许 B 帧，进一步提高压缩率
+            ] as [String: Any],
+            // 优先使用硬件编码器（VideoToolbox），失败时自动回退软件编码
+            AVVideoEncoderSpecificationKey: [
+                "EnableHardwareAcceleratedVideoEncoder": true,
+                "RequireHardwareAcceleratedVideoEncoder": false
             ] as [String: Any]
         ]
         let videoInput = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
@@ -1051,7 +1087,8 @@ actor TimelineExporter {
         let pbAttrs: [String: Any] = [
             kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
             kCVPixelBufferWidthKey as String: Int(renderSize.width),
-            kCVPixelBufferHeightKey as String: Int(renderSize.height)
+            kCVPixelBufferHeightKey as String: Int(renderSize.height),
+            kCVPixelBufferIOSurfacePropertiesKey as String: [:] as [String: Any]  // GPU 直接访问，避免 CPU 拷贝
         ]
         let adaptor = AVAssetWriterInputPixelBufferAdaptor(
             assetWriterInput: videoInput, sourcePixelBufferAttributes: pbAttrs)
@@ -1159,7 +1196,8 @@ actor TimelineExporter {
         var activeItems: [(text: String, style: SubtitleStyle)] = []
         for (track, style) in info.tracks {
             if let clip = track.clips.first(where: { $0.startTime <= time && $0.endTime > time }) {
-                activeItems.append((clip.text, style))
+                let text = style.mergeLineBreaks ? Self.mergeBreaks(clip.text) : clip.text
+                activeItems.append((text, style))
             }
         }
         guard !activeItems.isEmpty else { return }
@@ -1240,8 +1278,9 @@ actor TimelineExporter {
         }
 
         // 从底部往上堆叠绘制（y-down 坐标系）
+        // reversed() 使最后一条轨道在最底部，与预览 VStack 顺序一致
         var yPos = CGFloat(h) - bottomPad  // 底部起始 y
-        for layout in layouts {
+        for layout in layouts.reversed() {
             yPos -= layout.layerH
             let xOrig = (CGFloat(w) - layout.layerW) / 2
 
@@ -1284,6 +1323,21 @@ actor TimelineExporter {
     }
 
     /// 解析分辨率字符串，如 "1080p  1920×1080" → CGSize(1920, 1080)
+    /// 合并手动换行：中文之间直接拼接，其他用空格连接
+    private static func mergeBreaks(_ text: String) -> String {
+        let lines = text.components(separatedBy: .newlines).map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+        guard lines.count > 1 else { return text }
+        var result = lines[0]
+        for i in 1..<lines.count {
+            let prev = result.unicodeScalars.last
+            let next = lines[i].unicodeScalars.first
+            let prevIsCJK = prev.map { $0.value > 0x2E80 } ?? false
+            let nextIsCJK = next.map { $0.value > 0x2E80 } ?? false
+            result += (prevIsCJK && nextIsCJK) ? lines[i] : " " + lines[i]
+        }
+        return result
+    }
+
     private func parseResolution(_ str: String, fallback: CGSize) -> CGSize {
         // 匹配 "数字×数字" 或 "数字x数字"
         let pattern = #"(\d{3,5})\s*[×xX]\s*(\d{3,5})"#
@@ -1436,9 +1490,9 @@ private struct BitratePreset {
     let value: Int
     static let all: [BitratePreset] = [
         .init(label: "低质量", value: 2000),
-        .init(label: "标准",   value: 8000),
-        .init(label: "高质量", value: 20000),
-        .init(label: "无损",   value: 50000),
+        .init(label: "标准",   value: 5000),
+        .init(label: "高质量", value: 12000),
+        .init(label: "极高",   value: 30000),
     ]
 }
 

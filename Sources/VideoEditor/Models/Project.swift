@@ -4,6 +4,20 @@ import MediaToolbox
 import Accelerate
 import Combine
 
+// MARK: - PlaybackClock（高频播放状态，独立 ObservableObject）
+// 播放时 currentTime 每秒更新 30 次。如果放在 ProjectState 里，
+// 所有监听 ProjectState 的视图（属性区、素材库等）都会被迫重新 evaluate body。
+// 拆分后只有 PlayerView 和 TimelineView 监听 PlaybackClock，其余视图不受影响。
+
+final class PlaybackClock: ObservableObject {
+    @Published var currentTime: Double = 0
+    @Published var isPlaying: Bool = false
+    @Published var duration: Double = 60
+    @Published var lastVideoEndTime: Double = 0
+    @Published var seekRequest: Int = 0
+    var pendingSeekTime: Double? = nil
+}
+
 // MARK: - Asset Type
 
 enum AssetType: String, Codable {
@@ -45,11 +59,12 @@ struct SubtitleStyle: Equatable, Codable {
     var widthPercent: Double  = 95
     var alignment: String     = "center" // "left" / "center" / "right"
     var lineSpacing: Double   = 6      // px between bilingual lines
+    var mergeLineBreaks: Bool = false   // 合并换行：去掉字幕中的手动换行，按宽度自动重排
 
     enum CodingKeys: String, CodingKey {
         case fontName, fontSize, bold, italic
         case textColorHex, backgroundColorHex, backgroundOpacity
-        case bottomMargin, widthPercent, alignment, lineSpacing
+        case bottomMargin, widthPercent, alignment, lineSpacing, mergeLineBreaks
     }
 
     func encode(to encoder: Encoder) throws {
@@ -65,6 +80,7 @@ struct SubtitleStyle: Equatable, Codable {
         try c.encode(widthPercent, forKey: .widthPercent)
         try c.encode(alignment, forKey: .alignment)
         try c.encode(lineSpacing, forKey: .lineSpacing)
+        try c.encode(mergeLineBreaks, forKey: .mergeLineBreaks)
     }
 
     init(from decoder: Decoder) throws {
@@ -80,6 +96,7 @@ struct SubtitleStyle: Equatable, Codable {
         widthPercent = try c.decode(Double.self, forKey: .widthPercent)
         alignment = try c.decode(String.self, forKey: .alignment)
         lineSpacing = try c.decode(Double.self, forKey: .lineSpacing)
+        mergeLineBreaks = (try? c.decode(Bool.self, forKey: .mergeLineBreaks)) ?? false
     }
 
     init() {}
@@ -110,6 +127,7 @@ struct VideoClip: Identifiable, Equatable, Codable {
     var overrideFPS: Int           = 0
     var overrideBitrate: Int       = 0   // kbps
     var volume: Float              = 1.0
+    var audioTrackIndex: Int       = 0   // 多音轨时选择哪个音频流（0=默认第一个）
     // Transform
     var scaleX: Double   = 1.0
     var scaleY: Double   = 1.0
@@ -191,7 +209,7 @@ struct ExportSettings {
     var filename: String         = ""
     var resolution: String       = "1080p  1920×1080"
     var fps: Int                 = 30
-    var bitrate: Int             = 8000   // kbps
+    var bitrate: Int             = 5000   // kbps（1080p 标准画质，网络视频常用 2-6 Mbps）
     var content: ExportContent   = .video
     static let resolutions = ["原始分辨率","4K  3840×2160","1080p  1920×1080","720p  1280×720","480p  854×480"]
     static let fpsOptions  = [24, 25, 30, 60]
@@ -256,22 +274,39 @@ final class ProjectState: ObservableObject {
     @Published var subtitleBottomMargin: Double = 5   // 全局：所有字幕整体距下边缘 %
     @Published var subtitleLineSpacing: Double  = 6   // 全局：字幕轨道之间的间距 pt
 
-    // Playback
-    @Published var currentTime: Double  = 0
-    @Published var duration: Double     = 60
-    @Published var isPlaying: Bool      = false
+    // Playback — 高频属性委托给 PlaybackClock，避免刷新全部视图
+    let clock = PlaybackClock()
+    var currentTime: Double {
+        get { clock.currentTime }
+        set { clock.currentTime = newValue }
+    }
+    var duration: Double {
+        get { clock.duration }
+        set { clock.duration = newValue }
+    }
+    var isPlaying: Bool {
+        get { clock.isPlaying }
+        set { clock.isPlaying = newValue }
+    }
+    var lastVideoEndTime: Double {
+        get { clock.lastVideoEndTime }
+        set { clock.lastVideoEndTime = newValue }
+    }
+    var seekRequest: Int {
+        get { clock.seekRequest }
+        set { clock.seekRequest = newValue }
+    }
+    var pendingSeekTime: Double? {
+        get { clock.pendingSeekTime }
+        set { clock.pendingSeekTime = newValue }
+    }
     @Published var playerItem: AVPlayerItem? = nil
-    var pendingSeekTime: Double? = nil
-    /// End time of the last video clip on the timeline — used to black out
-    /// the preview when the playhead is past all clip content.
-    @Published var lastVideoEndTime: Double = 0
-    /// Bumped whenever the user drags the playhead/ruler — PlayerView
-    /// observes this and tells AVPlayer to seek to `currentTime`. The
-    /// periodic time observer doesn't bump it (so playback doesn't loop).
-    @Published var seekRequest: Int     = 0
 
     // Timeline
     @Published var pixelsPerSecond: Double = 30
+    weak var timelineHScrollView: NSScrollView?
+    private var _zoomScrollTarget: Double? = nil
+    private var _zoomWorkItem: DispatchWorkItem? = nil
     @Published var snapEnabled: Bool = true
     @Published var showImageTracks: Bool = true
     var timelineVisibleWidth: Double = 800  // 由 GeometryReader 更新
@@ -299,7 +334,48 @@ final class ProjectState: ObservableObject {
         let end = contentEndTime
         guard end > 0 else { return }
         let availableWidth = max(timelineVisibleWidth - 40, 100)
-        pixelsPerSecond = availableWidth / end
+        zoomTo(availableWidth / end)
+    }
+
+    func zoomTo(_ newPPS: Double) {
+        let clamped = newPPS.clamped(to: minPixelsPerSecond...3000)
+        let oldPPS = pixelsPerSecond
+        guard clamped != oldPPS else { return }
+        guard let sv = timelineHScrollView, let doc = sv.documentView else {
+            pixelsPerSecond = clamped
+            return
+        }
+        // 连续快速缩放时，用上次 pending target 而非实际滚动位置（因为上次 async 可能还没执行）
+        let effectiveScrollX = _zoomScrollTarget ?? sv.contentView.bounds.origin.x
+        let playheadInViewport = currentTime * oldPPS - effectiveScrollX
+        let targetX = max(0, currentTime * clamped - playheadInViewport)
+        _zoomScrollTarget = targetX
+
+        // ① 预扩容 documentView —— 防止 NSScrollView 在新 PPS 下把 scroll 位置 clamp 到旧的小内容宽度
+        let newContentW = max(contentEndTime * clamped + 300, max(timelineVisibleWidth, 800))
+        if newContentW > doc.frame.width {
+            doc.setFrameSize(NSSize(width: newContentW, height: doc.frame.height))
+        }
+        // ② 同步设置 scroll —— SwiftUI 还没 re-render，先抢占正确位置
+        let maxX1 = max(0, doc.frame.width - sv.contentView.bounds.width)
+        sv.contentView.setBoundsOrigin(NSPoint(x: min(targetX, maxX1), y: 0))
+        sv.reflectScrolledClipView(sv.contentView)
+
+        // ③ 触发 SwiftUI 重新布局
+        pixelsPerSecond = clamped
+
+        // ④ 布局完成后修正（SwiftUI 可能覆盖了我们的 scroll）
+        _zoomWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self, weak sv] in
+            guard let self = self, let sv = sv, let doc = sv.documentView,
+                  let target = self._zoomScrollTarget else { return }
+            self._zoomScrollTarget = nil
+            let maxX2 = max(0, doc.frame.width - sv.contentView.bounds.width)
+            sv.contentView.setBoundsOrigin(NSPoint(x: min(max(0, target), maxX2), y: 0))
+            sv.reflectScrolledClipView(sv.contentView)
+        }
+        _zoomWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.04, execute: work)
     }
     @Published var showVideoTracks: Bool = true
     @Published var showAudioTracks: Bool = true
@@ -402,6 +478,15 @@ final class ProjectState: ObservableObject {
     @Published var assetThumbnails: [UUID: [ThumbnailFrame]] = [:] // asset ID → timeline thumbnail strip
     @Published var waveformCache: [UUID: WaveformData] = [:]       // asset ID → waveform peaks
     var imageVideoCache: [UUID: URL] = [:]                         // asset ID → generated video file
+    private var avAssetCache: [URL: AVURLAsset] = [:]             // URL → cached AVURLAsset（避免重复创建）
+
+    /// 获取或创建缓存的 AVURLAsset
+    func cachedAVAsset(url: URL) -> AVURLAsset {
+        if let cached = avAssetCache[url] { return cached }
+        let asset = AVURLAsset(url: url)
+        avAssetCache[url] = asset
+        return asset
+    }
 
     // Translation
     @Published var translationTargetLang: String = "中文（简体）"
@@ -675,7 +760,7 @@ final class ProjectState: ObservableObject {
         // User confirmed — save snapshot WITH mediaAssets for undo
         let snapshot = currentSnapshot(includeAssets: true)
         undoStack.append(snapshot)
-        if undoStack.count > 50 { undoStack.removeFirst() }
+        if undoStack.count > 30 { undoStack.removeFirst() }
         redoStack.removeAll()
         undoCount = undoStack.count
         redoCount = 0
@@ -839,6 +924,7 @@ final class ProjectState: ObservableObject {
     /// Generate timeline thumbnail strip for a video asset (evenly spaced frames).
     func loadTimelineThumbnails(assetID: UUID, url: URL) {
         guard assetThumbnails[assetID] == nil else { return }
+        assetThumbnails[assetID] = []  // 标记为已开始加载，防止重复请求
         let id = assetID
         Task {
             let av = AVURLAsset(url: url)
@@ -850,18 +936,30 @@ final class ProjectState: ObservableObject {
             gen.requestedTimeToleranceBefore = CMTime(seconds: 0.5, preferredTimescale: 600)
             gen.requestedTimeToleranceAfter  = CMTime(seconds: 0.5, preferredTimescale: 600)
 
-            let interval = max(1.0, dur / 30.0)  // at most ~30 frames
-            var frames: [ThumbnailFrame] = []
+            let interval = max(1.0, dur / 30.0)
+            var times: [NSValue] = []
             var t = 0.0
             while t < dur {
-                let time = CMTime(seconds: t, preferredTimescale: 600)
-                if let cg = try? gen.copyCGImage(at: time, actualTime: nil) {
-                    let img = NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
-                    frames.append(ThumbnailFrame(time: t, image: img))
-                }
+                times.append(NSValue(time: CMTime(seconds: t, preferredTimescale: 600)))
                 t += interval
             }
-            await MainActor.run { self.assetThumbnails[id] = frames }
+
+            // 使用批量异步 API，比串行 copyCGImage 快很多
+            var frames: [ThumbnailFrame] = []
+            let semaphore = DispatchSemaphore(value: 0)
+            var remaining = times.count
+            gen.generateCGImagesAsynchronously(forTimes: times) { requested, cgImage, actual, result, error in
+                if result == .succeeded, let cg = cgImage {
+                    let img = NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
+                    frames.append(ThumbnailFrame(time: requested.seconds, image: img))
+                }
+                remaining -= 1
+                if remaining == 0 { semaphore.signal() }
+            }
+            // 在后台线程等待完成
+            await Task.detached(priority: .utility) { semaphore.wait() }.value
+            let sorted = frames.sorted(by: { $0.time < $1.time })
+            await MainActor.run { self.assetThumbnails[id] = sorted }
         }
     }
 
@@ -887,8 +985,10 @@ final class ProjectState: ObservableObject {
             reader.startReading()
 
             var allPeaks: [Float] = []
-            var buf16: [Int16] = []
             let chunkTarget = 2000  // samples per peak
+            // 直接在原始缓冲区上计算峰值，避免反复 append/removeFirst 的内存拷贝
+            var runningPeak: Int16 = 0
+            var samplesInChunk = 0
 
             while let sampleBuf = output.copyNextSampleBuffer() {
                 guard let blockBuf = CMSampleBufferGetDataBuffer(sampleBuf) else { continue }
@@ -900,18 +1000,20 @@ final class ProjectState: ObservableObject {
                 let count = length / MemoryLayout<Int16>.size
                 let samples = UnsafeBufferPointer(
                     start: UnsafeRawPointer(ptr).bindMemory(to: Int16.self, capacity: count), count: count)
-                buf16.append(contentsOf: samples)
 
-                while buf16.count >= chunkTarget {
-                    let chunk = Array(buf16.prefix(chunkTarget))
-                    buf16.removeFirst(chunkTarget)
-                    let peak = chunk.map { abs(Float($0)) }.max() ?? 0
-                    allPeaks.append(peak / Float(Int16.max))
+                for sample in samples {
+                    let absSample = sample == Int16.min ? Int16.max : abs(sample)
+                    if absSample > runningPeak { runningPeak = absSample }
+                    samplesInChunk += 1
+                    if samplesInChunk >= chunkTarget {
+                        allPeaks.append(Float(runningPeak) / Float(Int16.max))
+                        runningPeak = 0
+                        samplesInChunk = 0
+                    }
                 }
             }
-            if !buf16.isEmpty {
-                let peak = buf16.map { abs(Float($0)) }.max() ?? 0
-                allPeaks.append(peak / Float(Int16.max))
+            if samplesInChunk > 0 {
+                allPeaks.append(Float(runningPeak) / Float(Int16.max))
             }
 
             await MainActor.run {
@@ -949,7 +1051,7 @@ final class ProjectState: ObservableObject {
         }
         mediaThumbnails.removeValue(forKey: assetID)
         undoStack.append(snap)
-        if undoStack.count > 50 { undoStack.removeFirst() }
+        if undoStack.count > 30 { undoStack.removeFirst() }
         redoStack.removeAll()
         undoCount = undoStack.count
         redoCount = 0
@@ -1310,6 +1412,9 @@ final class ProjectState: ObservableObject {
         }
     }
 
+    /// 上次 rebuild 使用的轨道指纹，跳过无变化的重复 rebuild
+    private var lastRebuildFingerprint: Int = 0
+
     /// Build a full timeline composition from all clips and load it as the
     /// playerItem. If `seekTo` is given, also seeks to that time after load.
     /// Gaps between clips are rendered black by AVPlayer automatically.
@@ -1327,6 +1432,18 @@ final class ProjectState: ObservableObject {
         let aEnd = aTracks.flatMap(\.clips).map(\.endTime).max() ?? 0
         let sEnd = sTracks.flatMap(\.clips).map(\.endTime).max() ?? 0
         let endTime = max(vEnd, max(iEnd, max(aEnd, sEnd)))
+
+        // 指纹检测：跳过无变化的重复 rebuild（seekTo 除外）
+        var hasher = Hasher()
+        hasher.combine(vTracks.flatMap(\.clips).map { "\($0.id)\($0.startTime)\($0.endTime)\($0.trimStart)\($0.volume)\($0.scaleX)\($0.offsetX)" }.joined())
+        hasher.combine(iTracks.flatMap(\.clips).map { "\($0.id)\($0.startTime)\($0.endTime)\($0.scaleX)\($0.offsetX)" }.joined())
+        hasher.combine(aTracks.flatMap(\.clips).map { "\($0.id)\($0.startTime)\($0.endTime)\($0.trimStart)\($0.volume)" }.joined())
+        hasher.combine(vTracks.map { "\($0.isVisible)\($0.isMuted)" }.joined())
+        hasher.combine(iTracks.map { "\($0.isVisible)" }.joined())
+        hasher.combine(aTracks.map { "\($0.isVisible)\($0.isMuted)" }.joined())
+        let fp = hasher.finalize()
+        if seekTo == nil && fp == lastRebuildFingerprint { return }
+        lastRebuildFingerprint = fp
         rebuildTask?.cancel()
         rebuildTask = Task {
             let composition = AVMutableComposition()
@@ -1339,7 +1456,7 @@ final class ProjectState: ObservableObject {
             for track in vTracks {
                 for clip in track.clips.sorted(by: { $0.startTime < $1.startTime }) {
                     guard let url = clip.url else { continue }
-                    let asset = AVURLAsset(url: url)
+                    let asset = self.cachedAVAsset(url: url)
                     let assetDur = (try? await asset.load(.duration)) ?? .zero
                     let trimSt  = CMTime(seconds: clip.trimStart, preferredTimescale: 600)
                     let maxDur  = assetDur - trimSt
@@ -1355,12 +1472,15 @@ final class ProjectState: ObservableObject {
                         try? vt.insertTimeRange(range, of: vAsset, at: at)
                         videoCompTracks.append((vt, clip, clip.startTime, clip.startTime + useDur.seconds))
                     }
-                    if !track.isMuted,
-                       let aAsset = try? await asset.loadTracks(withMediaType: .audio).first,
-                       let at2 = composition.addMutableTrack(withMediaType: .audio,
-                                                             preferredTrackID: kCMPersistentTrackID_Invalid) {
-                        try? at2.insertTimeRange(range, of: aAsset, at: at)
-                        audioParams.append((at2.trackID, clip.volume, 1.0, 1.0, clip.startTime, useDur.seconds, 0, 0))
+                    if !track.isMuted {
+                        let allAudioTracks = (try? await asset.loadTracks(withMediaType: .audio)) ?? []
+                        let idx = min(clip.audioTrackIndex, max(allAudioTracks.count - 1, 0))
+                        if let aAsset = allAudioTracks.isEmpty ? nil : allAudioTracks[idx] as AVAssetTrack?,
+                           let at2 = composition.addMutableTrack(withMediaType: .audio,
+                                                                  preferredTrackID: kCMPersistentTrackID_Invalid) {
+                            try? at2.insertTimeRange(range, of: aAsset, at: at)
+                            audioParams.append((at2.trackID, clip.volume, 1.0, 1.0, clip.startTime, useDur.seconds, 0, 0))
+                        }
                     }
                 }
             }
@@ -1383,7 +1503,7 @@ final class ProjectState: ObservableObject {
                         }
                     }
                     guard let url else { continue }
-                    let asset = AVURLAsset(url: url)
+                    let asset = self.cachedAVAsset(url: url)
                     let assetDur = (try? await asset.load(.duration)) ?? .zero
                     let useDur = CMTimeMinimum(CMTime(seconds: clip.duration, preferredTimescale: 600), assetDur)
                     guard useDur.seconds > 0.01 else { continue }
@@ -1429,7 +1549,7 @@ final class ProjectState: ObservableObject {
                 guard track.isVisible && !track.isMuted else { continue }
                 for clip in track.clips {
                     guard let url = clip.url else { continue }
-                    let asset = AVURLAsset(url: url)
+                    let asset = self.cachedAVAsset(url: url)
                     guard let aAsset = try? await asset.loadTracks(withMediaType: .audio).first else { continue }
                     let assetDur = (try? await asset.load(.duration)) ?? .zero
                     let trimSt  = CMTime(seconds: clip.trimStart, preferredTimescale: 600)
@@ -1906,8 +2026,10 @@ final class ProjectState: ObservableObject {
         }
 
         Task.detached { [weak self] in
+            // 第一步：快速 remux（只复制视频流，音频转 AAC，跳过字幕/附件等不兼容流）
             let remuxOK = Self.runFFmpegSync(ffmpeg: ffmpeg, arguments: [
                 "-i", task.inputURL.path,
+                "-map", "0:v:0", "-map", "0:a?",
                 "-c:v", "copy",
                 "-c:a", "aac", "-b:a", "192k",
                 "-movflags", "+faststart",
@@ -2567,7 +2689,7 @@ final class ProjectState: ObservableObject {
 
     func pushUndo() {
         undoStack.append(currentSnapshot())
-        if undoStack.count > 50 { undoStack.removeFirst() }
+        if undoStack.count > 30 { undoStack.removeFirst() }
         redoStack.removeAll()
         undoCount = undoStack.count
         redoCount = 0
@@ -2580,7 +2702,7 @@ final class ProjectState: ObservableObject {
         var snap = currentSnapshot()
         snap.mediaAssets = mediaAssets
         undoStack.append(snap)
-        if undoStack.count > 50 { undoStack.removeFirst() }
+        if undoStack.count > 30 { undoStack.removeFirst() }
         redoStack.removeAll()
         undoCount = undoStack.count
         redoCount = 0
@@ -2716,7 +2838,7 @@ final class ProjectState: ObservableObject {
 
         if changed {
             undoStack.append(snap)
-            if undoStack.count > 50 { undoStack.removeFirst() }
+            if undoStack.count > 30 { undoStack.removeFirst() }
             redoStack.removeAll()
             undoCount = undoStack.count
             redoCount = 0
@@ -2768,7 +2890,7 @@ final class ProjectState: ObservableObject {
 
         if changed {
             undoStack.append(snap)
-            if undoStack.count > 50 { undoStack.removeFirst() }
+            if undoStack.count > 30 { undoStack.removeFirst() }
             redoStack.removeAll()
             undoCount = undoStack.count
             redoCount = 0
@@ -2951,7 +3073,7 @@ final class ProjectState: ObservableObject {
         }
 
         undoStack.append(snap)
-        if undoStack.count > 50 { undoStack.removeFirst() }
+        if undoStack.count > 30 { undoStack.removeFirst() }
         redoStack.removeAll()
         undoCount = undoStack.count
         redoCount = 0
@@ -3003,7 +3125,7 @@ final class ProjectState: ObservableObject {
         }
         if changed {
             undoStack.append(snap)
-            if undoStack.count > 50 { undoStack.removeFirst() }
+            if undoStack.count > 30 { undoStack.removeFirst() }
             redoStack.removeAll()
             undoCount = undoStack.count
             redoCount = 0
@@ -3098,7 +3220,7 @@ final class ProjectState: ObservableObject {
         selectedSubtitleClipID = clip.id
 
         undoStack.append(snap)
-        if undoStack.count > 50 { undoStack.removeFirst() }
+        if undoStack.count > 30 { undoStack.removeFirst() }
         redoStack.removeAll()
         undoCount = undoStack.count
         redoCount = 0

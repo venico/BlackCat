@@ -6,6 +6,7 @@ import UniformTypeIdentifiers
 
 struct TimelineView: View {
     @EnvironmentObject private var project: ProjectState
+    @EnvironmentObject private var clock: PlaybackClock
     private let labelW: CGFloat = 84
     private let rulerH: CGFloat = 26
 
@@ -37,6 +38,10 @@ struct TimelineView: View {
     // Global event monitors
     @State private var keyMonitor:    Any? = nil
     @State private var scrollMonitor: Any? = nil
+    @State private var scrollBarHovered = false
+    @State private var scrollFraction: Double = 0
+    @State private var scrollViewportFraction: Double = 1
+    @State private var scrollOffsetX: CGFloat = 0
 
     private enum DragOp {
         case moveVideo(id: UUID, originStart: Double, originDur: Double, srcTrack: Int)
@@ -256,15 +261,14 @@ struct TimelineView: View {
             return event
         }
 
-        // Command + scroll wheel → zoom timeline (pixelsPerSecond)
-        scrollMonitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { event in
+        // Command + scroll wheel → zoom timeline (pixelsPerSecond)，以播放头为中心
+        scrollMonitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { [self] event in
             guard event.modifierFlags.contains(.command) else { return event }
             let delta = event.scrollingDeltaY != 0 ? event.scrollingDeltaY : event.scrollingDeltaX
             guard abs(delta) > 0 else { return event }
             DispatchQueue.main.async {
                 let factor = delta > 0 ? 1.08 : 1.0 / 1.08
-                project.pixelsPerSecond = (project.pixelsPerSecond * Double(factor))
-                    .clamped(to: project.minPixelsPerSecond...3000)
+                project.zoomTo(project.pixelsPerSecond * Double(factor))
             }
             return nil  // consume — prevents scroll view from also scrolling
         }
@@ -363,12 +367,21 @@ struct TimelineView: View {
         GeometryReader { visibleGeo in
             let visibleW = visibleGeo.size.width
             let _ = updateVisibleWidth(visibleW)
-            let contentW = project.duration * project.pixelsPerSecond + 300
+            let contentW = clock.duration * project.pixelsPerSecond + 300
             let totalW = max(contentW, max(visibleW, 800))
             let effectiveH = max(totalContentH(), viewportH)
+            ZStack(alignment: .bottom) {
             ScrollView(.horizontal, showsIndicators: false) {
                 ZStack(alignment: .topLeading) {
-                    TimelineRuler(pps: project.pixelsPerSecond, duration: project.duration)
+                    TimelineScrollViewFinder(project: project, onScroll: { frac, vpFrac, offX in
+                        scrollFraction = frac
+                        scrollViewportFraction = vpFrac
+                        scrollOffsetX = offX
+                    })
+                    .frame(width: 1, height: 1)
+                    .opacity(0)
+                    TimelineRuler(pps: project.pixelsPerSecond, duration: clock.duration,
+                                  scrollOffsetX: scrollOffsetX, vpWidth: visibleW)
                         .frame(height: rulerH)
                         .allowsHitTesting(false)
 
@@ -445,9 +458,10 @@ struct TimelineView: View {
                     }
                 }
                 .onContinuousHover { phase in
-                    guard dragOp == nil else { return }
                     switch phase {
                     case .active(let loc):
+                        scrollBarHovered = loc.y > effectiveH - 24
+                        guard dragOp == nil else { return }
                         if trackGapHit(y: loc.y) != nil {
                             NSCursor.resizeUpDown.set()
                         } else if let edge = findClipTarget(at: loc)?.trimEdge {
@@ -456,6 +470,7 @@ struct TimelineView: View {
                             NSCursor.arrow.set()
                         }
                     case .ended:
+                        scrollBarHovered = false
                         NSCursor.arrow.set()
                     }
                 }
@@ -475,7 +490,23 @@ struct TimelineView: View {
                     return true
                 }
             }
-            .scrollClipDisabled(true)
+
+
+            // 自定义水平滚动条
+            if scrollViewportFraction < 1 {
+                TimelineScrollBar(
+                    fraction: scrollFraction,
+                    viewportFraction: scrollViewportFraction,
+                    isVisible: scrollBarHovered,
+                    onDrag: { newFrac in
+                        guard let sv = project.timelineHScrollView, let doc = sv.documentView else { return }
+                        let maxX = doc.frame.width - sv.contentView.bounds.width
+                        sv.contentView.scroll(to: NSPoint(x: max(0, newFrac * maxX), y: 0))
+                        sv.reflectScrolledClipView(sv.contentView)
+                    }
+                )
+            }
+            } // ZStack
         }
     }
 
@@ -639,7 +670,7 @@ struct TimelineView: View {
     }
 
     private func startDrag(at pt: CGPoint) {
-        let playheadX = project.currentTime * project.pixelsPerSecond
+        let playheadX = clock.currentTime * project.pixelsPerSecond
         // Dragging anywhere on the playhead stem (±10 px) moves the playhead.
         if abs(pt.x - playheadX) < 10 { dragOp = .movingPlayhead; return }
 
@@ -815,7 +846,7 @@ struct TimelineView: View {
 
     /// 收集所有片段的起止时间作为吸附点（排除指定 ID）
     private func collectSnapPoints(excluding ids: Set<UUID>) -> [Double] {
-        var pts: [Double] = [0, project.currentTime] // 轨道起始位置 + 播放头
+        var pts: [Double] = [0, clock.currentTime] // 轨道起始位置 + 播放头
         for t in project.videoTracks {
             for c in t.clips where !ids.contains(c.id) { pts.append(c.startTime); pts.append(c.endTime) }
         }
@@ -940,7 +971,7 @@ struct TimelineView: View {
             let (snapped, sp) = snapEdge(ne, excluding: [id])
             ne = min(snapped, maxEnd); activeSnapTime = sp
             project.updateVideoClip(id: id) { $0.endTime = ne }
-            if ne > project.duration { project.duration = ne }
+            if ne > clock.duration { clock.duration = ne }
         case .trimImageLeft(let id, let originStart, let originEnd):
             var ns = max(0, min(originStart + dt, originEnd - 0.1))
             let (snapped, sp) = snapEdge(ns, excluding: [id])
@@ -951,7 +982,7 @@ struct TimelineView: View {
             let (snapped, sp) = snapEdge(ne, excluding: [id])
             ne = snapped; activeSnapTime = sp
             project.updateImageClip(id: id) { $0.endTime = ne }
-            if ne > project.duration { project.duration = ne }
+            if ne > clock.duration { clock.duration = ne }
         case .trimAudioLeft(let id, let originStart, let originEnd, let originTrimStart, let assetDur):
             var ns = max(0, min(originStart + dt, originEnd - 0.1))
             let minStart = originStart - originTrimStart
@@ -967,7 +998,7 @@ struct TimelineView: View {
             let (snapped, sp) = snapEdge(ne, excluding: [id])
             ne = min(snapped, maxEnd); activeSnapTime = sp
             project.updateAudioClip(id: id) { $0.endTime = ne }
-            if ne > project.duration { project.duration = ne }
+            if ne > clock.duration { clock.duration = ne }
         case .trimSubtitleLeft(let id, let originStart, let originEnd):
             var ns = max(0, min(originStart + dt, originEnd - 0.1))
             let (snapped, sp) = snapEdge(ns, excluding: [id])
@@ -978,7 +1009,7 @@ struct TimelineView: View {
             let (snapped, sp) = snapEdge(ne, excluding: [id])
             ne = snapped; activeSnapTime = sp
             project.updateSubtitleTime(id: id, end: ne)
-            if ne > project.duration { project.duration = ne }
+            if ne > clock.duration { clock.duration = ne }
         case .movingPlayhead:
             activeSnapTime = nil
             let t = max(0, Double(current.x) / pps)
@@ -1017,11 +1048,42 @@ struct TimelineView: View {
         var rowTop: CGFloat = rulerH
         var first = true
 
+        // 边缘检测：当两个片段相邻时，左边缘优先（离片段中心更近的边优先）
         func edge(x: CGFloat, xMin: CGFloat, xMax: CGFloat) -> ClipTrimEdge? {
             guard xMax - xMin >= 20 else { return nil }
-            if abs(x - xMin) <= threshold { return .left }
-            if abs(x - xMax) <= threshold { return .right }
+            let nearLeft = abs(x - xMin) <= threshold
+            let nearRight = abs(x - xMax) <= threshold
+            if nearLeft && nearRight {
+                // 两边都在阈值内（极短片段），选更近的
+                return abs(x - xMin) <= abs(x - xMax) ? .left : .right
+            }
+            if nearLeft { return .left }
+            if nearRight { return .right }
             return nil
+        }
+
+        // 在一行 clips 中找最佳匹配：优先匹配鼠标在 clip 内部的（解决相邻片段边缘重叠问题）
+        typealias Match = (hit: ClipHit, trimEdge: ClipTrimEdge?)
+        func bestMatch<C>(_ clips: [C], x: CGFloat, _ makeHit: (C, CGFloat, CGFloat) -> ClipHit,
+                          _ start: (C) -> Double, _ end: (C) -> Double) -> Match? {
+            var insideMatch: Match? = nil
+            var edgeMatch: Match? = nil
+            for c in clips {
+                let xMin = CGFloat(start(c) * pps) + 1
+                let xMax = CGFloat(end(c) * pps) + 1
+                let inside = x >= xMin && x <= xMax
+                let inZone = x >= xMin - threshold && x <= xMax + threshold
+                guard inZone else { continue }
+                let e = edge(x: x, xMin: xMin, xMax: xMax)
+                let hit = makeHit(c, xMin, xMax)
+                if inside {
+                    // 鼠标在 clip 内部 → 最高优先级
+                    if insideMatch == nil { insideMatch = (hit, e) }
+                } else if edgeMatch == nil {
+                    edgeMatch = (hit, e)
+                }
+            }
+            return insideMatch ?? edgeMatch
         }
 
         if project.showImageTracks {
@@ -1029,14 +1091,9 @@ struct TimelineView: View {
                 if !first { rowTop += 1 }; first = false
                 let h = imgH(ti)
                 if pt.y >= rowTop && pt.y < rowTop + h {
-                    for c in project.imageTracks[ti].clips {
-                        let xMin = CGFloat(c.startTime * pps) + 1
-                        let xMax = CGFloat(c.endTime   * pps) + 1
-                        if pt.x >= xMin - threshold && pt.x <= xMax + threshold {
-                            let hit = ClipHit.image(id: c.id, start: c.startTime, dur: c.duration)
-                            return (hit, edge(x: pt.x, xMin: xMin, xMax: xMax))
-                        }
-                    }
+                    if let m = bestMatch(project.imageTracks[ti].clips, x: pt.x,
+                        { c, _, _ in .image(id: c.id, start: c.startTime, dur: c.duration) },
+                        { $0.startTime }, { $0.endTime }) { return m }
                     return nil
                 }
                 rowTop += h
@@ -1047,14 +1104,9 @@ struct TimelineView: View {
                 if !first { rowTop += 1 }; first = false
                 let h = vidH(ti)
                 if pt.y >= rowTop && pt.y < rowTop + h {
-                    for c in project.videoTracks[ti].clips {
-                        let xMin = CGFloat(c.startTime * pps) + 1
-                        let xMax = CGFloat(c.endTime   * pps) + 1
-                        if pt.x >= xMin - threshold && pt.x <= xMax + threshold {
-                            let hit = ClipHit.video(id: c.id, start: c.startTime, dur: c.duration)
-                            return (hit, edge(x: pt.x, xMin: xMin, xMax: xMax))
-                        }
-                    }
+                    if let m = bestMatch(project.videoTracks[ti].clips, x: pt.x,
+                        { c, _, _ in .video(id: c.id, start: c.startTime, dur: c.duration) },
+                        { $0.startTime }, { $0.endTime }) { return m }
                     return nil
                 }
                 rowTop += h
@@ -1065,14 +1117,9 @@ struct TimelineView: View {
                 if !first { rowTop += 1 }; first = false
                 let h = audH(ti)
                 if pt.y >= rowTop && pt.y < rowTop + h {
-                    for c in project.audioTracks[ti].clips {
-                        let xMin = CGFloat(c.startTime * pps) + 1
-                        let xMax = CGFloat(c.endTime   * pps) + 1
-                        if pt.x >= xMin - threshold && pt.x <= xMax + threshold {
-                            let hit = ClipHit.audio(id: c.id, start: c.startTime, dur: c.duration)
-                            return (hit, edge(x: pt.x, xMin: xMin, xMax: xMax))
-                        }
-                    }
+                    if let m = bestMatch(project.audioTracks[ti].clips, x: pt.x,
+                        { c, _, _ in .audio(id: c.id, start: c.startTime, dur: c.duration) },
+                        { $0.startTime }, { $0.endTime }) { return m }
                     return nil
                 }
                 rowTop += h
@@ -1083,14 +1130,9 @@ struct TimelineView: View {
                 if !first { rowTop += 1 }; first = false
                 let h = subH(ti)
                 if pt.y >= rowTop && pt.y < rowTop + h {
-                    for c in project.subtitleTracks[ti].clips {
-                        let xMin = CGFloat(c.startTime * pps) + 1
-                        let xMax = CGFloat(c.endTime   * pps) + 1
-                        if pt.x >= xMin - threshold && pt.x <= xMax + threshold {
-                            let hit = ClipHit.subtitle(id: c.id, start: c.startTime, dur: c.duration)
-                            return (hit, edge(x: pt.x, xMin: xMin, xMax: xMax))
-                        }
-                    }
+                    if let m = bestMatch(project.subtitleTracks[ti].clips, x: pt.x,
+                        { c, _, _ in .subtitle(id: c.id, start: c.startTime, dur: c.duration) },
+                        { $0.startTime }, { $0.endTime }) { return m }
                     return nil
                 }
                 rowTop += h
@@ -1214,15 +1256,28 @@ struct TimelineView: View {
         return h
     }
 
+    /// 判断片段是否在可视区域内（含缓冲区）
+    private func isClipVisible(startTime: Double, endTime: Double) -> Bool {
+        let pps = project.pixelsPerSecond
+        let vpW = max(project.timelineVisibleWidth, 400)
+        let buffer = vpW * 0.5  // 左右各半屏缓冲，减少滚动时闪烁
+        let visibleLeft = scrollOffsetX - buffer
+        let visibleRight = scrollOffsetX + vpW + buffer
+        let clipLeft = startTime * pps
+        let clipRight = endTime * pps
+        return clipRight >= visibleLeft && clipLeft <= visibleRight
+    }
+
     private var trackRows: some View {
         VStack(spacing: 1) {
         if project.showImageTracks {
             ForEach(project.imageTracks.indices, id:\.self) { i in
                 trackRow(height: imgH(i), hidden: !project.imageTracks[i].isVisible, tint: Color(hex: "#E8A54B")) {
-                    ForEach(project.imageTracks[i].clips) { clip in
+                    ForEach(project.imageTracks[i].clips.filter { isClipVisible(startTime: $0.startTime, endTime: $0.endTime) }) { clip in
                         ImageClipView(clip: clip, pps: project.pixelsPerSecond, h: imgH(i),
                                       sel: isSelected(clip.id, primary: project.selectedImageClipID),
-                                      isDragging: draggingClipID == clip.id)
+                                      isDragging: draggingClipID == clip.id,
+                                      scrollOffsetX: scrollOffsetX)
                     }
                 }
             }
@@ -1230,10 +1285,11 @@ struct TimelineView: View {
         if project.showVideoTracks {
             ForEach(project.videoTracks.indices, id:\.self) { i in
                 trackRow(height: vidH(i), hidden: !project.videoTracks[i].isVisible, tint: Color(hex: "#3DBFBA")) {
-                    ForEach(project.videoTracks[i].clips) { clip in
+                    ForEach(project.videoTracks[i].clips.filter { isClipVisible(startTime: $0.startTime, endTime: $0.endTime) }) { clip in
                         VideoClipView(clip: clip, pps: project.pixelsPerSecond, h: vidH(i),
                                       sel: isSelected(clip.id, primary: project.selectedVideoClipID),
-                                      isDragging: draggingClipID == clip.id)
+                                      isDragging: draggingClipID == clip.id,
+                                      scrollOffsetX: scrollOffsetX)
                     }
                 }
             }
@@ -1241,10 +1297,11 @@ struct TimelineView: View {
         if project.showAudioTracks {
             ForEach(project.audioTracks.indices, id:\.self) { i in
                 trackRow(height: audH(i), hidden: !project.audioTracks[i].isVisible, muted: project.audioTracks[i].isMuted, tint: Color(hex: "#5DB85D")) {
-                    ForEach(project.audioTracks[i].clips) { clip in
+                    ForEach(project.audioTracks[i].clips.filter { isClipVisible(startTime: $0.startTime, endTime: $0.endTime) }) { clip in
                         AudioClipView(clip: clip, pps: project.pixelsPerSecond, h: audH(i),
                                       sel: isSelected(clip.id, primary: project.selectedAudioClipID),
-                                      isDragging: draggingClipID == clip.id)
+                                      isDragging: draggingClipID == clip.id,
+                                      scrollOffsetX: scrollOffsetX)
                     }
                 }
             }
@@ -1252,10 +1309,11 @@ struct TimelineView: View {
         if project.showSubtitleTracks {
             ForEach(project.subtitleTracks.indices, id:\.self) { i in
                 trackRow(height: subH(i), hidden: !project.subtitleTracks[i].isVisible, tint: Color(hex: "#7B6FC4")) {
-                    ForEach(project.subtitleTracks[i].clips) { clip in
+                    ForEach(project.subtitleTracks[i].clips.filter { isClipVisible(startTime: $0.startTime, endTime: $0.endTime) }) { clip in
                         SubtitleClipView(clip: clip, pps: project.pixelsPerSecond, h: subH(i),
                                          sel: isSelected(clip.id, primary: project.selectedSubtitleClipID),
-                                         isDragging: draggingClipID == clip.id)
+                                         isDragging: draggingClipID == clip.id,
+                                         scrollOffsetX: scrollOffsetX)
                     }
                 }
             }
@@ -1523,7 +1581,16 @@ private struct VideoClipView: View {
     let h: CGFloat
     let sel: Bool
     var isDragging: Bool = false
+    var scrollOffsetX: CGFloat = 0
     @EnvironmentObject var project: ProjectState
+
+    private var stickyTitleX: CGFloat {
+        let w = max(clip.duration * pps, 5)
+        let clipStart = CGFloat(clip.startTime * pps) + 1
+        let clipLeftInViewport = clipStart - scrollOffsetX
+        if clipLeftInViewport < 5 { return min(-clipLeftInViewport + 5, w - 60) }
+        return 5
+    }
 
     var body: some View {
         let w = max(clip.duration*pps, 5)
@@ -1537,13 +1604,13 @@ private struct VideoClipView: View {
             // Selection border
             RoundedRectangle(cornerRadius:4)
                 .stroke(sel ? Color.white : Color.clear, lineWidth: sel ? 2 : 0)
-            // Name label top-left with shadow
+            // Name label — sticky to viewport left edge
             Text(clip.name).font(.system(size:9, weight:.medium))
                 .foregroundColor(.white)
                 .shadow(color: .black.opacity(0.8), radius: 2, x: 0, y: 1)
                 .shadow(color: .black.opacity(0.5), radius: 4, x: 0, y: 1)
                 .lineLimit(1)
-                .padding(.leading, 5)
+                .padding(.leading, stickyTitleX)
                 .padding(.top, 4)
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         }
@@ -1563,10 +1630,19 @@ private struct VideoClipView: View {
     private func thumbnailStrip(frames: [ThumbnailFrame], clipWidth: CGFloat) -> some View {
         let thumbH = h - 4
         let ratio: CGFloat = frames.first.map { CGFloat($0.image.size.width) / max(CGFloat($0.image.size.height), 1) } ?? 1.0
-        let thumbW = thumbH * ratio
+        let thumbW = max(thumbH * ratio, 1)
         let count = max(1, Int(ceil(clipWidth / thumbW)))
+        // 只渲染可视范围内的缩略图
+        let clipStartX = clip.startTime * pps
+        let visLeft = scrollOffsetX - clipStartX - thumbW  // 相对于片段左侧的可见左边界
+        let visRight = scrollOffsetX + max(project.timelineVisibleWidth, 400) - clipStartX + thumbW
+        let startIdx = max(0, Int(floor(visLeft / thumbW)))
+        let endIdx = min(count, Int(ceil(visRight / thumbW)))
         HStack(spacing: 0) {
-            ForEach(0..<count, id: \.self) { i in
+            if startIdx > 0 {
+                Color.clear.frame(width: thumbW * CGFloat(startIdx), height: thumbH)
+            }
+            ForEach(startIdx..<endIdx, id: \.self) { i in
                 let t = clip.trimStart + clip.duration * Double(i) / Double(count)
                 let frame = closestFrame(frames, at: t)
                 Image(nsImage: frame.image)
@@ -1575,6 +1651,9 @@ private struct VideoClipView: View {
                     .frame(width: i == count - 1 ? clipWidth - thumbW * CGFloat(count - 1) : thumbW,
                            height: thumbH)
                     .clipped()
+            }
+            if endIdx < count {
+                Color.clear.frame(width: thumbW * CGFloat(count - endIdx), height: thumbH)
             }
         }
         .frame(width: clipWidth, height: thumbH)
@@ -1592,12 +1671,20 @@ private struct ImageClipView: View {
     let h: CGFloat
     let sel: Bool
     var isDragging: Bool = false
+    var scrollOffsetX: CGFloat = 0
     @EnvironmentObject var project: ProjectState
+
+    private var stickyTitleX: CGFloat {
+        let w = max(clip.duration * pps, 5)
+        let clipStart = CGFloat(clip.startTime * pps) + 1
+        let clipLeftInViewport = clipStart - scrollOffsetX
+        if clipLeftInViewport < 5 { return min(-clipLeftInViewport + 5, w - 60) }
+        return 5
+    }
 
     var body: some View {
         let w = max(clip.duration*pps, 5)
         ZStack(alignment:.leading) {
-            // Thumbnail or solid color
             if let thumb = project.mediaThumbnails[clip.assetID] {
                 Image(nsImage: thumb)
                     .resizable()
@@ -1615,7 +1702,7 @@ private struct ImageClipView: View {
                 .shadow(color: .black.opacity(0.8), radius: 2, x: 0, y: 1)
                 .shadow(color: .black.opacity(0.5), radius: 4, x: 0, y: 1)
                 .lineLimit(1)
-                .padding(.leading, 5)
+                .padding(.leading, stickyTitleX)
                 .padding(.top, 4)
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         }
@@ -1633,26 +1720,35 @@ private struct AudioClipView: View {
     let h: CGFloat
     let sel: Bool
     var isDragging: Bool = false
+    var scrollOffsetX: CGFloat = 0
     @EnvironmentObject var project: ProjectState
+
+    private var stickyTitleX: CGFloat {
+        let w = max(clip.duration * pps, 5)
+        let clipStart = CGFloat(clip.startTime * pps) + 1
+        let clipLeftInViewport = clipStart - scrollOffsetX
+        if clipLeftInViewport < 5 { return min(-clipLeftInViewport + 5, w - 60) }
+        return 5
+    }
 
     var body: some View {
         let w = max(clip.duration*pps, 5)
         ZStack(alignment: .leading) {
             RoundedRectangle(cornerRadius:4).fill(Color(hex:"#5DB85D").opacity(0.78))
-            // Waveform overlay — full height
             if let wave = project.waveformCache[clip.assetID] {
                 AudioWaveformCanvas(waveData: wave, trimStart: clip.trimStart,
-                                     clipDuration: clip.duration, fullHeight: true)
+                                     clipDuration: clip.duration, fullHeight: true,
+                                     clipStartX: CGFloat(clip.startTime * pps),
+                                     scrollOffsetX: scrollOffsetX,
+                                     vpWidth: max(project.timelineVisibleWidth, 400))
                     .clipShape(RoundedRectangle(cornerRadius: 4))
             }
-            // Selection border
             RoundedRectangle(cornerRadius:4).stroke(sel ? Color.white : Color.clear, lineWidth: sel ? 2 : 0)
-            // Name top-left with light shadow
             Text(clip.name).font(.system(size:9, weight:.medium))
                 .foregroundColor(.white)
                 .shadow(color: .black.opacity(0.4), radius: 2, x: 0, y: 1)
                 .lineLimit(1)
-                .padding(.leading, 5)
+                .padding(.leading, stickyTitleX)
                 .padding(.top, 4)
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         }
@@ -1675,6 +1771,9 @@ private struct AudioWaveformCanvas: View {
     let trimStart: Double
     let clipDuration: Double
     var fullHeight: Bool = false
+    var clipStartX: CGFloat = 0      // 片段在内容坐标中的起始 x
+    var scrollOffsetX: CGFloat = 0
+    var vpWidth: CGFloat = 800
 
     var body: some View {
         Canvas { ctx, size in
@@ -1689,24 +1788,28 @@ private struct AudioWaveformCanvas: View {
             let barCount = Int(size.width)
             guard barCount > 0 else { return }
 
+            // 只绘制可视范围内的条
+            let visLeft = max(0, Int(scrollOffsetX - clipStartX - 2))
+            let visRight = min(barCount, Int(scrollOffsetX + vpWidth - clipStartX + 2))
+            let drawStart = max(0, visLeft)
+            let drawEnd = min(barCount, visRight)
+            guard drawStart < drawEnd else { return }
+
             if fullHeight {
-                // Normalize: find max peak in visible range so waveform fills height
                 let maxPeak = max(visible.max() ?? 1, 0.01)
-                // Bars grow from bottom, full height
-                for x in 0..<barCount {
+                for x in drawStart..<drawEnd {
                     let sIdx = x * visible.count / barCount
                     let eIdx = min(sIdx + max(1, visible.count / barCount), visible.count)
                     guard sIdx < eIdx else { continue }
-                    let peak = (visible[sIdx..<eIdx].max() ?? 0) / maxPeak  // normalized 0..1
+                    let peak = (visible[sIdx..<eIdx].max() ?? 0) / maxPeak
                     let barH = max(1, CGFloat(peak) * size.height)
                     let rect = CGRect(x: CGFloat(x), y: size.height - barH,
                                       width: 1, height: barH)
                     ctx.fill(Path(rect), with: .color(.white.opacity(0.30)))
                 }
             } else {
-                // Centered waveform
                 let midY = size.height / 2
-                for x in 0..<barCount {
+                for x in drawStart..<drawEnd {
                     let sIdx = x * visible.count / barCount
                     let eIdx = min(sIdx + max(1, visible.count / barCount), visible.count)
                     guard sIdx < eIdx else { continue }
@@ -1727,11 +1830,20 @@ private struct SubtitleClipView: View {
     let h: CGFloat
     let sel: Bool
     var isDragging: Bool = false
+    var scrollOffsetX: CGFloat = 0
     @EnvironmentObject var project: ProjectState
     @State private var breathing = false
 
     private var isPlaceholder: Bool {
         project.placeholderClipIDs.contains(clip.id)
+    }
+
+    private var stickyTitleX: CGFloat {
+        let w = max(clip.duration * pps, 4)
+        let clipStart = CGFloat(clip.startTime * pps) + 1
+        let clipLeftInViewport = clipStart - scrollOffsetX
+        if clipLeftInViewport < 4 { return min(-clipLeftInViewport + 4, w - 40) }
+        return 4
     }
 
     var body: some View {
@@ -1746,7 +1858,8 @@ private struct SubtitleClipView: View {
                 Text(clip.text.components(separatedBy:"\n").first ?? clip.text)
                     .font(.system(size:8, weight:.medium))
                     .foregroundColor(.white.opacity(0.9)).lineLimit(1)
-                    .padding(.horizontal, 4)
+                    .padding(.leading, stickyTitleX)
+                    .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
         .frame(width: w, height: clipH)
@@ -1764,6 +1877,7 @@ private struct SubtitleClipView: View {
 
 private struct TimelineRuler: View {
     let pps: Double; let duration: Double
+    var scrollOffsetX: CGFloat = 0; var vpWidth: CGFloat = 800
     private let fps: Double = 30
 
     // 主刻度级别（每个主刻度显示标签）
@@ -1822,12 +1936,16 @@ private struct TimelineRuler: View {
             let level = chooseLevel()
             let majorStep = level.majorStep
             let minorStep = majorStep / Double(level.minorDiv)
-            let maxTime = max(duration, size.width / pps) + majorStep
 
-            var t = 0.0
-            while t <= maxTime {
+            // 只绘制可视范围内的刻度（Canvas 坐标 = 内容坐标）
+            // Canvas 自动裁剪，但跳过不可见区域避免无用计算
+            let startTime = max(0, floor((scrollOffsetX / pps) / minorStep) * minorStep - minorStep)
+            let endTime = min(max(duration, size.width / pps) + majorStep,
+                              ((scrollOffsetX + vpWidth) / pps) + majorStep)
+
+            var t = startTime
+            while t <= endTime {
                 let x = t * pps
-                // 判断是否是主刻度（容差处理浮点精度）
                 let majRem = majorStep > 0.001 ? t.truncatingRemainder(dividingBy: majorStep) : 0
                 let isMajor = majRem < 0.001 || (majorStep - majRem) < 0.001
 
@@ -1859,11 +1977,12 @@ private struct TimelineRuler: View {
 
 private struct DraggablePlayhead: View {
     @EnvironmentObject private var project: ProjectState
+    @EnvironmentObject private var clock: PlaybackClock
     let pps: Double
     let fullHeight: CGFloat
 
     var body: some View {
-        let x = project.currentTime * pps
+        let x = clock.currentTime * pps
         ZStack(alignment: .topLeading) {
             Path { p in
                 p.move(to: CGPoint(x: x,   y: 16))
@@ -1952,9 +2071,12 @@ struct TimelineToolbar: View {
             // 右侧：缩放
             HStack(spacing:6) {
                 TBtn(icon:"arrow.left.and.right.square", help:"缩放至适合") { project.zoomToFit() }
-                TBtn(icon:"minus.magnifyingglass", help:"缩小") { project.pixelsPerSecond = max(project.minPixelsPerSecond, project.pixelsPerSecond/1.5) }
-                LogSlider(value: $project.pixelsPerSecond, range: project.minPixelsPerSecond...3000).frame(width:100).help("时间轴缩放")
-                TBtn(icon:"plus.magnifyingglass", help:"放大")  { project.pixelsPerSecond = min(3000, project.pixelsPerSecond*1.5) }
+                TBtn(icon:"minus.magnifyingglass", help:"缩小") { project.zoomTo(project.pixelsPerSecond / 1.5) }
+                LogSlider(value: Binding(
+                    get: { project.pixelsPerSecond },
+                    set: { project.zoomTo($0) }
+                ), range: project.minPixelsPerSecond...3000).frame(width:100).help("时间轴缩放")
+                TBtn(icon:"plus.magnifyingglass", help:"放大")  { project.zoomTo(project.pixelsPerSecond * 1.5) }
             }.padding(.trailing,12)
         }
         .frame(height:36)
@@ -2240,5 +2362,118 @@ final class LangMenuHandler: NSObject {
         let langs = ProjectState.supportedLanguages
         guard langs.indices.contains(sender.tag) else { return }
         project?.translationTargetLang = langs[sender.tag]
+    }
+}
+
+// MARK: - NSScrollView finder (always-visible scrollbar + programmatic scroll)
+
+private struct TimelineScrollViewFinder: NSViewRepresentable {
+    let project: ProjectState
+    let onScroll: (Double, Double, CGFloat) -> Void
+
+    func makeCoordinator() -> Coordinator { Coordinator(onScroll: onScroll) }
+
+    func makeNSView(context: Context) -> NSView {
+        let v = _FinderNSView()
+        v.coordinator = context.coordinator
+        v.project = project
+        return v
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        context.coordinator.onScroll = onScroll
+    }
+
+    final class Coordinator: NSObject {
+        var onScroll: (Double, Double, CGFloat) -> Void
+        var observer: Any?
+        init(onScroll: @escaping (Double, Double, CGFloat) -> Void) { self.onScroll = onScroll }
+        deinit { if let o = observer { NotificationCenter.default.removeObserver(o) } }
+
+        func observe(_ sv: NSScrollView) {
+            sv.contentView.postsBoundsChangedNotifications = true
+            observer = NotificationCenter.default.addObserver(
+                forName: NSView.boundsDidChangeNotification,
+                object: sv.contentView, queue: .main
+            ) { [weak self, weak sv] _ in self?.update(sv) }
+            update(sv)
+        }
+
+        func update(_ sv: NSScrollView?) {
+            guard let sv = sv, let doc = sv.documentView else { return }
+            let cW = doc.frame.width, vW = sv.contentView.bounds.width
+            guard cW > 0 else { return }
+            let vpFrac = min(vW / cW, 1.0)
+            let maxS = cW - vW
+            let frac = maxS > 0 ? sv.contentView.bounds.origin.x / maxS : 0
+            let offX = sv.contentView.bounds.origin.x
+            onScroll(frac, vpFrac, offX)
+        }
+    }
+
+    private final class _FinderNSView: NSView {
+        weak var project: ProjectState?
+        weak var coordinator: Coordinator?
+        private var didFind = false
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            guard !didFind, window != nil, let sv = enclosingScrollView else { return }
+            didFind = true
+            sv.hasHorizontalScroller = false
+            project?.timelineHScrollView = sv
+            coordinator?.observe(sv)
+        }
+    }
+}
+
+// MARK: - Custom horizontal scrollbar
+
+private struct TimelineScrollBar: View {
+    let fraction: Double
+    let viewportFraction: Double
+    let isVisible: Bool
+    let onDrag: (Double) -> Void
+
+    @State private var isDragging = false
+    @State private var dragStartFraction: Double = 0
+
+    private let barH: CGFloat = 6
+
+    var body: some View {
+        GeometryReader { geo in
+            let trackW = geo.size.width - 16
+            let knobW = max(trackW * viewportFraction, 30)
+            let maxOffset = max(trackW - knobW, 1)
+            let knobX = 8 + fraction * maxOffset
+            let show = isVisible || isDragging
+
+            ZStack(alignment: .leading) {
+                RoundedRectangle(cornerRadius: 3)
+                    .fill(Color.white.opacity(0.08))
+                    .frame(width: trackW, height: barH)
+                    .offset(x: 8)
+
+                RoundedRectangle(cornerRadius: 3)
+                    .fill(Color.white.opacity(isDragging ? 0.55 : 0.35))
+                    .frame(width: knobW, height: barH)
+                    .offset(x: knobX)
+                    .gesture(
+                        DragGesture(minimumDistance: 1)
+                            .onChanged { v in
+                                if !isDragging {
+                                    isDragging = true
+                                    dragStartFraction = fraction
+                                }
+                                let delta = v.translation.width / maxOffset
+                                onDrag((dragStartFraction + delta).clamped(to: 0...1))
+                            }
+                            .onEnded { _ in isDragging = false }
+                    )
+            }
+            .frame(height: barH)
+            .opacity(show ? 1 : 0)
+            .animation(.easeInOut(duration: show ? 0.15 : 0.4), value: show)
+        }
+        .frame(height: barH + 4)
     }
 }
