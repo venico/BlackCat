@@ -162,21 +162,21 @@ struct ContentView: View {
         }
         .background(Color.black)
         .overlay(alignment: .bottomTrailing) {
-            ExportProgressOverlay(manager: exportManager)
+            VStack(alignment: .trailing, spacing: 8) {
+                if !project.activeTasks.isEmpty {
+                    TranscodeOverlay()
+                        .environmentObject(project)
+                }
+                ExportProgressOverlay(manager: exportManager)
+            }
+            .padding(.trailing, 16)
+            .padding(.bottom, 16)
         }
         .overlay(alignment: .bottomTrailing) {
             SaveToastStack()
                 .environmentObject(project)
                 .padding(.trailing, 16)
                 .padding(.bottom, 48)
-        }
-        .overlay(alignment: .bottomTrailing) {
-            if !project.activeTasks.isEmpty {
-                TranscodeOverlay()
-                    .environmentObject(project)
-                    .padding(.trailing, 16)
-                    .padding(.bottom, 90)
-            }
         }
         .environmentObject(project)
         .environmentObject(project.clock)

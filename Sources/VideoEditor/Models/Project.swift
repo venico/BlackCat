@@ -1815,7 +1815,7 @@ final class ProjectState: ObservableObject {
     ]
 
     /// 支持智能 remux 的容器（编码兼容时直接 copy，不兼容才转码）
-    private static let smartRemuxExtensions: Set<String> = ["mkv"]
+    private static let smartRemuxExtensions: Set<String> = ["mkv", "ts", "mts", "m2ts"]
 
     /// 需要 FFmpeg 转码的音频格式（转为 m4a）
     private static let needsTranscodeAudioExtensions: Set<String> = [
@@ -1870,23 +1870,8 @@ final class ProjectState: ObservableObject {
             return
         }
 
-        // MKV 等智能 remux 格式：编码兼容时直接 copy，不兼容才完整转码
-        if type == .video && Self.smartRemuxExtensions.contains(ext) {
-            let fileName = url.deletingPathExtension().lastPathComponent
-            let shortHash = String(url.path.hashValue, radix: 16, uppercase: false).suffix(8)
-            let outputDir = FileManager.default.temporaryDirectory
-                .appendingPathComponent("BlackCatTranscode", isDirectory: true)
-            let outputURL = outputDir.appendingPathComponent("\(fileName)_\(shortHash).mp4")
-            if mediaAssets.contains(where: { $0.url == outputURL }) {
-                showImportToast("「\(url.lastPathComponent)」已在素材库中，已跳过")
-                return
-            }
-            smartRemuxAndImport(url: url, outputURL: outputURL)
-            return
-        }
-
-        // 需要转码的视频格式，先转为 MP4 再导入
-        if type == .video && Self.needsTranscodeExtensions.contains(ext) {
+        // 需要转码或智能 remux 的视频格式
+        if type == .video && (Self.needsTranscodeExtensions.contains(ext) || Self.smartRemuxExtensions.contains(ext)) {
             // 检查转码后的文件是否已在素材库中（防止同一源文件重复导入）
             let fileName = url.deletingPathExtension().lastPathComponent
             let outputURL = FileManager.default.temporaryDirectory
@@ -2045,53 +2030,40 @@ final class ProjectState: ObservableObject {
 
         Task.detached { [weak self] in
             // 用 ffprobe 检测编解码器兼容性
-            let codecs = Self.probeCodecs(ffmpegDir: ffmpeg.deletingLastPathComponent().path, inputPath: task.inputURL.path)
+            let ffmpegDir = ffmpeg.deletingLastPathComponent().path
+            let codecs = Self.probeCodecs(ffmpegDir: ffmpegDir, inputPath: task.inputURL.path)
             let videoCompatible = ["h264", "hevc", "mpeg4"].contains(codecs.video)
-            let audioCompatible = ["aac", "alac", "mp3", ""].contains(codecs.audio) // 空=无音频流
+            let audioCompatible = ["aac", "alac", "mp3", ""].contains(codecs.audio)
 
-            // 第一步：快速 remux（视频兼容时 copy，音频兼容时也 copy）
-            var remuxArgs = ["-i", task.inputURL.path, "-map", "0:v:0", "-map", "0:a?"]
-            if videoCompatible {
-                remuxArgs += ["-c:v", "copy"]
+            let totalDuration = Self.probeVideoDuration(ffmpegDir: ffmpegDir, inputPath: task.inputURL.path)
+
+            // 构建 ffmpeg 参数：智能选择 copy 或转码
+            var args: [String] = []
+            if videoCompatible && audioCompatible {
+                // 全兼容：纯封装转换（最快）
+                args = ["-i", task.inputURL.path, "-map", "0:v:0", "-map", "0:a?",
+                        "-c:v", "copy", "-c:a", "copy",
+                        "-movflags", "+faststart", "-y", task.outputURL.path]
+            } else if videoCompatible {
+                // 视频兼容、音频不兼容：copy视频，转码音��
+                args = ["-i", task.inputURL.path, "-map", "0:v:0", "-map", "0:a?",
+                        "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+                        "-movflags", "+faststart", "-y", task.outputURL.path]
             } else {
-                remuxArgs += ["-c:v", "h264_videotoolbox", "-b:v", "8000k"]
-            }
-            if audioCompatible {
-                remuxArgs += ["-c:a", "copy"]
-            } else {
-                remuxArgs += ["-c:a", "aac", "-b:a", "192k"]
-            }
-            remuxArgs += ["-movflags", "+faststart", "-y", task.outputURL.path]
-
-            let remuxOK = Self.runFFmpegSync(ffmpeg: ffmpeg, arguments: remuxArgs)
-            if remuxOK {
-                let asset = AVURLAsset(url: task.outputURL)
-                let playable = (try? await asset.load(.isPlayable)) ?? false
-                if playable {
-                    await MainActor.run {
-                        self?.importFileDirectly(url: task.outputURL, type: .video)
-                        self?.finishTranscodeTask(task.id)
-                    }
-                    return
-                }
-                try? FileManager.default.removeItem(at: task.outputURL)
+                // 视频不兼容：完整转码
+                args = ["-hwaccel", "videotoolbox",
+                        "-i", task.inputURL.path,
+                        "-c:v", "h264_videotoolbox", "-b:v", "8000k",
+                        "-profile:v", "high", "-level:v", "4.2",
+                        "-c:a", audioCompatible ? "copy" : "aac"]
+                if !audioCompatible { args += ["-b:a", "192k"] }
+                args += ["-movflags", "+faststart", "-y", task.outputURL.path]
             }
 
-            let totalDuration = Self.probeVideoDuration(ffmpegDir: ffmpeg.deletingLastPathComponent().path, inputPath: task.inputURL.path)
             let process = Process()
             await MainActor.run { task.process = process }
             process.executableURL = ffmpeg
-            process.arguments = [
-                "-hwaccel", "videotoolbox",
-                "-i", task.inputURL.path,
-                "-c:v", "h264_videotoolbox",
-                "-b:v", "8000k",
-                "-profile:v", "high",
-                "-level:v", "4.2",
-                "-c:a", "aac", "-b:a", "192k",
-                "-movflags", "+faststart",
-                "-y", task.outputURL.path
-            ]
+            process.arguments = args
 
             let pipe = Pipe()
             process.standardError = pipe
@@ -2137,59 +2109,6 @@ final class ProjectState: ObservableObject {
                     self?.showImportToast("转码失败，FFmpeg 退出码: \(process.terminationStatus)")
                 }
                 self?.finishTranscodeTask(task.id)
-            }
-        }
-    }
-
-    /// MKV 智能 remux：编码兼容直接 copy（秒级），不兼容才走完整转码
-    private func smartRemuxAndImport(url: URL, outputURL: URL) {
-        guard let ffmpeg = Self.findFFmpeg() else {
-            showImportToast("未找到 FFmpeg，无法处理 \(url.lastPathComponent)")
-            return
-        }
-        let outputDir = outputURL.deletingLastPathComponent()
-        try? FileManager.default.createDirectory(at: outputDir, withIntermediateDirectories: true)
-
-        // 如果之前已 remux 过，直接导入
-        if FileManager.default.fileExists(atPath: outputURL.path) {
-            importFileDirectly(url: outputURL, type: .video)
-            return
-        }
-
-        let displayName = url.lastPathComponent
-        showImportToast("正在处理「\(displayName)」...")
-
-        Task.detached { [weak self] in
-            let ffmpegDir = ffmpeg.deletingLastPathComponent().path
-            let codecs = Self.probeCodecs(ffmpegDir: ffmpegDir, inputPath: url.path)
-            let videoOK = ["h264", "hevc", "mpeg4"].contains(codecs.video)
-            let audioOK = ["aac", "alac", "mp3", ""].contains(codecs.audio)
-
-            // 构建 remux 参数
-            var args = ["-i", url.path, "-map", "0:v:0", "-map", "0:a?"]
-            args += ["-c:v", videoOK ? "copy" : "h264_videotoolbox"]
-            if !videoOK { args += ["-b:v", "8000k"] }
-            args += ["-c:a", audioOK ? "copy" : "aac"]
-            if !audioOK { args += ["-b:a", "192k"] }
-            args += ["-movflags", "+faststart", "-y", outputURL.path]
-
-            let ok = Self.runFFmpegSync(ffmpeg: ffmpeg, arguments: args)
-            if ok {
-                let asset = AVURLAsset(url: outputURL)
-                let playable = (try? await asset.load(.isPlayable)) ?? false
-                if playable {
-                    await MainActor.run {
-                        self?.importFileDirectly(url: outputURL, type: .video)
-                        self?.showImportToast("「\(displayName)」导入完成")
-                    }
-                    return
-                }
-                try? FileManager.default.removeItem(at: outputURL)
-            }
-
-            // remux 失败，走完整转码
-            await MainActor.run {
-                self?.transcodeAndImport(url: url)
             }
         }
     }

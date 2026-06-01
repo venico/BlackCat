@@ -476,75 +476,74 @@ struct TranscodeOverlay: View {
     @EnvironmentObject private var project: ProjectState
 
     var body: some View {
-        VStack(spacing: 6) {
-            HStack {
-                Text("转码中 (\(project.activeTasks.count))")
-                    .font(.system(size: 11, weight: .semibold))
-                    .foregroundColor(Color.labelPrimary)
-                Spacer()
-                if project.activeTasks.count > 1 {
-                    Button { project.cancelTranscoding() } label: {
-                        Text("全部取消")
-                            .font(.system(size: 10, weight: .medium))
-                            .foregroundColor(Color.labelSecondary)
-                    }
-                    .buttonStyle(.plain)
-                }
-            }
+        VStack(alignment: .trailing, spacing: 8) {
             ForEach(project.activeTasks) { task in
-                TranscodeTaskRow(task: task)
+                TranscodeTaskBubble(task: task)
+                    .environmentObject(project)
+                    .transition(.asymmetric(
+                        insertion: .move(edge: .trailing).combined(with: .opacity),
+                        removal: .opacity))
             }
         }
-        .padding(10)
-        .frame(width: 280)
-        .background(Color(white: 0.12).opacity(0.95))
-        .clipShape(RoundedRectangle(cornerRadius: 10))
-        .shadow(color: .black.opacity(0.4), radius: 8, y: 4)
+        .animation(.spring(response: 0.35, dampingFraction: 0.8), value: project.activeTasks.count)
     }
 }
 
-private struct TranscodeTaskRow: View {
+private struct TranscodeTaskBubble: View {
     @EnvironmentObject private var project: ProjectState
     @ObservedObject var task: ProjectState.TranscodeTask
-    @State private var hovered = false
+    @State private var hovering = false
 
     var body: some View {
-        VStack(spacing: 4) {
-            HStack(spacing: 6) {
-                ProgressView()
-                    .controlSize(.mini)
-                    .scaleEffect(0.7)
+        HStack(spacing: 10) {
+            // Icon
+            ZStack {
+                Circle()
+                    .fill(Color.accent.opacity(0.2))
+                    .frame(width: 28, height: 28)
+                Image(systemName: "arrow.triangle.2.circlepath")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundColor(Color.accent)
+            }
+
+            VStack(alignment: .leading, spacing: 3) {
                 Text(task.displayName)
-                    .font(.system(size: 10))
+                    .font(.system(size: 11, weight: .medium))
                     .foregroundColor(Color.labelPrimary)
-                    .lineLimit(1)
-                Spacer()
-                Text("\(Int(task.progress * 100))%")
-                    .font(.system(size: 10).monospacedDigit())
-                    .foregroundColor(Color.labelSecondary)
-                Button { project.cancelTranscodeTask(task.id) } label: {
-                    Image(systemName: "xmark")
-                        .font(.system(size: 8, weight: .bold))
-                        .foregroundColor(hovered ? Color.labelPrimary : Color.labelSecondary)
-                        .frame(width: 14, height: 14)
-                        .background(Color.white.opacity(hovered ? 0.15 : 0.08))
-                        .clipShape(Circle())
-                }
-                .buttonStyle(.plain)
-                .onHover { hovered = $0 }
-            }
-            GeometryReader { geo in
-                ZStack(alignment: .leading) {
-                    RoundedRectangle(cornerRadius: 2)
-                        .fill(Color.white.opacity(0.1))
-                        .frame(height: 3)
-                    RoundedRectangle(cornerRadius: 2)
-                        .fill(Color.accent)
-                        .frame(width: geo.size.width * CGFloat(task.progress), height: 3)
+                    .lineLimit(1).truncationMode(.middle)
+
+                HStack(spacing: 6) {
+                    ProgressView(value: task.progress)
+                        .progressViewStyle(.linear)
+                        .tint(Color.accent)
+                        .frame(width: 100)
+                    Text("\(Int(task.progress * 100))%")
+                        .font(.system(size: 10).monospacedDigit())
+                        .foregroundColor(Color.labelSecondary)
                 }
             }
-            .frame(height: 3)
+
+            Button { project.cancelTranscodeTask(task.id) } label: {
+                Image(systemName: "xmark")
+                    .font(.system(size: 9, weight: .bold))
+                    .foregroundColor(hovering ? Color.labelPrimary : Color.labelSecondary)
+                    .frame(width: 18, height: 18)
+                    .background(Color.white.opacity(hovering ? 0.15 : 0.08))
+                    .clipShape(Circle())
+            }
+            .buttonStyle(.plain)
+            .onHover { hovering = $0 }
         }
-        .padding(.vertical, 2)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .background(
+            RoundedRectangle(cornerRadius: 10)
+                .fill(Color(red: 0.16, green: 0.16, blue: 0.17))
+                .shadow(color: .black.opacity(0.5), radius: 8, y: 4)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 10)
+                .stroke(Color.white.opacity(0.12), lineWidth: 0.5)
+        )
     }
 }
