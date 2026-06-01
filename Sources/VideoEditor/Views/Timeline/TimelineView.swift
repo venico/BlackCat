@@ -182,6 +182,20 @@ struct TimelineView: View {
             return Color.clear
         })
         .clipped()
+        .overlay(alignment: .topLeading) {
+            // 播放头三角（最外层 overlay，不被任何 ScrollView 裁剪）
+            Canvas { ctx, size in
+                let x = labelW + clock.currentTime * project.pixelsPerSecond - scrollOffsetX
+                var tri = Path()
+                tri.move(to: CGPoint(x: x, y: 16))
+                tri.addLine(to: CGPoint(x: x - 5, y: 6))
+                tri.addLine(to: CGPoint(x: x + 5, y: 6))
+                tri.closeSubpath()
+                ctx.fill(tri, with: .color(Color.accent))
+            }
+            .frame(height: rulerH)
+            .allowsHitTesting(false)
+        }
         .overlay(alignment: .bottomTrailing) {
             if project.translationTotal > 0 {
                 TranslationProgressBubble()
@@ -349,10 +363,10 @@ struct TimelineView: View {
                 }
             }
             } // end inner VStack
+            .background(Color(red:0.09,green:0.09,blue:0.10))
         }
         .frame(width: labelW)
         .frame(maxHeight: .infinity, alignment: .top)
-        .background(Color(red:0.09,green:0.09,blue:0.10))
     }
 
     private func updateVisibleWidth(_ w: Double) {
@@ -1153,7 +1167,8 @@ struct TimelineView: View {
                 let h = imgH(ti)
                 let yRange = rowTop ... (rowTop + h)
                 for c in project.imageTracks[ti].clips {
-                    let xRange = (c.startTime*pps) ... (c.endTime*pps)
+                    let xEnd = max(c.startTime*pps, c.endTime*pps)
+                    let xRange = (c.startTime*pps) ... xEnd
                     if rectIntersects(rect, xRange: xRange, yRange: yRange) { ids.insert(c.id) }
                 }
                 rowTop += h
@@ -1165,7 +1180,8 @@ struct TimelineView: View {
                 let h = vidH(ti)
                 let yRange = rowTop ... (rowTop + h)
                 for c in project.videoTracks[ti].clips {
-                    let xRange = (c.startTime*pps) ... (c.endTime*pps)
+                    let xEnd = max(c.startTime*pps, c.endTime*pps)
+                    let xRange = (c.startTime*pps) ... xEnd
                     if rectIntersects(rect, xRange: xRange, yRange: yRange) { ids.insert(c.id) }
                 }
                 rowTop += h
@@ -1177,7 +1193,8 @@ struct TimelineView: View {
                 let h = audH(ti)
                 let yRange = rowTop ... (rowTop + h)
                 for c in project.audioTracks[ti].clips {
-                    let xRange = (c.startTime*pps) ... (c.endTime*pps)
+                    let xEnd = max(c.startTime*pps, c.endTime*pps)
+                    let xRange = (c.startTime*pps) ... xEnd
                     if rectIntersects(rect, xRange: xRange, yRange: yRange) { ids.insert(c.id) }
                 }
                 rowTop += h
@@ -1189,7 +1206,8 @@ struct TimelineView: View {
                 let h = subH(ti)
                 let yRange = rowTop ... (rowTop + h)
                 for c in project.subtitleTracks[ti].clips {
-                    let xRange = (c.startTime*pps) ... (c.endTime*pps)
+                    let xEnd = max(c.startTime*pps, c.endTime*pps)
+                    let xRange = (c.startTime*pps) ... xEnd
                     if rectIntersects(rect, xRange: xRange, yRange: yRange) { ids.insert(c.id) }
                 }
                 rowTop += h
@@ -1536,11 +1554,11 @@ private struct OverlayBtn: View {
                 .foregroundColor(hov ? (destructive ? .red.opacity(0.9) : .white.opacity(0.95)) : Color.labelSecondary)
                 .frame(width: 22, height: 22)
                 .background(
-                    RoundedRectangle(cornerRadius: 4)
+                    RoundedRectangle(cornerRadius: 6)
                         .fill(hov ? Color.white.opacity(0.16) : Color.white.opacity(0.07))
                 )
                 .overlay(
-                    RoundedRectangle(cornerRadius: 4)
+                    RoundedRectangle(cornerRadius: 6)
                         .stroke(Color.white.opacity(hov ? 0.15 : 0.05), lineWidth: 0.5)
                 )
         }
@@ -1599,10 +1617,10 @@ private struct VideoClipView: View {
             if let frames = project.assetThumbnails[clip.assetID], !frames.isEmpty {
                 thumbnailStrip(frames: frames, clipWidth: w)
             } else {
-                RoundedRectangle(cornerRadius:4).fill(Color(hex:"#3DBFBA").opacity(0.82))
+                RoundedRectangle(cornerRadius:6).fill(Color(hex:"#3DBFBA").opacity(0.82))
             }
             // Selection border
-            RoundedRectangle(cornerRadius:4)
+            RoundedRectangle(cornerRadius:6)
                 .stroke(sel ? Color.white : Color.clear, lineWidth: sel ? 2 : 0)
             // Name label — sticky to viewport left edge
             Text(clip.name).font(.system(size:9, weight:.medium))
@@ -1615,7 +1633,7 @@ private struct VideoClipView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         }
         .frame(width: w, height: h-4)
-        .clipShape(RoundedRectangle(cornerRadius: 4))
+        .clipShape(RoundedRectangle(cornerRadius: 6))
         .opacity(isDragging ? 0 : (project.clipboardIsCut && project.clipboardSourceID == clip.id ? 0.35 : 1.0))
         .offset(x: clip.startTime*pps + 1)
         .allowsHitTesting(false)
@@ -1637,7 +1655,7 @@ private struct VideoClipView: View {
         let visLeft = scrollOffsetX - clipStartX - thumbW  // 相对于片段左侧的可见左边界
         let visRight = scrollOffsetX + max(project.timelineVisibleWidth, 400) - clipStartX + thumbW
         let startIdx = max(0, Int(floor(visLeft / thumbW)))
-        let endIdx = min(count, Int(ceil(visRight / thumbW)))
+        let endIdx = max(startIdx, min(count, Int(ceil(visRight / thumbW))))
         HStack(spacing: 0) {
             if startIdx > 0 {
                 Color.clear.frame(width: thumbW * CGFloat(startIdx), height: thumbH)
@@ -1657,7 +1675,7 @@ private struct VideoClipView: View {
             }
         }
         .frame(width: clipWidth, height: thumbH)
-        .clipShape(RoundedRectangle(cornerRadius: 4))
+        .clipShape(RoundedRectangle(cornerRadius: 6))
     }
 
     private func closestFrame(_ frames: [ThumbnailFrame], at time: Double) -> ThumbnailFrame {
@@ -1691,11 +1709,11 @@ private struct ImageClipView: View {
                     .aspectRatio(contentMode: .fill)
                     .frame(width: w, height: h - 4)
                     .clipped()
-                    .clipShape(RoundedRectangle(cornerRadius: 4))
+                    .clipShape(RoundedRectangle(cornerRadius: 6))
             } else {
-                RoundedRectangle(cornerRadius:4).fill(Color(hex:"#E8A54B").opacity(0.82))
+                RoundedRectangle(cornerRadius:6).fill(Color(hex:"#E8A54B").opacity(0.82))
             }
-            RoundedRectangle(cornerRadius:4)
+            RoundedRectangle(cornerRadius:6)
                 .stroke(sel ? Color.white : Color.clear, lineWidth: sel ? 2 : 0)
             Text(clip.name).font(.system(size:9, weight:.medium))
                 .foregroundColor(.white)
@@ -1707,7 +1725,7 @@ private struct ImageClipView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         }
         .frame(width: w, height: h-4)
-        .clipShape(RoundedRectangle(cornerRadius: 4))
+        .clipShape(RoundedRectangle(cornerRadius: 6))
         .opacity(isDragging ? 0 : (project.clipboardIsCut && project.clipboardSourceID == clip.id ? 0.35 : 1.0))
         .offset(x: clip.startTime*pps + 1)
         .allowsHitTesting(false)
@@ -1734,16 +1752,16 @@ private struct AudioClipView: View {
     var body: some View {
         let w = max(clip.duration*pps, 5)
         ZStack(alignment: .leading) {
-            RoundedRectangle(cornerRadius:4).fill(Color(hex:"#5DB85D").opacity(0.78))
+            RoundedRectangle(cornerRadius:6).fill(Color(hex:"#5DB85D").opacity(0.78))
             if let wave = project.waveformCache[clip.assetID] {
                 AudioWaveformCanvas(waveData: wave, trimStart: clip.trimStart,
                                      clipDuration: clip.duration, fullHeight: true,
                                      clipStartX: CGFloat(clip.startTime * pps),
                                      scrollOffsetX: scrollOffsetX,
                                      vpWidth: max(project.timelineVisibleWidth, 400))
-                    .clipShape(RoundedRectangle(cornerRadius: 4))
+                    .clipShape(RoundedRectangle(cornerRadius: 6))
             }
-            RoundedRectangle(cornerRadius:4).stroke(sel ? Color.white : Color.clear, lineWidth: sel ? 2 : 0)
+            RoundedRectangle(cornerRadius:6).stroke(sel ? Color.white : Color.clear, lineWidth: sel ? 2 : 0)
             Text(clip.name).font(.system(size:9, weight:.medium))
                 .foregroundColor(.white)
                 .shadow(color: .black.opacity(0.4), radius: 2, x: 0, y: 1)
@@ -1753,7 +1771,7 @@ private struct AudioClipView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         }
         .frame(width: w, height: h-4)
-        .clipShape(RoundedRectangle(cornerRadius: 4))
+        .clipShape(RoundedRectangle(cornerRadius: 6))
         .opacity(isDragging ? 0 : (project.clipboardIsCut && project.clipboardSourceID == clip.id ? 0.35 : 1.0))
         .offset(x: clip.startTime*pps + 1)
         .onAppear {
@@ -1780,8 +1798,8 @@ private struct AudioWaveformCanvas: View {
             guard waveData.totalDuration > 0, !waveData.samples.isEmpty else { return }
             let startFrac = trimStart / waveData.totalDuration
             let endFrac   = (trimStart + clipDuration) / waveData.totalDuration
-            let startIdx  = Int(startFrac * Double(waveData.samples.count))
-            let endIdx    = min(Int(endFrac * Double(waveData.samples.count)), waveData.samples.count)
+            let startIdx  = max(0, Int(startFrac * Double(waveData.samples.count)))
+            let endIdx    = max(startIdx, min(Int(endFrac * Double(waveData.samples.count)), waveData.samples.count))
             guard startIdx < endIdx else { return }
 
             let visible = Array(waveData.samples[startIdx..<endIdx])
@@ -1850,9 +1868,9 @@ private struct SubtitleClipView: View {
         let w = max(clip.duration*pps, 4)
         let clipH = h - 6
         ZStack(alignment:.leading) {
-            RoundedRectangle(cornerRadius:3)
+            RoundedRectangle(cornerRadius:6)
                 .fill(Color(hex:"#7B6FC4").opacity(isPlaceholder ? 0.35 : 0.85))
-                .overlay(RoundedRectangle(cornerRadius:3)
+                .overlay(RoundedRectangle(cornerRadius:6)
                     .stroke(sel ? Color.white : Color(hex:"#9B8FD4").opacity(0.4), lineWidth: sel ? 2 : 1))
             if !isPlaceholder && w > 16 {
                 Text(clip.text.components(separatedBy:"\n").first ?? clip.text)
@@ -1984,13 +2002,7 @@ private struct DraggablePlayhead: View {
     var body: some View {
         let x = clock.currentTime * pps
         ZStack(alignment: .topLeading) {
-            Path { p in
-                p.move(to: CGPoint(x: x,   y: 16))
-                p.addLine(to: CGPoint(x: x-5, y: 6))
-                p.addLine(to: CGPoint(x: x+5, y: 6))
-                p.closeSubpath()
-            }.fill(Color.accent)
-            Rectangle().fill(Color.accent.opacity(0.7))
+            Rectangle().fill(Color.accent)
                 .frame(width: 1, height: fullHeight - 16)
                 .offset(x: x - 0.5, y: 16)
         }
@@ -2075,7 +2087,7 @@ struct TimelineToolbar: View {
                 LogSlider(value: Binding(
                     get: { project.pixelsPerSecond },
                     set: { project.zoomTo($0) }
-                ), range: project.minPixelsPerSecond...3000).frame(width:100).help("时间轴缩放")
+                ), range: min(project.minPixelsPerSecond, 3000)...3000).frame(width:100).help("时间轴缩放")
                 TBtn(icon:"plus.magnifyingglass", help:"放大")  { project.zoomTo(project.pixelsPerSecond * 1.5) }
             }.padding(.trailing,12)
         }
@@ -2448,12 +2460,12 @@ private struct TimelineScrollBar: View {
             let show = isVisible || isDragging
 
             ZStack(alignment: .leading) {
-                RoundedRectangle(cornerRadius: 3)
+                RoundedRectangle(cornerRadius: 6)
                     .fill(Color.white.opacity(0.08))
                     .frame(width: trackW, height: barH)
                     .offset(x: 8)
 
-                RoundedRectangle(cornerRadius: 3)
+                RoundedRectangle(cornerRadius: 6)
                     .fill(Color.white.opacity(isDragging ? 0.55 : 0.35))
                     .frame(width: knobW, height: barH)
                     .offset(x: knobX)

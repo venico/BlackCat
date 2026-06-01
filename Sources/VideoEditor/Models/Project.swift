@@ -338,7 +338,8 @@ final class ProjectState: ObservableObject {
     }
 
     func zoomTo(_ newPPS: Double) {
-        let clamped = newPPS.clamped(to: minPixelsPerSecond...3000)
+        let minPPS = min(minPixelsPerSecond, 3000)
+        let clamped = newPPS.clamped(to: minPPS...3000)
         let oldPPS = pixelsPerSecond
         guard clamped != oldPPS else { return }
         guard let sv = timelineHScrollView, let doc = sv.documentView else {
