@@ -120,22 +120,26 @@ private struct ExportJobBubble: View {
                 }
 
                 VStack(alignment: .leading, spacing: 3) {
-                    Text(job.filename)
+                    Text(Self.truncatedFilename(job.filename))
                         .font(.system(size: 11, weight: .medium))
                         .foregroundColor(Color.labelPrimary)
-                        .lineLimit(1).truncationMode(.middle)
+                        .lineLimit(1)
 
                     switch job.state {
                     case .running:
-                        HStack(spacing: 6) {
-                            ProgressView(value: job.progress)
-                                .progressViewStyle(.linear)
-                                .tint(Color.accent)
-                                .frame(width: 100)
-                            Text("\(Int(job.progress * 100))%")
-                                .font(.system(size: 10).monospacedDigit())
-                                .foregroundColor(Color.labelSecondary)
+                        GeometryReader { geo in
+                            HStack(spacing: 6) {
+                                ProgressView(value: job.progress)
+                                    .progressViewStyle(.linear)
+                                    .tint(Color.accent)
+                                Text("\(Int(job.progress * 100))%")
+                                    .font(.system(size: 10).monospacedDigit())
+                                    .foregroundColor(Color.labelSecondary)
+                                    .fixedSize()
+                            }
+                            .frame(width: geo.size.width)
                         }
+                        .frame(height: 14)
                     case .done:
                         Text("导出完成 · 点击查看")
                             .font(.system(size: 10))
@@ -158,6 +162,7 @@ private struct ExportJobBubble: View {
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 10)
+            .frame(maxWidth: 260)
             .background(
                 RoundedRectangle(cornerRadius: 10)
                     .fill(Color(red: 0.16, green: 0.16, blue: 0.17))
@@ -194,6 +199,25 @@ private struct ExportJobBubble: View {
         case .done:    return .green
         case .failed:  return .red.opacity(0.8)
         }
+    }
+
+    private static func truncatedFilename(_ name: String, maxLength: Int = 30) -> String {
+        guard name.count > maxLength else { return name }
+        let ext: String
+        let base: String
+        if let dotIdx = name.lastIndex(of: ".") {
+            ext = String(name[dotIdx...])
+            base = String(name[..<dotIdx])
+        } else {
+            ext = ""
+            base = name
+        }
+        let tailLen = 6
+        let keep = maxLength - tailLen - ext.count - 3
+        guard keep > 0, tailLen < base.count else { return name }
+        let head = String(base.prefix(keep))
+        let tail = String(base.suffix(tailLen))
+        return "\(head)...\(tail)\(ext)"
     }
 }
 
