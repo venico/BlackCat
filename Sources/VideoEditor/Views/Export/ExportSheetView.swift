@@ -435,12 +435,13 @@ struct ExportSheetView: View {
                 } label: {
                     Text("开始导出")
                         .font(.system(size: 13, weight: .semibold))
-                        .foregroundColor(.black)
+                        .foregroundColor(project.exportSettings.outputPath == nil ? .gray : .black)
                         .frame(width: 120, height: 36)
-                        .background(Color.accent)
+                        .background(project.exportSettings.outputPath == nil ? Color.white.opacity(0.08) : Color.accent)
                         .cornerRadius(8)
                 }
                 .buttonStyle(.plain)
+                .disabled(project.exportSettings.outputPath == nil)
             }
             .padding(.horizontal, 24)
             .padding(.vertical, 16)

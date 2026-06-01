@@ -2026,15 +2026,26 @@ final class ProjectState: ObservableObject {
         }
 
         Task.detached { [weak self] in
-            // 第一步：快速 remux（只复制视频流，音频转 AAC，跳过字幕/附件等不兼容流）
-            let remuxOK = Self.runFFmpegSync(ffmpeg: ffmpeg, arguments: [
-                "-i", task.inputURL.path,
-                "-map", "0:v:0", "-map", "0:a?",
-                "-c:v", "copy",
-                "-c:a", "aac", "-b:a", "192k",
-                "-movflags", "+faststart",
-                "-y", task.outputURL.path
-            ])
+            // 用 ffprobe 检测编解码器兼容性
+            let codecs = Self.probeCodecs(ffmpegDir: ffmpeg.deletingLastPathComponent().path, inputPath: task.inputURL.path)
+            let videoCompatible = ["h264", "hevc", "mpeg4"].contains(codecs.video)
+            let audioCompatible = ["aac", "alac", "mp3", ""].contains(codecs.audio) // 空=无音频流
+
+            // 第一步：快速 remux（视频兼容时 copy，音频兼容时也 copy）
+            var remuxArgs = ["-i", task.inputURL.path, "-map", "0:v:0", "-map", "0:a?"]
+            if videoCompatible {
+                remuxArgs += ["-c:v", "copy"]
+            } else {
+                remuxArgs += ["-c:v", "h264_videotoolbox", "-b:v", "8000k"]
+            }
+            if audioCompatible {
+                remuxArgs += ["-c:a", "copy"]
+            } else {
+                remuxArgs += ["-c:a", "aac", "-b:a", "192k"]
+            }
+            remuxArgs += ["-movflags", "+faststart", "-y", task.outputURL.path]
+
+            let remuxOK = Self.runFFmpegSync(ffmpeg: ffmpeg, arguments: remuxArgs)
             if remuxOK {
                 let asset = AVURLAsset(url: task.outputURL)
                 let playable = (try? await asset.load(.isPlayable)) ?? false
@@ -2199,6 +2210,37 @@ final class ProjectState: ObservableObject {
     }
 
     /// 用 ffprobe 获取视频总时长（秒）
+    /// 用 ffprobe 检测视频/音频编解码器名称
+    private static func probeCodecs(ffmpegDir: String, inputPath: String) -> (video: String, audio: String) {
+        let probePath = ffmpegDir + "/ffprobe"
+        guard FileManager.default.isExecutableFile(atPath: probePath) else { return ("", "") }
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: probePath)
+        proc.arguments = ["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=codec_name", "-of", "default=noprint_wrappers=1:nokey=1", inputPath]
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError = Pipe()
+        try? proc.run()
+        proc.waitUntilExit()
+        let vCodec = (try? pipe.fileHandleForReading.readDataToEndOfFile())
+            .flatMap { String(data: $0, encoding: .utf8) }?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+
+        let proc2 = Process()
+        proc2.executableURL = URL(fileURLWithPath: probePath)
+        proc2.arguments = ["-v", "error", "-select_streams", "a:0", "-show_entries", "stream=codec_name", "-of", "default=noprint_wrappers=1:nokey=1", inputPath]
+        let pipe2 = Pipe()
+        proc2.standardOutput = pipe2
+        proc2.standardError = Pipe()
+        try? proc2.run()
+        proc2.waitUntilExit()
+        let aCodec = (try? pipe2.fileHandleForReading.readDataToEndOfFile())
+            .flatMap { String(data: $0, encoding: .utf8) }?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+
+        return (vCodec, aCodec)
+    }
+
     private static func probeVideoDuration(ffmpegDir: String, inputPath: String) -> Double {
         let probePath = ffmpegDir + "/ffprobe"
         guard FileManager.default.isExecutableFile(atPath: probePath) else { return 0 }
