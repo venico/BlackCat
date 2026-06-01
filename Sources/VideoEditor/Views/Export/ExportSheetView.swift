@@ -201,8 +201,8 @@ private struct ExportJobBubble: View {
         }
     }
 
-    private static func truncatedFilename(_ name: String, maxLength: Int = 30) -> String {
-        guard name.count > maxLength else { return name }
+    private static func truncatedFilename(_ name: String, maxVisualWidth: Int = 28) -> String {
+        guard visualWidth(of: name) > maxVisualWidth else { return name }
         let ext: String
         let base: String
         if let dotIdx = name.lastIndex(of: ".") {
@@ -213,11 +213,27 @@ private struct ExportJobBubble: View {
             base = name
         }
         let tailLen = 6
-        let keep = maxLength - tailLen - ext.count - 3
-        guard keep > 0, tailLen < base.count else { return name }
-        let head = String(base.prefix(keep))
+        guard tailLen < base.count else { return name }
         let tail = String(base.suffix(tailLen))
+        let dotsWidth = 3
+        let tailWidth = visualWidth(of: tail)
+        let extWidth = visualWidth(of: ext)
+        let budget = maxVisualWidth - dotsWidth - tailWidth - extWidth
+        guard budget > 0 else { return name }
+        var head = ""
+        var used = 0
+        for ch in base {
+            let w = ch.isCJK ? 2 : 1
+            if used + w > budget { break }
+            head.append(ch)
+            used += w
+        }
+        guard !head.isEmpty else { return name }
         return "\(head)...\(tail)\(ext)"
+    }
+
+    private static func visualWidth(of str: String) -> Int {
+        str.reduce(0) { $0 + ($1.isCJK ? 2 : 1) }
     }
 }
 
@@ -1530,5 +1546,19 @@ private struct ESection<Content: View>: View {
                 .foregroundColor(Color.labelSecondary).tracking(0.4).textCase(.uppercase)
             content
         }
+    }
+}
+
+private extension Character {
+    var isCJK: Bool {
+        guard let scalar = unicodeScalars.first else { return false }
+        let v = scalar.value
+        return (0x4E00...0x9FFF).contains(v)
+            || (0x3400...0x4DBF).contains(v)
+            || (0x3000...0x303F).contains(v)
+            || (0xFF00...0xFFEF).contains(v)
+            || (0x3040...0x309F).contains(v)
+            || (0x30A0...0x30FF).contains(v)
+            || (0xAC00...0xD7AF).contains(v)
     }
 }
