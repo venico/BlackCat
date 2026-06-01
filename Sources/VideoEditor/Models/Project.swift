@@ -1811,8 +1811,11 @@ final class ProjectState: ObservableObject {
 
     /// 需要 FFmpeg 转码的视频格式
     private static let needsTranscodeExtensions: Set<String> = [
-        "mkv","avi","wmv","flv","ts","mts","m2ts","webm","3gp","mpg","mpeg","vob","rm","rmvb","f4v","ogv"
+        "avi","wmv","flv","ts","mts","m2ts","webm","3gp","mpg","mpeg","vob","rm","rmvb","f4v","ogv"
     ]
+
+    /// 支持智能 remux 的容器（编码兼容时直接 copy，不兼容才转码）
+    private static let smartRemuxExtensions: Set<String> = ["mkv"]
 
     /// 需要 FFmpeg 转码的音频格式（转为 m4a）
     private static let needsTranscodeAudioExtensions: Set<String> = [
@@ -1864,6 +1867,21 @@ final class ProjectState: ObservableObject {
                 return
             }
             transcodeAudioAndImport(url: url, outputURL: outputURL, displayName: url.lastPathComponent)
+            return
+        }
+
+        // MKV 等智能 remux 格式：编码兼容时直接 copy，不兼容才完整转码
+        if type == .video && Self.smartRemuxExtensions.contains(ext) {
+            let fileName = url.deletingPathExtension().lastPathComponent
+            let shortHash = String(url.path.hashValue, radix: 16, uppercase: false).suffix(8)
+            let outputDir = FileManager.default.temporaryDirectory
+                .appendingPathComponent("BlackCatTranscode", isDirectory: true)
+            let outputURL = outputDir.appendingPathComponent("\(fileName)_\(shortHash).mp4")
+            if mediaAssets.contains(where: { $0.url == outputURL }) {
+                showImportToast("「\(url.lastPathComponent)」已在素材库中，已跳过")
+                return
+            }
+            smartRemuxAndImport(url: url, outputURL: outputURL)
             return
         }
 
@@ -2119,6 +2137,59 @@ final class ProjectState: ObservableObject {
                     self?.showImportToast("转码失败，FFmpeg 退出码: \(process.terminationStatus)")
                 }
                 self?.finishTranscodeTask(task.id)
+            }
+        }
+    }
+
+    /// MKV 智能 remux：编码兼容直接 copy（秒级），不兼容才走完整转码
+    private func smartRemuxAndImport(url: URL, outputURL: URL) {
+        guard let ffmpeg = Self.findFFmpeg() else {
+            showImportToast("未找到 FFmpeg，无法处理 \(url.lastPathComponent)")
+            return
+        }
+        let outputDir = outputURL.deletingLastPathComponent()
+        try? FileManager.default.createDirectory(at: outputDir, withIntermediateDirectories: true)
+
+        // 如果之前已 remux 过，直接导入
+        if FileManager.default.fileExists(atPath: outputURL.path) {
+            importFileDirectly(url: outputURL, type: .video)
+            return
+        }
+
+        let displayName = url.lastPathComponent
+        showImportToast("正在处理「\(displayName)」...")
+
+        Task.detached { [weak self] in
+            let ffmpegDir = ffmpeg.deletingLastPathComponent().path
+            let codecs = Self.probeCodecs(ffmpegDir: ffmpegDir, inputPath: url.path)
+            let videoOK = ["h264", "hevc", "mpeg4"].contains(codecs.video)
+            let audioOK = ["aac", "alac", "mp3", ""].contains(codecs.audio)
+
+            // 构建 remux 参数
+            var args = ["-i", url.path, "-map", "0:v:0", "-map", "0:a?"]
+            args += ["-c:v", videoOK ? "copy" : "h264_videotoolbox"]
+            if !videoOK { args += ["-b:v", "8000k"] }
+            args += ["-c:a", audioOK ? "copy" : "aac"]
+            if !audioOK { args += ["-b:a", "192k"] }
+            args += ["-movflags", "+faststart", "-y", outputURL.path]
+
+            let ok = Self.runFFmpegSync(ffmpeg: ffmpeg, arguments: args)
+            if ok {
+                let asset = AVURLAsset(url: outputURL)
+                let playable = (try? await asset.load(.isPlayable)) ?? false
+                if playable {
+                    await MainActor.run {
+                        self?.importFileDirectly(url: outputURL, type: .video)
+                        self?.showImportToast("「\(displayName)」导入完成")
+                    }
+                    return
+                }
+                try? FileManager.default.removeItem(at: outputURL)
+            }
+
+            // remux 失败，走完整转码
+            await MainActor.run {
+                self?.transcodeAndImport(url: url)
             }
         }
     }
