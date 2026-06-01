@@ -613,7 +613,7 @@ actor TimelineExporter {
                                                          preferredTrackID: kCMPersistentTrackID_Invalid)
                     try vt?.insertTimeRange(range, of: vAsset, at: at)
                     if let vt {
-                        videoCompTracks.append((track: vt, clip: clip, startTime: clip.startTime, endTime: clip.startTime + useDur.seconds))
+                        videoCompTracks.append((track: vt, clip: clip, startTime: clip.startTime, endTime: clip.endTime))
                     }
                     if idx == 0 {
                         sourceVideoSize = try await vAsset.load(.naturalSize)
@@ -1162,37 +1162,55 @@ actor TimelineExporter {
         let hasSubtitles = subtitleInfo.hasSubtitles
         let videoQueue = DispatchQueue(label: "export.video")
         let audioQueue = DispatchQueue(label: "export.audio")
-        let targetFps = Int32(fps)
+        let targetFps = fps
 
         // 音视频必须并行消费，否则 AVAssetReader 内部缓冲区满会死锁
         await withTaskGroup(of: Void.self) { group in
-            // 视频帧处理
+            // 视频帧处理：按目标帧率重采样（源帧不够则重复，多则丢弃）
             group.addTask {
                 await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
                     var frameIndex: Int64 = 0
+                    var currentPB: CVPixelBuffer? = nil
+                    var currentReaderTime: Double = 0
+                    var nextSB: CMSampleBuffer? = videoOutput.copyNextSampleBuffer()
+
                     videoInput.requestMediaDataWhenReady(on: videoQueue) {
                         while videoInput.isReadyForMoreMediaData {
-                            guard let sb = videoOutput.copyNextSampleBuffer() else {
+                            let targetTime = Double(frameIndex) / Double(targetFps)
+                            guard targetTime < totalDuration + 0.1 else {
                                 videoInput.markAsFinished()
                                 cont.resume()
                                 return
                             }
-                            // 自己生成精确的 PTS，不依赖 reader 的时间戳
-                            let exactPTS = CMTime(value: frameIndex, timescale: targetFps)
-                            let readerPTS = CMSampleBufferGetPresentationTimeStamp(sb)
-                            let timeForSubtitle = readerPTS.seconds  // 字幕用 reader 时间（对应源内容）
 
-                            if let pb = CMSampleBufferGetImageBuffer(sb) {
-                                if hasSubtitles {
-                                    self.drawSubtitlesOnPixelBuffer(pb, atTime: timeForSubtitle, info: subtitleInfo)
+                            // 推进 reader 直到找到覆盖 targetTime 的帧
+                            while let sb = nextSB {
+                                let pts = CMSampleBufferGetPresentationTimeStamp(sb).seconds
+                                if pts <= targetTime {
+                                    currentPB = CMSampleBufferGetImageBuffer(sb)
+                                    currentReaderTime = pts
+                                    nextSB = videoOutput.copyNextSampleBuffer()
+                                } else {
+                                    break
                                 }
-                                adaptor.append(pb, withPresentationTime: exactPTS)
-                            } else {
-                                // fallback: 直接 append sample buffer
-                                videoInput.append(sb)
+                            }
+
+                            // reader 耗尽且没有当前帧
+                            if currentPB == nil && nextSB == nil {
+                                videoInput.markAsFinished()
+                                cont.resume()
+                                return
+                            }
+
+                            let outputPTS = CMTime(value: frameIndex, timescale: Int32(targetFps))
+                            if let pb = currentPB {
+                                if hasSubtitles {
+                                    self.drawSubtitlesOnPixelBuffer(pb, atTime: targetTime, info: subtitleInfo)
+                                }
+                                adaptor.append(pb, withPresentationTime: outputPTS)
                             }
                             frameIndex += 1
-                            let pct = min(readerPTS.seconds / max(totalDuration, 0.01), 0.99)
+                            let pct = min(targetTime / max(totalDuration, 0.01), 0.99)
                             progress(pct)
                         }
                     }
