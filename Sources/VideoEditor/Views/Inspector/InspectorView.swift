@@ -156,7 +156,7 @@ private struct SubtitleInspector: View {
                     Text("合并换行")
                         .font(.system(size: 11))
                         .foregroundColor(Color.labelSecondary)
-                        .frame(width: 76, alignment: .leading)
+                        .frame(width: 68, alignment: .leading)
                     Toggle("", isOn: $ls.mergeLineBreaks)
                         .toggleStyle(.switch)
                         .scaleEffect(0.7, anchor: .leading)
@@ -190,7 +190,7 @@ private struct SubtitleInspector: View {
                     Text("文字颜色")
                         .font(.system(size: 11))
                         .foregroundColor(Color.labelSecondary)
-                        .frame(width: 76, alignment: .leading)
+                        .frame(width: 68, alignment: .leading)
                     ColorPicker("", selection: $ls.textColor).labelsHidden()
                         .onChange(of: ls.textColor) { _ in writeStyle() }
                     Spacer(minLength: 0)
@@ -199,7 +199,7 @@ private struct SubtitleInspector: View {
                     Text("背景颜色")
                         .font(.system(size: 11))
                         .foregroundColor(Color.labelSecondary)
-                        .frame(width: 76, alignment: .leading)
+                        .frame(width: 68, alignment: .leading)
                     ColorPicker("", selection: $ls.backgroundColor).labelsHidden()
                         .onChange(of: ls.backgroundColor) { _ in writeStyle() }
                     Spacer(minLength: 0)
@@ -224,7 +224,7 @@ private struct SubtitleInspector: View {
                     Text("对齐方式")
                         .font(.system(size: 11))
                         .foregroundColor(Color.labelSecondary)
-                        .frame(width: 76, alignment: .leading)
+                        .frame(width: 68, alignment: .leading)
                     HStack(spacing: 4) {
                         ForEach([("text.alignleft","left"),("text.aligncenter","center"),("text.alignright","right")], id:\.1) { icon, val in
                             Button { ls.alignment = val; writeStyle() } label: {
@@ -398,174 +398,77 @@ private struct ImageInspector: View {
     @State private var hasPushedUndo = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            // Thumbnail
-            if let thumb = project.mediaThumbnails[clip.assetID] {
-                Image(nsImage: thumb)
-                    .resizable()
-                    .aspectRatio(contentMode: .fit)
-                    .frame(maxWidth: .infinity)
-                    .frame(height: 120)
-                    .clipShape(RoundedRectangle(cornerRadius: 6))
-            }
-
-            // Name
-            inspRow("名称") {
-                Text(clip.name)
-                    .font(.system(size: 11))
-                    .foregroundColor(Color.labelPrimary)
-                    .lineLimit(2)
-            }
-
-            // Resolution
-            inspRow("分辨率") {
-                Text("\(clip.imageWidth) × \(clip.imageHeight)")
-                    .font(.system(size: 11).monospacedDigit())
-                    .foregroundColor(Color.labelPrimary)
-            }
-
-            // Duration
-            inspRow("时长") {
-                Text(String(format: "%.1f 秒", clip.duration))
-                    .font(.system(size: 11).monospacedDigit())
-                    .foregroundColor(Color.labelPrimary)
-            }
-
-            // Position
-            HStack {
-                Text("位置")
-                    .font(.system(size: 10, weight: .medium))
-                    .foregroundColor(Color.labelSecondary.opacity(0.7))
-                    .tracking(0.4)
-                Spacer()
-                Button {
-                    offsetX = 0; offsetY = 0
-                    applyTransform()
-                } label: {
-                    Text("居中")
-                        .font(.system(size: 9, weight: .medium))
-                        .foregroundColor(hasOffset ? .black : Color.labelSecondary)
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 2)
-                        .background(hasOffset ? Color(hex: "#E8A54B") : Color.white.opacity(0.08))
-                        .clipShape(RoundedRectangle(cornerRadius: 4))
+        VStack(alignment: .leading, spacing: 0) {
+            ISection(title: "片段信息") {
+                if let thumb = project.mediaThumbnails[clip.assetID] {
+                    Image(nsImage: thumb)
+                        .resizable()
+                        .aspectRatio(contentMode: .fit)
+                        .frame(maxWidth: .infinity)
+                        .frame(height: 100)
+                        .clipShape(RoundedRectangle(cornerRadius: 6))
                 }
-                .buttonStyle(.plain)
-                .disabled(!hasOffset)
+                InfoRow(label: "名称",   value: clip.name)
+                InfoRow(label: "分辨率", value: "\(clip.imageWidth) × \(clip.imageHeight)")
+                InfoRow(label: "时长",   value: String(format: "%.1f 秒", clip.duration))
             }
-            .padding(.top, 16)
 
-            HStack(spacing: 8) {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("X").font(.system(size: 9)).foregroundColor(Color.labelSecondary)
-                    HStack(spacing: 2) {
-                        Slider(value: $offsetX, in: -1.0...1.0)
-                            .frame(width: 80)
-                            .onChange(of: offsetX) { _ in applyTransform() }
-                        Text("\(Int(offsetX * 100))")
-                            .font(.system(size: 10).monospacedDigit())
-                            .foregroundColor(Color.labelPrimary)
-                            .frame(width: 30)
+            ISection(title: nil) {
+                imgSectionHeader("位置") {
+                    Button { offsetX = 0; offsetY = 0; applyTransform() } label: {
+                        Text("居中")
+                            .font(.system(size: 9, weight: .medium))
+                            .foregroundColor(hasOffset ? .black : Color.labelSecondary)
+                            .padding(.horizontal, 6).padding(.vertical, 2)
+                            .background(hasOffset ? Color(hex: "#E8A54B") : Color.white.opacity(0.08))
+                            .clipShape(RoundedRectangle(cornerRadius: 4))
+                    }.buttonStyle(.plain).disabled(!hasOffset)
+                }
+                HStack(spacing: 10) {
+                    imgDualSlider("X", value: $offsetX, range: -1.0...1.0) { _ in applyTransform() }
+                    imgDualSlider("Y", value: $offsetY, range: -1.0...1.0) { _ in applyTransform() }
+                }
+            }
+
+            ISection(title: nil) {
+                imgSectionHeader("缩放") {
+                    Button { lockAspect.toggle(); syncLock() } label: {
+                        Image(systemName: lockAspect ? "lock.fill" : "lock.open")
+                            .font(.system(size: 10))
+                            .foregroundColor(lockAspect ? Color.accent : Color.labelSecondary)
+                    }.buttonStyle(.plain)
+                }
+                HStack(spacing: 10) {
+                    imgDualSlider("宽", value: $scaleX, range: 0.1...3.0, unit: "%", scale: 100) { v in
+                        if lockAspect { scaleY = v }; applyTransform()
                     }
-                }
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Y").font(.system(size: 9)).foregroundColor(Color.labelSecondary)
-                    HStack(spacing: 2) {
-                        Slider(value: $offsetY, in: -1.0...1.0)
-                            .frame(width: 80)
-                            .onChange(of: offsetY) { _ in applyTransform() }
-                        Text("\(Int(offsetY * 100))")
-                            .font(.system(size: 10).monospacedDigit())
-                            .foregroundColor(Color.labelPrimary)
-                            .frame(width: 30)
+                    imgDualSlider("高", value: $scaleY, range: 0.1...3.0, unit: "%", scale: 100) { v in
+                        if lockAspect { scaleX = v }; applyTransform()
                     }
                 }
             }
 
-            // Scale
-            HStack {
-                Text("缩放")
-                    .font(.system(size: 10, weight: .medium))
-                    .foregroundColor(Color.labelSecondary.opacity(0.7))
-                    .tracking(0.4)
-                Spacer()
-                Button { lockAspect.toggle(); syncLock() } label: {
-                    Image(systemName: lockAspect ? "lock.fill" : "lock.open")
-                        .font(.system(size: 10))
-                        .foregroundColor(lockAspect ? Color.accent : Color.labelSecondary)
+            ISection(title: nil) {
+                imgSectionHeader("裁剪") {
+                    Button { cropTop = 0; cropBottom = 0; cropLeft = 0; cropRight = 0; applyTransform() } label: {
+                        Text("重置")
+                            .font(.system(size: 9, weight: .medium))
+                            .foregroundColor(hasCrop ? .black : Color.labelSecondary)
+                            .padding(.horizontal, 6).padding(.vertical, 2)
+                            .background(hasCrop ? Color(hex: "#E8A54B") : Color.white.opacity(0.08))
+                            .clipShape(RoundedRectangle(cornerRadius: 4))
+                    }.buttonStyle(.plain).disabled(!hasCrop)
                 }
-                .buttonStyle(.plain)
-            }
-            .padding(.top, 16)
-
-            HStack(spacing: 8) {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("宽").font(.system(size: 9)).foregroundColor(Color.labelSecondary)
-                    HStack(spacing: 2) {
-                        Slider(value: $scaleX, in: 0.1...3.0)
-                            .frame(width: 80)
-                            .onChange(of: scaleX) { v in
-                                if lockAspect { scaleY = v }
-                                applyTransform()
-                            }
-                        Text("\(Int(scaleX * 100))%")
-                            .font(.system(size: 10).monospacedDigit())
-                            .foregroundColor(Color.labelPrimary)
-                            .frame(width: 36)
-                    }
+                VStack(spacing: 8) {
+                    cropSlider(label: "上", value: $cropTop, edge: 0)
+                    cropSlider(label: "下", value: $cropBottom, edge: 1)
+                    cropSlider(label: "左", value: $cropLeft, edge: 2)
+                    cropSlider(label: "右", value: $cropRight, edge: 3)
                 }
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("高").font(.system(size: 9)).foregroundColor(Color.labelSecondary)
-                    HStack(spacing: 2) {
-                        Slider(value: $scaleY, in: 0.1...3.0)
-                            .frame(width: 80)
-                            .onChange(of: scaleY) { v in
-                                if lockAspect { scaleX = v }
-                                applyTransform()
-                            }
-                        Text("\(Int(scaleY * 100))%")
-                            .font(.system(size: 10).monospacedDigit())
-                            .foregroundColor(Color.labelPrimary)
-                            .frame(width: 36)
-                    }
-                }
-            }
-
-            // Crop
-            HStack {
-                Text("裁剪")
-                    .font(.system(size: 10, weight: .medium))
-                    .foregroundColor(Color.labelSecondary.opacity(0.7))
-                    .tracking(0.4)
-                Spacer()
-                Button {
-                    cropTop = 0; cropBottom = 0; cropLeft = 0; cropRight = 0
-                    applyTransform()
-                } label: {
-                    Text("重置")
-                        .font(.system(size: 9, weight: .medium))
-                        .foregroundColor(hasCrop ? .black : Color.labelSecondary)
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 2)
-                        .background(hasCrop ? Color(hex: "#E8A54B") : Color.white.opacity(0.08))
-                        .clipShape(RoundedRectangle(cornerRadius: 4))
-                }
-                .buttonStyle(.plain)
-                .disabled(!hasCrop)
-            }
-            .padding(.top, 16)
-
-            VStack(spacing: 14) {
-                cropSlider(label: "上", value: $cropTop, edge: 0)
-                cropSlider(label: "下", value: $cropBottom, edge: 1)
-                cropSlider(label: "左", value: $cropLeft, edge: 2)
-                cropSlider(label: "右", value: $cropRight, edge: 3)
             }
         }
-        .padding(14)
         .onAppear { syncFromClip() }
         .onChange(of: clip.id) { _ in syncFromClip() }
-        // Sync back from external changes (e.g. preview drag)
         .onChange(of: clip.offsetX)    { v in if abs(v - offsetX) > 0.001 { offsetX = v } }
         .onChange(of: clip.offsetY)    { v in if abs(v - offsetY) > 0.001 { offsetY = v } }
         .onChange(of: clip.scaleX)     { v in if abs(v - scaleX)  > 0.001 { scaleX  = v } }
@@ -586,15 +489,9 @@ private struct ImageInspector: View {
 
     @ViewBuilder
     private func cropSlider(label: String, value: Binding<Double>, edge: Int) -> some View {
-        HStack(spacing: 6) {
-            Text(label).font(.system(size: 9)).foregroundColor(Color.labelSecondary).frame(width: 14)
-            Slider(value: value, in: 0...0.99)
-                .onChange(of: value.wrappedValue) { _ in applyCropWithCompensation(edge: edge) }
-            Text("\(Int(value.wrappedValue * 100))%")
-                .font(.system(size: 10).monospacedDigit())
-                .foregroundColor(Color.labelPrimary)
-                .frame(width: 30)
-        }
+        ICapsuleSlider(label: label, value: value, range: 0...0.99,
+                       unit: "%", displayScale: 100, labelWidth: 14)
+            .onChange(of: value.wrappedValue) { _ in applyCropWithCompensation(edge: edge) }
     }
 
     private func syncFromClip() {
@@ -645,15 +542,24 @@ private struct ImageInspector: View {
     }
 
     @ViewBuilder
-    private func inspRow(_ label: String, @ViewBuilder content: () -> some View) -> some View {
+    private func imgSectionHeader<Trailing: View>(_ title: String, @ViewBuilder trailing: () -> Trailing) -> some View {
         HStack {
-            Text(label)
-                .font(.system(size: 11))
-                .foregroundColor(Color.labelSecondary)
-                .frame(width: 50, alignment: .leading)
+            Text(title)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundColor(Color.labelPrimary)
+                .tracking(0.2)
             Spacer()
-            content()
+            trailing()
         }
+    }
+
+    @ViewBuilder
+    private func imgDualSlider(_ label: String, value: Binding<Double>, range: ClosedRange<Double>,
+                              unit: String = "", scale: Double = 100,
+                              onChange: @escaping (Double) -> Void) -> some View {
+        ICapsuleSlider(label: label, value: value, range: range,
+                       unit: unit, displayScale: scale, labelWidth: 14)
+            .onChange(of: value.wrappedValue) { v in onChange(v) }
     }
 }
 
@@ -721,7 +627,6 @@ private struct VideoInspector: View {
                 ), range: 0...400, unit: "%")
             }
 
-            // 多音轨选择（仅在有 ≥2 条音频轨道时显示）
             if audioTrackLabels.count >= 2 {
                 ISection(title: "音轨") {
                     IPicker(selection: Binding(
@@ -734,142 +639,61 @@ private struct VideoInspector: View {
                             options: audioTrackLabels.enumerated().map { ($0.offset, $0.element) })
                 }
             }
-        }
 
-        // 位置
-        VStack(alignment: .leading, spacing: 4) {
-            HStack {
-                Text("位置")
-                    .font(.system(size: 10, weight: .medium))
-                    .foregroundColor(Color.labelSecondary.opacity(0.7))
-                    .tracking(0.4)
-                Spacer()
-                Button {
-                    offsetX = 0; offsetY = 0
-                    applyTransform()
-                } label: {
-                    Text("居中")
-                        .font(.system(size: 9, weight: .medium))
-                        .foregroundColor(hasOffset ? .black : Color.labelSecondary)
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 2)
-                        .background(hasOffset ? Color(hex: "#E8A54B") : Color.white.opacity(0.08))
-                        .clipShape(RoundedRectangle(cornerRadius: 4))
+            ISection(title: nil) {
+                sectionHeader("位置") {
+                    Button { offsetX = 0; offsetY = 0; applyTransform() } label: {
+                        Text("居中")
+                            .font(.system(size: 9, weight: .medium))
+                            .foregroundColor(hasOffset ? .black : Color.labelSecondary)
+                            .padding(.horizontal, 6).padding(.vertical, 2)
+                            .background(hasOffset ? Color(hex: "#E8A54B") : Color.white.opacity(0.08))
+                            .clipShape(RoundedRectangle(cornerRadius: 4))
+                    }.buttonStyle(.plain).disabled(!hasOffset)
                 }
-                .buttonStyle(.plain)
-                .disabled(!hasOffset)
+                HStack(spacing: 10) {
+                    dualSlider("X", value: $offsetX, range: -1.0...1.0) { _ in applyTransform() }
+                    dualSlider("Y", value: $offsetY, range: -1.0...1.0) { _ in applyTransform() }
+                }
             }
-            .padding(.top, 16)
 
-            HStack(spacing: 8) {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("X").font(.system(size: 9)).foregroundColor(Color.labelSecondary)
-                    HStack(spacing: 2) {
-                        Slider(value: $offsetX, in: -1.0...1.0)
-                            .frame(width: 80)
-                            .onChange(of: offsetX) { _ in applyTransform() }
-                        Text("\(Int(offsetX * 100))")
-                            .font(.system(size: 10).monospacedDigit())
-                            .foregroundColor(Color.labelPrimary)
-                            .frame(width: 30)
-                    }
+            ISection(title: nil) {
+                sectionHeader("缩放") {
+                    Button { lockAspect.toggle(); syncLock() } label: {
+                        Image(systemName: lockAspect ? "lock.fill" : "lock.open")
+                            .font(.system(size: 10))
+                            .foregroundColor(lockAspect ? Color.accent : Color.labelSecondary)
+                    }.buttonStyle(.plain)
                 }
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Y").font(.system(size: 9)).foregroundColor(Color.labelSecondary)
-                    HStack(spacing: 2) {
-                        Slider(value: $offsetY, in: -1.0...1.0)
-                            .frame(width: 80)
-                            .onChange(of: offsetY) { _ in applyTransform() }
-                        Text("\(Int(offsetY * 100))")
-                            .font(.system(size: 10).monospacedDigit())
-                            .foregroundColor(Color.labelPrimary)
-                            .frame(width: 30)
+                HStack(spacing: 10) {
+                    dualSlider("宽", value: $scaleX, range: 0.1...3.0, unit: "%", scale: 100) { v in
+                        if lockAspect { scaleY = v }; applyTransform()
+                    }
+                    dualSlider("高", value: $scaleY, range: 0.1...3.0, unit: "%", scale: 100) { v in
+                        if lockAspect { scaleX = v }; applyTransform()
                     }
                 }
             }
 
-            // 缩放
-            HStack {
-                Text("缩放")
-                    .font(.system(size: 10, weight: .medium))
-                    .foregroundColor(Color.labelSecondary.opacity(0.7))
-                    .tracking(0.4)
-                Spacer()
-                Button { lockAspect.toggle(); syncLock() } label: {
-                    Image(systemName: lockAspect ? "lock.fill" : "lock.open")
-                        .font(.system(size: 10))
-                        .foregroundColor(lockAspect ? Color.accent : Color.labelSecondary)
+            ISection(title: nil) {
+                sectionHeader("裁剪") {
+                    Button { cropTop = 0; cropBottom = 0; cropLeft = 0; cropRight = 0; applyTransform() } label: {
+                        Text("重置")
+                            .font(.system(size: 9, weight: .medium))
+                            .foregroundColor(hasCrop ? .black : Color.labelSecondary)
+                            .padding(.horizontal, 6).padding(.vertical, 2)
+                            .background(hasCrop ? Color(hex: "#E8A54B") : Color.white.opacity(0.08))
+                            .clipShape(RoundedRectangle(cornerRadius: 4))
+                    }.buttonStyle(.plain).disabled(!hasCrop)
                 }
-                .buttonStyle(.plain)
-            }
-            .padding(.top, 16)
-
-            HStack(spacing: 8) {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("宽").font(.system(size: 9)).foregroundColor(Color.labelSecondary)
-                    HStack(spacing: 2) {
-                        Slider(value: $scaleX, in: 0.1...3.0)
-                            .frame(width: 80)
-                            .onChange(of: scaleX) { v in
-                                if lockAspect { scaleY = v }
-                                applyTransform()
-                            }
-                        Text("\(Int(scaleX * 100))%")
-                            .font(.system(size: 10).monospacedDigit())
-                            .foregroundColor(Color.labelPrimary)
-                            .frame(width: 36)
-                    }
+                VStack(spacing: 8) {
+                    videoCropSlider(label: "上", value: $cropTop, edge: 0)
+                    videoCropSlider(label: "下", value: $cropBottom, edge: 1)
+                    videoCropSlider(label: "左", value: $cropLeft, edge: 2)
+                    videoCropSlider(label: "右", value: $cropRight, edge: 3)
                 }
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("高").font(.system(size: 9)).foregroundColor(Color.labelSecondary)
-                    HStack(spacing: 2) {
-                        Slider(value: $scaleY, in: 0.1...3.0)
-                            .frame(width: 80)
-                            .onChange(of: scaleY) { v in
-                                if lockAspect { scaleX = v }
-                                applyTransform()
-                            }
-                        Text("\(Int(scaleY * 100))%")
-                            .font(.system(size: 10).monospacedDigit())
-                            .foregroundColor(Color.labelPrimary)
-                            .frame(width: 36)
-                    }
-                }
-            }
-
-            // 裁剪
-            HStack {
-                Text("裁剪")
-                    .font(.system(size: 10, weight: .medium))
-                    .foregroundColor(Color.labelSecondary.opacity(0.7))
-                    .tracking(0.4)
-                Spacer()
-                Button {
-                    cropTop = 0; cropBottom = 0; cropLeft = 0; cropRight = 0
-                    applyTransform()
-                } label: {
-                    Text("重置")
-                        .font(.system(size: 9, weight: .medium))
-                        .foregroundColor(hasCrop ? .black : Color.labelSecondary)
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 2)
-                        .background(hasCrop ? Color(hex: "#E8A54B") : Color.white.opacity(0.08))
-                        .clipShape(RoundedRectangle(cornerRadius: 4))
-                }
-                .buttonStyle(.plain)
-                .disabled(!hasCrop)
-            }
-            .padding(.top, 16)
-
-            VStack(spacing: 14) {
-                videoCropSlider(label: "上", value: $cropTop, edge: 0)
-                videoCropSlider(label: "下", value: $cropBottom, edge: 1)
-                videoCropSlider(label: "左", value: $cropLeft, edge: 2)
-                videoCropSlider(label: "右", value: $cropRight, edge: 3)
             }
         }
-        .padding(.horizontal, 14)
-        .padding(.bottom, 14)
         .onAppear { loadMeta(); syncFromClip() }
         .onChange(of: clip.id) { _ in loadMeta(); syncFromClip() }
         .onChange(of: clip.offsetX)    { v in if abs(v - offsetX) > 0.001 { offsetX = v } }
@@ -891,16 +715,31 @@ private struct VideoInspector: View {
     }
 
     @ViewBuilder
-    private func videoCropSlider(label: String, value: Binding<Double>, edge: Int) -> some View {
-        HStack(spacing: 6) {
-            Text(label).font(.system(size: 9)).foregroundColor(Color.labelSecondary).frame(width: 14)
-            Slider(value: value, in: 0...0.99)
-                .onChange(of: value.wrappedValue) { _ in applyTransform() }
-            Text("\(Int(value.wrappedValue * 100))%")
-                .font(.system(size: 10).monospacedDigit())
+    private func sectionHeader<Trailing: View>(_ title: String, @ViewBuilder trailing: () -> Trailing) -> some View {
+        HStack {
+            Text(title)
+                .font(.system(size: 11, weight: .semibold))
                 .foregroundColor(Color.labelPrimary)
-                .frame(width: 30)
+                .tracking(0.2)
+            Spacer()
+            trailing()
         }
+    }
+
+    @ViewBuilder
+    private func dualSlider(_ label: String, value: Binding<Double>, range: ClosedRange<Double>,
+                            unit: String = "", scale: Double = 100,
+                            onChange: @escaping (Double) -> Void) -> some View {
+        ICapsuleSlider(label: label, value: value, range: range,
+                       unit: unit, displayScale: scale, labelWidth: 14)
+            .onChange(of: value.wrappedValue) { v in onChange(v) }
+    }
+
+    @ViewBuilder
+    private func videoCropSlider(label: String, value: Binding<Double>, edge: Int) -> some View {
+        ICapsuleSlider(label: label, value: value, range: 0...0.99,
+                       unit: "%", displayScale: 100, labelWidth: 14)
+            .onChange(of: value.wrappedValue) { _ in applyTransform() }
     }
 
     private func syncFromClip() {
@@ -1040,7 +879,7 @@ private struct AudioInspector: View {
                     Text("淡入")
                         .font(.system(size: 11))
                         .foregroundColor(Color.labelSecondary)
-                        .frame(width: 76, alignment: .leading)
+                        .frame(width: 68, alignment: .leading)
                     Toggle("", isOn: Binding(
                         get: { clip.fadeInEnabled },
                         set: { v in
@@ -1066,7 +905,7 @@ private struct AudioInspector: View {
                     Text("淡出")
                         .font(.system(size: 11))
                         .foregroundColor(Color.labelSecondary)
-                        .frame(width: 76, alignment: .leading)
+                        .frame(width: 68, alignment: .leading)
                     Toggle("", isOn: Binding(
                         get: { clip.fadeOutEnabled },
                         set: { v in
@@ -1134,18 +973,17 @@ struct ISection<Content: View>: View {
     let title: String?
     @ViewBuilder let content: Content
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
+        VStack(alignment: .leading, spacing: 10) {
             if let t = title {
                 Text(t)
-                    .font(.system(size: 10, weight: .medium))
-                    .foregroundColor(Color.labelSecondary.opacity(0.7))
-                    .tracking(0.4)
-                    .textCase(.uppercase)
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundColor(Color.labelPrimary)
+                    .tracking(0.2)
             }
             content
         }
         .padding(.horizontal, 14)
-        .padding(.top, 16)
+        .padding(.top, 12)
         .padding(.bottom, 4)
         .frame(maxWidth: .infinity, alignment: .leading)
     }
@@ -1180,17 +1018,75 @@ struct ISlider: View {
     let unit: String
 
     var body: some View {
-        HStack(spacing: 12) {
+        ICapsuleSlider(label: label, value: $value, range: range,
+                       unit: unit, labelWidth: 64)
+    }
+}
+
+/// 胶囊式滑块：标签(左) + 滑块 + 可编辑数值(右)，整体浅色圆角胶囊。
+/// 参考 Sketch 属性面板：滑块与数值并存，可拖动也可点击数值直接输入。
+struct ICapsuleSlider: View {
+    let label: String
+    @Binding var value: Double
+    let range: ClosedRange<Double>
+    var decimals: Int = 0
+    var unit: String = ""
+    var displayScale: Double = 1    // 显示值 = value × displayScale（如 offset -1...1 显示为 -100...100）
+    var labelWidth: CGFloat = 18
+
+    @State private var editText: String = ""
+    @FocusState private var focused: Bool
+
+    private var disp: Double { value * displayScale }
+    private var fmt: String {
+        decimals > 0 ? String(format: "%.\(decimals)f", disp) : "\(Int(disp.rounded()))"
+    }
+
+    var body: some View {
+        HStack(spacing: 6) {
             Text(label)
-                .font(.system(size: 11))
+                .font(.system(size: 10))
                 .foregroundColor(Color.labelSecondary)
-                .frame(width: 76, alignment: .leading)
-            Slider(value: $value, in: range).accentColor(Color.accent)
-            Text("\(Int(value))\(unit)")
-                .font(.system(size: 10).monospacedDigit())
-                .foregroundColor(Color.labelSecondary)
-                .frame(width: 38, alignment: .trailing)
+                .frame(width: labelWidth, alignment: .leading)
+                .lineLimit(1)
+            Slider(value: $value, in: range)
+                .accentColor(Color.accent)
+                .controlSize(.mini)
+            HStack(spacing: 1) {
+                TextField("", text: $editText)
+                    .font(.system(size: 10).monospacedDigit())
+                    .foregroundColor(Color.labelPrimary)
+                    .multilineTextAlignment(.trailing)
+                    .textFieldStyle(.plain)
+                    .focused($focused)
+                    .frame(width: 30)
+                    .onAppear { editText = fmt }
+                    .onChange(of: value) { _ in if !focused { editText = fmt } }
+                    .onSubmit { commit() }
+                    .onChange(of: focused) { _ in if !focused { commit() } }
+                if !unit.isEmpty {
+                    Text(unit)
+                        .font(.system(size: 10))
+                        .foregroundColor(Color.labelSecondary)
+                }
+            }
         }
+        .padding(.horizontal, 8)
+        .frame(height: 28)
+        .background(Color.white.opacity(0.06))
+        .cornerRadius(6)
+        .overlay(
+            RoundedRectangle(cornerRadius: 6)
+                .stroke(focused ? Color.accent : Color.white.opacity(0.08),
+                        lineWidth: focused ? 1 : 0.5)
+        )
+    }
+
+    private func commit() {
+        if let v = Double(editText) {
+            value = (v / displayScale).clamped(to: range)
+        }
+        editText = fmt
     }
 }
 
@@ -1198,9 +1094,9 @@ struct InfoRow: View {
     let label: String; let value: String
     var body: some View {
         HStack {
-            Text(label).font(.system(size: 11)).foregroundColor(Color.labelSecondary)
+            Text(label).font(.system(size: 10)).foregroundColor(Color.labelSecondary)
             Spacer()
-            Text(value).font(.system(size: 11)).foregroundColor(Color.labelPrimary).lineLimit(1)
+            Text(value).font(.system(size: 10)).foregroundColor(Color.labelPrimary).lineLimit(1)
         }
     }
 }
