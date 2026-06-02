@@ -117,11 +117,12 @@ private struct SubtitleInspector: View {
     @State private var endTime: Double   = 0
     @State private var ls = SubtitleStyle()   // local copy — ColorPicker needs @State binding
 
-    private var trackIndex: Int {
+    // 返回 nil 表示 clip 已从轨道中移除（不能写入样式）
+    private var trackIndex: Int? {
         for (i, t) in project.subtitleTracks.enumerated() {
             if t.clips.contains(where: { $0.id == clip.id }) { return i }
         }
-        return 0
+        return nil
     }
 
     var body: some View {
@@ -249,15 +250,14 @@ private struct SubtitleInspector: View {
 
     private func syncAll() {
         text = clip.text; startTime = clip.startTime; endTime = clip.endTime
-        let i = trackIndex
-        if project.subtitleStyles.indices.contains(i) { ls = project.subtitleStyles[i] }
+        guard let i = trackIndex else { return }
+        ls = project.subtitleTracks[i].subtitleStyle ?? SubtitleStyle()
     }
 
     private func writeStyle() {
-        let i = trackIndex
-        guard project.subtitleStyles.indices.contains(i) else { return }
+        guard let i = trackIndex else { return }  // clip 已删除，禁止写入
         project.pushUndoThrottled()
-        project.subtitleStyles[i] = ls
+        project.subtitleTracks[i].subtitleStyle = ls
     }
 
 }
@@ -737,7 +737,7 @@ private struct VideoInspector: View {
         }
 
         // 位置
-        VStack(alignment: .leading, spacing: 6) {
+        VStack(alignment: .leading, spacing: 4) {
             HStack {
                 Text("位置")
                     .font(.system(size: 10, weight: .medium))
@@ -868,7 +868,8 @@ private struct VideoInspector: View {
                 videoCropSlider(label: "右", value: $cropRight, edge: 3)
             }
         }
-        .padding(14)
+        .padding(.horizontal, 14)
+        .padding(.bottom, 14)
         .onAppear { loadMeta(); syncFromClip() }
         .onChange(of: clip.id) { _ in loadMeta(); syncFromClip() }
         .onChange(of: clip.offsetX)    { v in if abs(v - offsetX) > 0.001 { offsetX = v } }

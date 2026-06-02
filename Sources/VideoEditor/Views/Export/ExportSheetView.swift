@@ -541,7 +541,6 @@ struct ExportSheetView: View {
             audioTracks: project.audioTracks,
             subtitleTracks: project.subtitleTracks,
             imageTracks: project.imageTracks,
-            subtitleStyles: project.subtitleStyles,
             subtitleBottomMargin: project.subtitleBottomMargin,
             subtitleLineSpacing: project.subtitleLineSpacing,
             previewRenderSize: project.previewRenderSize,
@@ -561,7 +560,6 @@ struct ExportInput {
     let audioTracks:    [Track<AudioClip>]
     let subtitleTracks: [Track<SubtitleClip>]
     let imageTracks:    [Track<ImageClip>]
-    let subtitleStyles: [SubtitleStyle]
     let subtitleBottomMargin: Double
     let subtitleLineSpacing:  Double
     let previewRenderSize: CGSize          // 预览分辨率，用于字幕缩放基准
@@ -953,10 +951,9 @@ actor TimelineExporter {
             let fontScale = input.previewRenderSize.width > 0
                 ? renderSize.width / input.previewRenderSize.width : 1.0
             let subRenderInfo = SubtitleRenderInfo(
-                tracks: input.subtitleTracks.enumerated().compactMap { i, t in
+                tracks: input.subtitleTracks.compactMap { t in
                     guard t.isVisible && !t.clips.isEmpty else { return nil }
-                    let s = i < input.subtitleStyles.count ? input.subtitleStyles[i] : SubtitleStyle()
-                    return (t, s)
+                    return (t, t.subtitleStyle ?? SubtitleStyle())
                 },
                 fontScale: fontScale,
                 bottomMargin: input.subtitleBottomMargin,
@@ -1205,9 +1202,13 @@ actor TimelineExporter {
                             let outputPTS = CMTime(value: frameIndex, timescale: Int32(targetFps))
                             if let pb = currentPB {
                                 if hasSubtitles {
-                                    self.drawSubtitlesOnPixelBuffer(pb, atTime: targetTime, info: subtitleInfo)
+                                    // 在副本上绘制字幕，避免重复帧（帧率不匹配时 pb 复用）导致背景叠加闪烁
+                                    let renderPB = Self.copyPixelBuffer(pb) ?? pb
+                                    self.drawSubtitlesOnPixelBuffer(renderPB, atTime: targetTime, info: subtitleInfo)
+                                    adaptor.append(renderPB, withPresentationTime: outputPTS)
+                                } else {
+                                    adaptor.append(pb, withPresentationTime: outputPTS)
                                 }
-                                adaptor.append(pb, withPresentationTime: outputPTS)
                             }
                             frameIndex += 1
                             let pct = min(targetTime / max(totalDuration, 0.01), 0.99)
@@ -1246,6 +1247,25 @@ actor TimelineExporter {
     }
 
     // MARK: - 逐帧字幕绘制
+
+    /// 复制 pixel buffer（32BGRA），用于在副本上绘制字幕，不污染原始帧
+    private static nonisolated func copyPixelBuffer(_ src: CVPixelBuffer) -> CVPixelBuffer? {
+        let w   = CVPixelBufferGetWidth(src)
+        let h   = CVPixelBufferGetHeight(src)
+        let fmt = CVPixelBufferGetPixelFormatType(src)
+        var dst: CVPixelBuffer?
+        guard CVPixelBufferCreate(kCFAllocatorDefault, w, h, fmt, nil, &dst) == kCVReturnSuccess,
+              let dst else { return nil }
+        CVPixelBufferLockBaseAddress(src, .readOnly)
+        CVPixelBufferLockBaseAddress(dst, [])
+        if let srcAddr = CVPixelBufferGetBaseAddress(src),
+           let dstAddr = CVPixelBufferGetBaseAddress(dst) {
+            memcpy(dstAddr, srcAddr, CVPixelBufferGetBytesPerRow(src) * h)
+        }
+        CVPixelBufferUnlockBaseAddress(dst, [])
+        CVPixelBufferUnlockBaseAddress(src, .readOnly)
+        return dst
+    }
 
     /// 在 pixel buffer 上直接绘制字幕（CoreGraphics）
     private nonisolated func drawSubtitlesOnPixelBuffer(

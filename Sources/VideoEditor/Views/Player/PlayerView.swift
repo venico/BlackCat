@@ -110,8 +110,7 @@ private struct SubtitleOverlay: View {
             let scale = geo.size.width / project.previewRenderSize.width
             let pairs: [(String, SubtitleStyle)] = project.subtitleTracks.indices.compactMap { i in
                 guard project.subtitleTracks[i].isVisible else { return nil }
-                let style = project.subtitleStyles.indices.contains(i)
-                    ? project.subtitleStyles[i] : SubtitleStyle()
+                let style = project.subtitleTracks[i].subtitleStyle ?? SubtitleStyle()
                 guard let clip = project.subtitleTracks[i].clips.first(where: {
                     $0.startTime <= clock.currentTime && $0.endTime > clock.currentTime
                 }) else { return nil }

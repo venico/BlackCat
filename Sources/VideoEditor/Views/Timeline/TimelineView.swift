@@ -186,6 +186,7 @@ struct TimelineView: View {
             // 播放头三角（最外层 overlay，不被任何 ScrollView 裁剪）
             Canvas { ctx, size in
                 let x = labelW + clock.currentTime * project.pixelsPerSecond - scrollOffsetX
+                guard x >= labelW else { return }  // 播放头在可视区左边界之外，不显示三角
                 var tri = Path()
                 tri.move(to: CGPoint(x: x, y: 16))
                 tri.addLine(to: CGPoint(x: x - 5, y: 6))
@@ -303,8 +304,9 @@ struct TimelineView: View {
                 Button("添加图片轨道") { project.imageTracks.append(Track(label: "图片")) }
                 Button("添加音频轨道") { project.audioTracks.append(Track(label: "音频")) }
                 Button("添加字幕轨道") {
-                    project.subtitleTracks.append(Track(label: "字幕"))
-                    project.subtitleStyles.append(SubtitleStyle())
+                    var newTrack = Track<SubtitleClip>(label: "字幕")
+                    newTrack.subtitleStyle = SubtitleStyle()
+                    project.subtitleTracks.append(newTrack)
                 }
             } label: {
                 Image(systemName: "plus")
@@ -2241,10 +2243,10 @@ private struct TranslateToolGroup: View {
     /// 在源轨道下方新建翻译轨道，返回新轨道 index
     private func createTranslationTrack(after srcIdx: Int) -> Int {
         let lang = shortLang(project.translationTargetLang)
-        let newTrack = Track<SubtitleClip>(label: "字幕(\(lang))")
+        var newTrack = Track<SubtitleClip>(label: "字幕(\(lang))")
+        newTrack.subtitleStyle = SubtitleStyle()
         let insertIdx = srcIdx + 1
         project.subtitleTracks.insert(newTrack, at: insertIdx)
-        project.subtitleStyles.insert(SubtitleStyle(), at: min(insertIdx, project.subtitleStyles.count))
         return insertIdx
     }
 

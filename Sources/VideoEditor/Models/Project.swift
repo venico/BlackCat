@@ -194,6 +194,7 @@ struct Track<Clip: Identifiable & Equatable & Codable>: Identifiable, Codable {
     var label: String   = ""
     var isMuted: Bool   = false
     var isVisible: Bool = true
+    var subtitleStyle: SubtitleStyle? = nil  // 仅字幕轨道使用，style 随 track 生死
 }
 
 // MARK: - Export Settings
@@ -252,7 +253,6 @@ struct ProjectSnapshot {
     var audioTracks: [Track<AudioClip>]
     var imageTracks: [Track<ImageClip>]
     var subtitleTracks: [Track<SubtitleClip>]
-    var subtitleStyles: [SubtitleStyle]
     var subtitleBottomMargin: Double
     var subtitleLineSpacing: Double
     var duration: Double
@@ -270,7 +270,6 @@ final class ProjectState: ObservableObject {
     @Published var audioTracks: [Track<AudioClip>]    = [Track(label: "音频")]
     @Published var imageTracks: [Track<ImageClip>]       = []
     @Published var subtitleTracks: [Track<SubtitleClip>] = [Track(label: "字幕")]
-    @Published var subtitleStyles: [SubtitleStyle]    = [SubtitleStyle(), SubtitleStyle()]
     @Published var subtitleBottomMargin: Double = 5   // 全局：所有字幕整体距下边缘 %
     @Published var subtitleLineSpacing: Double  = 6   // 全局：字幕轨道之间的间距 pt
 
@@ -537,7 +536,6 @@ final class ProjectState: ObservableObject {
         audioTracks = [Track(label: "音频")]
         imageTracks = []
         subtitleTracks = [Track(label: "字幕")]
-        subtitleStyles = [SubtitleStyle(), SubtitleStyle()]
         subtitleBottomMargin = 5
         subtitleLineSpacing = 6
         undoStack.removeAll(); redoStack.removeAll()
@@ -617,8 +615,15 @@ final class ProjectState: ObservableObject {
         videoTracks = doc.videoTracks
         audioTracks = doc.audioTracks
         imageTracks = doc.imageTracks
-        subtitleTracks = doc.subtitleTracks
-        subtitleStyles = doc.subtitleStyles
+        // 加载字幕轨道，兼容旧 .bcj（subtitleStyles 单独数组）：把旧 style 迁移进 track
+        var loadedSubtitleTracks = doc.subtitleTracks
+        for i in loadedSubtitleTracks.indices {
+            if loadedSubtitleTracks[i].subtitleStyle == nil,
+               i < doc.subtitleStyles.count {
+                loadedSubtitleTracks[i].subtitleStyle = doc.subtitleStyles[i]
+            }
+        }
+        subtitleTracks = loadedSubtitleTracks
         subtitleBottomMargin = doc.subtitleBottomMargin ?? doc.subtitleStyles.first?.bottomMargin ?? 5
         subtitleLineSpacing = doc.subtitleLineSpacing ?? doc.subtitleStyles.first?.lineSpacing ?? 6
         exportSettings = doc.exportSettings
@@ -685,7 +690,7 @@ final class ProjectState: ObservableObject {
             audioTracks: audioTracks,
             imageTracks: imageTracks,
             subtitleTracks: subtitleTracks,
-            subtitleStyles: subtitleStyles,
+            subtitleStyles: subtitleTracks.map { $0.subtitleStyle ?? SubtitleStyle() },  // 向后兼容旧格式
             mediaAssets: mediaAssets,
             exportSettings: exportSettings,
             previewResolution: previewResolution,
@@ -1296,8 +1301,8 @@ final class ProjectState: ObservableObject {
                 if !placed {
                     var newTrack = Track<SubtitleClip>(label: "字幕")
                     newTrack.clips.append(removed)
+                    newTrack.subtitleStyle = newSubtitleStyle()
                     subtitleTracks.append(newTrack)
-                    subtitleStyles.append(newSubtitleStyle())
                 }
             }
             return
@@ -2071,7 +2076,7 @@ final class ProjectState: ObservableObject {
 
             do { try process.run() } catch {
                 await MainActor.run {
-                    self?.showImportToast("转码失败：\(error.localizedDescription)")
+                    self?.showImportToast("转码失败")
                     self?.finishTranscodeTask(task.id)
                 }
                 return
@@ -2107,7 +2112,7 @@ final class ProjectState: ObservableObject {
                 if process.terminationStatus == 0 {
                     self?.importFileDirectly(url: task.outputURL, type: .video)
                 } else if process.terminationStatus != 15 {
-                    self?.showImportToast("转码失败，FFmpeg 退出码: \(process.terminationStatus)")
+                    self?.showImportToast("转码失败")
                 }
                 self?.finishTranscodeTask(task.id)
             }
@@ -2338,13 +2343,13 @@ final class ProjectState: ObservableObject {
             // line (so bilingual / multi-language workflows don't merge).
             if let idx = subtitleTracks.firstIndex(where: { $0.clips.isEmpty }) {
                 subtitleTracks[idx].clips = clips
-                if subtitleStyles.indices.contains(idx) == false {
-                    subtitleStyles.append(newSubtitleStyle())
+                if subtitleTracks[idx].subtitleStyle == nil {
+                    subtitleTracks[idx].subtitleStyle = newSubtitleStyle()
                 }
             } else {
-                subtitleTracks.append(
-                    Track(clips: clips, label: "字幕"))
-                subtitleStyles.append(newSubtitleStyle())
+                var newTrack = Track<SubtitleClip>(clips: clips, label: "字幕")
+                newTrack.subtitleStyle = newSubtitleStyle()
+                subtitleTracks.append(newTrack)
             }
             if let mx = clips.map(\.endTime).max() { duration = max(duration, mx) }
             if let i = mediaAssets.firstIndex(where:{ $0.id == asset.id }) {
@@ -2776,7 +2781,7 @@ final class ProjectState: ObservableObject {
     private func currentSnapshot(includeAssets: Bool = false) -> ProjectSnapshot {
         ProjectSnapshot(videoTracks: videoTracks, audioTracks: audioTracks,
                         imageTracks: imageTracks,
-                        subtitleTracks: subtitleTracks, subtitleStyles: subtitleStyles,
+                        subtitleTracks: subtitleTracks,
                         subtitleBottomMargin: subtitleBottomMargin,
                         subtitleLineSpacing: subtitleLineSpacing,
                         duration: duration,
@@ -2787,7 +2792,6 @@ final class ProjectState: ObservableObject {
         audioTracks    = s.audioTracks
         imageTracks    = s.imageTracks
         subtitleTracks = s.subtitleTracks
-        subtitleStyles = s.subtitleStyles
         subtitleBottomMargin = s.subtitleBottomMargin
         subtitleLineSpacing  = s.subtitleLineSpacing
         duration       = s.duration
@@ -3239,9 +3243,9 @@ final class ProjectState: ObservableObject {
             trackIdx = subtitleTracks.firstIndex { $0.clips.contains { $0.id == sid } } ?? 0
         } else {
             // 没选中任何字幕 → 新建轨道（放在最后）
-            let newTrack = Track<SubtitleClip>(label: "字幕")
+            var newTrack = Track<SubtitleClip>(label: "字幕")
+            newTrack.subtitleStyle = newSubtitleStyle()
             subtitleTracks.append(newTrack)
-            subtitleStyles.append(newSubtitleStyle())
             trackIdx = subtitleTracks.count - 1
         }
 
