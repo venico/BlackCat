@@ -182,21 +182,7 @@ struct TimelineView: View {
             return Color.clear
         })
         .clipped()
-        .overlay(alignment: .topLeading) {
-            // 播放头三角（最外层 overlay，不被任何 ScrollView 裁剪）
-            Canvas { ctx, size in
-                let x = labelW + clock.currentTime * project.pixelsPerSecond - scrollOffsetX
-                guard x >= labelW else { return }  // 播放头在可视区左边界之外，不显示三角
-                var tri = Path()
-                tri.move(to: CGPoint(x: x, y: 16))
-                tri.addLine(to: CGPoint(x: x - 5, y: 6))
-                tri.addLine(to: CGPoint(x: x + 5, y: 6))
-                tri.closeSubpath()
-                ctx.fill(tri, with: .color(Color.accent))
-            }
-            .frame(height: rulerH)
-            .allowsHitTesting(false)
-        }
+        // 播放头三角和竖线都在 DraggablePlayhead 内部（ScrollView 内），完全同步不分离
         .overlay(alignment: .bottomTrailing) {
             if project.translationTotal > 0 {
                 TranslationProgressBubble()
@@ -453,6 +439,7 @@ struct TimelineView: View {
                     }
 
                     DraggablePlayhead(pps: project.pixelsPerSecond, fullHeight: effectiveH)
+                        .zIndex(10)
                 }
                 .frame(width: totalW, alignment: .topLeading)
                 .frame(minHeight: effectiveH)
@@ -2003,10 +1990,17 @@ private struct DraggablePlayhead: View {
 
     var body: some View {
         let x = clock.currentTime * pps
-        ZStack(alignment: .topLeading) {
-            Rectangle().fill(Color.accent)
-                .frame(width: 1, height: fullHeight - 16)
-                .offset(x: x - 0.5, y: 16)
+        Canvas { ctx, size in
+            // 三角（y 6~16）
+            var tri = Path()
+            tri.move(to: CGPoint(x: x, y: 16))
+            tri.addLine(to: CGPoint(x: x - 5, y: 6))
+            tri.addLine(to: CGPoint(x: x + 5, y: 6))
+            tri.closeSubpath()
+            ctx.fill(tri, with: .color(Color.accent))
+            // 竖线（y 16 ~ fullHeight）
+            let line = CGRect(x: x - 0.5, y: 16, width: 1, height: fullHeight - 16)
+            ctx.fill(Path(line), with: .color(Color.accent))
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .allowsHitTesting(false)

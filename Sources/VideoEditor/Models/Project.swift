@@ -1441,9 +1441,9 @@ final class ProjectState: ObservableObject {
 
         // 指纹检测：跳过无变化的重复 rebuild（seekTo 除外）
         var hasher = Hasher()
-        hasher.combine(vTracks.flatMap(\.clips).map { "\($0.id)\($0.startTime)\($0.endTime)\($0.trimStart)\($0.volume)\($0.scaleX)\($0.offsetX)" }.joined())
-        hasher.combine(iTracks.flatMap(\.clips).map { "\($0.id)\($0.startTime)\($0.endTime)\($0.scaleX)\($0.offsetX)" }.joined())
-        hasher.combine(aTracks.flatMap(\.clips).map { "\($0.id)\($0.startTime)\($0.endTime)\($0.trimStart)\($0.volume)" }.joined())
+        hasher.combine(vTracks.flatMap(\.clips).map { "\($0.id)\($0.startTime)\($0.endTime)\($0.trimStart)\($0.volume)\($0.scaleX)\($0.scaleY)\($0.offsetX)\($0.offsetY)\($0.cropTop)\($0.cropBottom)\($0.cropLeft)\($0.cropRight)\($0.audioTrackIndex)" }.joined())
+        hasher.combine(iTracks.flatMap(\.clips).map { "\($0.id)\($0.startTime)\($0.endTime)\($0.scaleX)\($0.scaleY)\($0.offsetX)\($0.offsetY)\($0.cropTop)\($0.cropBottom)\($0.cropLeft)\($0.cropRight)" }.joined())
+        hasher.combine(aTracks.flatMap(\.clips).map { "\($0.id)\($0.startTime)\($0.endTime)\($0.trimStart)\($0.volume)\($0.leftChannel)\($0.rightChannel)\($0.fadeInEnabled)\($0.fadeInDuration)\($0.fadeOutEnabled)\($0.fadeOutDuration)" }.joined())
         hasher.combine(vTracks.map { "\($0.isVisible)\($0.isMuted)" }.joined())
         hasher.combine(iTracks.map { "\($0.isVisible)" }.joined())
         hasher.combine(aTracks.map { "\($0.isVisible)\($0.isMuted)" }.joined())
@@ -1567,8 +1567,10 @@ final class ProjectState: ObservableObject {
                     if let at2 = composition.addMutableTrack(withMediaType: .audio,
                                                              preferredTrackID: kCMPersistentTrackID_Invalid) {
                         try? at2.insertTimeRange(range, of: aAsset, at: at)
-                        let fadeIn  = clip.fadeInEnabled  ? min(clip.fadeInDuration,  clip.duration) : 0
-                        let fadeOut = clip.fadeOutEnabled ? min(clip.fadeOutDuration, clip.duration) : 0
+                        // 防止淡入淡出 volume ramp 重叠导致崩溃：基于实际时长，fadeIn + fadeOut ≤ 时长
+                        let effDur  = useDur.seconds
+                        let fadeIn  = clip.fadeInEnabled  ? min(max(0, clip.fadeInDuration),  effDur) : 0
+                        let fadeOut = clip.fadeOutEnabled ? min(max(0, clip.fadeOutDuration), max(0, effDur - fadeIn)) : 0
                         audioParams.append((at2.trackID, clip.volume, clip.leftChannel, clip.rightChannel, clip.startTime, useDur.seconds, fadeIn, fadeOut))
                     }
                 }
@@ -1593,28 +1595,28 @@ final class ProjectState: ObservableObject {
                 let ts: CMTimeScale = 600
                 let clipStart = CMTime(seconds: param.startTime, preferredTimescale: ts)
                 let clipDur   = param.duration
-                if param.fadeIn > 0 {
-                    // 淡入：从 0 → volume
-                    p.setVolumeRamp(fromStartVolume: 0, toEndVolume: param.volume,
-                                    timeRange: CMTimeRange(start: clipStart,
-                                                           duration: CMTime(seconds: param.fadeIn, preferredTimescale: ts)))
-                }
-                if param.fadeOut > 0 {
-                    // 淡出：从 volume → 0
-                    let fadeOutStart = CMTime(seconds: param.startTime + clipDur - param.fadeOut, preferredTimescale: ts)
-                    p.setVolumeRamp(fromStartVolume: param.volume, toEndVolume: 0,
-                                    timeRange: CMTimeRange(start: fadeOutStart,
-                                                           duration: CMTime(seconds: param.fadeOut, preferredTimescale: ts)))
-                }
-                // 中间段保持基准音量（淡入结束到淡出开始）
                 if param.fadeIn > 0 || param.fadeOut > 0 {
-                    let midStart = CMTime(seconds: param.startTime + param.fadeIn, preferredTimescale: ts)
-                    let midEnd   = param.startTime + clipDur - param.fadeOut
-                    let midDur   = midEnd - (param.startTime + param.fadeIn)
-                    if midDur > 0 {
+                    // volume ramp 必须按时间递增顺序添加：淡入 → 中间 → 淡出，否则 AVFoundation 抛异常崩溃
+                    // 1) 淡入：0 → volume
+                    if param.fadeIn > 0 {
+                        p.setVolumeRamp(fromStartVolume: 0, toEndVolume: param.volume,
+                                        timeRange: CMTimeRange(start: clipStart,
+                                                               duration: CMTime(seconds: param.fadeIn, preferredTimescale: ts)))
+                    }
+                    // 2) 中间段：保持基准音量（淡入结束 → 淡出开始）
+                    let midStartSec = param.startTime + param.fadeIn
+                    let midDurSec   = clipDur - param.fadeIn - param.fadeOut
+                    if midDurSec > 0.001 {
                         p.setVolumeRamp(fromStartVolume: param.volume, toEndVolume: param.volume,
-                                        timeRange: CMTimeRange(start: midStart,
-                                                               duration: CMTime(seconds: midDur, preferredTimescale: ts)))
+                                        timeRange: CMTimeRange(start: CMTime(seconds: midStartSec, preferredTimescale: ts),
+                                                               duration: CMTime(seconds: midDurSec, preferredTimescale: ts)))
+                    }
+                    // 3) 淡出：volume → 0
+                    if param.fadeOut > 0 {
+                        let fadeOutStart = CMTime(seconds: param.startTime + clipDur - param.fadeOut, preferredTimescale: ts)
+                        p.setVolumeRamp(fromStartVolume: param.volume, toEndVolume: 0,
+                                        timeRange: CMTimeRange(start: fadeOutStart,
+                                                               duration: CMTime(seconds: param.fadeOut, preferredTimescale: ts)))
                     }
                 } else {
                     p.setVolume(param.volume, at: .zero)

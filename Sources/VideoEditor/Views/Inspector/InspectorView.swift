@@ -116,6 +116,7 @@ private struct SubtitleInspector: View {
     @State private var startTime: Double = 0
     @State private var endTime: Double   = 0
     @State private var ls = SubtitleStyle()   // local copy — ColorPicker needs @State binding
+    @State private var isSyncing = false   // 外部（撤销/重做）同步 ls 时为 true，避免回写触发 writeStyle
 
     // 返回 nil 表示 clip 已从轨道中移除（不能写入样式）
     private var trackIndex: Int? {
@@ -123,6 +124,12 @@ private struct SubtitleInspector: View {
             if t.clips.contains(where: { $0.id == clip.id }) { return i }
         }
         return nil
+    }
+
+    /// 当前轨道的字幕样式（撤销/重做等外部操作会改变它）
+    private var currentStyle: SubtitleStyle {
+        guard let i = trackIndex else { return SubtitleStyle() }
+        return project.subtitleTracks[i].subtitleStyle ?? SubtitleStyle()
     }
 
     var body: some View {
@@ -244,18 +251,26 @@ private struct SubtitleInspector: View {
         }
         .onAppear { syncAll() }
         .onChange(of: clip.id) { _ in syncAll() }
+        .onChange(of: currentStyle) { newStyle in
+            // 撤销/重做等外部改变样式时，同步回本地 ls 以刷新面板（不回写）
+            guard !isSyncing, newStyle != ls else { return }
+            isSyncing = true
+            ls = newStyle
+            DispatchQueue.main.async { isSyncing = false }
+        }
     }
 
     // MARK: Helpers
 
     private func syncAll() {
+        isSyncing = true
         text = clip.text; startTime = clip.startTime; endTime = clip.endTime
-        guard let i = trackIndex else { return }
-        ls = project.subtitleTracks[i].subtitleStyle ?? SubtitleStyle()
+        if let i = trackIndex { ls = project.subtitleTracks[i].subtitleStyle ?? SubtitleStyle() }
+        DispatchQueue.main.async { isSyncing = false }
     }
 
     private func writeStyle() {
-        guard let i = trackIndex else { return }  // clip 已删除，禁止写入
+        guard !isSyncing, let i = trackIndex else { return }  // 同步中或 clip 已删除，禁止写入
         project.pushUndoThrottled()
         project.subtitleTracks[i].subtitleStyle = ls
     }
@@ -490,8 +505,8 @@ private struct ImageInspector: View {
     @ViewBuilder
     private func cropSlider(label: String, value: Binding<Double>, edge: Int) -> some View {
         ICapsuleSlider(label: label, value: value, range: 0...0.99,
-                       unit: "%", displayScale: 100, labelWidth: 14)
-            .onChange(of: value.wrappedValue) { _ in applyCropWithCompensation(edge: edge) }
+                       unit: "%", displayScale: 100, labelWidth: 14,
+                       onChange: { _ in applyCropWithCompensation(edge: edge) })
     }
 
     private func syncFromClip() {
@@ -558,8 +573,8 @@ private struct ImageInspector: View {
                               unit: String = "", scale: Double = 100,
                               onChange: @escaping (Double) -> Void) -> some View {
         ICapsuleSlider(label: label, value: value, range: range,
-                       unit: unit, displayScale: scale, labelWidth: 14)
-            .onChange(of: value.wrappedValue) { v in onChange(v) }
+                       unit: unit, displayScale: scale, labelWidth: 14,
+                       onChange: onChange)
     }
 }
 
@@ -731,15 +746,15 @@ private struct VideoInspector: View {
                             unit: String = "", scale: Double = 100,
                             onChange: @escaping (Double) -> Void) -> some View {
         ICapsuleSlider(label: label, value: value, range: range,
-                       unit: unit, displayScale: scale, labelWidth: 14)
-            .onChange(of: value.wrappedValue) { v in onChange(v) }
+                       unit: unit, displayScale: scale, labelWidth: 14,
+                       onChange: onChange)
     }
 
     @ViewBuilder
     private func videoCropSlider(label: String, value: Binding<Double>, edge: Int) -> some View {
         ICapsuleSlider(label: label, value: value, range: 0...0.99,
-                       unit: "%", displayScale: 100, labelWidth: 14)
-            .onChange(of: value.wrappedValue) { _ in applyTransform() }
+                       unit: "%", displayScale: 100, labelWidth: 14,
+                       onChange: { _ in applyTransform() })
     }
 
     private func syncFromClip() {
@@ -894,12 +909,18 @@ private struct AudioInspector: View {
                 }
                 if clip.fadeInEnabled {
                     ISlider(label: "淡入时长", value: Binding(
-                        get: { clip.fadeInDuration },
+                        get: { ((min(max(0, clip.fadeInDuration), clip.duration) * 10).rounded() / 10) },
                         set: { v in
-                            project.updateAudioClip(id: clip.id) { $0.fadeInDuration = max(0.1, min(v, $0.duration)) }
-                            project.rebuildTimelinePreview()
+                            project.updateAudioClip(id: clip.id) {
+                                let newIn = (max(0, min(v, $0.duration)) * 10).rounded() / 10
+                                $0.fadeInDuration = newIn
+                                if $0.fadeOutEnabled, newIn + $0.fadeOutDuration > $0.duration {
+                                    $0.fadeOutDuration = ((max(0, $0.duration - newIn)) * 10).rounded() / 10
+                                }
+                            }
+                            project.rebuildTimelinePreviewDebounced()
                         }
-                    ), range: 0.1...10, unit: "秒")
+                    ), range: 0...max(0.1, clip.duration), unit: "秒", decimals: 1)
                 }
                 HStack(spacing: 12) {
                     Text("淡出")
@@ -920,12 +941,18 @@ private struct AudioInspector: View {
                 }
                 if clip.fadeOutEnabled {
                     ISlider(label: "淡出时长", value: Binding(
-                        get: { clip.fadeOutDuration },
+                        get: { ((min(max(0, clip.fadeOutDuration), clip.duration) * 10).rounded() / 10) },
                         set: { v in
-                            project.updateAudioClip(id: clip.id) { $0.fadeOutDuration = max(0.1, min(v, $0.duration)) }
-                            project.rebuildTimelinePreview()
+                            project.updateAudioClip(id: clip.id) {
+                                let newOut = (max(0, min(v, $0.duration)) * 10).rounded() / 10
+                                $0.fadeOutDuration = newOut
+                                if $0.fadeInEnabled, $0.fadeInDuration + newOut > $0.duration {
+                                    $0.fadeInDuration = ((max(0, $0.duration - newOut)) * 10).rounded() / 10
+                                }
+                            }
+                            project.rebuildTimelinePreviewDebounced()
                         }
-                    ), range: 0.1...10, unit: "秒")
+                    ), range: 0...max(0.1, clip.duration), unit: "秒", decimals: 1)
                 }
             }
         }
@@ -1016,10 +1043,11 @@ struct ISlider: View {
     @Binding var value: Double
     let range: ClosedRange<Double>
     let unit: String
+    var decimals: Int = 0
 
     var body: some View {
         ICapsuleSlider(label: label, value: $value, range: range,
-                       unit: unit, labelWidth: 64)
+                       decimals: decimals, unit: unit, labelWidth: 64)
     }
 }
 
@@ -1033,8 +1061,11 @@ struct ICapsuleSlider: View {
     var unit: String = ""
     var displayScale: Double = 1    // 显示值 = value × displayScale（如 offset -1...1 显示为 -100...100）
     var labelWidth: CGFloat = 18
+    var onChange: ((Double) -> Void)? = nil
+    // (reserved for future use)
 
     @State private var editText: String = ""
+    @State private var dragging = false
     @FocusState private var focused: Bool
 
     private var disp: Double { value * displayScale }
@@ -1049,9 +1080,9 @@ struct ICapsuleSlider: View {
                 .foregroundColor(Color.labelSecondary)
                 .frame(width: labelWidth, alignment: .leading)
                 .lineLimit(1)
-            Slider(value: $value, in: range)
-                .accentColor(Color.accent)
-                .controlSize(.mini)
+            CustomSlider(value: $value, range: range, onDragging: { d in
+                dragging = d
+            })
             HStack(spacing: 1) {
                 TextField("", text: $editText)
                     .font(.system(size: 10).monospacedDigit())
@@ -1061,7 +1092,7 @@ struct ICapsuleSlider: View {
                     .focused($focused)
                     .frame(width: 30)
                     .onAppear { editText = fmt }
-                    .onChange(of: value) { _ in if !focused { editText = fmt } }
+                    .onChange(of: value) { v in if !focused { editText = fmt }; if dragging { onChange?(v) } }
                     .onSubmit { commit() }
                     .onChange(of: focused) { _ in if !focused { commit() } }
                 if !unit.isEmpty {
@@ -1085,6 +1116,7 @@ struct ICapsuleSlider: View {
     private func commit() {
         if let v = Double(editText) {
             value = (v / displayScale).clamped(to: range)
+            onChange?(value)
         }
         editText = fmt
     }
@@ -1117,6 +1149,66 @@ private struct ActionBtn: View {
         }
         .buttonStyle(.plain)
         .onHover { hov = $0 }
+    }
+}
+
+// MARK: - CustomSlider（自绘滑块，替代 macOS Slider 解决精度问题）
+
+/// 完全自绘的滑块：轨道 + 填充 + 圆形 thumb + 拖拽手势。
+/// 拖到最左精确等于 range.lowerBound，最右精确等于 range.upperBound，
+/// 无 macOS Slider 的像素精度、刻度线、最小值跳变等问题。
+struct CustomSlider: View {
+    @Binding var value: Double
+    let range: ClosedRange<Double>
+    var onDragging: ((Bool) -> Void)? = nil
+
+    private let trackH: CGFloat = 4
+    private let thumbR: CGFloat = 6
+
+    var body: some View {
+        GeometryReader { geo in
+            let w = geo.size.width
+            let span = range.upperBound - range.lowerBound
+            let frac = span > 0 ? CGFloat((value - range.lowerBound) / span) : 0
+            let fillW = frac * w   // 填充宽度（0 ~ w）
+
+            ZStack(alignment: .leading) {
+                // 轨道背景
+                Capsule()
+                    .fill(Color.white.opacity(0.12))
+                    .frame(height: trackH)
+
+                // 已填充
+                if fillW > 0.5 {
+                    Capsule()
+                        .fill(Color.accent)
+                        .frame(width: fillW, height: trackH)
+                }
+
+                // Thumb（中心在 fillW 位置，钳制在 thumbR...w-thumbR 之间）
+                Circle()
+                    .fill(Color.white)
+                    .shadow(color: .black.opacity(0.3), radius: 1, y: 0.5)
+                    .frame(width: thumbR * 2, height: thumbR * 2)
+                    .position(x: max(thumbR, min(fillW, w - thumbR)),
+                              y: geo.size.height / 2)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .contentShape(Rectangle())
+            .gesture(
+                DragGesture(minimumDistance: 0)
+                    .onChanged { v in
+                        onDragging?(true)
+                        // 直接映射：鼠标 x / 轨道宽度 = 比例 → 值。最左=0，最右=最大
+                        let newFrac = max(0, min(1, Double(v.location.x / w)))
+                        value = (range.lowerBound + newFrac * span).clamped(to: range)
+                    }
+                    .onEnded { _ in
+                        onDragging?(false)
+                    }
+            )
+        }
+        .frame(height: thumbR * 2 + 4)
     }
 }
 

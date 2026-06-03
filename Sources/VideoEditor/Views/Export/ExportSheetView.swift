@@ -385,12 +385,10 @@ struct ExportSheetView: View {
                                     .font(.system(size: 11).monospacedDigit())
                                     .foregroundColor(Color.labelPrimary)
                             }
-                            Slider(value: Binding(
+                            CustomSlider(value: Binding(
                                 get: { Double(project.exportSettings.bitrate) },
                                 set: { project.exportSettings.bitrate = Int(($0 / 500).rounded() * 500) }
-                            ), in: 500...50000)
-                            .frame(height: 20)
-                            .accentColor(Color.accent)
+                            ), range: 500...50000)
 
                             HStack {
                                 ForEach(BitratePreset.all, id: \.label) { preset in
@@ -652,8 +650,9 @@ actor TimelineExporter {
                                                         preferredTrackID: kCMPersistentTrackID_Invalid)
                 if let extra { try extra.insertTimeRange(range, of: aAsset, at: at) }
                 if let tid = extra?.trackID {
-                    let fadeIn  = clip.fadeInEnabled  ? min(clip.fadeInDuration,  clip.duration) : 0
-                    let fadeOut = clip.fadeOutEnabled ? min(clip.fadeOutDuration, clip.duration) : 0
+                    let effDur  = useDur.seconds
+                    let fadeIn  = clip.fadeInEnabled  ? min(max(0, clip.fadeInDuration),  effDur) : 0
+                    let fadeOut = clip.fadeOutEnabled ? min(max(0, clip.fadeOutDuration), max(0, effDur - fadeIn)) : 0
                     audioMixParams.append((tid, clip.volume, clip.leftChannel, clip.rightChannel, clip.startTime, useDur.seconds, fadeIn, fadeOut))
                 }
             }
@@ -746,24 +745,25 @@ actor TimelineExporter {
             p.trackID = param.trackID
             let ts: CMTimeScale = 600
             let clipStart = CMTime(seconds: param.startTime, preferredTimescale: ts)
-            if param.fadeIn > 0 {
-                p.setVolumeRamp(fromStartVolume: 0, toEndVolume: param.volume,
-                                timeRange: CMTimeRange(start: clipStart,
-                                                       duration: CMTime(seconds: param.fadeIn, preferredTimescale: ts)))
-            }
-            if param.fadeOut > 0 {
-                let fadeOutStart = CMTime(seconds: param.startTime + param.duration - param.fadeOut, preferredTimescale: ts)
-                p.setVolumeRamp(fromStartVolume: param.volume, toEndVolume: 0,
-                                timeRange: CMTimeRange(start: fadeOutStart,
-                                                       duration: CMTime(seconds: param.fadeOut, preferredTimescale: ts)))
-            }
             if param.fadeIn > 0 || param.fadeOut > 0 {
-                let midStart = CMTime(seconds: param.startTime + param.fadeIn, preferredTimescale: ts)
-                let midDur = param.duration - param.fadeIn - param.fadeOut
-                if midDur > 0 {
+                // volume ramp 必须按时间递增顺序添加：淡入 → 中间 → 淡出，否则 AVFoundation 抛异常崩溃
+                if param.fadeIn > 0 {
+                    p.setVolumeRamp(fromStartVolume: 0, toEndVolume: param.volume,
+                                    timeRange: CMTimeRange(start: clipStart,
+                                                           duration: CMTime(seconds: param.fadeIn, preferredTimescale: ts)))
+                }
+                let midStartSec = param.startTime + param.fadeIn
+                let midDurSec   = param.duration - param.fadeIn - param.fadeOut
+                if midDurSec > 0.001 {
                     p.setVolumeRamp(fromStartVolume: param.volume, toEndVolume: param.volume,
-                                    timeRange: CMTimeRange(start: midStart,
-                                                           duration: CMTime(seconds: midDur, preferredTimescale: ts)))
+                                    timeRange: CMTimeRange(start: CMTime(seconds: midStartSec, preferredTimescale: ts),
+                                                           duration: CMTime(seconds: midDurSec, preferredTimescale: ts)))
+                }
+                if param.fadeOut > 0 {
+                    let fadeOutStart = CMTime(seconds: param.startTime + param.duration - param.fadeOut, preferredTimescale: ts)
+                    p.setVolumeRamp(fromStartVolume: param.volume, toEndVolume: 0,
+                                    timeRange: CMTimeRange(start: fadeOutStart,
+                                                           duration: CMTime(seconds: param.fadeOut, preferredTimescale: ts)))
                 }
             } else {
                 p.setVolume(param.volume, at: .zero)
