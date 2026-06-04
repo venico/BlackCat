@@ -2022,8 +2022,7 @@ private struct LogSlider: View {
     }
 
     var body: some View {
-        Slider(value: logValue, in: log(range.lowerBound)...log(range.upperBound))
-            .accentColor(Color.accent)
+        CustomSlider(value: logValue, range: log(range.lowerBound)...log(range.upperBound))
     }
 }
 
