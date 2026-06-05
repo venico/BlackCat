@@ -211,10 +211,11 @@ struct TimelineView: View {
 
             // Esc → 取消选择
             if event.keyCode == 53 {
-                project.selectedVideoClipID    = nil
-                project.selectedImageClipID    = nil
-                project.selectedAudioClipID    = nil
-                project.selectedSubtitleClipID = nil
+                project.selectedVideoClipID      = nil
+                project.selectedImageClipID      = nil
+                project.selectedAudioClipID      = nil
+                project.selectedSubtitleClipID   = nil
+                project.selectedTransitionClipID = nil
                 project.selectedClipIDs.removeAll()
                 return nil
             }
@@ -467,6 +468,8 @@ struct TimelineView: View {
                         guard dragOp == nil else { return }
                         if trackGapHit(y: loc.y) != nil {
                             NSCursor.resizeUpDown.set()
+                        } else if hitTestTransitionIcon(at: loc) != nil {
+                            NSCursor.pointingHand.set()
                         } else if let edge = findClipTarget(at: loc)?.trimEdge {
                             (edge == .left ? Self.trimLeftCursor : Self.trimRightCursor).set()
                         } else {
@@ -551,10 +554,21 @@ struct TimelineView: View {
                 applyDrag(op: op, totalTranslation: v.translation, current: v.location)
             }
             .onEnded { v in
-                // 点击（没有拖动）→ 选中clip或取消选择
+                // 点击（没有拖动）→ 优先检测转场图标，然后选中clip或取消选择
                 if dragOp == nil && v.startLocation.y >= rulerH {
+                    // 转场图标优先（图标在片段内部，不在边缘）
+                    if let transClipID = hitTestTransitionIcon(at: v.startLocation) {
+                        project.selectedTransitionClipID = transClipID
+                        project.mediaLibraryTab = "transition"
+                        project.selectedVideoClipID    = nil
+                        project.selectedImageClipID    = nil
+                        project.selectedAudioClipID    = nil
+                        project.selectedSubtitleClipID = nil
+                        project.selectedClipIDs.removeAll()
+                    }
                     let isShift = NSEvent.modifierFlags.contains(.shift)
-                    if let (hit, _) = findClipTarget(at: v.startLocation) {
+                    let hitTransition = hitTestTransitionIcon(at: v.startLocation) != nil
+                    if !hitTransition, let (hit, _) = findClipTarget(at: v.startLocation) {
                         if isShift {
                             switch hit {
                             case .video(let id, _, _), .image(let id, _, _),
@@ -563,6 +577,7 @@ struct TimelineView: View {
                             }
                         } else {
                             project.selectedClipIDs.removeAll()
+                            project.selectedTransitionClipID = nil
                             switch hit {
                             case .video(let id, _, _):
                                 project.selectedVideoClipID = id
@@ -586,12 +601,14 @@ struct TimelineView: View {
                                 project.selectedAudioClipID = nil
                             }
                         }
-                    } else {
+                    } else if !hitTransition {
+                        // 点击空白区域：取消选择 + seek
                         project.selectedClipIDs.removeAll()
-                        project.selectedVideoClipID    = nil
-                        project.selectedImageClipID    = nil
-                        project.selectedAudioClipID    = nil
-                        project.selectedSubtitleClipID = nil
+                        project.selectedVideoClipID      = nil
+                        project.selectedImageClipID      = nil
+                        project.selectedAudioClipID      = nil
+                        project.selectedSubtitleClipID   = nil
+                        project.selectedTransitionClipID = nil
                         let t = max(0, Double(v.startLocation.x) / project.pixelsPerSecond)
                         project.requestSeek(to: t)
                     }
@@ -676,6 +693,20 @@ struct TimelineView: View {
         let playheadX = clock.currentTime * project.pixelsPerSecond
         // Dragging anywhere on the playhead stem (±10 px) moves the playhead.
         if abs(pt.x - playheadX) < 10 { dragOp = .movingPlayhead; return }
+
+        // 检测转场菱形图标点击（±10px 范围）
+        if let transClipID = hitTestTransitionIcon(at: pt) {
+            project.selectedTransitionClipID = transClipID
+            project.mediaLibraryTab = "transition"
+            // 清除片段选中
+            project.selectedVideoClipID = nil
+            project.selectedImageClipID = nil
+            project.selectedAudioClipID = nil
+            project.selectedSubtitleClipID = nil
+            project.selectedClipIDs.removeAll()
+            dragOp = .ignored
+            return
+        }
 
         if let (hit, trimEdge) = findClipTarget(at: pt) {
             // Multi-drag only for interior (move) grabs on already-selected group.
@@ -1044,6 +1075,45 @@ struct TimelineView: View {
 
     /// Returns the clip at `pt` plus which trim edge was hit (nil = interior / move).
     /// The edge hit zone is 8 px; clips narrower than 20 px are always treated as interior.
+    /// 检测点击是否命中转场菱形图标，返回对应 clip 的 ID
+    private func hitTestTransitionIcon(at pt: CGPoint) -> UUID? {
+        guard pt.y >= rulerH, project.showVideoTracks else { return nil }
+        let pps = project.pixelsPerSecond
+        var rowTop: CGFloat = rulerH
+        var first = true
+        // 跳过图片轨道
+        if project.showImageTracks {
+            for i in project.imageTracks.indices {
+                if !first { rowTop += 1 }; first = false
+                rowTop += imgH(i)
+            }
+        }
+        // 视频轨道
+        for ti in project.videoTracks.indices {
+            if !first { rowTop += 1 }; first = false
+            let h = vidH(ti)
+            if pt.y >= rowTop && pt.y < rowTop + h {
+                let sorted = project.videoTracks[ti].clips.sorted { $0.startTime < $1.startTime }
+                guard sorted.count >= 2 else { return nil }
+                for idx in 1..<sorted.count {
+                    let prev = sorted[idx - 1]
+                    let clip = sorted[idx]
+                    if abs(prev.endTime - clip.startTime) < 0.05 {
+                        // 图标在切割点顶部：x 对齐 cutX，y 在轨道顶部附近（rowTop + 14）
+                        let cutX = clip.startTime * pps
+                        let iconCenterY = rowTop + 16
+                        if abs(pt.x - cutX) < 18 && abs(pt.y - iconCenterY) < 18 {
+                            return clip.id
+                        }
+                    }
+                }
+                return nil
+            }
+            rowTop += h
+        }
+        return nil
+    }
+
     private func findClipTarget(at pt: CGPoint) -> (hit: ClipHit, trimEdge: ClipTrimEdge?)? {
         guard pt.y >= rulerH else { return nil }
         let pps = project.pixelsPerSecond
@@ -1298,6 +1368,8 @@ struct TimelineView: View {
                                       isDragging: draggingClipID == clip.id,
                                       scrollOffsetX: scrollOffsetX)
                     }
+                    // 转场图标：相邻视频片段之间
+                    transitionIcons(trackIndex: i, trackHeight: vidH(i))
                 }
             }
         }
@@ -1449,6 +1521,54 @@ struct TimelineView: View {
         return TrackTarget()
     }
 
+    /// 在视频轨道中渲染转场菱形图标（相邻 clip 之间）
+    @ViewBuilder
+    private func transitionIcons(trackIndex: Int, trackHeight: CGFloat) -> some View {
+        let pairs = adjacentPairs(in: project.videoTracks[trackIndex])
+        ForEach(pairs, id: \.clipID) { pair in
+            TransitionDiamond(hasTransition: pair.hasTransition, isSelected: project.selectedTransitionClipID == pair.clipID)
+                .offset(x: pair.cutX - 16, y: 0)
+                .zIndex(5)
+                .allowsHitTesting(true)
+                .onTapGesture {
+                    project.selectedTransitionClipID = pair.clipID
+                    project.mediaLibraryTab = "transition"
+                    project.selectedVideoClipID    = nil
+                    project.selectedImageClipID    = nil
+                    project.selectedAudioClipID    = nil
+                    project.selectedSubtitleClipID = nil
+                    project.selectedClipIDs.removeAll()
+                }
+                .contextMenu {
+                    Button(role: .destructive) {
+                        project.pushUndo()
+                        project.updateVideoClip(id: pair.clipID) { $0.inTransition = nil }
+                        if project.selectedTransitionClipID == pair.clipID {
+                            project.selectedTransitionClipID = nil
+                        }
+                        project.rebuildTimelinePreviewDebounced()
+                    } label: {
+                        Label("删除转场", systemImage: "trash")
+                    }
+                }
+        }
+    }
+
+    /// 计算一个视频轨道中所有相邻切割点信息
+    private func adjacentPairs(in track: Track<VideoClip>) -> [(clipID: UUID, cutX: CGFloat, hasTransition: Bool)] {
+        let sorted = track.clips.sorted { $0.startTime < $1.startTime }
+        var result: [(clipID: UUID, cutX: CGFloat, hasTransition: Bool)] = []
+        guard sorted.count >= 2 else { return result }
+        let pps = project.pixelsPerSecond
+        for i in 1..<sorted.count {
+            if abs(sorted[i-1].endTime - sorted[i].startTime) < 0.05 {
+                let cutX = CGFloat(sorted[i].startTime * pps)
+                result.append((sorted[i].id, cutX, sorted[i].inTransition != nil))
+            }
+        }
+        return result
+    }
+
     @ViewBuilder
     private func trackRow<C: View>(height: CGFloat, hidden: Bool = false, muted: Bool = false, tint: Color = .white, @ViewBuilder clips: () -> C) -> some View {
         ZStack(alignment: .leading) {
@@ -1457,6 +1577,29 @@ struct TimelineView: View {
         }
         .frame(height: height)
         .opacity(hidden ? 0.32 : (muted ? 0.4 : 1.0))
+    }
+}
+
+// MARK: - Transition Diamond Icon
+
+private struct TransitionDiamond: View {
+    let hasTransition: Bool
+    let isSelected: Bool
+
+    var body: some View {
+        ZStack {
+            // 菱形填充
+            Image(systemName: "diamond.fill")
+                .font(.system(size: 16, weight: .medium))
+                .foregroundColor(hasTransition
+                    ? (isSelected ? Color.accent : Color(hex: "#3DBFBA"))
+                    : Color.white.opacity(0.7))
+            // 描边，让菱形在任何背景上都清晰
+            Image(systemName: "diamond")
+                .font(.system(size: 16, weight: .semibold))
+                .foregroundColor(isSelected ? .white : Color.black.opacity(0.4))
+        }
+        .frame(width: 32, height: 32)
     }
 }
 

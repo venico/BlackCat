@@ -13,7 +13,9 @@ struct InspectorView: View {
         VStack(spacing: 0) {
             header
             ScrollView(showsIndicators: false) {
-                if let clip = project.selectedSubtitleClip {
+                if let transID = project.selectedTransitionClipID {
+                    TransitionInspector(clipID: transID)
+                } else if let clip = project.selectedSubtitleClip {
                     SubtitleInspector(clip: clip).id(clip.id)
                 } else if let clip = project.selectedImageClip {
                     ImageInspector(clip: clip).id(clip.id)
@@ -72,10 +74,11 @@ struct InspectorView: View {
     }
 
     private var tag: String {
-        if project.selectedSubtitleClipID != nil { return "字幕片段" }
-        if project.selectedImageClipID    != nil { return "图片片段" }
-        if project.selectedVideoClipID    != nil { return "视频片段" }
-        if project.selectedAudioClipID    != nil { return "音频片段" }
+        if project.selectedTransitionClipID != nil { return "转场" }
+        if project.selectedSubtitleClipID   != nil { return "字幕片段" }
+        if project.selectedImageClipID      != nil { return "图片片段" }
+        if project.selectedVideoClipID      != nil { return "视频片段" }
+        if project.selectedAudioClipID      != nil { return "音频片段" }
         // 默认片段的标签
         if let clip = defaultClip {
             switch clip {
@@ -838,6 +841,59 @@ private struct VideoInspector: View {
                 await MainActor.run { audioTrackLabels = labels }
             }
         }
+    }
+}
+
+// MARK: - Transition Inspector
+
+private struct TransitionInspector: View {
+    @EnvironmentObject private var project: ProjectState
+    let clipID: UUID
+
+    private var transition: Transition? {
+        project.videoTracks.flatMap(\.clips).first(where: { $0.id == clipID })?.inTransition
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            if let t = transition {
+                ISection(title: "转场效果") {
+                    HStack(spacing: 6) {
+                        Image(systemName: "diamond.fill")
+                            .font(.system(size: 10))
+                            .foregroundColor(Color.accent)
+                        Text(t.type.label)
+                            .font(.system(size: 12, weight: .medium))
+                            .foregroundColor(Color.labelPrimary)
+                    }
+                }
+                ISection(title: "时长") {
+                    ICapsuleSlider(
+                        label: "时长",
+                        value: Binding(
+                            get: { t.duration },
+                            set: { v in
+                                project.pushUndoThrottled()
+                                project.updateVideoClip(id: clipID) {
+                                    $0.inTransition?.duration = max(0.1, min(v, 2.0))
+                                }
+                                project.rebuildTimelinePreviewDebounced()
+                            }
+                        ),
+                        range: 0.1...2.0,
+                        decimals: 1,
+                        unit: "秒"
+                    )
+                }
+            } else {
+                ISection(title: "转场效果") {
+                    Text("未设置转场")
+                        .font(.system(size: 11))
+                        .foregroundColor(Color.labelSecondary)
+                }
+            }
+        }
+        .padding(.top, 4)
     }
 }
 

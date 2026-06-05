@@ -113,6 +113,66 @@ struct SubtitleClip: Identifiable, Equatable, Codable {
     var duration: Double { endTime - startTime }
 }
 
+// MARK: - Transition
+
+enum TransitionType: String, Codable, CaseIterable {
+    case dissolve       // 淡入淡出
+    case fadeToBlack    // 渐黑
+    case pushLeft       // 从右推入
+    case pushRight      // 从左推入
+    case pushUp         // 从下推入
+    case pushDown       // 从上推入
+
+    var label: String {
+        switch self {
+        case .dissolve:    return "淡入淡出"
+        case .fadeToBlack: return "渐黑"
+        case .pushLeft:    return "推入(左)"
+        case .pushRight:   return "推入(右)"
+        case .pushUp:      return "推入(上)"
+        case .pushDown:    return "推入(下)"
+        }
+    }
+
+    var icon: String {
+        switch self {
+        case .dissolve:    return "circle.lefthalf.filled"
+        case .fadeToBlack: return "circle.filled.ipad.landscape"
+        case .pushLeft:    return "arrow.left.square"
+        case .pushRight:   return "arrow.right.square"
+        case .pushUp:      return "arrow.up.square"
+        case .pushDown:    return "arrow.down.square"
+        }
+    }
+}
+
+struct Transition: Identifiable, Equatable, Codable {
+    var id = UUID()
+    var type: TransitionType = .dissolve
+    var duration: Double = 0.5  // 秒，以切割点为中心
+}
+
+/// 编译后的转场参数，供 VideoComposition instruction 构建使用
+struct TransitionCompInfo {
+    let trackA: AVMutableCompositionTrack   // 前一个 clip 的 track
+    let trackB: AVMutableCompositionTrack   // 后一个 clip 的 track
+    let clipA: VideoClip
+    let clipB: VideoClip
+    let type: TransitionType
+    /// 效果区间开始（= cutT - half）
+    let overlapStart: CMTime
+    /// 效果区间结束（dissolve/push = cutT + half；fadeToBlack = cutT + half 但 A/B 各占一半）
+    let overlapEnd: CMTime
+    /// 原始切割点（fadeToBlack 用来分隔 A 淡出段 / B 淡入段）
+    let cutT: CMTime
+    let half: Double         // 单边时长（秒）
+    let renderSize: CGSize
+    let natSizeA: CGSize
+    let natSizeB: CGSize
+}
+
+// MARK: - Video Clip
+
 struct VideoClip: Identifiable, Equatable, Codable {
     var id = UUID()
     var assetID: UUID
@@ -142,6 +202,8 @@ struct VideoClip: Identifiable, Equatable, Codable {
     // 源视频原始尺寸（用于预览裁剪框计算）
     var videoWidth: Double  = 0
     var videoHeight: Double = 0
+    // 转场：从前一个 clip 到本 clip 的转场效果（nil = 无转场）
+    var inTransition: Transition? = nil
 }
 
 struct AudioClip: Identifiable, Equatable, Codable {
@@ -392,6 +454,9 @@ final class ProjectState: ObservableObject {
     @Published var selectedAudioClipID: UUID?    = nil
     @Published var selectedImageClipID: UUID?    = nil
     @Published var selectedSubtitleClipID: UUID? = nil
+    // Transition selection
+    @Published var selectedTransitionClipID: UUID? = nil  // 当前选中的转场（clip ID，其 inTransition 被编辑）
+    @Published var mediaLibraryTab: String = "video"      // 素材库当前标签（提升到 ProjectState，转场图标点击可切换）
     // Multi-selection (used by box-select & bulk delete)
     @Published var selectedClipIDs: Set<UUID>    = []
 
@@ -1441,7 +1506,7 @@ final class ProjectState: ObservableObject {
 
         // 指纹检测：跳过无变化的重复 rebuild（seekTo 除外）
         var hasher = Hasher()
-        hasher.combine(vTracks.flatMap(\.clips).map { "\($0.id)\($0.startTime)\($0.endTime)\($0.trimStart)\($0.volume)\($0.scaleX)\($0.scaleY)\($0.offsetX)\($0.offsetY)\($0.cropTop)\($0.cropBottom)\($0.cropLeft)\($0.cropRight)\($0.audioTrackIndex)" }.joined())
+        hasher.combine(vTracks.flatMap(\.clips).map { "\($0.id)\($0.startTime)\($0.endTime)\($0.trimStart)\($0.volume)\($0.scaleX)\($0.scaleY)\($0.offsetX)\($0.offsetY)\($0.cropTop)\($0.cropBottom)\($0.cropLeft)\($0.cropRight)\($0.audioTrackIndex)\($0.inTransition?.type.rawValue ?? "")\($0.inTransition?.duration ?? 0)" }.joined())
         hasher.combine(iTracks.flatMap(\.clips).map { "\($0.id)\($0.startTime)\($0.endTime)\($0.scaleX)\($0.scaleY)\($0.offsetX)\($0.offsetY)\($0.cropTop)\($0.cropBottom)\($0.cropLeft)\($0.cropRight)" }.joined())
         hasher.combine(aTracks.flatMap(\.clips).map { "\($0.id)\($0.startTime)\($0.endTime)\($0.trimStart)\($0.volume)\($0.leftChannel)\($0.rightChannel)\($0.fadeInEnabled)\($0.fadeInDuration)\($0.fadeOutEnabled)\($0.fadeOutDuration)" }.joined())
         hasher.combine(vTracks.map { "\($0.isVisible)\($0.isMuted)" }.joined())
@@ -1458,25 +1523,73 @@ final class ProjectState: ObservableObject {
             var imageCompTracks: [(track: AVMutableCompositionTrack, clip: ImageClip)] = []  // from image clips (on top)
             let renderSize = previewRenderSize
 
-            // 视频轨道
+            // 视频轨道 — 第一遍：预加载 assetDur，计算平均分配的 half
+            // aExtend = A 延伸量（借 A 的 asset 尾部），bAdvance = B 提前量（借 B 的 trimStart 前内容）
+            struct TransAdj { let clipAID: UUID; let clipBID: UUID; let half: Double; let type: TransitionType }
+            var transAdjusts: [TransAdj] = []
+            var clipAssetDurSec: [UUID: Double] = [:]
             for track in vTracks {
-                for clip in track.clips.sorted(by: { $0.startTime < $1.startTime }) {
+                let sortedClips = track.clips.sorted { $0.startTime < $1.startTime }
+                for clip in sortedClips {
+                    guard let url = clip.url else { continue }
+                    let dur = (try? await self.cachedAVAsset(url: url).load(.duration))?.seconds ?? 0
+                    clipAssetDurSec[clip.id] = dur
+                }
+                guard sortedClips.count >= 2 else { continue }
+                for i in 1..<sortedClips.count {
+                    let cA = sortedClips[i - 1], cB = sortedClips[i]
+                    guard let trans = cB.inTransition,
+                          abs(cA.endTime - cB.startTime) < 0.05 else { continue }
+                    let wantedHalf = trans.duration / 2
+                    let half: Double
+                    if trans.type == .fadeToBlack {
+                        // fadeToBlack 无 overlap，half 直接用 wantedHalf（各自消耗自己的内容）
+                        half = wantedHalf
+                    } else {
+                        // 平均分配：A 延伸 half（受 asset 尾部余量限制），B 提前 half（受 trimStart 限制）
+                        let availA = max(0, (clipAssetDurSec[cA.id] ?? 0) - (cA.trimStart + cA.duration))
+                        let availB = cB.trimStart
+                        half = max(0, min(wantedHalf, min(availA, availB)))
+                    }
+                    if half > 0.005 {
+                        transAdjusts.append(TransAdj(clipAID: cA.id, clipBID: cB.id, half: half, type: trans.type))
+                    }
+                }
+            }
+
+            // 视频轨道 — 第二遍：按 transAdjusts 插入（A 延伸 + B 提前）
+            for track in vTracks {
+                let sortedClips = track.clips.sorted(by: { $0.startTime < $1.startTime })
+                for clip in sortedClips {
                     guard let url = clip.url else { continue }
                     let asset = self.cachedAVAsset(url: url)
-                    let assetDur = (try? await asset.load(.duration)) ?? .zero
+                    let assetDurSec = clipAssetDurSec[clip.id] ?? 0
+                    let assetDur = CMTime(seconds: assetDurSec, preferredTimescale: 600)
                     let trimSt  = CMTime(seconds: clip.trimStart, preferredTimescale: 600)
                     let maxDur  = assetDur - trimSt
                     let useDur  = CMTimeMinimum(CMTime(seconds: clip.duration, preferredTimescale: 600), maxDur)
                     guard useDur.seconds > 0.01 else { continue }
-                    let range = CMTimeRange(start: trimSt, duration: useDur)
-                    let at    = CMTime(seconds: clip.startTime, preferredTimescale: 600)
+
+                    // 查询该 clip 作为 A 需要延伸多少，作为 B 需要提前多少
+                    let aExtend  = transAdjusts.first(where: { $0.clipAID == clip.id && $0.type != .fadeToBlack })?.half ?? 0
+                    let bAdvance = transAdjusts.first(where: { $0.clipBID == clip.id && $0.type != .fadeToBlack })?.half ?? 0
+
+                    let actualTrimSt = CMTime(seconds: clip.trimStart - bAdvance, preferredTimescale: 600)
+                    let actualDur    = useDur + CMTime(seconds: bAdvance + aExtend, preferredTimescale: 600)
+                    let actualRange  = CMTimeRange(start: actualTrimSt, duration: actualDur)
+                    let at           = CMTime(seconds: clip.startTime - bAdvance, preferredTimescale: 600)
+                    // 音频不做 overlap，保持原始时间范围
+                    let audioRange   = CMTimeRange(start: trimSt, duration: useDur)
+                    let audioAt      = CMTime(seconds: clip.startTime, preferredTimescale: 600)
 
                     if track.isVisible,
                        let vAsset = try? await asset.loadTracks(withMediaType: .video).first,
                        let vt = composition.addMutableTrack(withMediaType: .video,
                                                             preferredTrackID: kCMPersistentTrackID_Invalid) {
-                        try? vt.insertTimeRange(range, of: vAsset, at: at)
-                        videoCompTracks.append((vt, clip, clip.startTime, clip.startTime + useDur.seconds))
+                        try? vt.insertTimeRange(actualRange, of: vAsset, at: at)
+                        videoCompTracks.append((vt, clip,
+                                                clip.startTime - bAdvance,         // 实际开始（B 提前）
+                                                clip.startTime + useDur.seconds + aExtend)) // 实际结束（A 延伸）
                     }
                     if !track.isMuted {
                         let allAudioTracks = (try? await asset.loadTracks(withMediaType: .audio)) ?? []
@@ -1484,11 +1597,32 @@ final class ProjectState: ObservableObject {
                         if let aAsset = allAudioTracks.isEmpty ? nil : allAudioTracks[idx] as AVAssetTrack?,
                            let at2 = composition.addMutableTrack(withMediaType: .audio,
                                                                   preferredTrackID: kCMPersistentTrackID_Invalid) {
-                            try? at2.insertTimeRange(range, of: aAsset, at: at)
+                            try? at2.insertTimeRange(audioRange, of: aAsset, at: audioAt)
                             audioParams.append((at2.trackID, clip.volume, 1.0, 1.0, clip.startTime, useDur.seconds, 0, 0))
                         }
                     }
                 }
+            }
+
+            // 收集转场信息
+            var transitionInfos: [TransitionCompInfo] = []
+            for adj in transAdjusts {
+                guard let entryA = videoCompTracks.first(where: { $0.clip.id == adj.clipAID }),
+                      let entryB = videoCompTracks.first(where: { $0.clip.id == adj.clipBID }) else { continue }
+                let ts: CMTimeScale = 600
+                let cutT         = CMTime(seconds: entryB.clip.startTime, preferredTimescale: ts)
+                let overlapStart = CMTime(seconds: entryB.clip.startTime - adj.half, preferredTimescale: ts)
+                let overlapEnd   = CMTime(seconds: entryB.clip.startTime + adj.half, preferredTimescale: ts)
+                let natSizeA = (try? await entryA.track.load(.naturalSize)) ?? .zero
+                let natSizeB = (try? await entryB.track.load(.naturalSize)) ?? .zero
+                transitionInfos.append(TransitionCompInfo(
+                    trackA: entryA.track, trackB: entryB.track,
+                    clipA: entryA.clip, clipB: entryB.clip,
+                    type: adj.type,
+                    overlapStart: overlapStart, overlapEnd: overlapEnd, cutT: cutT,
+                    half: adj.half, renderSize: renderSize,
+                    natSizeA: natSizeA, natSizeB: natSizeB
+                ))
             }
 
             // 图片轨道（上层）
@@ -1639,6 +1773,9 @@ final class ProjectState: ObservableObject {
                 let vc = AVMutableVideoComposition()
                 vc.renderSize = renderSize
                 vc.frameDuration = CMTime(value: 1, timescale: 30)
+                // 多 track 时必须指定 Invalid，否则 AVFoundation 从某个 active track 取帧时序
+                // 转场区间 A/B 切换会导致帧时序混乱，播放抖动
+                vc.sourceTrackIDForFrameTiming = kCMPersistentTrackID_Invalid
 
                 // Collect image clip time ranges — 使用 CMTime 量化后的值避免精度偏差
                 let ts: CMTimeScale = 600
@@ -1659,6 +1796,12 @@ final class ProjectState: ObservableObject {
                 var cmBoundaries: [CMTime] = [.zero, composition.duration]
                 for r in imageClipCMRanges { cmBoundaries.append(r.start); cmBoundaries.append(r.end) }
                 for r in videoClipCMRanges { cmBoundaries.append(r.start); cmBoundaries.append(r.end) }
+                // 所有转场的 overlapStart / overlapEnd 加入 boundaries
+                for ti in transitionInfos {
+                    cmBoundaries.append(ti.overlapStart)
+                    cmBoundaries.append(ti.overlapEnd)
+                    if ti.type == .fadeToBlack { cmBoundaries.append(ti.cutT) }
+                }
                 // 去重 + 排序
                 let sortedCM = Array(Set(cmBoundaries.map { $0.value })).sorted().map { CMTime(value: $0, timescale: ts) }
 
@@ -1701,13 +1844,20 @@ final class ProjectState: ObservableObject {
                         let clipEnd   = videoClipCMRanges[idx].end
                         let active = segStartCM >= clipStart && segStartCM < clipEnd
                         if active {
-                            if let natSize = try? await entry.track.load(.naturalSize), natSize.width > 0, natSize.height > 0 {
+                            let natSize = (try? await entry.track.load(.naturalSize)) ?? .zero
+                            if natSize.width > 0, natSize.height > 0 {
                                 let t = Self.videoTransform(clip: entry.clip, natSize: natSize, renderSize: renderSize)
                                 li.setTransform(t, at: .zero)
                                 let c = entry.clip
                                 if c.cropTop > 0.001 || c.cropBottom > 0.001 || c.cropLeft > 0.001 || c.cropRight > 0.001 {
                                     li.setCropRectangle(Self.videoCropRect(clip: c, natSize: natSize), at: .zero)
                                 }
+                                // 检查是否在 transition 效果区间内
+                                Self.applyTransitionRamp(
+                                    li: li, track: entry.track, clip: entry.clip,
+                                    transform: t, natSize: natSize, renderSize: renderSize,
+                                    segStart: segStartCM, transitions: transitionInfos
+                                )
                             }
                         } else {
                             li.setOpacity(0, at: .zero)
@@ -1795,6 +1945,77 @@ final class ProjectState: ObservableObject {
         let w = natSize.width  * (1 - CGFloat(clip.cropLeft + clip.cropRight))
         let h = natSize.height * (1 - CGFloat(clip.cropTop  + clip.cropBottom))
         return CGRect(x: x, y: y, width: max(w, 1), height: max(h, 1))
+    }
+
+    // MARK: - Transition ramp helper
+
+    /// 为处于转场效果区间内的 layerInstruction 设置 opacity/transform ramp。
+    /// 必须在 setTransform 之后调用（ramp 会覆盖静态 transform）。
+    static func applyTransitionRamp(
+        li: AVMutableVideoCompositionLayerInstruction,
+        track: AVMutableCompositionTrack,
+        clip: VideoClip,
+        transform t: CGAffineTransform,
+        natSize: CGSize,
+        renderSize: CGSize,
+        segStart: CMTime,
+        transitions: [TransitionCompInfo]
+    ) {
+        let ts: CMTimeScale = 600
+        for trans in transitions {
+            let isA = track === trans.trackA
+            let isB = track === trans.trackB
+            guard isA || isB else { continue }
+
+            // 确定该 track 在此时间段的效果区间
+            // dissolve/push：A 和 B 都在 [overlapStart, overlapEnd]（平均分配，同时重叠）
+            // fadeToBlack：A 在 [overlapStart, cutT]，B 在 [cutT, overlapEnd]
+            let segStart_forA: CMTime
+            let segEnd_forA:   CMTime
+            let segStart_forB: CMTime
+            let segEnd_forB:   CMTime
+            if trans.type == .fadeToBlack {
+                segStart_forA = trans.overlapStart;  segEnd_forA = trans.cutT
+                segStart_forB = trans.cutT;          segEnd_forB = trans.overlapEnd
+            } else {
+                segStart_forA = trans.overlapStart;  segEnd_forA = trans.overlapEnd
+                segStart_forB = trans.overlapStart;  segEnd_forB = trans.overlapEnd
+            }
+
+            let effectStart = isA ? segStart_forA : segStart_forB
+            let effectEnd   = isA ? segEnd_forA   : segEnd_forB
+            guard segStart >= effectStart && segStart < effectEnd else { continue }
+
+            let fadeRange = CMTimeRange(start: effectStart, duration: effectEnd - effectStart)
+            let fromOpacity: Float = isA ? 1 : 0
+            let toOpacity:   Float = isA ? 0 : 1
+
+            // Push 偏移：A 推出（→ pushDX），B 从反方向推入（← pushDX）
+            let pushDX: CGFloat
+            let pushDY: CGFloat
+            switch trans.type {
+            case .pushLeft:  pushDX = -renderSize.width;  pushDY = 0
+            case .pushRight: pushDX =  renderSize.width;  pushDY = 0
+            case .pushUp:    pushDX = 0; pushDY =  renderSize.height
+            case .pushDown:  pushDX = 0; pushDY = -renderSize.height
+            default:         pushDX = 0; pushDY = 0
+            }
+
+            switch trans.type {
+            case .dissolve, .fadeToBlack:
+                li.setOpacityRamp(fromStartOpacity: fromOpacity, toEndOpacity: toOpacity,
+                                  timeRange: fadeRange)
+            case .pushLeft, .pushRight, .pushUp, .pushDown:
+                // concatenating 在 renderSize 输出坐标系追加偏移，不受 natSize→renderSize 的 scale 影响
+                // translatedBy 是在 natSize 输入坐标系偏移，4K 视频 scale=0.5 会导致偏移量减半
+                let offsetFwd = CGAffineTransform(translationX:  pushDX, y:  pushDY)
+                let offsetRev = CGAffineTransform(translationX: -pushDX, y: -pushDY)
+                let fromT = isA ? t : t.concatenating(offsetRev)
+                let toT   = isA ? t.concatenating(offsetFwd) : t
+                li.setTransformRamp(fromStart: fromT, toEnd: toT, timeRange: fadeRange)
+            }
+            break
+        }
     }
 
     /// Select a clip for preview and seek to its start so the user sees it.

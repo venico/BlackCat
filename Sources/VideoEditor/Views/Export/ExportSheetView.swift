@@ -590,46 +590,112 @@ actor TimelineExporter {
         let includeAudio = true  // video 和 audioOnly 都需要音频
 
         var videoCompTracks: [(track: AVMutableCompositionTrack, clip: VideoClip, startTime: Double, endTime: Double)] = []
-        // ── 视频轨道 ──
+
+        // ── 视频轨道 — 第一遍：预加载 assetDur，计算平均分配 half ──
+        struct ExportTransAdj { let clipAID: UUID; let clipBID: UUID; let half: Double; let type: TransitionType }
+        var exportTransAdjusts: [ExportTransAdj] = []
+        var exportClipAssetDurSec: [UUID: Double] = [:]
+        var firstVideoClipID: UUID? = nil
         for track in input.videoTracks {
-            for (idx, clip) in track.clips.sorted(by: { $0.startTime < $1.startTime }).enumerated() {
+            let sortedClips = track.clips.sorted { $0.startTime < $1.startTime }
+            for clip in sortedClips {
+                guard let url = clip.url else { continue }
+                let dur = (try? await AVURLAsset(url: url).load(.duration))?.seconds ?? 0
+                exportClipAssetDurSec[clip.id] = dur
+                if firstVideoClipID == nil && track.isVisible { firstVideoClipID = clip.id }
+            }
+            guard sortedClips.count >= 2 else { continue }
+            for i in 1..<sortedClips.count {
+                let cA = sortedClips[i-1], cB = sortedClips[i]
+                guard let trans = cB.inTransition, abs(cA.endTime - cB.startTime) < 0.05 else { continue }
+                let wantedHalf = trans.duration / 2
+                let half: Double
+                if trans.type == .fadeToBlack {
+                    half = wantedHalf
+                } else {
+                    let availA = max(0, (exportClipAssetDurSec[cA.id] ?? 0) - (cA.trimStart + cA.duration))
+                    let availB = cB.trimStart
+                    half = max(0, min(wantedHalf, min(availA, availB)))
+                }
+                if half > 0.005 {
+                    exportTransAdjusts.append(ExportTransAdj(clipAID: cA.id, clipBID: cB.id, half: half, type: trans.type))
+                }
+            }
+        }
+
+        // ── 视频轨道 — 第二遍：按 transAdjusts 插入（A 延伸 + B 提前）──
+        for track in input.videoTracks {
+            let sortedClips = track.clips.sorted(by: { $0.startTime < $1.startTime })
+            for (clipIdx, clip) in sortedClips.enumerated() {
                 guard let url = clip.url else { continue }
                 let asset = AVURLAsset(url: url)
-                let assetDur = try await asset.load(.duration)
+                let assetDurSec = exportClipAssetDurSec[clip.id] ?? 0
+                let assetDur = CMTime(seconds: assetDurSec, preferredTimescale: 600)
                 let trimSt = CMTime(seconds: clip.trimStart, preferredTimescale: 600)
                 let maxDur = assetDur - trimSt
                 let useDur = CMTimeMinimum(CMTime(seconds: clip.duration, preferredTimescale: 600), maxDur)
-                let range  = CMTimeRange(start: trimSt, duration: useDur)
-                let at     = CMTime(seconds: clip.startTime, preferredTimescale: 600)
+                guard useDur.seconds > 0.01 else { continue }
 
-                // 视频画面（可见 + video模式才加）
+                let aExtend  = exportTransAdjusts.first(where: { $0.clipAID == clip.id && $0.type != .fadeToBlack })?.half ?? 0
+                let bAdvance = exportTransAdjusts.first(where: { $0.clipBID == clip.id && $0.type != .fadeToBlack })?.half ?? 0
+
+                let actualTrimSt = CMTime(seconds: clip.trimStart - bAdvance, preferredTimescale: 600)
+                let actualDur    = useDur + CMTime(seconds: bAdvance + aExtend, preferredTimescale: 600)
+                let actualRange  = CMTimeRange(start: actualTrimSt, duration: actualDur)
+                let at           = CMTime(seconds: clip.startTime - bAdvance, preferredTimescale: 600)
+                let audioRange   = CMTimeRange(start: trimSt, duration: useDur)
+                let audioAt      = CMTime(seconds: clip.startTime, preferredTimescale: 600)
+
                 if includeVideo && track.isVisible,
                    let vAsset = try? await asset.loadTracks(withMediaType: .video).first {
                     let vt = composition.addMutableTrack(withMediaType: .video,
                                                          preferredTrackID: kCMPersistentTrackID_Invalid)
-                    try vt?.insertTimeRange(range, of: vAsset, at: at)
+                    try vt?.insertTimeRange(actualRange, of: vAsset, at: at)
                     if let vt {
-                        videoCompTracks.append((track: vt, clip: clip, startTime: clip.startTime, endTime: clip.endTime))
+                        videoCompTracks.append((track: vt, clip: clip,
+                                                startTime: clip.startTime - bAdvance,
+                                                endTime: clip.endTime + aExtend))
                     }
-                    if idx == 0 {
+                    if clip.id == firstVideoClipID {
                         sourceVideoSize = try await vAsset.load(.naturalSize)
                         let mfd = try await vAsset.load(.minFrameDuration)
                         if mfd.isValid && mfd.seconds > 0 { sourceFrameDuration = mfd }
                     }
                 }
-                // 音频（未静音才加，支持多音轨选择）
                 if includeAudio && !track.isMuted {
                     let allAudioTracks = (try? await asset.loadTracks(withMediaType: .audio)) ?? []
-                    let idx = min(clip.audioTrackIndex, max(allAudioTracks.count - 1, 0))
-                    if let aAsset = allAudioTracks.isEmpty ? nil : allAudioTracks[idx] {
+                    let aIdx = min(clip.audioTrackIndex, max(allAudioTracks.count - 1, 0))
+                    if let aAsset = allAudioTracks.isEmpty ? nil : allAudioTracks[aIdx] {
                         let at2 = composition.addMutableTrack(withMediaType: .audio,
                                                               preferredTrackID: kCMPersistentTrackID_Invalid)
-                        if let at2 { try at2.insertTimeRange(range, of: aAsset, at: at) }
+                        if let at2 { try at2.insertTimeRange(audioRange, of: aAsset, at: audioAt) }
                         if let tid = at2?.trackID {
                             audioMixParams.append((tid, clip.volume, 1.0, 1.0, clip.startTime, useDur.seconds, 0, 0))
                         }
                     }
                 }
+            }
+        }
+
+        // ── 收集转场信息 ──
+        var transitionInfos: [TransitionCompInfo] = []
+        if includeVideo {
+            for adj in exportTransAdjusts {
+                guard let entryA = videoCompTracks.first(where: { $0.clip.id == adj.clipAID }),
+                      let entryB = videoCompTracks.first(where: { $0.clip.id == adj.clipBID }) else { continue }
+                let ts: CMTimeScale = 600
+                let cutT         = CMTime(seconds: entryB.clip.startTime, preferredTimescale: ts)
+                let overlapStart = CMTime(seconds: entryB.clip.startTime - adj.half, preferredTimescale: ts)
+                let overlapEnd   = CMTime(seconds: entryB.clip.startTime + adj.half, preferredTimescale: ts)
+                let natSizeA = (try? await entryA.track.load(.naturalSize)) ?? .zero
+                let natSizeB = (try? await entryB.track.load(.naturalSize)) ?? .zero
+                transitionInfos.append(TransitionCompInfo(
+                    trackA: entryA.track, trackB: entryB.track,
+                    clipA: entryA.clip, clipB: entryB.clip, type: adj.type,
+                    overlapStart: overlapStart, overlapEnd: overlapEnd, cutT: cutT,
+                    half: adj.half, renderSize: .zero,
+                    natSizeA: natSizeA, natSizeB: natSizeB
+                ))
             }
         }
 
@@ -781,6 +847,14 @@ actor TimelineExporter {
         if includeVideo {
             // 应用导出设置的分辨率
             let renderSize = self.parseResolution(settings.resolution, fallback: sourceVideoSize)
+            // renderSize 确定后，更新 transitionInfos 里的占位 renderSize
+            transitionInfos = transitionInfos.map {
+                TransitionCompInfo(trackA: $0.trackA, trackB: $0.trackB,
+                                   clipA: $0.clipA, clipB: $0.clipB, type: $0.type,
+                                   overlapStart: $0.overlapStart, overlapEnd: $0.overlapEnd, cutT: $0.cutT,
+                                   half: $0.half, renderSize: renderSize,
+                                   natSizeA: $0.natSizeA, natSizeB: $0.natSizeB)
+            }
             // 应用导出设置的帧率
             let fps = settings.fps
             let frameDuration = CMTime(value: 1, timescale: Int32(fps))
@@ -815,6 +889,11 @@ actor TimelineExporter {
                 var cmBoundaries: [CMTime] = [.zero, composition.duration]
                 for r in imageClipCMRanges { cmBoundaries.append(r.start); cmBoundaries.append(r.end) }
                 for r in videoClipCMRanges { cmBoundaries.append(r.start); cmBoundaries.append(r.end) }
+                for ti in transitionInfos {
+                    cmBoundaries.append(ti.overlapStart)
+                    cmBoundaries.append(ti.overlapEnd)
+                    if ti.type == .fadeToBlack { cmBoundaries.append(ti.cutT) }
+                }
                 let sortedCM = Array(Set(cmBoundaries.map { $0.value })).sorted().map { CMTime(value: $0, timescale: ts) }
 
                 var instructions: [AVMutableVideoCompositionInstruction] = []
@@ -854,13 +933,19 @@ actor TimelineExporter {
                         let clipEnd   = videoClipCMRanges[idx].end
                         let active = segStartCM >= clipStart && segStartCM < clipEnd
                         if active {
-                            if let natSize = try? await entry.track.load(.naturalSize), natSize.width > 0, natSize.height > 0 {
+                            let natSize = (try? await entry.track.load(.naturalSize)) ?? .zero
+                            if natSize.width > 0, natSize.height > 0 {
                                 let t = ProjectState.videoTransform(clip: entry.clip, natSize: natSize, renderSize: renderSize)
                                 li.setTransform(t, at: .zero)
                                 let c = entry.clip
                                 if c.cropTop > 0.001 || c.cropBottom > 0.001 || c.cropLeft > 0.001 || c.cropRight > 0.001 {
                                     li.setCropRectangle(ProjectState.videoCropRect(clip: c, natSize: natSize), at: .zero)
                                 }
+                                ProjectState.applyTransitionRamp(
+                                    li: li, track: entry.track, clip: entry.clip,
+                                    transform: t, natSize: natSize, renderSize: renderSize,
+                                    segStart: segStartCM, transitions: transitionInfos
+                                )
                             }
                         } else {
                             li.setOpacity(0, at: .zero)

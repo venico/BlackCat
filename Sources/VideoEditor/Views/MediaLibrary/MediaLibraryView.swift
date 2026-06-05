@@ -4,10 +4,20 @@ import UniformTypeIdentifiers
 struct MediaLibraryView: View {
     @EnvironmentObject private var project: ProjectState
     @State private var isDragOver = false
-    @State private var selectedTab: AssetType = .video
+
+    private var isTransitionTab: Bool { project.mediaLibraryTab == "transition" }
+
+    private var selectedAssetType: AssetType {
+        switch project.mediaLibraryTab {
+        case "audio": return .audio
+        case "image": return .image
+        case "subtitle": return .subtitle
+        default: return .video
+        }
+    }
 
     private var filteredAssets: [MediaAsset] {
-        project.mediaAssets.filter { $0.type == selectedTab }
+        project.mediaAssets.filter { $0.type == selectedAssetType }
     }
 
     private func countFor(_ type: AssetType) -> Int {
@@ -46,10 +56,11 @@ struct MediaLibraryView: View {
 
             // Tab bar — Finder-style segmented icons
             HStack(spacing: 0) {
-                tabIcon(.video, icon: "film")
-                tabIcon(.audio, icon: "music.note")
-                tabIcon(.image, icon: "photo")
-                tabIcon(.subtitle, icon: "captions.bubble")
+                tabBtn("video", icon: "film")
+                tabBtn("audio", icon: "music.note")
+                tabBtn("image", icon: "photo")
+                tabBtn("subtitle", icon: "captions.bubble")
+                tabBtn("transition", icon: "arrow.left.arrow.right")
             }
             .background(Color.white.opacity(0.06))
             .clipShape(Capsule())
@@ -58,11 +69,13 @@ struct MediaLibraryView: View {
 
             // Asset list + drag-drop target
             ZStack {
-                if filteredAssets.isEmpty {
+                if isTransitionTab {
+                    TransitionPanel()
+                } else if filteredAssets.isEmpty {
                     emptyState
                 } else {
                     ScrollView(showsIndicators: false) {
-                        if selectedTab == .image {
+                        if selectedAssetType == .image {
                             // 2-column grid for images
                             LazyVGrid(columns: [GridItem(.flexible(), spacing: 4),
                                                 GridItem(.flexible(), spacing: 4)], spacing: 4) {
@@ -72,7 +85,7 @@ struct MediaLibraryView: View {
                             }
                             .padding(.horizontal, 8)
                             .padding(.bottom, 8)
-                        } else if selectedTab == .video {
+                        } else if selectedAssetType == .video {
                             // 2-column grid for videos
                             LazyVGrid(columns: [GridItem(.flexible(), spacing: 4),
                                                 GridItem(.flexible(), spacing: 4)], spacing: 4) {
@@ -136,9 +149,9 @@ struct MediaLibraryView: View {
     }
 
     @ViewBuilder
-    private func tabIcon(_ type: AssetType, icon: String) -> some View {
-        let isActive = selectedTab == type
-        Button { selectedTab = type } label: {
+    private func tabBtn(_ tab: String, icon: String) -> some View {
+        let isActive = project.mediaLibraryTab == tab
+        Button { project.mediaLibraryTab = tab } label: {
             Image(systemName: icon)
                 .font(.system(size: 12, weight: .medium))
                 .foregroundColor(isActive ? .white : Color.labelSecondary)
@@ -601,5 +614,163 @@ private extension Character {
             || (0x3040...0x309F).contains(v)    // 平假名
             || (0x30A0...0x30FF).contains(v)    // 片假名
             || (0xAC00...0xD7AF).contains(v)    // 韩文
+    }
+}
+
+// MARK: - Transition Panel
+
+private struct TransitionPanel: View {
+    @EnvironmentObject private var project: ProjectState
+
+    private var selectedClipTransition: Transition? {
+        guard let id = project.selectedTransitionClipID else { return nil }
+        return project.videoTracks.flatMap(\.clips).first(where: { $0.id == id })?.inTransition
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            if project.selectedTransitionClipID == nil {
+                // 未选中转场图标
+                VStack(spacing: 10) {
+                    Image(systemName: "arrow.left.arrow.right")
+                        .font(.system(size: 28, weight: .ultraLight))
+                        .foregroundColor(Color.labelSecondary.opacity(0.30))
+                    Text("点击时间轴中片段间的\n菱形图标选择转场")
+                        .font(.system(size: 11))
+                        .foregroundColor(Color.labelSecondary.opacity(0.45))
+                        .multilineTextAlignment(.center)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                ScrollView(showsIndicators: false) {
+                    VStack(alignment: .leading, spacing: 10) {
+                        // 效果列表
+                        Text("选择效果")
+                            .font(.system(size: 10, weight: .medium))
+                            .foregroundColor(Color.labelSecondary)
+                            .padding(.horizontal, 10)
+                            .padding(.top, 4)
+
+                        LazyVGrid(columns: [GridItem(.flexible(), spacing: 6),
+                                            GridItem(.flexible(), spacing: 6)], spacing: 6) {
+                            ForEach(TransitionType.allCases, id: \.self) { type in
+                                TransitionPreviewCard(
+                                    type: type,
+                                    isSelected: selectedClipTransition?.type == type,
+                                    onSelect: {
+                                        guard let clipID = project.selectedTransitionClipID else { return }
+                                        project.pushUndo()
+                                        project.updateVideoClip(id: clipID) {
+                                            if $0.inTransition == nil {
+                                                $0.inTransition = Transition(type: type)
+                                            } else {
+                                                $0.inTransition?.type = type
+                                            }
+                                        }
+                                        project.rebuildTimelinePreviewDebounced()
+                                    }
+                                )
+                            }
+                        }
+                        .padding(.horizontal, 8)
+                    }
+                    .padding(.top, 6)
+                    .padding(.bottom, 8)
+                }
+            }
+        }
+    }
+}
+
+// MARK: - Transition Preview Card
+
+private struct TransitionPreviewCard: View {
+    let type: TransitionType
+    let isSelected: Bool
+    let onSelect: () -> Void
+    @State private var phase: Double = 0
+    @State private var hoverTask: Task<Void, Never>? = nil
+
+    var body: some View {
+        Button(action: onSelect) {
+            VStack(spacing: 4) {
+                ZStack {
+                    // 底层灰色色块
+                    RoundedRectangle(cornerRadius: 4)
+                        .fill(Color(white: 0.22))
+                    // 叠加层：灰白色块做转场动画
+                    transitionOverlay
+                }
+                .frame(height: 44)
+                .clipShape(RoundedRectangle(cornerRadius: 4))
+
+                Text(type.label)
+                    .font(.system(size: 9))
+                    .foregroundColor(isSelected ? Color.accent : Color.labelSecondary)
+                    .lineLimit(1)
+            }
+            .padding(6)
+            .background(isSelected ? Color.accent.opacity(0.15) : Color.clear)
+            .cornerRadius(6)
+            .overlay(
+                RoundedRectangle(cornerRadius: 6)
+                    .stroke(isSelected ? Color.accent : Color.clear, lineWidth: 1)
+            )
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering in
+            if hovering {
+                // hover 进入：启动独立 Task 循环播放，不污染其他卡片
+                hoverTask = Task {
+                    while !Task.isCancelled {
+                        withAnimation(.easeInOut(duration: 0.9)) { phase = 1.0 }
+                        try? await Task.sleep(nanoseconds: 950_000_000)
+                        guard !Task.isCancelled else { break }
+                        withAnimation(.easeInOut(duration: 0.9)) { phase = 0.0 }
+                        try? await Task.sleep(nanoseconds: 950_000_000)
+                    }
+                }
+            } else {
+                // hover 离开：取消任务，重置到初始状态
+                hoverTask?.cancel()
+                hoverTask = nil
+                withAnimation(.easeInOut(duration: 0.3)) { phase = 0.0 }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var transitionOverlay: some View {
+        let p = phase
+        switch type {
+        case .dissolve:
+            // 右侧浅灰块淡入淡出
+            RoundedRectangle(cornerRadius: 4)
+                .fill(Color(white: 0.55))
+                .opacity(p)
+        case .fadeToBlack:
+            // 黑色遮罩淡入淡出
+            Color.black.opacity(p)
+        case .pushLeft:
+            // 浅灰块从右推入
+            RoundedRectangle(cornerRadius: 4)
+                .fill(Color(white: 0.55))
+                .offset(x: (1 - p) * 80)
+        case .pushRight:
+            // 浅灰块从左推入
+            RoundedRectangle(cornerRadius: 4)
+                .fill(Color(white: 0.55))
+                .offset(x: -(1 - p) * 80)
+        case .pushUp:
+            // 浅灰块从下推入
+            RoundedRectangle(cornerRadius: 4)
+                .fill(Color(white: 0.55))
+                .offset(y: (1 - p) * 50)
+        case .pushDown:
+            // 浅灰块从上推入
+            RoundedRectangle(cornerRadius: 4)
+                .fill(Color(white: 0.55))
+                .offset(y: -(1 - p) * 50)
+        }
     }
 }
