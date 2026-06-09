@@ -414,6 +414,11 @@ private struct ImageInspector: View {
     @State private var cropLeft: Double = 0
     @State private var cropRight: Double = 0
     @State private var hasPushedUndo = false
+    // 色调调节
+    @State private var brightness: Double = 0
+    @State private var contrast:   Double = 0
+    @State private var saturation: Double = 0
+    @State private var hue:        Double = 0
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -484,6 +489,30 @@ private struct ImageInspector: View {
                     cropSlider(label: "右", value: $cropRight, edge: 3)
                 }
             }
+
+            ISection(title: nil) {
+                imgSectionHeader("色调") {
+                    Button {
+                        brightness = 0; contrast = 0; saturation = 0; hue = 0
+                        applyColorAdjust()
+                    } label: {
+                        Text("重置")
+                            .font(.system(size: 9, weight: .medium))
+                            .foregroundColor(hasColorAdj ? .black : Color.labelSecondary)
+                            .padding(.horizontal, 6).padding(.vertical, 2)
+                            .background(hasColorAdj ? Color(hex: "#E8A54B") : Color.white.opacity(0.08))
+                            .clipShape(RoundedRectangle(cornerRadius: 4))
+                    }.buttonStyle(.plain).disabled(!hasColorAdj)
+                }
+                ICapsuleSlider(label: "亮度", value: $brightness, range: -1.0...1.0,
+                               decimals: 2, labelWidth: 28, onChange: { _ in applyColorAdjust() })
+                ICapsuleSlider(label: "对比", value: $contrast,   range: -1.0...1.0,
+                               decimals: 2, labelWidth: 28, onChange: { _ in applyColorAdjust() })
+                ICapsuleSlider(label: "饱和", value: $saturation, range: -1.0...1.0,
+                               decimals: 2, labelWidth: 28, onChange: { _ in applyColorAdjust() })
+                ICapsuleSlider(label: "色相", value: $hue,        range: -180.0...180.0,
+                               decimals: 0, unit: "°", labelWidth: 28, onChange: { _ in applyColorAdjust() })
+            }
         }
         .onAppear { syncFromClip() }
         .onChange(of: clip.id) { _ in syncFromClip() }
@@ -495,6 +524,10 @@ private struct ImageInspector: View {
         .onChange(of: clip.cropBottom) { v in if abs(v - cropBottom) > 0.001 { cropBottom = v } }
         .onChange(of: clip.cropLeft)   { v in if abs(v - cropLeft)   > 0.001 { cropLeft   = v } }
         .onChange(of: clip.cropRight)  { v in if abs(v - cropRight)  > 0.001 { cropRight  = v } }
+        .onChange(of: clip.colorAdjust.brightness) { v in if abs(v - brightness) > 0.001 { brightness = v } }
+        .onChange(of: clip.colorAdjust.contrast)   { v in if abs(v - contrast)   > 0.001 { contrast   = v } }
+        .onChange(of: clip.colorAdjust.saturation) { v in if abs(v - saturation) > 0.001 { saturation = v } }
+        .onChange(of: clip.colorAdjust.hue)        { v in if abs(v - hue)        > 0.1   { hue        = v } }
     }
 
     private var hasOffset: Bool {
@@ -503,6 +536,10 @@ private struct ImageInspector: View {
 
     private var hasCrop: Bool {
         cropTop > 0.001 || cropBottom > 0.001 || cropLeft > 0.001 || cropRight > 0.001
+    }
+
+    private var hasColorAdj: Bool {
+        abs(brightness) > 0.01 || abs(contrast) > 0.01 || abs(saturation) > 0.01 || abs(hue) > 0.5
     }
 
     @ViewBuilder
@@ -522,6 +559,10 @@ private struct ImageInspector: View {
         cropBottom = clip.cropBottom
         cropLeft = clip.cropLeft
         cropRight = clip.cropRight
+        brightness = clip.colorAdjust.brightness
+        contrast   = clip.colorAdjust.contrast
+        saturation = clip.colorAdjust.saturation
+        hue        = clip.colorAdjust.hue
         hasPushedUndo = false
     }
 
@@ -545,6 +586,21 @@ private struct ImageInspector: View {
             $0.cropBottom = cropBottom
             $0.cropLeft = cropLeft
             $0.cropRight = cropRight
+        }
+        project.rebuildTimelinePreviewDebounced()
+    }
+
+    private func applyColorAdjust() {
+        if !hasPushedUndo {
+            project.pushUndo()
+            hasPushedUndo = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { hasPushedUndo = false }
+        }
+        project.updateImageClip(id: clip.id) {
+            $0.colorAdjust.brightness = brightness
+            $0.colorAdjust.contrast   = contrast
+            $0.colorAdjust.saturation = saturation
+            $0.colorAdjust.hue        = hue
         }
         project.rebuildTimelinePreviewDebounced()
     }
@@ -603,6 +659,11 @@ private struct VideoInspector: View {
     @State private var cropLeft: Double = 0
     @State private var cropRight: Double = 0
     @State private var hasPushedUndo = false
+    // 色调调节
+    @State private var brightness: Double = 0
+    @State private var contrast:   Double = 0
+    @State private var saturation: Double = 0
+    @State private var hue:        Double = 0
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -632,6 +693,55 @@ private struct VideoInspector: View {
                             set: { v in project.updateVideoClip(id: clip.id) { $0.endTime = $0.startTime + max(0.05, v) } }
                         ), step: 0.1, decimals: 2)
                     }
+                }
+            }
+
+            ISection(title: "速度") {
+                // 预设按钮
+                HStack(spacing: 4) {
+                    ForEach([0.25, 0.5, 1.0, 2.0, 4.0], id: \.self) { v in
+                        let isActive = abs(clip.speed - v) < 0.01
+                        Button {
+                            project.updateVideoClip(id: clip.id) { c in
+                                // 保持"源素材秒数"不变，调整 timeline 宽度
+                                let srcSec = c.duration * c.speed
+                                c.speed = v
+                                c.endTime = c.startTime + max(0.1, srcSec / v)
+                            }
+                            project.rebuildTimelinePreview()
+                            project.pushUndoThrottled()
+                        } label: {
+                            Text(v == 1.0 ? "1×" : (v < 1 ? String(format: "%.2g×", v) : String(format: "%.0f×", v)))
+                                .font(.system(size: 10, weight: .medium))
+                                .foregroundColor(isActive ? .black : Color.labelSecondary)
+                                .padding(.horizontal, 5).padding(.vertical, 2)
+                                .background(isActive ? Color(hex: "#E8A54B") : Color.white.opacity(0.08))
+                                .clipShape(RoundedRectangle(cornerRadius: 4))
+                        }.buttonStyle(.plain)
+                    }
+                    Spacer()
+                }
+                ICapsuleSlider(label: "速率", value: Binding(
+                    get: { clip.speed },
+                    set: { v in
+                        project.updateVideoClip(id: clip.id) { c in
+                            let srcSec = c.duration * c.speed
+                            c.speed = v
+                            c.endTime = c.startTime + max(0.1, srcSec / v)
+                        }
+                        project.rebuildTimelinePreview()
+                    }
+                ), range: 0.1...4.0, decimals: 2, unit: "×", labelWidth: 28)
+                if abs(clip.speed - 1.0) > 0.01 {
+                    HStack(spacing: 4) {
+                        Image(systemName: "waveform")
+                            .font(.system(size: 9))
+                            .foregroundColor(Color.labelSecondary)
+                        Text("变速后音调随之改变")
+                            .font(.system(size: 10))
+                            .foregroundColor(Color.labelSecondary)
+                    }
+                    .padding(.top, 2)
                 }
             }
 
@@ -711,6 +821,30 @@ private struct VideoInspector: View {
                     videoCropSlider(label: "右", value: $cropRight, edge: 3)
                 }
             }
+
+            ISection(title: nil) {
+                sectionHeader("色调") {
+                    Button {
+                        brightness = 0; contrast = 0; saturation = 0; hue = 0
+                        applyColorAdjust()
+                    } label: {
+                        Text("重置")
+                            .font(.system(size: 9, weight: .medium))
+                            .foregroundColor(hasColorAdj ? .black : Color.labelSecondary)
+                            .padding(.horizontal, 6).padding(.vertical, 2)
+                            .background(hasColorAdj ? Color(hex: "#E8A54B") : Color.white.opacity(0.08))
+                            .clipShape(RoundedRectangle(cornerRadius: 4))
+                    }.buttonStyle(.plain).disabled(!hasColorAdj)
+                }
+                ICapsuleSlider(label: "亮度", value: $brightness, range: -1.0...1.0,
+                               decimals: 2, labelWidth: 28, onChange: { _ in applyColorAdjust() })
+                ICapsuleSlider(label: "对比", value: $contrast,   range: -1.0...1.0,
+                               decimals: 2, labelWidth: 28, onChange: { _ in applyColorAdjust() })
+                ICapsuleSlider(label: "饱和", value: $saturation, range: -1.0...1.0,
+                               decimals: 2, labelWidth: 28, onChange: { _ in applyColorAdjust() })
+                ICapsuleSlider(label: "色相", value: $hue,        range: -180.0...180.0,
+                               decimals: 0, unit: "°", labelWidth: 28, onChange: { _ in applyColorAdjust() })
+            }
         }
         .onAppear { loadMeta(); syncFromClip() }
         .onChange(of: clip.id) { _ in loadMeta(); syncFromClip() }
@@ -722,6 +856,10 @@ private struct VideoInspector: View {
         .onChange(of: clip.cropBottom) { v in if abs(v - cropBottom) > 0.001 { cropBottom = v } }
         .onChange(of: clip.cropLeft)   { v in if abs(v - cropLeft)   > 0.001 { cropLeft   = v } }
         .onChange(of: clip.cropRight)  { v in if abs(v - cropRight)  > 0.001 { cropRight  = v } }
+        .onChange(of: clip.colorAdjust.brightness) { v in if abs(v - brightness) > 0.001 { brightness = v } }
+        .onChange(of: clip.colorAdjust.contrast)   { v in if abs(v - contrast)   > 0.001 { contrast   = v } }
+        .onChange(of: clip.colorAdjust.saturation) { v in if abs(v - saturation) > 0.001 { saturation = v } }
+        .onChange(of: clip.colorAdjust.hue)        { v in if abs(v - hue)        > 0.1   { hue        = v } }
     }
 
     private var hasOffset: Bool {
@@ -730,6 +868,10 @@ private struct VideoInspector: View {
 
     private var hasCrop: Bool {
         cropTop > 0.001 || cropBottom > 0.001 || cropLeft > 0.001 || cropRight > 0.001
+    }
+
+    private var hasColorAdj: Bool {
+        abs(brightness) > 0.01 || abs(contrast) > 0.01 || abs(saturation) > 0.01 || abs(hue) > 0.5
     }
 
     @ViewBuilder
@@ -770,6 +912,10 @@ private struct VideoInspector: View {
         cropBottom = clip.cropBottom
         cropLeft = clip.cropLeft
         cropRight = clip.cropRight
+        brightness = clip.colorAdjust.brightness
+        contrast   = clip.colorAdjust.contrast
+        saturation = clip.colorAdjust.saturation
+        hue        = clip.colorAdjust.hue
         hasPushedUndo = false
     }
 
@@ -793,6 +939,21 @@ private struct VideoInspector: View {
             $0.cropBottom = cropBottom
             $0.cropLeft = cropLeft
             $0.cropRight = cropRight
+        }
+        project.rebuildTimelinePreviewDebounced()
+    }
+
+    private func applyColorAdjust() {
+        if !hasPushedUndo {
+            project.pushUndo()
+            hasPushedUndo = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { hasPushedUndo = false }
+        }
+        project.updateVideoClip(id: clip.id) {
+            $0.colorAdjust.brightness = brightness
+            $0.colorAdjust.contrast   = contrast
+            $0.colorAdjust.saturation = saturation
+            $0.colorAdjust.hue        = hue
         }
         project.rebuildTimelinePreviewDebounced()
     }
@@ -882,7 +1043,8 @@ private struct TransitionInspector: View {
                         ),
                         range: 0.1...2.0,
                         decimals: 1,
-                        unit: "秒"
+                        unit: "秒",
+                        labelWidth: 28
                     )
                 }
             } else {
@@ -936,6 +1098,53 @@ private struct AudioInspector: View {
                             set: { v in project.updateAudioClip(id: clip.id) { $0.endTime = $0.startTime + max(0.05, v) } }
                         ), step: 0.1, decimals: 2)
                     }
+                }
+            }
+
+            ISection(title: "速度") {
+                HStack(spacing: 4) {
+                    ForEach([0.25, 0.5, 1.0, 2.0, 4.0], id: \.self) { v in
+                        let isActive = abs(clip.speed - v) < 0.01
+                        Button {
+                            project.updateAudioClip(id: clip.id) { c in
+                                let srcSec = c.duration * c.speed
+                                c.speed = v
+                                c.endTime = c.startTime + max(0.1, srcSec / v)
+                            }
+                            project.rebuildTimelinePreview()
+                            project.pushUndoThrottled()
+                        } label: {
+                            Text(v == 1.0 ? "1×" : (v < 1 ? String(format: "%.2g×", v) : String(format: "%.0f×", v)))
+                                .font(.system(size: 10, weight: .medium))
+                                .foregroundColor(isActive ? .black : Color.labelSecondary)
+                                .padding(.horizontal, 5).padding(.vertical, 2)
+                                .background(isActive ? Color(hex: "#E8A54B") : Color.white.opacity(0.08))
+                                .clipShape(RoundedRectangle(cornerRadius: 4))
+                        }.buttonStyle(.plain)
+                    }
+                    Spacer()
+                }
+                ICapsuleSlider(label: "速率", value: Binding(
+                    get: { clip.speed },
+                    set: { v in
+                        project.updateAudioClip(id: clip.id) { c in
+                            let srcSec = c.duration * c.speed
+                            c.speed = v
+                            c.endTime = c.startTime + max(0.1, srcSec / v)
+                        }
+                        project.rebuildTimelinePreview()
+                    }
+                ), range: 0.1...4.0, decimals: 2, unit: "×", labelWidth: 28)
+                if abs(clip.speed - 1.0) > 0.01 {
+                    HStack(spacing: 4) {
+                        Image(systemName: "waveform")
+                            .font(.system(size: 9))
+                            .foregroundColor(Color.labelSecondary)
+                        Text("变速后音调随之改变")
+                            .font(.system(size: 10))
+                            .foregroundColor(Color.labelSecondary)
+                    }
+                    .padding(.top, 2)
                 }
             }
 

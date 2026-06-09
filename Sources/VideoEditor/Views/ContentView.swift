@@ -167,6 +167,8 @@ struct ContentView: View {
                     TranscodeOverlay()
                         .environmentObject(project)
                 }
+                TranscribeOverlay()
+                    .environmentObject(project)
                 ExportProgressOverlay(manager: exportManager)
             }
             .padding(.trailing, 16)

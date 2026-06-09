@@ -483,6 +483,123 @@ private struct ExportButton: View {
     }
 }
 
+// MARK: - Transcribe Overlay (右下角浮层，语音识别状态)
+
+struct TranscribeOverlay: View {
+    @EnvironmentObject private var project: ProjectState
+
+    var body: some View {
+        VStack(alignment: .trailing, spacing: 8) {
+            if project.transcribeState != .idle {
+                TranscribeBubble(state: project.transcribeState) {
+                    project.transcribeState = .idle
+                }
+                .transition(.asymmetric(
+                    insertion: .move(edge: .trailing).combined(with: .opacity),
+                    removal: .opacity))
+            }
+        }
+        .animation(.spring(response: 0.35, dampingFraction: 0.8), value: project.transcribeState)
+    }
+}
+
+private struct TranscribeBubble: View {
+    let state: ProjectState.TranscribeState
+    let onDismiss: () -> Void
+    @State private var hovering = false
+
+    private var isRunning: Bool { if case .running = state { return true }; return false }
+
+    var body: some View {
+        HStack(spacing: 10) {
+            ZStack {
+                Circle().fill(iconBg).frame(width: 28, height: 28)
+                if isRunning {
+                    ProgressView().controlSize(.small).scaleEffect(0.7)
+                } else {
+                    Image(systemName: iconName)
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundColor(iconFg)
+                }
+            }
+            VStack(alignment: .leading, spacing: 3) {
+                Text("语音识别")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundColor(Color.labelPrimary)
+                    .lineLimit(1)
+                Text(statusText)
+                    .font(.system(size: 10))
+                    .foregroundColor(statusColor)
+                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 8)
+            if !isRunning {
+                Button(action: onDismiss) {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 9, weight: .bold))
+                        .foregroundColor(hovering ? Color.labelPrimary : Color.labelSecondary)
+                        .frame(width: 18, height: 18)
+                        .background(Color.white.opacity(hovering ? 0.15 : 0.08))
+                        .clipShape(Circle())
+                }
+                .buttonStyle(.plain)
+                .onHover { hovering = $0 }
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .frame(maxWidth: 260)
+        .background(
+            RoundedRectangle(cornerRadius: 10)
+                .fill(Color(red: 0.16, green: 0.16, blue: 0.17))
+                .shadow(color: .black.opacity(0.5), radius: 8, y: 4)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 10)
+                .stroke(Color.white.opacity(0.12), lineWidth: 0.5)
+        )
+    }
+
+    private var iconName: String {
+        switch state {
+        case .done:   return "checkmark"
+        case .failed: return "exclamationmark.triangle"
+        default:      return "waveform"
+        }
+    }
+    private var iconBg: Color {
+        switch state {
+        case .running: return Color.accent.opacity(0.2)
+        case .done:    return Color.green.opacity(0.2)
+        case .failed:  return Color.red.opacity(0.2)
+        case .idle:    return Color.clear
+        }
+    }
+    private var iconFg: Color {
+        switch state {
+        case .done:   return .green
+        case .failed: return .red.opacity(0.8)
+        default:      return Color.accent
+        }
+    }
+    private var statusText: String {
+        switch state {
+        case .running:       return "正在识别…（首次较慢）"
+        case .done(let n):   return "完成，生成 \(n) 条字幕"
+        case .failed(let m): return m
+        case .idle:          return ""
+        }
+    }
+    private var statusColor: Color {
+        switch state {
+        case .done:   return .green
+        case .failed: return .red.opacity(0.8)
+        default:      return Color.labelSecondary
+        }
+    }
+}
+
 // MARK: - Transcode Overlay (右下角浮层)
 
 struct TranscodeOverlay: View {
@@ -768,6 +885,32 @@ private struct TransitionPreviewCard: View {
                 .offset(y: (1 - p) * 50)
         case .pushDown:
             // 浅灰块从上推入
+            RoundedRectangle(cornerRadius: 4)
+                .fill(Color(white: 0.55))
+                .offset(y: -(1 - p) * 50)
+        case .zoom:
+            // 浅灰块从放大缩回 + 淡入
+            RoundedRectangle(cornerRadius: 4)
+                .fill(Color(white: 0.55))
+                .scaleEffect(1.5 - 0.5 * p)
+                .opacity(p)
+        case .slideLeft:
+            // 浅灰块从右滑入覆盖
+            RoundedRectangle(cornerRadius: 4)
+                .fill(Color(white: 0.55))
+                .offset(x: (1 - p) * 80)
+        case .slideRight:
+            // 浅灰块从左滑入覆盖
+            RoundedRectangle(cornerRadius: 4)
+                .fill(Color(white: 0.55))
+                .offset(x: -(1 - p) * 80)
+        case .slideUp:
+            // 浅灰块从下滑入覆盖
+            RoundedRectangle(cornerRadius: 4)
+                .fill(Color(white: 0.55))
+                .offset(y: (1 - p) * 50)
+        case .slideDown:
+            // 浅灰块从上滑入覆盖
             RoundedRectangle(cornerRadius: 4)
                 .fill(Color(white: 0.55))
                 .offset(y: -(1 - p) * 50)

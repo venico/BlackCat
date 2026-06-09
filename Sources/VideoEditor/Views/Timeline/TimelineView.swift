@@ -1763,6 +1763,22 @@ private struct VideoClipView: View {
                 .padding(.leading, stickyTitleX)
                 .padding(.top, 4)
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            // 速率徽章（speed != 1.0 时显示）
+            if abs(clip.speed - 1.0) > 0.01 {
+                let speedLabel: String = {
+                    let s = clip.speed
+                    if s < 1.0 { return String(format: "%.2g×", s) }
+                    else { return String(format: s.truncatingRemainder(dividingBy: 1) == 0 ? "%.0f×" : "%.1f×", s) }
+                }()
+                Text(speedLabel)
+                    .font(.system(size: 8, weight: .bold))
+                    .foregroundColor(.white)
+                    .padding(.horizontal, 4).padding(.vertical, 1)
+                    .background(Color.black.opacity(0.55))
+                    .clipShape(RoundedRectangle(cornerRadius: 3))
+                    .padding(.trailing, 5).padding(.bottom, 5)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomTrailing)
+            }
         }
         .frame(width: w, height: h-4)
         .clipShape(RoundedRectangle(cornerRadius: 6))
@@ -1793,7 +1809,7 @@ private struct VideoClipView: View {
                 Color.clear.frame(width: thumbW * CGFloat(startIdx), height: thumbH)
             }
             ForEach(startIdx..<endIdx, id: \.self) { i in
-                let t = clip.trimStart + clip.duration * Double(i) / Double(count)
+                let t = clip.trimStart + clip.duration * max(0.01, clip.speed) * Double(i) / Double(count)
                 let frame = closestFrame(frames, at: t)
                 Image(nsImage: frame.image)
                     .resizable()
@@ -1901,6 +1917,21 @@ private struct AudioClipView: View {
                 .padding(.leading, stickyTitleX)
                 .padding(.top, 4)
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            if abs(clip.speed - 1.0) > 0.01 {
+                let speedLabel: String = {
+                    let s = clip.speed
+                    if s < 1.0 { return String(format: "%.2g×", s) }
+                    else { return String(format: s.truncatingRemainder(dividingBy: 1) == 0 ? "%.0f×" : "%.1f×", s) }
+                }()
+                Text(speedLabel)
+                    .font(.system(size: 8, weight: .bold))
+                    .foregroundColor(.white)
+                    .padding(.horizontal, 4).padding(.vertical, 1)
+                    .background(Color.black.opacity(0.55))
+                    .clipShape(RoundedRectangle(cornerRadius: 3))
+                    .padding(.trailing, 5).padding(.bottom, 5)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomTrailing)
+            }
         }
         .frame(width: w, height: h-4)
         .clipShape(RoundedRectangle(cornerRadius: 6))
@@ -2327,6 +2358,9 @@ private struct TranslateToolGroup: View {
                  enabled: project.selectedSubtitleClip != nil) { translateCurrent() }
             TBtn(icon: "list.bullet.rectangle", help: "翻译整条轨道",
                  enabled: translateAllEnabled) { translateAll() }
+            TBtn(icon: project.isTranscribing ? "waveform" : "waveform.badge.mic",
+                 help: project.isTranscribing ? "正在识别字幕…" : "自动识别字幕（按当前翻译目标语言生成）",
+                 enabled: !project.isTranscribing) { project.autoTranscribeSelectedClip() }
         }
     }
 

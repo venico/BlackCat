@@ -566,6 +566,36 @@ struct ExportInput {
 }
 
 actor TimelineExporter {
+
+    // ── ffmpeg 变速音频预处理（与 ProjectState.generateSpeedAudio 逻辑相同，独立缓存）──
+    private var speedAudioCache: [String: URL] = [:]
+
+    private func generateSpeedAudio(inputURL: URL, trimStart: Double, srcDurSec: Double,
+                                    speed: Double, audioTrackIndex: Int) async -> URL? {
+        let key = "\(inputURL.path)|\(trimStart)|\(srcDurSec)|\(speed)|\(audioTrackIndex)"
+        if let cached = speedAudioCache[key], FileManager.default.fileExists(atPath: cached.path) {
+            return cached
+        }
+        guard let ffmpeg = ProjectState.findFFmpeg() else { return nil }
+        let tmpURL = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("bc_exp_\(UUID().uuidString).m4a")
+        let filterStr = ProjectState.buildAtempoFilter(speed: speed)
+        var args = ["-y"]
+        if trimStart > 0.001 { args += ["-ss", String(format: "%.6f", trimStart)] }
+        args += ["-t", String(format: "%.6f", srcDurSec), "-i", inputURL.path]
+        args += ["-vn"]
+        if audioTrackIndex > 0 { args += ["-map", "0:a:\(audioTrackIndex)"] }
+        args += ["-af", filterStr, "-c:a", "aac", "-ar", "44100", "-ac", "2", tmpURL.path]
+        let ok = await Task.detached(priority: .userInitiated) {
+            ProjectState.runFFmpegSync(ffmpeg: ffmpeg, arguments: args)
+        }.value
+        if ok {
+            speedAudioCache[key] = tmpURL
+            return tmpURL
+        }
+        return nil
+    }
+
     func export(_ input: ExportInput,
                 progress: @escaping (Double) -> Void) async throws -> URL {
         let settings = input.settings
@@ -613,7 +643,7 @@ actor TimelineExporter {
                 if trans.type == .fadeToBlack {
                     half = wantedHalf
                 } else {
-                    let availA = max(0, (exportClipAssetDurSec[cA.id] ?? 0) - (cA.trimStart + cA.duration))
+                    let availA = max(0, (exportClipAssetDurSec[cA.id] ?? 0) - (cA.trimStart + cA.duration * cA.speed))
                     let availB = cB.trimStart
                     half = max(0, min(wantedHalf, min(availA, availB)))
                 }
@@ -632,26 +662,31 @@ actor TimelineExporter {
                 let assetDurSec = exportClipAssetDurSec[clip.id] ?? 0
                 let assetDur = CMTime(seconds: assetDurSec, preferredTimescale: 600)
                 let trimSt = CMTime(seconds: clip.trimStart, preferredTimescale: 600)
-                let maxDur = assetDur - trimSt
-                let useDur = CMTimeMinimum(CMTime(seconds: clip.duration, preferredTimescale: 600), maxDur)
+                let maxSrcDur = assetDur - trimSt
+                let speed = max(0.01, clip.speed)
+                let maxTimelineDur = CMTime(seconds: maxSrcDur.seconds / speed, preferredTimescale: 600)
+                let useDur = CMTimeMinimum(CMTime(seconds: clip.duration, preferredTimescale: 600), maxTimelineDur)
                 guard useDur.seconds > 0.01 else { continue }
+                let srcContentDurSec = useDur.seconds * speed  // 源素材实际消耗量（秒）
 
                 let aExtend  = exportTransAdjusts.first(where: { $0.clipAID == clip.id && $0.type != .fadeToBlack })?.half ?? 0
                 let bAdvance = exportTransAdjusts.first(where: { $0.clipBID == clip.id && $0.type != .fadeToBlack })?.half ?? 0
 
-                let actualTrimSt = CMTime(seconds: clip.trimStart - bAdvance, preferredTimescale: 600)
-                let actualDur    = useDur + CMTime(seconds: bAdvance + aExtend, preferredTimescale: 600)
-                let actualRange  = CMTimeRange(start: actualTrimSt, duration: actualDur)
-                let at           = CMTime(seconds: clip.startTime - bAdvance, preferredTimescale: 600)
-                let audioRange   = CMTimeRange(start: trimSt, duration: useDur)
-                let audioAt      = CMTime(seconds: clip.startTime, preferredTimescale: 600)
-
+                let actualTrimSt  = CMTime(seconds: clip.trimStart - bAdvance, preferredTimescale: 600)
+                let actualSrcDur  = CMTime(seconds: srcContentDurSec + bAdvance + aExtend, preferredTimescale: 600)
+                let actualRange   = CMTimeRange(start: actualTrimSt, duration: actualSrcDur)
+                let at            = CMTime(seconds: clip.startTime - bAdvance, preferredTimescale: 600)
+                let targetDurSec  = useDur.seconds + bAdvance + aExtend
                 if includeVideo && track.isVisible,
                    let vAsset = try? await asset.loadTracks(withMediaType: .video).first {
                     let vt = composition.addMutableTrack(withMediaType: .video,
                                                          preferredTrackID: kCMPersistentTrackID_Invalid)
                     try vt?.insertTimeRange(actualRange, of: vAsset, at: at)
                     if let vt {
+                        if abs(speed - 1.0) > 0.001 {
+                            let compRange = CMTimeRange(start: at, duration: actualSrcDur)
+                            vt.scaleTimeRange(compRange, toDuration: CMTime(seconds: targetDurSec, preferredTimescale: 600))
+                        }
                         videoCompTracks.append((track: vt, clip: clip,
                                                 startTime: clip.startTime - bAdvance,
                                                 endTime: clip.endTime + aExtend))
@@ -663,14 +698,36 @@ actor TimelineExporter {
                     }
                 }
                 if includeAudio && !track.isMuted {
-                    let allAudioTracks = (try? await asset.loadTracks(withMediaType: .audio)) ?? []
-                    let aIdx = min(clip.audioTrackIndex, max(allAudioTracks.count - 1, 0))
-                    if let aAsset = allAudioTracks.isEmpty ? nil : allAudioTracks[aIdx] {
-                        let at2 = composition.addMutableTrack(withMediaType: .audio,
-                                                              preferredTrackID: kCMPersistentTrackID_Invalid)
-                        if let at2 { try at2.insertTimeRange(audioRange, of: aAsset, at: audioAt) }
-                        if let tid = at2?.trackID {
-                            audioMixParams.append((tid, clip.volume, 1.0, 1.0, clip.startTime, useDur.seconds, 0, 0))
+                    let aAt = CMTime(seconds: clip.startTime, preferredTimescale: 44100)
+                    if abs(speed - 1.0) > 0.001 {
+                        // 变速：用 ffmpeg atempo 预处理，避免 scaleTimeRange 音频失真
+                        if let url = clip.url,
+                           let speedURL = await self.generateSpeedAudio(
+                               inputURL: url, trimStart: clip.trimStart,
+                               srcDurSec: srcContentDurSec, speed: speed,
+                               audioTrackIndex: clip.audioTrackIndex),
+                           let at2 = composition.addMutableTrack(withMediaType: .audio,
+                                                                 preferredTrackID: kCMPersistentTrackID_Invalid) {
+                            let sAsset = AVURLAsset(url: speedURL)
+                            if let sTrack = try? await sAsset.loadTracks(withMediaType: .audio).first {
+                                let sDur = (try? await sAsset.load(.duration)) ?? .zero
+                                let ins  = CMTimeMinimum(sDur, CMTime(seconds: useDur.seconds, preferredTimescale: 44100))
+                                try? at2.insertTimeRange(CMTimeRange(start: .zero, duration: ins), of: sTrack, at: aAt)
+                                audioMixParams.append((at2.trackID, clip.volume, 1.0, 1.0, clip.startTime, ins.seconds, 0, 0))
+                            }
+                        }
+                    } else {
+                        // 正常速度：直接插入
+                        let allAudioTracks = (try? await asset.loadTracks(withMediaType: .audio)) ?? []
+                        let aIdx = min(clip.audioTrackIndex, max(allAudioTracks.count - 1, 0))
+                        if let aAsset = allAudioTracks.isEmpty ? nil : allAudioTracks[aIdx],
+                           let at2 = composition.addMutableTrack(withMediaType: .audio,
+                                                                 preferredTrackID: kCMPersistentTrackID_Invalid) {
+                            let ats: CMTimeScale = 44100
+                            let aStart  = CMTime(seconds: clip.trimStart, preferredTimescale: ats)
+                            let aSrcDur = CMTime(seconds: srcContentDurSec, preferredTimescale: ats)
+                            try? at2.insertTimeRange(CMTimeRange(start: aStart, duration: aSrcDur), of: aAsset, at: aAt)
+                            audioMixParams.append((at2.trackID, clip.volume, 1.0, 1.0, clip.startTime, useDur.seconds, 0, 0))
                         }
                     }
                 }
@@ -705,21 +762,50 @@ actor TimelineExporter {
             for clip in track.clips {
                 guard let url = clip.url else { continue }
                 let asset = AVURLAsset(url: url)
-                guard let aAsset = try? await asset.loadTracks(withMediaType: .audio).first else { continue }
                 let assetDur = try await asset.load(.duration)
-                let trimSt = CMTime(seconds: clip.trimStart, preferredTimescale: 600)
-                let maxDur = assetDur - trimSt
-                let useDur = CMTimeMinimum(CMTime(seconds: clip.duration, preferredTimescale: 600), maxDur)
-                let range = CMTimeRange(start: trimSt, duration: useDur)
-                let at    = CMTime(seconds: clip.startTime, preferredTimescale: 600)
-                let extra = composition.addMutableTrack(withMediaType: .audio,
-                                                        preferredTrackID: kCMPersistentTrackID_Invalid)
-                if let extra { try extra.insertTimeRange(range, of: aAsset, at: at) }
-                if let tid = extra?.trackID {
+                let aspeed   = max(0.01, clip.speed)
+                let ats: CMTimeScale = 44100
+                let trimSt   = CMTime(seconds: clip.trimStart, preferredTimescale: ats)
+                let maxSrcDur = assetDur - trimSt
+                let maxTimelineDur = CMTime(seconds: maxSrcDur.seconds / aspeed, preferredTimescale: ats)
+                let useDur   = CMTimeMinimum(CMTime(seconds: clip.duration, preferredTimescale: ats), maxTimelineDur)
+                guard useDur.seconds > 0.01 else { continue }
+                let srcDurSec = useDur.seconds * aspeed
+                let at        = CMTime(seconds: clip.startTime, preferredTimescale: ats)
+
+                var addedTrackID: CMPersistentTrackID? = nil
+
+                if abs(aspeed - 1.0) > 0.001 {
+                    // 变速：ffmpeg atempo 预处理
+                    if let speedURL = await self.generateSpeedAudio(
+                        inputURL: url, trimStart: clip.trimStart,
+                        srcDurSec: srcDurSec, speed: aspeed, audioTrackIndex: 0),
+                       let extra = composition.addMutableTrack(withMediaType: .audio,
+                                                               preferredTrackID: kCMPersistentTrackID_Invalid) {
+                        let sAsset = AVURLAsset(url: speedURL)
+                        if let sTrack = try? await sAsset.loadTracks(withMediaType: .audio).first {
+                            let sDur = (try? await sAsset.load(.duration)) ?? .zero
+                            let ins  = CMTimeMinimum(sDur, CMTime(seconds: useDur.seconds, preferredTimescale: ats))
+                            try? extra.insertTimeRange(CMTimeRange(start: .zero, duration: ins), of: sTrack, at: at)
+                            addedTrackID = extra.trackID
+                        }
+                    }
+                } else {
+                    // 正常速度：直接插入
+                    guard let aAsset = try? await asset.loadTracks(withMediaType: .audio).first else { continue }
+                    if let extra = composition.addMutableTrack(withMediaType: .audio,
+                                                              preferredTrackID: kCMPersistentTrackID_Invalid) {
+                        let srcDur = CMTime(seconds: srcDurSec, preferredTimescale: ats)
+                        try? extra.insertTimeRange(CMTimeRange(start: trimSt, duration: srcDur), of: aAsset, at: at)
+                        addedTrackID = extra.trackID
+                    }
+                }
+
+                if let tid = addedTrackID {
                     let effDur  = useDur.seconds
                     let fadeIn  = clip.fadeInEnabled  ? min(max(0, clip.fadeInDuration),  effDur) : 0
                     let fadeOut = clip.fadeOutEnabled ? min(max(0, clip.fadeOutDuration), max(0, effDur - fadeIn)) : 0
-                    audioMixParams.append((tid, clip.volume, clip.leftChannel, clip.rightChannel, clip.startTime, useDur.seconds, fadeIn, fadeOut))
+                    audioMixParams.append((tid, clip.volume, clip.leftChannel, clip.rightChannel, clip.startTime, effDur, fadeIn, fadeOut))
                 }
             }
         }
@@ -1046,6 +1132,20 @@ actor TimelineExporter {
                 renderSize: renderSize
             )
 
+            // ── 色调范围表（视频 clip），导出时逐帧应用 CIFilter ──
+            let colorRanges: [(start: Double, end: Double, adj: ColorAdjust)] =
+                input.videoTracks.flatMap { track -> [(Double, Double, ColorAdjust)] in
+                    guard track.isVisible else { return [] }
+                    return track.clips.compactMap { clip in
+                        clip.colorAdjust.isIdentity ? nil : (clip.startTime, clip.endTime, clip.colorAdjust)
+                    }
+                } + input.imageTracks.flatMap { track -> [(Double, Double, ColorAdjust)] in
+                    guard track.isVisible else { return [] }
+                    return track.clips.compactMap { clip in
+                        clip.colorAdjust.isIdentity ? nil : (clip.startTime, clip.endTime, clip.colorAdjust)
+                    }
+                }
+
             // ── 用 AVAssetWriter 导出（精确控制帧率）──
             try? FileManager.default.removeItem(at: input.outputURL)
             try await writerExport(
@@ -1053,6 +1153,7 @@ actor TimelineExporter {
                 videoComposition: videoComposition!,
                 audioMix: audioMix,
                 subtitleInfo: subRenderInfo,
+                colorRanges: colorRanges,
                 fps: fps,
                 bitrate: settings.bitrate,
                 outputURL: input.outputURL,
@@ -1158,6 +1259,7 @@ actor TimelineExporter {
         videoComposition: AVMutableVideoComposition,
         audioMix: AVMutableAudioMix,
         subtitleInfo: SubtitleRenderInfo,
+        colorRanges: [(start: Double, end: Double, adj: ColorAdjust)],
         fps: Int, bitrate: Int,
         outputURL: URL,
         progress: @escaping (Double) -> Void
@@ -1286,10 +1388,24 @@ actor TimelineExporter {
 
                             let outputPTS = CMTime(value: frameIndex, timescale: Int32(targetFps))
                             if let pb = currentPB {
-                                if hasSubtitles {
-                                    // 在副本上绘制字幕，避免重复帧（帧率不匹配时 pb 复用）导致背景叠加闪烁
+                                // 查找当前帧的色调调节
+                                let activeAdj = colorRanges.first {
+                                    targetTime >= $0.start && targetTime < $0.end
+                                }?.adj
+
+                                let needsExtra = hasSubtitles || (activeAdj != nil && activeAdj?.isIdentity == false)
+                                if needsExtra {
                                     let renderPB = Self.copyPixelBuffer(pb) ?? pb
-                                    self.drawSubtitlesOnPixelBuffer(renderPB, atTime: targetTime, info: subtitleInfo)
+                                    // 1. 色调调节
+                                    if let adj = activeAdj, !adj.isIdentity {
+                                        let src = CIImage(cvPixelBuffer: renderPB)
+                                        let dst = ColorAdjust.apply(src, adj)
+                                        ExportCIContext.shared.render(dst, to: renderPB)
+                                    }
+                                    // 2. 字幕
+                                    if hasSubtitles {
+                                        self.drawSubtitlesOnPixelBuffer(renderPB, atTime: targetTime, info: subtitleInfo)
+                                    }
                                     adaptor.append(renderPB, withPresentationTime: outputPTS)
                                 } else {
                                     adaptor.append(pb, withPresentationTime: outputPTS)

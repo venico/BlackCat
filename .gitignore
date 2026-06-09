@@ -11,3 +11,6 @@ DerivedData/
 黑猫剪辑.app/Contents/MacOS/ffprobe
 黑猫剪辑.app/Contents/_CodeSignature/
 黑猫剪辑.app/Contents/Frameworks/
+
+# Whisper 二进制和模型(走 release 附件，模型 488MB 超 GitHub 限制)
+Vendor/

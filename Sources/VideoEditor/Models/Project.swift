@@ -3,6 +3,7 @@ import AVFoundation
 import MediaToolbox
 import Accelerate
 import Combine
+import NaturalLanguage
 
 // MARK: - PlaybackClock（高频播放状态，独立 ObservableObject）
 // 播放时 currentTime 每秒更新 30 次。如果放在 ProjectState 里，
@@ -122,6 +123,11 @@ enum TransitionType: String, Codable, CaseIterable {
     case pushRight      // 从左推入
     case pushUp         // 从下推入
     case pushDown       // 从上推入
+    case zoom           // 缩放（前片放大淡出 + 后片缩小淡入）
+    case slideLeft      // 滑入(左)：后片从右滑入覆盖，前片不动
+    case slideRight     // 滑入(右)：后片从左滑入覆盖
+    case slideUp        // 滑入(上)：后片从下滑入覆盖
+    case slideDown      // 滑入(下)：后片从上滑入覆盖
 
     var label: String {
         switch self {
@@ -131,6 +137,11 @@ enum TransitionType: String, Codable, CaseIterable {
         case .pushRight:   return "推入(右)"
         case .pushUp:      return "推入(上)"
         case .pushDown:    return "推入(下)"
+        case .zoom:        return "缩放"
+        case .slideLeft:   return "滑入(左)"
+        case .slideRight:  return "滑入(右)"
+        case .slideUp:     return "滑入(上)"
+        case .slideDown:   return "滑入(下)"
         }
     }
 
@@ -142,6 +153,27 @@ enum TransitionType: String, Codable, CaseIterable {
         case .pushRight:   return "arrow.right.square"
         case .pushUp:      return "arrow.up.square"
         case .pushDown:    return "arrow.down.square"
+        case .zoom:        return "plus.magnifyingglass"
+        case .slideLeft:   return "arrow.left.to.line"
+        case .slideRight:  return "arrow.right.to.line"
+        case .slideUp:     return "arrow.up.to.line"
+        case .slideDown:   return "arrow.down.to.line"
+        }
+    }
+
+    /// 是否为滑入类（A 不动，仅 B 位移覆盖）
+    var isSlide: Bool {
+        switch self {
+        case .slideLeft, .slideRight, .slideUp, .slideDown: return true
+        default: return false
+        }
+    }
+
+    /// 是否为推入类（A、B 同时位移）
+    var isPush: Bool {
+        switch self {
+        case .pushLeft, .pushRight, .pushUp, .pushDown: return true
+        default: return false
         }
     }
 }
@@ -202,6 +234,11 @@ struct VideoClip: Identifiable, Equatable, Codable {
     // 源视频原始尺寸（用于预览裁剪框计算）
     var videoWidth: Double  = 0
     var videoHeight: Double = 0
+    // 播放速率：1.0=正常，2.0=2倍速，0.5=半速（0.1~4.0）
+    // 语义：时间轴宽度不变，源素材消耗量 = duration * speed
+    var speed: Double = 1.0
+    // 色调调节
+    var colorAdjust: ColorAdjust = .identity
     // 转场：从前一个 clip 到本 clip 的转场效果（nil = 无转场）
     var inTransition: Transition? = nil
 }
@@ -225,6 +262,8 @@ struct AudioClip: Identifiable, Equatable, Codable {
     var fadeOutEnabled: Bool  = false
     var fadeInDuration: Double  = 1.0  // seconds
     var fadeOutDuration: Double = 1.0  // seconds
+    // 播放速率
+    var speed: Double = 1.0
 }
 
 struct ImageClip: Identifiable, Equatable, Codable {
@@ -248,6 +287,8 @@ struct ImageClip: Identifiable, Equatable, Codable {
     var cropBottom: Double = 0
     var cropLeft: Double   = 0
     var cropRight: Double  = 0
+    // 色调调节
+    var colorAdjust: ColorAdjust = .identity
 }
 
 struct Track<Clip: Identifiable & Equatable & Codable>: Identifiable, Codable {
@@ -368,6 +409,8 @@ final class ProjectState: ObservableObject {
     weak var timelineHScrollView: NSScrollView?
     private var _zoomScrollTarget: Double? = nil
     private var _zoomWorkItem: DispatchWorkItem? = nil
+    /// 变速音频临时文件缓存：key = "path|trimStart|srcDurSec|speed|trackIdx"
+    private var audioSpeedCache: [String: URL] = [:]
     @Published var snapEnabled: Bool = true
     @Published var showImageTracks: Bool = true
     var timelineVisibleWidth: Double = 800  // 由 GeometryReader 更新
@@ -456,6 +499,15 @@ final class ProjectState: ObservableObject {
     @Published var selectedSubtitleClipID: UUID? = nil
     // Transition selection
     @Published var selectedTransitionClipID: UUID? = nil  // 当前选中的转场（clip ID，其 inTransition 被编辑）
+
+    // 语音识别状态（Whisper）
+    enum TranscribeState: Equatable {
+        case idle, running
+        case done(Int)        // 生成字幕条数
+        case failed(String)   // 失败原因
+    }
+    @Published var transcribeState: TranscribeState = .idle
+    var isTranscribing: Bool { if case .running = transcribeState { return true }; return false }
     @Published var mediaLibraryTab: String = "video"      // 素材库当前标签（提升到 ProjectState，转场图标点击可切换）
     // Multi-selection (used by box-select & bulk delete)
     @Published var selectedClipIDs: Set<UUID>    = []
@@ -1506,9 +1558,9 @@ final class ProjectState: ObservableObject {
 
         // 指纹检测：跳过无变化的重复 rebuild（seekTo 除外）
         var hasher = Hasher()
-        hasher.combine(vTracks.flatMap(\.clips).map { "\($0.id)\($0.startTime)\($0.endTime)\($0.trimStart)\($0.volume)\($0.scaleX)\($0.scaleY)\($0.offsetX)\($0.offsetY)\($0.cropTop)\($0.cropBottom)\($0.cropLeft)\($0.cropRight)\($0.audioTrackIndex)\($0.inTransition?.type.rawValue ?? "")\($0.inTransition?.duration ?? 0)" }.joined())
-        hasher.combine(iTracks.flatMap(\.clips).map { "\($0.id)\($0.startTime)\($0.endTime)\($0.scaleX)\($0.scaleY)\($0.offsetX)\($0.offsetY)\($0.cropTop)\($0.cropBottom)\($0.cropLeft)\($0.cropRight)" }.joined())
-        hasher.combine(aTracks.flatMap(\.clips).map { "\($0.id)\($0.startTime)\($0.endTime)\($0.trimStart)\($0.volume)\($0.leftChannel)\($0.rightChannel)\($0.fadeInEnabled)\($0.fadeInDuration)\($0.fadeOutEnabled)\($0.fadeOutDuration)" }.joined())
+        hasher.combine(vTracks.flatMap(\.clips).map { "\($0.id)\($0.startTime)\($0.endTime)\($0.trimStart)\($0.speed)\($0.volume)\($0.scaleX)\($0.scaleY)\($0.offsetX)\($0.offsetY)\($0.cropTop)\($0.cropBottom)\($0.cropLeft)\($0.cropRight)\($0.audioTrackIndex)\($0.inTransition?.type.rawValue ?? "")\($0.inTransition?.duration ?? 0)\($0.colorAdjust.brightness)\($0.colorAdjust.contrast)\($0.colorAdjust.saturation)\($0.colorAdjust.hue)" }.joined())
+        hasher.combine(iTracks.flatMap(\.clips).map { "\($0.id)\($0.startTime)\($0.endTime)\($0.scaleX)\($0.scaleY)\($0.offsetX)\($0.offsetY)\($0.cropTop)\($0.cropBottom)\($0.cropLeft)\($0.cropRight)\($0.colorAdjust.brightness)\($0.colorAdjust.contrast)\($0.colorAdjust.saturation)\($0.colorAdjust.hue)" }.joined())
+        hasher.combine(aTracks.flatMap(\.clips).map { "\($0.id)\($0.startTime)\($0.endTime)\($0.trimStart)\($0.speed)\($0.volume)\($0.leftChannel)\($0.rightChannel)\($0.fadeInEnabled)\($0.fadeInDuration)\($0.fadeOutEnabled)\($0.fadeOutDuration)" }.joined())
         hasher.combine(vTracks.map { "\($0.isVisible)\($0.isMuted)" }.joined())
         hasher.combine(iTracks.map { "\($0.isVisible)" }.joined())
         hasher.combine(aTracks.map { "\($0.isVisible)\($0.isMuted)" }.joined())
@@ -1547,7 +1599,8 @@ final class ProjectState: ObservableObject {
                         half = wantedHalf
                     } else {
                         // 平均分配：A 延伸 half（受 asset 尾部余量限制），B 提前 half（受 trimStart 限制）
-                        let availA = max(0, (clipAssetDurSec[cA.id] ?? 0) - (cA.trimStart + cA.duration))
+                        // A 消耗的源素材 = duration * speed，剩余可延伸 = assetDur - trimStart - duration*speed
+                        let availA = max(0, (clipAssetDurSec[cA.id] ?? 0) - (cA.trimStart + cA.duration * cA.speed))
                         let availB = cB.trimStart
                         half = max(0, min(wantedHalf, min(availA, availB)))
                     }
@@ -1566,39 +1619,69 @@ final class ProjectState: ObservableObject {
                     let assetDurSec = clipAssetDurSec[clip.id] ?? 0
                     let assetDur = CMTime(seconds: assetDurSec, preferredTimescale: 600)
                     let trimSt  = CMTime(seconds: clip.trimStart, preferredTimescale: 600)
-                    let maxDur  = assetDur - trimSt
-                    let useDur  = CMTimeMinimum(CMTime(seconds: clip.duration, preferredTimescale: 600), maxDur)
+                    let maxSrcDur = assetDur - trimSt
+                    // 变速：源素材消耗 = duration * speed，timeline 时长上限 = maxSrcDur / speed
+                    let speed = max(0.01, clip.speed)
+                    let maxTimelineDur = CMTime(seconds: maxSrcDur.seconds / speed, preferredTimescale: 600)
+                    let useDur = CMTimeMinimum(CMTime(seconds: clip.duration, preferredTimescale: 600), maxTimelineDur)
                     guard useDur.seconds > 0.01 else { continue }
+                    let srcContentDurSec = useDur.seconds * speed  // 源素材实际消耗量（秒）
 
                     // 查询该 clip 作为 A 需要延伸多少，作为 B 需要提前多少
                     let aExtend  = transAdjusts.first(where: { $0.clipAID == clip.id && $0.type != .fadeToBlack })?.half ?? 0
                     let bAdvance = transAdjusts.first(where: { $0.clipBID == clip.id && $0.type != .fadeToBlack })?.half ?? 0
 
+                    // 视频 source range：从 (trimStart - bAdvance) 开始，读 (srcContentDur + bAdvance + aExtend) 秒源素材
                     let actualTrimSt = CMTime(seconds: clip.trimStart - bAdvance, preferredTimescale: 600)
-                    let actualDur    = useDur + CMTime(seconds: bAdvance + aExtend, preferredTimescale: 600)
-                    let actualRange  = CMTimeRange(start: actualTrimSt, duration: actualDur)
+                    let actualSrcDur = CMTime(seconds: srcContentDurSec + bAdvance + aExtend, preferredTimescale: 600)
+                    let actualRange  = CMTimeRange(start: actualTrimSt, duration: actualSrcDur)
                     let at           = CMTime(seconds: clip.startTime - bAdvance, preferredTimescale: 600)
-                    // 音频不做 overlap，保持原始时间范围
-                    let audioRange   = CMTimeRange(start: trimSt, duration: useDur)
-                    let audioAt      = CMTime(seconds: clip.startTime, preferredTimescale: 600)
-
+                    let targetDurSec = useDur.seconds + bAdvance + aExtend   // timeline 上的目标时长
                     if track.isVisible,
                        let vAsset = try? await asset.loadTracks(withMediaType: .video).first,
                        let vt = composition.addMutableTrack(withMediaType: .video,
                                                             preferredTrackID: kCMPersistentTrackID_Invalid) {
                         try? vt.insertTimeRange(actualRange, of: vAsset, at: at)
+                        // 变速：把 actualSrcDur 缩放到 targetDur
+                        if abs(speed - 1.0) > 0.001 {
+                            let compRange = CMTimeRange(start: at, duration: actualSrcDur)
+                            vt.scaleTimeRange(compRange, toDuration: CMTime(seconds: targetDurSec, preferredTimescale: 600))
+                        }
                         videoCompTracks.append((vt, clip,
                                                 clip.startTime - bAdvance,         // 实际开始（B 提前）
                                                 clip.startTime + useDur.seconds + aExtend)) // 实际结束（A 延伸）
                     }
                     if !track.isMuted {
-                        let allAudioTracks = (try? await asset.loadTracks(withMediaType: .audio)) ?? []
-                        let idx = min(clip.audioTrackIndex, max(allAudioTracks.count - 1, 0))
-                        if let aAsset = allAudioTracks.isEmpty ? nil : allAudioTracks[idx] as AVAssetTrack?,
-                           let at2 = composition.addMutableTrack(withMediaType: .audio,
-                                                                  preferredTrackID: kCMPersistentTrackID_Invalid) {
-                            try? at2.insertTimeRange(audioRange, of: aAsset, at: audioAt)
-                            audioParams.append((at2.trackID, clip.volume, 1.0, 1.0, clip.startTime, useDur.seconds, 0, 0))
+                        let audioAt = CMTime(seconds: clip.startTime, preferredTimescale: 44100)
+                        if abs(speed - 1.0) > 0.001 {
+                            // 变速：ffmpeg atempo 预处理，生成已变速的临时音频文件（正常速度 insert）
+                            if let speedURL = await self.generateSpeedAudio(
+                                inputURL: url, trimStart: clip.trimStart,
+                                srcDurSec: srcContentDurSec, speed: speed,
+                                audioTrackIndex: clip.audioTrackIndex),
+                               let at2 = composition.addMutableTrack(withMediaType: .audio,
+                                                                      preferredTrackID: kCMPersistentTrackID_Invalid) {
+                                let sAsset = AVURLAsset(url: speedURL)
+                                if let sTrack = try? await sAsset.loadTracks(withMediaType: .audio).first {
+                                    let sDur = (try? await sAsset.load(.duration)) ?? .zero
+                                    let ins = CMTimeMinimum(sDur, CMTime(seconds: useDur.seconds, preferredTimescale: 44100))
+                                    try? at2.insertTimeRange(CMTimeRange(start: .zero, duration: ins), of: sTrack, at: audioAt)
+                                    audioParams.append((at2.trackID, clip.volume, 1.0, 1.0, clip.startTime, ins.seconds, 0, 0))
+                                }
+                            }
+                        } else {
+                            // 正常速度
+                            let allAudioTracks = (try? await asset.loadTracks(withMediaType: .audio)) ?? []
+                            let idx = min(clip.audioTrackIndex, max(allAudioTracks.count - 1, 0))
+                            if let aAsset = allAudioTracks.isEmpty ? nil : allAudioTracks[idx] as AVAssetTrack?,
+                               let at2 = composition.addMutableTrack(withMediaType: .audio,
+                                                                      preferredTrackID: kCMPersistentTrackID_Invalid) {
+                                let ats: CMTimeScale = 44100
+                                let trimSt  = CMTime(seconds: clip.trimStart, preferredTimescale: ats)
+                                let useDurC = CMTime(seconds: useDur.seconds, preferredTimescale: ats)
+                                try? at2.insertTimeRange(CMTimeRange(start: trimSt, duration: useDurC), of: aAsset, at: audioAt)
+                                audioParams.append((at2.trackID, clip.volume, 1.0, 1.0, clip.startTime, useDur.seconds, 0, 0))
+                            }
                         }
                     }
                 }
@@ -1689,23 +1772,47 @@ final class ProjectState: ObservableObject {
                 guard track.isVisible && !track.isMuted else { continue }
                 for clip in track.clips {
                     guard let url = clip.url else { continue }
-                    let asset = self.cachedAVAsset(url: url)
-                    guard let aAsset = try? await asset.loadTracks(withMediaType: .audio).first else { continue }
+                    let asset    = self.cachedAVAsset(url: url)
                     let assetDur = (try? await asset.load(.duration)) ?? .zero
-                    let trimSt  = CMTime(seconds: clip.trimStart, preferredTimescale: 600)
-                    let maxDur  = assetDur - trimSt
-                    let useDur  = CMTimeMinimum(CMTime(seconds: clip.duration, preferredTimescale: 600), maxDur)
+                    let aspeed   = max(0.01, clip.speed)
+                    let ats: CMTimeScale = 44100
+                    let trimSt   = CMTime(seconds: clip.trimStart, preferredTimescale: ats)
+                    let maxSrcDur = assetDur - trimSt
+                    let maxTimelineDur = CMTime(seconds: maxSrcDur.seconds / aspeed, preferredTimescale: ats)
+                    let useDur   = CMTimeMinimum(CMTime(seconds: clip.duration, preferredTimescale: ats), maxTimelineDur)
                     guard useDur.seconds > 0.01 else { continue }
-                    let range = CMTimeRange(start: trimSt, duration: useDur)
-                    let at    = CMTime(seconds: clip.startTime, preferredTimescale: 600)
-                    if let at2 = composition.addMutableTrack(withMediaType: .audio,
-                                                             preferredTrackID: kCMPersistentTrackID_Invalid) {
-                        try? at2.insertTimeRange(range, of: aAsset, at: at)
-                        // 防止淡入淡出 volume ramp 重叠导致崩溃：基于实际时长，fadeIn + fadeOut ≤ 时长
-                        let effDur  = useDur.seconds
-                        let fadeIn  = clip.fadeInEnabled  ? min(max(0, clip.fadeInDuration),  effDur) : 0
-                        let fadeOut = clip.fadeOutEnabled ? min(max(0, clip.fadeOutDuration), max(0, effDur - fadeIn)) : 0
-                        audioParams.append((at2.trackID, clip.volume, clip.leftChannel, clip.rightChannel, clip.startTime, useDur.seconds, fadeIn, fadeOut))
+                    let srcDurSec = useDur.seconds * aspeed
+                    let at        = CMTime(seconds: clip.startTime, preferredTimescale: ats)
+
+                    if abs(aspeed - 1.0) > 0.001 {
+                        // 变速：ffmpeg atempo 预处理
+                        if let speedURL = await self.generateSpeedAudio(
+                            inputURL: url, trimStart: clip.trimStart,
+                            srcDurSec: srcDurSec, speed: aspeed, audioTrackIndex: 0),
+                           let at2 = composition.addMutableTrack(withMediaType: .audio,
+                                                                  preferredTrackID: kCMPersistentTrackID_Invalid) {
+                            let sAsset = AVURLAsset(url: speedURL)
+                            if let sTrack = try? await sAsset.loadTracks(withMediaType: .audio).first {
+                                let sDur = (try? await sAsset.load(.duration)) ?? .zero
+                                let ins  = CMTimeMinimum(sDur, useDur)
+                                try? at2.insertTimeRange(CMTimeRange(start: .zero, duration: ins), of: sTrack, at: at)
+                                let effDur  = ins.seconds
+                                let fadeIn  = clip.fadeInEnabled  ? min(max(0, clip.fadeInDuration),  effDur) : 0
+                                let fadeOut = clip.fadeOutEnabled ? min(max(0, clip.fadeOutDuration), max(0, effDur - fadeIn)) : 0
+                                audioParams.append((at2.trackID, clip.volume, clip.leftChannel, clip.rightChannel, clip.startTime, effDur, fadeIn, fadeOut))
+                            }
+                        }
+                    } else {
+                        // 正常速度
+                        guard let aAsset = try? await asset.loadTracks(withMediaType: .audio).first else { continue }
+                        if let at2 = composition.addMutableTrack(withMediaType: .audio,
+                                                                  preferredTrackID: kCMPersistentTrackID_Invalid) {
+                            try? at2.insertTimeRange(CMTimeRange(start: trimSt, duration: useDur), of: aAsset, at: at)
+                            let effDur  = useDur.seconds
+                            let fadeIn  = clip.fadeInEnabled  ? min(max(0, clip.fadeInDuration),  effDur) : 0
+                            let fadeOut = clip.fadeOutEnabled ? min(max(0, clip.fadeOutDuration), max(0, effDur - fadeIn)) : 0
+                            audioParams.append((at2.trackID, clip.volume, clip.leftChannel, clip.rightChannel, clip.startTime, effDur, fadeIn, fadeOut))
+                        }
                     }
                 }
             }
@@ -1805,71 +1912,151 @@ final class ProjectState: ObservableObject {
                 // 去重 + 排序
                 let sortedCM = Array(Set(cmBoundaries.map { $0.value })).sorted().map { CMTime(value: $0, timescale: ts) }
 
-                var instructions: [AVMutableVideoCompositionInstruction] = []
+                // 用自定义 compositor 替代 layerInstructions，同时支持色调调节 + 转场渐变
+                vc.customVideoCompositorClass = ColorCompositor.self
+                // 每次重建前清空旧数据（避免旧 key 残留）
+                ColorCompositor.clearStore()
+                var colorInstructions: [AVVideoCompositionInstruction] = []
                 for i in 0..<(sortedCM.count - 1) {
                     let segStartCM = sortedCM[i]
                     let segEndCM   = sortedCM[i + 1]
                     let segDur = segEndCM - segStartCM
                     guard segDur.seconds > 0.001 else { continue }
 
-                    let instruction = AVMutableVideoCompositionInstruction()
-                    instruction.timeRange = CMTimeRange(start: segStartCM, duration: segDur)
-                    instruction.backgroundColor = CGColor(gray: 0, alpha: 1)
+                    let instr = AVMutableVideoCompositionInstruction()
+                    instr.timeRange = CMTimeRange(start: segStartCM, duration: segDur)
 
-                    var layerInstructions: [AVMutableVideoCompositionLayerInstruction] = []
-                    // 所有 image track 都有 sample（填充了整个时间线），
-                    // 不活跃的 clip 用 opacity=0 隐藏。
+                    var entries:      [CompositorTrackEntry] = []
+                    var activeTracks: [AVCompositionTrack]   = []
+                    var hasTween = false
+
+                    // 视频 track（底层）
+                    for (idx, entry) in videoCompTracks.enumerated() {
+                        let clipStart = videoClipCMRanges[idx].start
+                        let clipEnd   = videoClipCMRanges[idx].end
+                        guard segStartCM >= clipStart && segStartCM < clipEnd else { continue }
+                        // 只需要检查 track 有效，不需要 natSize（compositor 用实际 buffer 算 fit）
+                        guard (try? await entry.track.load(.naturalSize)) != nil else { continue }
+                        let clip = entry.clip
+                        var te = CompositorTrackEntry(
+                            trackID:     entry.track.trackID,
+                            userScaleX:  CGFloat(clip.scaleX),
+                            userScaleY:  CGFloat(clip.scaleY),
+                            userOffsetX: CGFloat(clip.offsetX),
+                            userOffsetY: CGFloat(clip.offsetY),
+                            cropTop:     CGFloat(clip.cropTop),
+                            cropBottom:  CGFloat(clip.cropBottom),
+                            cropLeft:    CGFloat(clip.cropLeft),
+                            cropRight:   CGFloat(clip.cropRight),
+                            colorAdjust: clip.colorAdjust,
+                            opacityRamp: nil,
+                            pushRamp:    nil)
+                        // 转场渐变
+                        for trans in transitionInfos {
+                            let isA = entry.track === trans.trackA
+                            let isB = entry.track === trans.trackB
+                            guard isA || isB else { continue }
+                            let effStart: CMTime
+                            let effEnd: CMTime
+                            if trans.type == .fadeToBlack {
+                                effStart = isA ? trans.overlapStart : trans.cutT
+                                effEnd   = isA ? trans.cutT : trans.overlapEnd
+                            } else {
+                                effStart = trans.overlapStart
+                                effEnd   = trans.overlapEnd
+                            }
+                            guard segStartCM >= effStart && segStartCM < effEnd else { continue }
+                            let fOp: Float = isA ? 1.0 : 0.0
+                            let tOp: Float = isA ? 0.0 : 1.0
+                            switch trans.type {
+                            case .dissolve, .fadeToBlack:
+                                te.opacityRamp = (from: fOp, to: tOp,
+                                                  start: effStart.seconds, end: effEnd.seconds)
+                                hasTween = true
+                            case .pushLeft, .pushRight, .pushUp, .pushDown:
+                                // dx/dy 以 renderSize 为单位，compositor 运行时在 fit 坐标系叠加偏移
+                                let (dx, dy): (CGFloat, CGFloat) = {
+                                    switch trans.type {
+                                    case .pushLeft:  return (-renderSize.width,  0)
+                                    case .pushRight: return ( renderSize.width,  0)
+                                    case .pushUp:    return (0,  renderSize.height)
+                                    default:         return (0, -renderSize.height)
+                                    }
+                                }()
+                                te.pushRamp = (dx: dx, dy: dy, isA: isA,
+                                               start: effStart.seconds, end: effEnd.seconds)
+                                hasTween = true
+                            case .zoom:
+                                // 前片(A)放大淡出，后片(B)从放大缩回 + 淡入
+                                te.opacityRamp = (from: fOp, to: tOp,
+                                                  start: effStart.seconds, end: effEnd.seconds)
+                                te.zoomRamp = (from: isA ? 1.0 : 1.4, to: isA ? 1.4 : 1.0,
+                                               start: effStart.seconds, end: effEnd.seconds)
+                                hasTween = true
+                            case .slideLeft, .slideRight, .slideUp, .slideDown:
+                                // 后片(B)从边缘滑入覆盖，前片(A)保持不动
+                                if isB {
+                                    let (dx, dy): (CGFloat, CGFloat) = {
+                                        switch trans.type {
+                                        case .slideLeft:  return (-renderSize.width,  0)
+                                        case .slideRight: return ( renderSize.width,  0)
+                                        case .slideUp:    return (0,  renderSize.height)
+                                        default:          return (0, -renderSize.height)
+                                        }
+                                    }()
+                                    te.pushRamp = (dx: dx, dy: dy, isA: false,
+                                                   start: effStart.seconds, end: effEnd.seconds)
+                                }
+                                hasTween = true
+                            }
+                            break
+                        }
+                        entries.append(te)
+                        activeTracks.append(entry.track)
+                    }
+
+                    // 图片 track（顶层）
                     for (idx, entry) in imageCompTracks.enumerated() {
                         let clipStartCM = imageClipCMRanges[idx].start
                         let clipEndCM   = imageClipCMRanges[idx].end
-                        let clipActive = segStartCM >= clipStartCM && segStartCM < clipEndCM
-                        let li = AVMutableVideoCompositionLayerInstruction(assetTrack: entry.track)
-                        if clipActive {
-                            if let natSize = try? await entry.track.load(.naturalSize), natSize.width > 0, natSize.height > 0 {
-                                let t = Self.imageTransform(clip: entry.clip, natSize: natSize, renderSize: renderSize)
-                                li.setTransform(t, at: .zero)
-                                let c = entry.clip
-                                if c.cropTop > 0.001 || c.cropBottom > 0.001 || c.cropLeft > 0.001 || c.cropRight > 0.001 {
-                                    li.setCropRectangle(Self.imageCropRect(clip: c, natSize: natSize), at: .zero)
-                                }
-                            }
-                        } else {
-                            li.setOpacity(0, at: .zero)
-                        }
-                        layerInstructions.append(li)
+                        guard segStartCM >= clipStartCM && segStartCM < clipEndCM else { continue }
+                        let iclip = entry.clip
+                        let te = CompositorTrackEntry(
+                            trackID:     entry.track.trackID,
+                            userScaleX:  CGFloat(iclip.scaleX),
+                            userScaleY:  CGFloat(iclip.scaleY),
+                            userOffsetX: CGFloat(iclip.offsetX),
+                            userOffsetY: CGFloat(iclip.offsetY),
+                            cropTop:     CGFloat(iclip.cropTop),
+                            cropBottom:  CGFloat(iclip.cropBottom),
+                            cropLeft:    CGFloat(iclip.cropLeft),
+                            cropRight:   CGFloat(iclip.cropRight),
+                            colorAdjust: iclip.colorAdjust,
+                            opacityRamp: nil,
+                            pushRamp:    nil)
+                        entries.append(te)
+                        activeTracks.append(entry.track)
                     }
-                    for (idx, entry) in videoCompTracks.enumerated() {
-                        let li = AVMutableVideoCompositionLayerInstruction(assetTrack: entry.track)
-                        let clipStart = videoClipCMRanges[idx].start
-                        let clipEnd   = videoClipCMRanges[idx].end
-                        let active = segStartCM >= clipStart && segStartCM < clipEnd
-                        if active {
-                            let natSize = (try? await entry.track.load(.naturalSize)) ?? .zero
-                            if natSize.width > 0, natSize.height > 0 {
-                                let t = Self.videoTransform(clip: entry.clip, natSize: natSize, renderSize: renderSize)
-                                li.setTransform(t, at: .zero)
-                                let c = entry.clip
-                                if c.cropTop > 0.001 || c.cropBottom > 0.001 || c.cropLeft > 0.001 || c.cropRight > 0.001 {
-                                    li.setCropRectangle(Self.videoCropRect(clip: c, natSize: natSize), at: .zero)
-                                }
-                                // 检查是否在 transition 效果区间内
-                                Self.applyTransitionRamp(
-                                    li: li, track: entry.track, clip: entry.clip,
-                                    transform: t, natSize: natSize, renderSize: renderSize,
-                                    segStart: segStartCM, transitions: transitionInfos
-                                )
-                            }
-                        } else {
-                            li.setOpacity(0, at: .zero)
-                        }
-                        layerInstructions.append(li)
+
+                    // 注册 track IDs：通过 layerInstructions 告知框架需要哪些 source frames
+                    instr.layerInstructions = activeTracks.map {
+                        AVMutableVideoCompositionLayerInstruction(assetTrack: $0)
                     }
-                    instruction.layerInstructions = layerInstructions
-                    instructions.append(instruction)
+                    instr.enablePostProcessing = hasTween
+
+                    // 向 ColorCompositor 静态字典注册数据（不用 associated object，避免 copy 丢失）
+                    let colorData = ColorCompositionData()
+                    colorData.entries    = entries
+                    colorData.renderSize = renderSize
+                    // key = segStartCM 转为 timescale=600 后的整数值
+                    let key = CMTimeConvertScale(segStartCM, timescale: 600, method: .default).value
+                    ColorCompositor.setData(colorData, forStartValue: key)
+
+                    colorInstructions.append(instr)
                 }
 
-                if !instructions.isEmpty {
-                    vc.instructions = instructions
+                if !colorInstructions.isEmpty {
+                    vc.instructions = colorInstructions
                     videoComposition = vc
                 }
             }
@@ -1885,6 +2072,9 @@ final class ProjectState: ObservableObject {
                     self.playerItem = nil
                 } else {
                     let item = AVPlayerItem(asset: composition)
+                    // varispeed：变速时音调随之改变（与剪映普通变速一致）
+                    // 不能用默认的 .spectral（保持音调），否则 scaleTimeRange 变速的音频会部分/全部静音
+                    item.audioTimePitchAlgorithm = .varispeed
                     item.audioMix = audioMix
                     if let vc = videoComposition {
                         item.videoComposition = vc
@@ -2013,6 +2203,36 @@ final class ProjectState: ObservableObject {
                 let fromT = isA ? t : t.concatenating(offsetRev)
                 let toT   = isA ? t.concatenating(offsetFwd) : t
                 li.setTransformRamp(fromStart: fromT, toEnd: toT, timeRange: fadeRange)
+            case .zoom:
+                // 前片(A)放大淡出，后片(B)从放大缩回 + 淡入；以 render 中心为锚缩放
+                let cx = renderSize.width / 2, cy = renderSize.height / 2
+                func zoomAffine(_ s: CGFloat) -> CGAffineTransform {
+                    CGAffineTransform(translationX: cx, y: cy)
+                        .scaledBy(x: s, y: s)
+                        .translatedBy(x: -cx, y: -cy)
+                }
+                let fromS: CGFloat = isA ? 1.0 : 1.4
+                let toS:   CGFloat = isA ? 1.4 : 1.0
+                li.setOpacityRamp(fromStartOpacity: fromOpacity, toEndOpacity: toOpacity,
+                                  timeRange: fadeRange)
+                li.setTransformRamp(fromStart: t.concatenating(zoomAffine(fromS)),
+                                    toEnd:     t.concatenating(zoomAffine(toS)),
+                                    timeRange: fadeRange)
+            case .slideLeft, .slideRight, .slideUp, .slideDown:
+                // 后片(B)从边缘滑入到原位；前片(A)保持不动（不设 ramp）
+                if isB {
+                    let (sdx, sdy): (CGFloat, CGFloat) = {
+                        switch trans.type {
+                        case .slideLeft:  return (-renderSize.width,  0)
+                        case .slideRight: return ( renderSize.width,  0)
+                        case .slideUp:    return (0,  renderSize.height)
+                        default:          return (0, -renderSize.height)
+                        }
+                    }()
+                    let offsetRev = CGAffineTransform(translationX: -sdx, y: -sdy)
+                    li.setTransformRamp(fromStart: t.concatenating(offsetRev),
+                                        toEnd: t, timeRange: fadeRange)
+                }
             }
             break
         }
@@ -2377,7 +2597,7 @@ final class ProjectState: ObservableObject {
     }
 
     /// 同步执行 FFmpeg 命令，返回是否成功
-    private static func runFFmpegSync(ffmpeg: URL, arguments: [String]) -> Bool {
+    static func runFFmpegSync(ffmpeg: URL, arguments: [String]) -> Bool {
         let proc = Process()
         proc.executableURL = ffmpeg
         proc.arguments = arguments
@@ -2393,7 +2613,48 @@ final class ProjectState: ObservableObject {
     }
 
     /// 查找 FFmpeg 可执行文件
-    private static func findFFmpeg() -> URL? {
+    // MARK: - 变速音频预处理（ffmpeg atempo）
+
+    /// 构建 atempo filter 字符串（atempo 范围 0.5~2.0，超出则串联）
+    static func buildAtempoFilter(speed: Double) -> String {
+        var filters: [String] = []
+        var r = speed
+        while r > 2.0 + 1e-6 { filters.append("atempo=2.0"); r /= 2.0 }
+        while r < 0.5 - 1e-6 { filters.append("atempo=0.5"); r /= 0.5 }
+        if abs(r - 1.0) > 1e-6 { filters.append(String(format: "atempo=%.6f", r)) }
+        if filters.isEmpty { filters.append("atempo=1.0") }
+        return filters.joined(separator: ",")
+    }
+
+    /// 用 ffmpeg 生成变速音频临时文件，带缓存。
+    /// - Returns: 临时 .m4a URL（正常速度，duration ≈ srcDurSec / speed）
+    func generateSpeedAudio(inputURL: URL, trimStart: Double, srcDurSec: Double,
+                             speed: Double, audioTrackIndex: Int) async -> URL? {
+        let key = "\(inputURL.path)|\(trimStart)|\(srcDurSec)|\(speed)|\(audioTrackIndex)"
+        if let cached = audioSpeedCache[key], FileManager.default.fileExists(atPath: cached.path) {
+            return cached
+        }
+        guard let ffmpeg = Self.findFFmpeg() else { return nil }
+        let tmpURL = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("bc_spd_\(UUID().uuidString).m4a")
+        let filterStr = Self.buildAtempoFilter(speed: speed)
+        var args = ["-y"]
+        if trimStart > 0.001 { args += ["-ss", String(format: "%.6f", trimStart)] }
+        args += ["-t", String(format: "%.6f", srcDurSec), "-i", inputURL.path]
+        args += ["-vn"]
+        if audioTrackIndex > 0 { args += ["-map", "0:a:\(audioTrackIndex)"] }
+        args += ["-af", filterStr, "-c:a", "aac", "-ar", "44100", "-ac", "2", tmpURL.path]
+        let ok = await Task.detached(priority: .userInitiated) {
+            Self.runFFmpegSync(ffmpeg: ffmpeg, arguments: args)
+        }.value
+        if ok {
+            audioSpeedCache[key] = tmpURL
+            return tmpURL
+        }
+        return nil
+    }
+
+    static func findFFmpeg() -> URL? {
         // 优先从 app bundle 内部查找（已内置）
         if let bundlePath = Bundle.main.executableURL?.deletingLastPathComponent() {
             let bundledFFmpeg = bundlePath.appendingPathComponent("ffmpeg")
@@ -3045,11 +3306,13 @@ final class ProjectState: ObservableObject {
                         var newClip = VideoClip(
                             assetID: c.assetID, name: c.name, url: c.url,
                             startTime: t, endTime: c.endTime,
-                            trimStart: c.trimStart + (t - c.startTime),
+                            // 分割点在时间轴上的偏移 * speed = 源素材消耗量
+                            trimStart: c.trimStart + (t - c.startTime) * c.speed,
                             overrideResolution: c.overrideResolution,
                             overrideFPS: c.overrideFPS,
                             overrideBitrate: c.overrideBitrate)
                         newClip.volume = c.volume
+                        newClip.speed = c.speed   // 继承速率
                         newClip.videoWidth = c.videoWidth; newClip.videoHeight = c.videoHeight
                         newClip.scaleX = c.scaleX; newClip.scaleY = c.scaleY
                         newClip.lockAspect = c.lockAspect
@@ -3068,12 +3331,13 @@ final class ProjectState: ObservableObject {
                     let c = audioTracks[ti].clips[ci]
                     if c.startTime + 0.01 < t && c.endTime - 0.01 > t {
                         audioTracks[ti].clips[ci].endTime = t
-                        let newClip = AudioClip(
+                        var newClip = AudioClip(
                             assetID: c.assetID, name: c.name, url: c.url,
                             startTime: t, endTime: c.endTime,
-                            trimStart: c.trimStart + (t - c.startTime),
+                            trimStart: c.trimStart + (t - c.startTime) * c.speed,
                             volume: c.volume, leftChannel: c.leftChannel, rightChannel: c.rightChannel,
                             sampleRate: c.sampleRate, format: c.format)
+                        newClip.speed = c.speed
                         audioTracks[ti].clips.insert(newClip, at: ci + 1)
                         changed = true
                     }
@@ -3484,6 +3748,98 @@ final class ProjectState: ObservableObject {
         redoStack.removeAll()
         undoCount = undoStack.count
         redoCount = 0
+    }
+
+    // MARK: - 自动语音识别（Whisper）
+
+    /// 对选中的视频/音频片段做语音识别并生成字幕轨道。
+    /// 未选中片段时，识别时间轴上第一个视频片段。
+    func autoTranscribeSelectedClip() {
+        guard !isTranscribing else { return }
+
+        // 解析识别目标：选中视频 > 选中音频 > 第一个视频片段
+        var url: URL?
+        var trimStart = 0.0, srcDur = 0.0, offset = 0.0, speed = 1.0
+        if let vid = selectedVideoClipID,
+           let c = videoTracks.flatMap(\.clips).first(where: { $0.id == vid }) {
+            url = c.url; trimStart = c.trimStart; speed = max(0.01, c.speed)
+            srcDur = c.duration * speed; offset = c.startTime
+        } else if let aid = selectedAudioClipID,
+                  let c = audioTracks.flatMap(\.clips).first(where: { $0.id == aid }) {
+            url = c.url; trimStart = c.trimStart; speed = max(0.01, c.speed)
+            srcDur = c.duration * speed; offset = c.startTime
+        } else if let c = videoTracks.flatMap(\.clips).sorted(by: { $0.startTime < $1.startTime }).first {
+            url = c.url; trimStart = c.trimStart; speed = max(0.01, c.speed)
+            srcDur = c.duration * speed; offset = c.startTime
+        }
+
+        guard let mediaURL = url else {
+            transcribeState = .failed("请先选择一个视频或音频片段")
+            return
+        }
+        guard WhisperTranscriber.isAvailable else {
+            transcribeState = .failed("语音识别组件未就绪（缺少模型或可执行文件）")
+            return
+        }
+
+        transcribeState = .running
+
+        // 识别用自动检测原声，再按需翻译到「翻译目标语言」
+        let displayName = translationTargetLang
+        let isTargetSimplified = (displayName == "中文（简体）")
+        let targetBase = WhisperTranscriber.langCode(forDisplayName: displayName)  // zh/en/it...
+
+        let capSpeed = speed, capOffset = offset
+        Task {
+            do {
+                // 1. whisper 自动检测音频语言识别原声（-l 强制目标语言对非目标音频会出错）
+                let segs = try await WhisperTranscriber.transcribe(
+                    mediaURL: mediaURL, trimStart: trimStart,
+                    duration: srcDur, language: "auto", prompt: nil)
+
+                // 2. 检测识别结果主语言，判断与目标语言是否一致
+                let sample = segs.prefix(12).map(\.text).joined(separator: " ")
+                let recog = NLLanguageRecognizer()
+                recog.processString(sample)
+                let detected = recog.dominantLanguage?.rawValue ?? ""
+                let detectedBase = String(detected.split(separator: "-").first ?? "")
+                let sameLang = (detectedBase == targetBase)
+                    || (detectedBase.hasPrefix("zh") && targetBase == "zh")
+
+                // 3. 同语言直接用（中文简体目标做繁→简）；跨语言逐段翻译到目标语言
+                var finalSegs: [(start: Double, end: Double, text: String)] = []
+                if sameLang {
+                    for s in segs {
+                        let text = isTargetSimplified ? OpenCC.toSimplified(s.text) : s.text
+                        finalSegs.append((s.start, s.end, text))
+                    }
+                } else {
+                    for s in segs {
+                        let t = await Translator.translate(s.text, to: displayName)
+                        finalSegs.append((s.start, s.end, t))
+                    }
+                }
+
+                await MainActor.run {
+                    self.pushUndo()
+                    var track = Track<SubtitleClip>(label: "识别字幕")
+                    track.subtitleStyle = self.newSubtitleStyle()
+                    for s in finalSegs {
+                        // 源段时间 → timeline 时间（变速映射 + 偏移）
+                        let st = capOffset + s.start / capSpeed
+                        let en = capOffset + s.end   / capSpeed
+                        track.clips.append(SubtitleClip(text: s.text, startTime: st, endTime: en))
+                    }
+                    track.clips.sort { $0.startTime < $1.startTime }
+                    self.subtitleTracks.append(track)
+                    self.transcribeState = .done(finalSegs.count)
+                }
+            } catch {
+                await MainActor.run {
+                    self.transcribeState = .failed(error.localizedDescription)
+                }
+            }
+        }
     }
 }
 
