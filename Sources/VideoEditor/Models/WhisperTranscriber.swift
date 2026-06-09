@@ -20,19 +20,115 @@ enum WhisperTranscriber {
         return nil
     }
 
+    /// 模型下载存放目录（沙盒安全的 Application Support）
+    static var supportDir: URL {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        let dir = base.appendingPathComponent("黑猫剪辑/whisper", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
+    }
+    static var downloadedModelURL: URL { supportDir.appendingPathComponent("ggml-small.bin") }
+
     static func findModel() -> URL? {
+        // 1. 已下载的（Application Support）
+        if FileManager.default.fileExists(atPath: downloadedModelURL.path) { return downloadedModelURL }
+        // 2. 打包进 bundle 的
         if let r = Bundle.main.resourceURL?.appendingPathComponent("ggml-small.bin"),
            FileManager.default.fileExists(atPath: r.path) { return r }
         if let dir = Bundle.main.executableURL?.deletingLastPathComponent() {
             let p = dir.appendingPathComponent("ggml-small.bin")
             if FileManager.default.fileExists(atPath: p.path) { return p }
         }
+        // 3. 开发期 devDir
         let dev = URL(fileURLWithPath: devDir).appendingPathComponent("ggml-small.bin")
         if FileManager.default.fileExists(atPath: dev.path) { return dev }
         return nil
     }
 
-    static var isAvailable: Bool { findWhisper() != nil && findModel() != nil }
+    /// whisper-cli 是否就绪（必须随 app 打包/签名，沙盒不允许执行下载的二进制）
+    static var whisperReady: Bool { findWhisper() != nil }
+    /// 模型是否就绪（可按需下载）
+    static var modelReady: Bool { findModel() != nil }
+    /// 整体可触发（cli 就绪即可；模型缺失会先下载）
+    static var isAvailable: Bool { findWhisper() != nil }
+
+    // MARK: - 模型按需下载
+
+    /// 模型下载源（多源 fallback：国内镜像优先，再官方）
+    static let modelSourceURLs = [
+        "https://hf-mirror.com/ggerganov/whisper.cpp/resolve/main/ggml-small.bin",
+        "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin"
+    ]
+
+    /// 下载模型到 Application Support（progress 回调 0~1）
+    static func downloadModel(progress: @escaping (Double) -> Void) async throws {
+        var lastError: Error?
+        for src in modelSourceURLs {
+            guard let url = URL(string: src) else { continue }
+            do {
+                try await downloadFile(url, to: downloadedModelURL, progress: progress)
+                // 校验大小，避免下到错误页/不完整文件（small 模型 ~466MB）
+                let attrs = try? FileManager.default.attributesOfItem(atPath: downloadedModelURL.path)
+                let size = (attrs?[.size] as? Int) ?? 0
+                if size > 100_000_000 { return }
+                try? FileManager.default.removeItem(at: downloadedModelURL)
+                lastError = TranscribeError.downloadFailed
+            } catch {
+                lastError = error
+                try? FileManager.default.removeItem(at: downloadedModelURL)
+            }
+        }
+        throw lastError ?? TranscribeError.downloadFailed
+    }
+
+    private static func downloadFile(_ url: URL, to dest: URL, progress: @escaping (Double) -> Void) async throws {
+        let delegate = DownloadProgressDelegate(dest: dest, progress: progress)
+        let session = URLSession(configuration: .default, delegate: delegate, delegateQueue: nil)
+        defer { session.finishTasksAndInvalidate() }
+        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+            delegate.continuation = cont
+            session.downloadTask(with: url).resume()
+        }
+    }
+
+    /// URLSession 下载进度代理（流式写盘 + 进度回调）
+    private final class DownloadProgressDelegate: NSObject, URLSessionDownloadDelegate {
+        let dest: URL
+        let progress: (Double) -> Void
+        var continuation: CheckedContinuation<Void, Error>?
+        init(dest: URL, progress: @escaping (Double) -> Void) {
+            self.dest = dest; self.progress = progress
+        }
+        private var lastReported: Double = -1
+        func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask,
+                        didWriteData bytesWritten: Int64, totalBytesWritten: Int64,
+                        totalBytesExpectedToWrite: Int64) {
+            guard totalBytesExpectedToWrite > 0 else { return }
+            let p = Double(totalBytesWritten) / Double(totalBytesExpectedToWrite)
+            if p - lastReported >= 0.01 || p >= 1.0 {   // 每 1% 回调一次，避免 flood
+                lastReported = p
+                progress(p)
+            }
+        }
+        func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask,
+                        didFinishDownloadingTo location: URL) {
+            do {
+                try? FileManager.default.removeItem(at: dest)
+                try FileManager.default.moveItem(at: location, to: dest)
+                progress(1.0)
+                continuation?.resume()
+            } catch {
+                continuation?.resume(throwing: error)
+            }
+            continuation = nil
+        }
+        func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+            if let error {
+                continuation?.resume(throwing: error)
+                continuation = nil
+            }
+        }
+    }
 
     /// 翻译目标语言显示名 → whisper ISO 639-1 代码
     static func langCode(forDisplayName name: String) -> String {
@@ -65,7 +161,7 @@ enum WhisperTranscriber {
 
     enum TranscribeError: Error, LocalizedError {
         case whisperNotFound, modelNotFound, ffmpegNotFound
-        case audioExtractFailed, recognizeFailed, noResult
+        case audioExtractFailed, recognizeFailed, noResult, downloadFailed
         var errorDescription: String? {
             switch self {
             case .whisperNotFound:    return "找不到 whisper-cli 可执行文件"
@@ -74,6 +170,7 @@ enum WhisperTranscriber {
             case .audioExtractFailed: return "音频提取失败"
             case .recognizeFailed:    return "语音识别失败"
             case .noResult:           return "未识别到任何语音内容"
+            case .downloadFailed:     return "模型下载失败，请检查网络后重试"
             }
         }
     }

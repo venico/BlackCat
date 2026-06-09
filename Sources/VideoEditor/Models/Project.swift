@@ -502,12 +502,19 @@ final class ProjectState: ObservableObject {
 
     // 语音识别状态（Whisper）
     enum TranscribeState: Equatable {
-        case idle, running
-        case done(Int)        // 生成字幕条数
-        case failed(String)   // 失败原因
+        case idle
+        case downloading(Double)  // 首次下载模型，进度 0~1
+        case running
+        case done(Int)            // 生成字幕条数
+        case failed(String)       // 失败原因
     }
     @Published var transcribeState: TranscribeState = .idle
-    var isTranscribing: Bool { if case .running = transcribeState { return true }; return false }
+    var isTranscribing: Bool {
+        switch transcribeState {
+        case .downloading, .running: return true
+        default: return false
+        }
+    }
     @Published var mediaLibraryTab: String = "video"      // 素材库当前标签（提升到 ProjectState，转场图标点击可切换）
     // Multi-selection (used by box-select & bulk delete)
     @Published var selectedClipIDs: Set<UUID>    = []
@@ -3777,12 +3784,13 @@ final class ProjectState: ObservableObject {
             transcribeState = .failed("请先选择一个视频或音频片段")
             return
         }
-        guard WhisperTranscriber.isAvailable else {
-            transcribeState = .failed("语音识别组件未就绪（缺少模型或可执行文件）")
+        guard WhisperTranscriber.whisperReady else {
+            transcribeState = .failed("语音识别引擎未就绪（whisper-cli 缺失）")
             return
         }
 
-        transcribeState = .running
+        // 模型未下载则进入下载态，否则直接识别
+        transcribeState = WhisperTranscriber.modelReady ? .running : .downloading(0)
 
         // 识别用自动检测原声，再按需翻译到「翻译目标语言」
         let displayName = translationTargetLang
@@ -3792,6 +3800,13 @@ final class ProjectState: ObservableObject {
         let capSpeed = speed, capOffset = offset
         Task {
             do {
+                // 0. 首次使用：模型缺失则先下载（约 466MB，下载到 Application Support，仅一次）
+                if !WhisperTranscriber.modelReady {
+                    try await WhisperTranscriber.downloadModel { p in
+                        DispatchQueue.main.async { self.transcribeState = .downloading(p) }
+                    }
+                    await MainActor.run { self.transcribeState = .running }
+                }
                 // 1. whisper 自动检测音频语言识别原声（-l 强制目标语言对非目标音频会出错）
                 let segs = try await WhisperTranscriber.transcribe(
                     mediaURL: mediaURL, trimStart: trimStart,

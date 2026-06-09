@@ -508,13 +508,15 @@ private struct TranscribeBubble: View {
     let onDismiss: () -> Void
     @State private var hovering = false
 
-    private var isRunning: Bool { if case .running = state { return true }; return false }
+    private var isBusy: Bool {
+        switch state { case .running, .downloading: return true; default: return false }
+    }
 
     var body: some View {
         HStack(spacing: 10) {
             ZStack {
                 Circle().fill(iconBg).frame(width: 28, height: 28)
-                if isRunning {
+                if isBusy {
                     ProgressView().controlSize(.small).scaleEffect(0.7)
                 } else {
                     Image(systemName: iconName)
@@ -534,7 +536,7 @@ private struct TranscribeBubble: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
             Spacer(minLength: 8)
-            if !isRunning {
+            if !isBusy {
                 Button(action: onDismiss) {
                     Image(systemName: "xmark")
                         .font(.system(size: 9, weight: .bold))
@@ -570,7 +572,7 @@ private struct TranscribeBubble: View {
     }
     private var iconBg: Color {
         switch state {
-        case .running: return Color.accent.opacity(0.2)
+        case .running, .downloading: return Color.accent.opacity(0.2)
         case .done:    return Color.green.opacity(0.2)
         case .failed:  return Color.red.opacity(0.2)
         case .idle:    return Color.clear
@@ -585,7 +587,8 @@ private struct TranscribeBubble: View {
     }
     private var statusText: String {
         switch state {
-        case .running:       return "正在识别…（首次较慢）"
+        case .downloading(let p): return "下载识别模型 \(Int(p * 100))%（约 466MB，仅首次）"
+        case .running:       return "正在识别…"
         case .done(let n):   return "完成，生成 \(n) 条字幕"
         case .failed(let m): return m
         case .idle:          return ""
