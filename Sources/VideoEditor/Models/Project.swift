@@ -42,6 +42,8 @@ struct MediaAsset: Identifiable, Equatable, Codable {
     var name: String
     var type: AssetType
     var duration: Double = 0
+    var importDate: Date?
+    var fileSize: Int64?
     var fileExists: Bool { FileManager.default.fileExists(atPath: url.path) }
     static func == (lhs: MediaAsset, rhs: MediaAsset) -> Bool { lhs.id == rhs.id }
 }
@@ -291,6 +293,151 @@ struct ImageClip: Identifiable, Equatable, Codable {
     var colorAdjust: ColorAdjust = .identity
 }
 
+// MARK: - Text Template (文字样式模板)
+
+struct TextTemplate: Identifiable, Codable, Equatable {
+    var id = UUID()
+    var name: String = "模板"
+    var fontName: String = "PingFang SC"
+    var fontSize: CGFloat = 64
+    var bold: Bool = true
+    var italic: Bool = false
+    var textColorHex: String = "#FFFFFF"
+    var strokeColorHex: String = "#000000"
+    var strokeWidth: Double = 0
+    var bgColorHex: String = "#000000"
+    var bgOpacity: Double = 0
+    var alignment: String = "center"
+    var rotation: Double = 0
+    var opacity: Double = 1
+    var animation: TextAnimation = .none
+
+    static func from(_ clip: TextClip, name: String) -> TextTemplate {
+        TextTemplate(
+            name: name,
+            fontName: clip.fontName, fontSize: clip.fontSize,
+            bold: clip.bold, italic: clip.italic,
+            textColorHex: clip.textColor.toHex(),
+            strokeColorHex: clip.strokeColor.toHex(),
+            strokeWidth: clip.strokeWidth,
+            bgColorHex: clip.bgColor.toHex(),
+            bgOpacity: clip.bgOpacity,
+            alignment: clip.alignment,
+            rotation: clip.rotation,
+            opacity: clip.opacity,
+            animation: clip.animation
+        )
+    }
+
+    func apply(to clip: inout TextClip) {
+        clip.fontName = fontName; clip.fontSize = fontSize
+        clip.bold = bold; clip.italic = italic
+        clip.textColor = Color(hex: textColorHex)
+        clip.strokeColor = Color(hex: strokeColorHex)
+        clip.strokeWidth = strokeWidth
+        clip.bgColor = Color(hex: bgColorHex)
+        clip.bgOpacity = bgOpacity
+        clip.alignment = alignment
+        clip.rotation = rotation
+        clip.opacity = opacity
+        clip.animation = animation
+    }
+}
+
+// MARK: - Text Clip (文字/标题图层)
+
+enum TextAnimation: String, Codable, CaseIterable {
+    case none, fadeIn, popIn, slideUp, typewriter
+    var label: String {
+        switch self {
+        case .none:       return "无"
+        case .fadeIn:     return "淡入"
+        case .popIn:      return "弹入"
+        case .slideUp:    return "上滑入"
+        case .typewriter: return "打字机"
+        }
+    }
+}
+
+struct TextClip: Identifiable, Equatable, Codable {
+    var id = UUID()
+    var text: String      = "标题文字"
+    var startTime: Double
+    var endTime: Double
+    var duration: Double { endTime - startTime }
+    // 位置：画面比例，文字中心点 (0~1)，(0.5,0.5)=正中
+    var posX: Double = 0.5
+    var posY: Double = 0.5
+    // 样式
+    var fontName: String  = "PingFang SC"
+    var fontSize: CGFloat = 64
+    var bold: Bool        = true
+    var italic: Bool      = false
+    var textColor: Color  = .white
+    var strokeColor: Color = .black
+    var strokeWidth: Double = 0        // 描边宽度(px)，0=无描边
+    var bgColor: Color    = .black
+    var bgOpacity: Double = 0          // 背景不透明度，0=无背景框
+    var alignment: String = "center"   // left/center/right
+    var rotation: Double  = 0          // 旋转角度(度)
+    var opacity: Double   = 1
+    var animation: TextAnimation = .none
+
+    enum CodingKeys: String, CodingKey {
+        case id, text, startTime, endTime, posX, posY
+        case fontName, fontSize, bold, italic
+        case textColorHex, strokeColorHex, strokeWidth, bgColorHex, bgOpacity
+        case alignment, rotation, opacity, animation
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(id, forKey: .id)
+        try c.encode(text, forKey: .text)
+        try c.encode(startTime, forKey: .startTime)
+        try c.encode(endTime, forKey: .endTime)
+        try c.encode(posX, forKey: .posX)
+        try c.encode(posY, forKey: .posY)
+        try c.encode(fontName, forKey: .fontName)
+        try c.encode(fontSize, forKey: .fontSize)
+        try c.encode(bold, forKey: .bold)
+        try c.encode(italic, forKey: .italic)
+        try c.encode(textColor.toHex(), forKey: .textColorHex)
+        try c.encode(strokeColor.toHex(), forKey: .strokeColorHex)
+        try c.encode(strokeWidth, forKey: .strokeWidth)
+        try c.encode(bgColor.toHex(), forKey: .bgColorHex)
+        try c.encode(bgOpacity, forKey: .bgOpacity)
+        try c.encode(alignment, forKey: .alignment)
+        try c.encode(rotation, forKey: .rotation)
+        try c.encode(opacity, forKey: .opacity)
+        try c.encode(animation, forKey: .animation)
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id        = try c.decode(UUID.self, forKey: .id)
+        text      = try c.decode(String.self, forKey: .text)
+        startTime = try c.decode(Double.self, forKey: .startTime)
+        endTime   = try c.decode(Double.self, forKey: .endTime)
+        posX      = (try? c.decode(Double.self, forKey: .posX)) ?? 0.5
+        posY      = (try? c.decode(Double.self, forKey: .posY)) ?? 0.5
+        fontName  = (try? c.decode(String.self, forKey: .fontName)) ?? "PingFang SC"
+        fontSize  = (try? c.decode(CGFloat.self, forKey: .fontSize)) ?? 64
+        bold      = (try? c.decode(Bool.self, forKey: .bold)) ?? true
+        italic    = (try? c.decode(Bool.self, forKey: .italic)) ?? false
+        textColor   = Color(hex: (try? c.decode(String.self, forKey: .textColorHex)) ?? "#FFFFFF")
+        strokeColor = Color(hex: (try? c.decode(String.self, forKey: .strokeColorHex)) ?? "#000000")
+        strokeWidth = (try? c.decode(Double.self, forKey: .strokeWidth)) ?? 0
+        bgColor     = Color(hex: (try? c.decode(String.self, forKey: .bgColorHex)) ?? "#000000")
+        bgOpacity   = (try? c.decode(Double.self, forKey: .bgOpacity)) ?? 0
+        alignment   = (try? c.decode(String.self, forKey: .alignment)) ?? "center"
+        rotation    = (try? c.decode(Double.self, forKey: .rotation)) ?? 0
+        opacity     = (try? c.decode(Double.self, forKey: .opacity)) ?? 1
+        animation   = (try? c.decode(TextAnimation.self, forKey: .animation)) ?? .none
+    }
+    init(text: String = "标题文字", startTime: Double, endTime: Double) {
+        self.text = text; self.startTime = startTime; self.endTime = endTime
+    }
+}
+
 struct Track<Clip: Identifiable & Equatable & Codable>: Identifiable, Codable {
     var id = UUID()
     var clips: [Clip]   = []
@@ -340,6 +487,8 @@ struct ProjectDocument: Codable {
     var imageTracks: [Track<ImageClip>]
     var subtitleTracks: [Track<SubtitleClip>]
     var subtitleStyles: [SubtitleStyle]
+    var textTracks: [Track<TextClip>]?     // 文字/标题图层（向后兼容：旧 .bcj 无此字段）
+    var textTemplates: [TextTemplate]?    // 文字样式模板（向后兼容）
     var mediaAssets: [MediaAsset]
     var exportSettings: ExportSettings
     var previewResolution: String
@@ -356,6 +505,7 @@ struct ProjectSnapshot {
     var audioTracks: [Track<AudioClip>]
     var imageTracks: [Track<ImageClip>]
     var subtitleTracks: [Track<SubtitleClip>]
+    var textTracks: [Track<TextClip>]
     var subtitleBottomMargin: Double
     var subtitleLineSpacing: Double
     var duration: Double
@@ -370,9 +520,11 @@ final class ProjectState: ObservableObject {
 
     // Tracks
     @Published var videoTracks: [Track<VideoClip>]    = [Track(label: "视频")]
-    @Published var audioTracks: [Track<AudioClip>]    = [Track(label: "音频")]
+    @Published var audioTracks: [Track<AudioClip>]    = []
     @Published var imageTracks: [Track<ImageClip>]       = []
-    @Published var subtitleTracks: [Track<SubtitleClip>] = [Track(label: "字幕")]
+    @Published var subtitleTracks: [Track<SubtitleClip>] = []
+    @Published var textTracks: [Track<TextClip>] = []
+    @Published var textTemplates: [TextTemplate] = []  // 文字样式模板
     @Published var subtitleBottomMargin: Double = 5   // 全局：所有字幕整体距下边缘 %
     @Published var subtitleLineSpacing: Double  = 6   // 全局：字幕轨道之间的间距 pt
 
@@ -422,6 +574,7 @@ final class ProjectState: ObservableObject {
         for t in audioTracks { for c in t.clips { maxEnd = max(maxEnd, c.endTime) } }
         for t in imageTracks { for c in t.clips { maxEnd = max(maxEnd, c.endTime) } }
         for t in subtitleTracks { for c in t.clips { maxEnd = max(maxEnd, c.endTime) } }
+        for t in textTracks { for c in t.clips { maxEnd = max(maxEnd, c.endTime) } }
         return maxEnd
     }
 
@@ -485,6 +638,7 @@ final class ProjectState: ObservableObject {
     @Published var showVideoTracks: Bool = true
     @Published var showAudioTracks: Bool = true
     @Published var showSubtitleTracks: Bool = true
+    @Published var showTextTracks: Bool = true
 
     // 删除确认
     @Published var showDeleteConfirm: Bool = false
@@ -497,6 +651,7 @@ final class ProjectState: ObservableObject {
     @Published var selectedAudioClipID: UUID?    = nil
     @Published var selectedImageClipID: UUID?    = nil
     @Published var selectedSubtitleClipID: UUID? = nil
+    @Published var selectedTextClipID: UUID?     = nil
     // Transition selection
     @Published var selectedTransitionClipID: UUID? = nil  // 当前选中的转场（clip ID，其 inTransition 被编辑）
 
@@ -504,18 +659,33 @@ final class ProjectState: ObservableObject {
     enum TranscribeState: Equatable {
         case idle
         case downloading(Double)  // 首次下载模型，进度 0~1
-        case running
+        case running(Double)      // 识别进度 0~1
         case done(Int)            // 生成字幕条数
         case failed(String)       // 失败原因
     }
     @Published var transcribeState: TranscribeState = .idle
+    var transcribeTask: Task<Void, Never>? = nil
     var isTranscribing: Bool {
         switch transcribeState {
-        case .downloading, .running: return true
+        case .downloading, .running(_): return true
         default: return false
         }
     }
+    func cancelTranscribe() {
+        transcribeTask?.cancel()
+        transcribeTask = nil
+        transcribeState = .idle
+    }
     @Published var mediaLibraryTab: String = "video"      // 素材库当前标签（提升到 ProjectState，转场图标点击可切换）
+    enum MediaSortOrder: String, CaseIterable {
+        case name = "名称"
+        case duration = "时长"
+        case importDate = "导入时间"
+        case fileSize = "文件大小"
+    }
+    @Published var mediaSortOrder: MediaSortOrder = .importDate
+    @Published var mediaSortAscending: Bool = false
+    @Published var mediaSearchText: String = ""
     // Multi-selection (used by box-select & bulk delete)
     @Published var selectedClipIDs: Set<UUID>    = []
 
@@ -525,6 +695,7 @@ final class ProjectState: ObservableObject {
         case audio(AudioClip, trackIndex: Int)
         case image(ImageClip, trackIndex: Int)
         case subtitle(SubtitleClip, trackIndex: Int)
+        case text(TextClip, trackIndex: Int)
     }
     var clipboard: ClipboardItem?
     @Published var clipboardIsCut: Bool = false
@@ -542,6 +713,44 @@ final class ProjectState: ObservableObject {
     @Published var saveToasts: [SaveToast] = []
     /// Toast message for import feedback (e.g. duplicate file skipped)
     @Published var importToastMessage: String? = nil
+
+    // 右上角成功提示（5s 倒计时自动消失）
+    struct SuccessToastItem: Identifiable {
+        let id = UUID()
+        let icon: String
+        let iconColor: Color
+        let title: String
+        let subtitle: String
+        var countdown: Int = 5
+        var revealURL: URL? = nil
+    }
+    @Published var successToasts: [SuccessToastItem] = []
+    private var successTimer: Timer?
+
+    func showSuccessToast(icon: String, iconColor: Color = .green, title: String, subtitle: String, revealURL: URL? = nil) {
+        let item = SuccessToastItem(icon: icon, iconColor: iconColor, title: title, subtitle: subtitle, revealURL: revealURL)
+        withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) { successToasts.append(item) }
+        startSuccessTimerIfNeeded()
+    }
+
+    func dismissSuccessToast(_ id: UUID) {
+        withAnimation(.easeOut(duration: 0.25)) { successToasts.removeAll { $0.id == id } }
+        if successToasts.isEmpty { successTimer?.invalidate(); successTimer = nil }
+    }
+
+    private func startSuccessTimerIfNeeded() {
+        guard successTimer == nil else { return }
+        successTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] timer in
+            guard let self else { timer.invalidate(); return }
+            for i in self.successToasts.indices.reversed() {
+                self.successToasts[i].countdown -= 1
+                if self.successToasts[i].countdown <= 0 {
+                    withAnimation(.easeOut(duration: 0.25)) { self.successToasts.remove(at: i) }
+                }
+            }
+            if self.successToasts.isEmpty { timer.invalidate(); self.successTimer = nil }
+        }
+    }
 
     // 并发转码（最多5个同时运行，多余排队）
     static let maxConcurrentTranscodes = 5
@@ -600,6 +809,7 @@ final class ProjectState: ObservableObject {
     // Thumbnail & Waveform cache
     @Published var mediaThumbnails: [UUID: NSImage] = [:]          // asset ID → single thumbnail (media library)
     @Published var assetThumbnails: [UUID: [ThumbnailFrame]] = [:] // asset ID → timeline thumbnail strip
+    @Published var thumbnailsReloading: Set<UUID> = []              // 正在重建缩略图的 asset IDs
     @Published var waveformCache: [UUID: WaveformData] = [:]       // asset ID → waveform peaks
     var imageVideoCache: [UUID: URL] = [:]                         // asset ID → generated video file
     private var avAssetCache: [URL: AVURLAsset] = [:]             // URL → cached AVURLAsset（避免重复创建）
@@ -657,9 +867,10 @@ final class ProjectState: ObservableObject {
         projectFileURL = fileURL
         // 重置到空项目状态（素材库保留，不清空）
         videoTracks = [Track(label: "视频")]
-        audioTracks = [Track(label: "音频")]
+        audioTracks = []
         imageTracks = []
-        subtitleTracks = [Track(label: "字幕")]
+        subtitleTracks = []
+        textTracks = []
         subtitleBottomMargin = 5
         subtitleLineSpacing = 6
         undoStack.removeAll(); redoStack.removeAll()
@@ -667,6 +878,7 @@ final class ProjectState: ObservableObject {
         currentTime = 0; duration = 60
         selectedVideoClipID = nil; selectedAudioClipID = nil
         selectedImageClipID = nil; selectedSubtitleClipID = nil
+        selectedTextClipID = nil
         selectedClipIDs.removeAll()
         assetThumbnails.removeAll()
         waveformCache.removeAll()
@@ -748,6 +960,8 @@ final class ProjectState: ObservableObject {
             }
         }
         subtitleTracks = loadedSubtitleTracks
+        textTracks = doc.textTracks ?? []
+        textTemplates = doc.textTemplates ?? []
         subtitleBottomMargin = doc.subtitleBottomMargin ?? doc.subtitleStyles.first?.bottomMargin ?? 5
         subtitleLineSpacing = doc.subtitleLineSpacing ?? doc.subtitleStyles.first?.lineSpacing ?? 6
         exportSettings = doc.exportSettings
@@ -799,13 +1013,21 @@ final class ProjectState: ObservableObject {
     }
 
     func saveProject(silent: Bool = false) {
-        if projectFileURL == nil {
+        if projectFileURL == nil && !silent {
+            let panel = NSSavePanel()
+            panel.title = "保存项目"
+            panel.nameFieldStringValue = (projectName.trimmingCharacters(in: .whitespaces).isEmpty ? "未命名项目" : projectName) + ".bcj"
+            panel.allowedContentTypes = [.init(filenameExtension: "bcj") ?? .json]
+            panel.canCreateDirectories = true
+            guard panel.runModal() == .OK, let url = panel.url else { return }
+            projectName = url.deletingPathExtension().lastPathComponent
+            projectFileURL = url
+        } else if projectFileURL == nil {
             let docDir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
                 ?? FileManager.default.temporaryDirectory
             let name = projectName.trimmingCharacters(in: .whitespaces).isEmpty ? "未命名项目" : projectName
-            let fileURL = docDir.appendingPathComponent("\(name).bcj")
             projectName = name
-            projectFileURL = fileURL
+            projectFileURL = docDir.appendingPathComponent("\(name).bcj")
         }
         guard let fileURL = projectFileURL else { return }
         let doc = ProjectDocument(
@@ -815,6 +1037,8 @@ final class ProjectState: ObservableObject {
             imageTracks: imageTracks,
             subtitleTracks: subtitleTracks,
             subtitleStyles: subtitleTracks.map { $0.subtitleStyle ?? SubtitleStyle() },  // 向后兼容旧格式
+            textTracks: textTracks,
+            textTemplates: textTemplates.isEmpty ? nil : textTemplates,
             mediaAssets: mediaAssets,
             exportSettings: exportSettings,
             previewResolution: previewResolution,
@@ -842,13 +1066,7 @@ final class ProjectState: ObservableObject {
             return
         }
         guard !silent else { return }
-        let toast = SaveToast(path: fileURL.path)
-        if saveToasts.count >= 5 { saveToasts.removeFirst() }
-        saveToasts.append(toast)
-        let tid = toast.id
-        DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
-            self?.saveToasts.removeAll { $0.id == tid }
-        }
+        showSuccessToast(icon: "checkmark", title: "已保存", subtitle: fileURL.lastPathComponent, revealURL: fileURL)
     }
 
     /// Show a brief import feedback toast (auto-dismiss after 3 seconds)
@@ -1015,6 +1233,12 @@ final class ProjectState: ObservableObject {
         return nil
     }
 
+    var selectedTextClip: TextClip? {
+        guard let id = selectedTextClipID else { return nil }
+        for t in textTracks { if let c = t.clips.first(where:{ $0.id == id }) { return c } }
+        return nil
+    }
+
     var selectedVideoClip: VideoClip? {
         guard let id = selectedVideoClipID else { return nil }
         for t in videoTracks { if let c = t.clips.first(where:{ $0.id == id }) { return c } }
@@ -1054,19 +1278,36 @@ final class ProjectState: ObservableObject {
     /// Generate timeline thumbnail strip for a video asset (evenly spaced frames).
     func loadTimelineThumbnails(assetID: UUID, url: URL) {
         guard assetThumbnails[assetID] == nil else { return }
-        assetThumbnails[assetID] = []  // 标记为已开始加载，防止重复请求
+        generateThumbnails(assetID: assetID, url: url)
+    }
+
+    func reloadThumbnails(assetID: UUID, url: URL) {
+        guard !thumbnailsReloading.contains(assetID) else { return }
+        thumbnailsReloading.insert(assetID)
+        generateThumbnails(assetID: assetID, url: url, isReload: true)
+    }
+
+    private func generateThumbnails(assetID: UUID, url: URL, isReload: Bool = false) {
+        if !isReload { assetThumbnails[assetID] = [] }
         let id = assetID
+        let pps = pixelsPerSecond
         Task {
             let av = AVURLAsset(url: url)
             let dur = (try? await av.load(.duration))?.seconds ?? 0
-            guard dur > 0.1 else { return }
+            guard dur > 0.1 else {
+                await MainActor.run { self.thumbnailsReloading.remove(id) }
+                return
+            }
             let gen = AVAssetImageGenerator(asset: av)
             gen.appliesPreferredTrackTransform = true
             gen.maximumSize = CGSize(width: 160, height: 104)
-            gen.requestedTimeToleranceBefore = CMTime(seconds: 0.5, preferredTimescale: 600)
-            gen.requestedTimeToleranceAfter  = CMTime(seconds: 0.5, preferredTimescale: 600)
+            gen.requestedTimeToleranceBefore = CMTime(seconds: 0.3, preferredTimescale: 600)
+            gen.requestedTimeToleranceAfter  = CMTime(seconds: 0.3, preferredTimescale: 600)
 
-            let interval = max(1.0, dur / 30.0)
+            let thumbWidth = 48.0
+            let neededFrames = Int(dur * pps / thumbWidth)
+            let frameCount = max(10, min(200, neededFrames))
+            let interval = dur / Double(frameCount)
             var times: [NSValue] = []
             var t = 0.0
             while t < dur {
@@ -1074,7 +1315,6 @@ final class ProjectState: ObservableObject {
                 t += interval
             }
 
-            // 使用批量异步 API，比串行 copyCGImage 快很多
             var frames: [ThumbnailFrame] = []
             let semaphore = DispatchSemaphore(value: 0)
             var remaining = times.count
@@ -1086,10 +1326,23 @@ final class ProjectState: ObservableObject {
                 remaining -= 1
                 if remaining == 0 { semaphore.signal() }
             }
-            // 在后台线程等待完成
             await Task.detached(priority: .utility) { semaphore.wait() }.value
             let sorted = frames.sorted(by: { $0.time < $1.time })
-            await MainActor.run { self.assetThumbnails[id] = sorted }
+            await MainActor.run {
+                self.assetThumbnails[id] = sorted
+                self.thumbnailsReloading.remove(id)
+            }
+        }
+    }
+
+    func refreshAllThumbnails() {
+        var seen = Set<UUID>()
+        for t in videoTracks {
+            for c in t.clips {
+                guard !seen.contains(c.assetID), let url = c.url else { continue }
+                seen.insert(c.assetID)
+                reloadThumbnails(assetID: c.assetID, url: url)
+            }
         }
     }
 
@@ -1438,6 +1691,56 @@ final class ProjectState: ObservableObject {
         SubtitleStyle()
     }
 
+    func resolveTextOverlap(id: UUID) {
+        for ti in textTracks.indices {
+            guard let ci = textTracks[ti].clips.firstIndex(where: { $0.id == id }) else { continue }
+            let clip = textTracks[ti].clips[ci]
+            let hasOverlap = textTracks[ti].clips.contains {
+                $0.id != id && $0.startTime < clip.endTime - 0.001 && $0.endTime > clip.startTime + 0.001
+            }
+            if hasOverlap {
+                let removed = textTracks[ti].clips.remove(at: ci)
+                var placed = false
+                for dti in textTracks.indices {
+                    if dti == ti { continue }
+                    let noOverlap = !textTracks[dti].clips.contains {
+                        $0.startTime < removed.endTime - 0.001 && $0.endTime > removed.startTime + 0.001
+                    }
+                    if noOverlap {
+                        textTracks[dti].clips.append(removed)
+                        placed = true
+                        break
+                    }
+                }
+                if !placed {
+                    var newTrack = Track<TextClip>(label: "文字")
+                    newTrack.clips.append(removed)
+                    textTracks.append(newTrack)
+                }
+            }
+            return
+        }
+    }
+
+    func moveTextClipToTrack(id: UUID, from: Int, to: Int) {
+        guard textTracks.indices.contains(from), textTracks.indices.contains(to) else { return }
+        guard let idx = textTracks[from].clips.firstIndex(where: { $0.id == id }) else { return }
+        pushUndoThrottled()
+        let clip = textTracks[from].clips.remove(at: idx)
+        textTracks[to].clips.append(clip)
+    }
+
+    func updateTextTime(id: UUID, start: Double? = nil, end: Double? = nil) {
+        pushUndoThrottled()
+        for i in textTracks.indices {
+            if let j = textTracks[i].clips.firstIndex(where: { $0.id == id }) {
+                if let s = start { textTracks[i].clips[j].startTime = s }
+                if let e = end   { textTracks[i].clips[j].endTime   = e }
+                return
+            }
+        }
+    }
+
     // MARK: - Multi-select helpers
 
     /// Shift+click: toggle a clip in/out of multi-selection
@@ -1449,26 +1752,31 @@ final class ProjectState: ObservableObject {
             if selectedImageClipID == id    { selectedImageClipID = nil }
             if selectedAudioClipID == id    { selectedAudioClipID = nil }
             if selectedSubtitleClipID == id { selectedSubtitleClipID = nil }
+            if selectedTextClipID == id     { selectedTextClipID = nil }
         } else {
             // Move current primary into multi-set if needed
             if let pid = selectedVideoClipID, pid != id { selectedClipIDs.insert(pid) }
             if let pid = selectedImageClipID, pid != id { selectedClipIDs.insert(pid) }
             if let pid = selectedAudioClipID, pid != id { selectedClipIDs.insert(pid) }
             if let pid = selectedSubtitleClipID, pid != id { selectedClipIDs.insert(pid) }
+            if let pid = selectedTextClipID, pid != id { selectedClipIDs.insert(pid) }
             selectedClipIDs.insert(id)
             // Set as new primary based on type
             if videoTracks.flatMap(\.clips).contains(where: { $0.id == id }) {
                 selectedVideoClipID = id
-                selectedImageClipID = nil; selectedAudioClipID = nil; selectedSubtitleClipID = nil
+                selectedImageClipID = nil; selectedAudioClipID = nil; selectedSubtitleClipID = nil; selectedTextClipID = nil
             } else if imageTracks.flatMap(\.clips).contains(where: { $0.id == id }) {
                 selectedImageClipID = id
-                selectedVideoClipID = nil; selectedAudioClipID = nil; selectedSubtitleClipID = nil
+                selectedVideoClipID = nil; selectedAudioClipID = nil; selectedSubtitleClipID = nil; selectedTextClipID = nil
             } else if audioTracks.flatMap(\.clips).contains(where: { $0.id == id }) {
                 selectedAudioClipID = id
-                selectedVideoClipID = nil; selectedImageClipID = nil; selectedSubtitleClipID = nil
+                selectedVideoClipID = nil; selectedImageClipID = nil; selectedSubtitleClipID = nil; selectedTextClipID = nil
             } else if subtitleTracks.flatMap(\.clips).contains(where: { $0.id == id }) {
                 selectedSubtitleClipID = id
-                selectedVideoClipID = nil; selectedImageClipID = nil; selectedAudioClipID = nil
+                selectedVideoClipID = nil; selectedImageClipID = nil; selectedAudioClipID = nil; selectedTextClipID = nil
+            } else if textTracks.flatMap(\.clips).contains(where: { $0.id == id }) {
+                selectedTextClipID = id
+                selectedVideoClipID = nil; selectedImageClipID = nil; selectedAudioClipID = nil; selectedSubtitleClipID = nil
             }
         }
     }
@@ -1479,6 +1787,7 @@ final class ProjectState: ObservableObject {
         if let pid = selectedImageClipID    { selectedClipIDs.insert(pid) }
         if let pid = selectedAudioClipID    { selectedClipIDs.insert(pid) }
         if let pid = selectedSubtitleClipID { selectedClipIDs.insert(pid) }
+        if let pid = selectedTextClipID     { selectedClipIDs.insert(pid) }
     }
 
     /// 向左全选：选中同轨道中 startTime <= 当前片段的所有片段
@@ -2348,7 +2657,10 @@ final class ProjectState: ObservableObject {
     private func importFileDirectly(url: URL, type: AssetType, displayName: String? = nil) {
         // 兜底去重：防止任何路径绕过前置检查
         guard !mediaAssets.contains(where: { $0.url == url }) else { return }
-        let asset = MediaAsset(url: url, name: displayName ?? url.lastPathComponent, type: type)
+        let fSize = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int64) ?? nil
+        var asset = MediaAsset(url: url, name: displayName ?? url.lastPathComponent, type: type)
+        asset.importDate = Date()
+        asset.fileSize = fSize
         let aid = asset.id
         mediaAssets.append(asset)
         // Trigger thumbnail / waveform generation
@@ -2428,8 +2740,10 @@ final class ProjectState: ObservableObject {
     }
 
     private func finishTranscodeTask(_ taskID: UUID) {
+        let name = activeTasks.first(where: { $0.id == taskID })?.displayName ?? "转码"
         activeTasks.removeAll { $0.id == taskID }
         drainPendingTasks()
+        showSuccessToast(icon: "checkmark", title: name, subtitle: "转码完成")
         if activeTasks.isEmpty && pendingTasks.isEmpty {
             isTranscoding = false
             transcodingProgress = 0
@@ -3273,6 +3587,7 @@ final class ProjectState: ObservableObject {
         ProjectSnapshot(videoTracks: videoTracks, audioTracks: audioTracks,
                         imageTracks: imageTracks,
                         subtitleTracks: subtitleTracks,
+                        textTracks: textTracks,
                         subtitleBottomMargin: subtitleBottomMargin,
                         subtitleLineSpacing: subtitleLineSpacing,
                         duration: duration,
@@ -3283,6 +3598,7 @@ final class ProjectState: ObservableObject {
         audioTracks    = s.audioTracks
         imageTracks    = s.imageTracks
         subtitleTracks = s.subtitleTracks
+        textTracks     = s.textTracks
         subtitleBottomMargin = s.subtitleBottomMargin
         subtitleLineSpacing  = s.subtitleLineSpacing
         duration       = s.duration
@@ -3390,6 +3706,7 @@ final class ProjectState: ObservableObject {
         if let id = selectedImageClipID    { ids.insert(id) }
         if let id = selectedAudioClipID    { ids.insert(id) }
         if let id = selectedSubtitleClipID { ids.insert(id) }
+        if let id = selectedTextClipID     { ids.insert(id) }
         guard !ids.isEmpty else { return }
 
         for i in videoTracks.indices {
@@ -3412,11 +3729,17 @@ final class ProjectState: ObservableObject {
             subtitleTracks[i].clips.removeAll { ids.contains($0.id) }
             if subtitleTracks[i].clips.count != before { changed = true }
         }
+        for i in textTracks.indices {
+            let before = textTracks[i].clips.count
+            textTracks[i].clips.removeAll { ids.contains($0.id) }
+            if textTracks[i].clips.count != before { changed = true }
+        }
 
         selectedVideoClipID    = nil
         selectedImageClipID    = nil
         selectedAudioClipID    = nil
         selectedSubtitleClipID = nil
+        selectedTextClipID     = nil
         selectedClipIDs.removeAll()
 
         if changed {
@@ -3470,6 +3793,16 @@ final class ProjectState: ObservableObject {
                 }
             }
         }
+        if let id = selectedTextClipID {
+            for (ti, track) in textTracks.enumerated() {
+                if let clip = track.clips.first(where: { $0.id == id }) {
+                    clipboard = .text(clip, trackIndex: ti)
+                    clipboardIsCut = false
+                    clipboardSourceID = nil
+                    return
+                }
+            }
+        }
     }
 
     /// 剪切当前选中的片段（粘贴时移除原始片段）
@@ -3510,6 +3843,16 @@ final class ProjectState: ObservableObject {
                 }
             }
         }
+        if let id = selectedTextClipID {
+            for (ti, track) in textTracks.enumerated() {
+                if let clip = track.clips.first(where: { $0.id == id }) {
+                    clipboard = .text(clip, trackIndex: ti)
+                    clipboardIsCut = true
+                    clipboardSourceID = id
+                    return
+                }
+            }
+        }
     }
 
     /// 粘贴剪贴板内容到当前播放头位置，放在同类型的当前选中轨道或原始轨道
@@ -3531,6 +3874,9 @@ final class ProjectState: ObservableObject {
             }
             for i in subtitleTracks.indices {
                 subtitleTracks[i].clips.removeAll { $0.id == srcID }
+            }
+            for i in textTracks.indices {
+                textTracks[i].clips.removeAll { $0.id == srcID }
             }
             // 剪切只能粘贴一次
             clipboardIsCut = false
@@ -3600,6 +3946,23 @@ final class ProjectState: ObservableObject {
                 selectedSubtitleClipID = newClip.id
                 selectedVideoClipID = nil
                 selectedAudioClipID = nil
+            }
+
+        case .text(let clip, let trackIdx):
+            var newClip = TextClip(text: clip.text, startTime: t, endTime: t + clip.duration)
+            newClip.fontName = clip.fontName; newClip.fontSize = clip.fontSize
+            newClip.bold = clip.bold; newClip.italic = clip.italic
+            newClip.textColor = clip.textColor; newClip.strokeColor = clip.strokeColor
+            newClip.strokeWidth = clip.strokeWidth; newClip.bgColor = clip.bgColor
+            newClip.bgOpacity = clip.bgOpacity; newClip.alignment = clip.alignment
+            newClip.rotation = clip.rotation; newClip.opacity = clip.opacity
+            newClip.posX = clip.posX; newClip.posY = clip.posY
+            newClip.animation = clip.animation
+            let idx = textTracks.indices.contains(trackIdx) ? trackIdx : 0
+            if textTracks.indices.contains(idx) {
+                textTracks[idx].clips.append(newClip)
+                selectedTextClipID = newClip.id
+                selectedVideoClipID = nil; selectedAudioClipID = nil; selectedSubtitleClipID = nil
             }
         }
 
@@ -3757,6 +4120,96 @@ final class ProjectState: ObservableObject {
         redoCount = 0
     }
 
+    // MARK: - 文字/标题图层
+
+    /// 在播放头插入文字图层（选中文字则在其轨道，否则用最后一条文字轨道，无则新建）
+    func addTextAtPlayhead() {
+        let snap = currentSnapshot()
+        let trackIdx: Int
+        if let tid = selectedTextClipID,
+           let i = textTracks.firstIndex(where: { $0.clips.contains { $0.id == tid } }) {
+            trackIdx = i
+        } else if !textTracks.isEmpty {
+            trackIdx = textTracks.count - 1
+        } else {
+            textTracks.append(Track<TextClip>(label: "文字"))
+            trackIdx = textTracks.count - 1
+        }
+        let start = currentTime
+        let end   = currentTime + 3.0
+        let clip  = TextClip(text: "标题文字", startTime: start, endTime: end)
+        textTracks[trackIdx].clips.append(clip)
+        textTracks[trackIdx].clips.sort { $0.startTime < $1.startTime }
+        // 选中新建的文字，清其他选中
+        selectedTextClipID = clip.id
+        selectedVideoClipID = nil; selectedAudioClipID = nil
+        selectedImageClipID = nil; selectedSubtitleClipID = nil
+        selectedClipIDs.removeAll()
+
+        undoStack.append(snap)
+        if undoStack.count > 30 { undoStack.removeFirst() }
+        redoStack.removeAll()
+        undoCount = undoStack.count
+        redoCount = 0
+        isSaved = false
+    }
+
+    /// 更新指定文字片段（Inspector 编辑用）
+    func updateTextClip(id: UUID, _ mutate: (inout TextClip) -> Void) {
+        for ti in textTracks.indices {
+            if let ci = textTracks[ti].clips.firstIndex(where: { $0.id == id }) {
+                mutate(&textTracks[ti].clips[ci])
+                isSaved = false
+                return
+            }
+        }
+    }
+
+    /// 删除指定文字片段
+    func deleteTextClip(id: UUID) {
+        let snap = currentSnapshot()
+        for ti in textTracks.indices {
+            if let ci = textTracks[ti].clips.firstIndex(where: { $0.id == id }) {
+                textTracks[ti].clips.remove(at: ci)
+                if selectedTextClipID == id { selectedTextClipID = nil }
+                undoStack.append(snap)
+                if undoStack.count > 30 { undoStack.removeFirst() }
+                redoStack.removeAll()
+                undoCount = undoStack.count; redoCount = 0
+                isSaved = false
+                return
+            }
+        }
+    }
+
+    // MARK: - 文字样式模板
+
+    func saveTextTemplate(from clipID: UUID, name: String) {
+        guard let clip = textTracks.flatMap(\.clips).first(where: { $0.id == clipID }) else { return }
+        let template = TextTemplate.from(clip, name: name)
+        textTemplates.append(template)
+        isSaved = false
+        scheduleAutoSave()
+    }
+
+    func saveTextTemplateFromClip(_ clipID: UUID) {
+        let idx = textTemplates.count + 1
+        saveTextTemplate(from: clipID, name: "模板 \(idx)")
+    }
+
+    func applyTextTemplate(_ template: TextTemplate, to clipID: UUID) {
+        pushUndo()
+        updateTextClip(id: clipID) { clip in
+            template.apply(to: &clip)
+        }
+    }
+
+    func deleteTextTemplate(id: UUID) {
+        textTemplates.removeAll { $0.id == id }
+        isSaved = false
+        scheduleAutoSave()
+    }
+
     // MARK: - 自动语音识别（Whisper）
 
     /// 对选中的视频/音频片段做语音识别并生成字幕轨道。
@@ -3790,7 +4243,7 @@ final class ProjectState: ObservableObject {
         }
 
         // 模型未下载则进入下载态，否则直接识别
-        transcribeState = WhisperTranscriber.modelReady ? .running : .downloading(0)
+        transcribeState = WhisperTranscriber.modelReady ? .running(0) : .downloading(0)
 
         // 识别用自动检测原声，再按需翻译到「翻译目标语言」
         let displayName = translationTargetLang
@@ -3798,21 +4251,22 @@ final class ProjectState: ObservableObject {
         let targetBase = WhisperTranscriber.langCode(forDisplayName: displayName)  // zh/en/it...
 
         let capSpeed = speed, capOffset = offset
-        Task {
+        transcribeTask = Task {
             do {
-                // 0. 首次使用：模型缺失则先下载（约 466MB，下载到 Application Support，仅一次）
                 if !WhisperTranscriber.modelReady {
                     try await WhisperTranscriber.downloadModel { p in
                         DispatchQueue.main.async { self.transcribeState = .downloading(p) }
                     }
-                    await MainActor.run { self.transcribeState = .running }
+                    await MainActor.run { self.transcribeState = .running(0.05) }
                 }
-                // 1. whisper 自动检测音频语言识别原声（-l 强制目标语言对非目标音频会出错）
+                try Task.checkCancellation()
+                await MainActor.run { self.transcribeState = .running(0.1) }
                 let segs = try await WhisperTranscriber.transcribe(
                     mediaURL: mediaURL, trimStart: trimStart,
                     duration: srcDur, language: "auto", prompt: nil)
+                try Task.checkCancellation()
 
-                // 2. 检测识别结果主语言，判断与目标语言是否一致
+                await MainActor.run { self.transcribeState = .running(0.7) }
                 let sample = segs.prefix(12).map(\.text).joined(separator: " ")
                 let recog = NLLanguageRecognizer()
                 recog.processString(sample)
@@ -3821,37 +4275,53 @@ final class ProjectState: ObservableObject {
                 let sameLang = (detectedBase == targetBase)
                     || (detectedBase.hasPrefix("zh") && targetBase == "zh")
 
-                // 3. 同语言直接用（中文简体目标做繁→简）；跨语言逐段翻译到目标语言
                 var finalSegs: [(start: Double, end: Double, text: String)] = []
                 if sameLang {
-                    for s in segs {
+                    for (i, s) in segs.enumerated() {
+                        try Task.checkCancellation()
                         let text = isTargetSimplified ? OpenCC.toSimplified(s.text) : s.text
                         finalSegs.append((s.start, s.end, text))
+                        let p = 0.7 + 0.25 * Double(i + 1) / Double(max(segs.count, 1))
+                        await MainActor.run { self.transcribeState = .running(p) }
                     }
                 } else {
-                    for s in segs {
+                    for (i, s) in segs.enumerated() {
+                        try Task.checkCancellation()
                         let t = await Translator.translate(s.text, to: displayName)
                         finalSegs.append((s.start, s.end, t))
+                        let p = 0.7 + 0.25 * Double(i + 1) / Double(max(segs.count, 1))
+                        await MainActor.run { self.transcribeState = .running(p) }
                     }
                 }
 
+                try Task.checkCancellation()
                 await MainActor.run {
                     self.pushUndo()
                     var track = Track<SubtitleClip>(label: "识别字幕")
                     track.subtitleStyle = self.newSubtitleStyle()
                     for s in finalSegs {
-                        // 源段时间 → timeline 时间（变速映射 + 偏移）
                         let st = capOffset + s.start / capSpeed
                         let en = capOffset + s.end   / capSpeed
                         track.clips.append(SubtitleClip(text: s.text, startTime: st, endTime: en))
                     }
                     track.clips.sort { $0.startTime < $1.startTime }
                     self.subtitleTracks.append(track)
-                    self.transcribeState = .done(finalSegs.count)
+                    self.transcribeState = .idle
+                    self.transcribeTask = nil
+                    self.showSuccessToast(icon: "checkmark", title: "语音识别", subtitle: "完成，生成 \(finalSegs.count) 条字幕")
+                }
+            } catch is CancellationError {
+                await MainActor.run {
+                    WhisperTranscriber.killCurrentProcess()
+                    self.transcribeState = .idle
+                    self.transcribeTask = nil
                 }
             } catch {
                 await MainActor.run {
-                    self.transcribeState = .failed(error.localizedDescription)
+                    if self.transcribeState != .idle {
+                        self.transcribeState = .failed(error.localizedDescription)
+                    }
+                    self.transcribeTask = nil
                 }
             }
         }

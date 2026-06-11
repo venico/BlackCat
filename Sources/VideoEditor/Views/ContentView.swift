@@ -167,18 +167,40 @@ struct ContentView: View {
                     TranscodeOverlay()
                         .environmentObject(project)
                 }
-                TranscribeOverlay()
-                    .environmentObject(project)
-                ExportProgressOverlay(manager: exportManager)
+                if project.isTranscribing || { if case .failed = project.transcribeState { return true } else { return false } }() {
+                    TranscribeOverlay()
+                        .environmentObject(project)
+                }
+                if !exportManager.jobs.isEmpty {
+                    ExportProgressOverlay(manager: exportManager)
+                }
+                ForEach(project.successToasts) { toast in
+                    SuccessToastBubble(toast: toast,
+                        onTap: {
+                            if let url = toast.revealURL {
+                                NSWorkspace.shared.activateFileViewerSelecting([url])
+                            }
+                            project.dismissSuccessToast(toast.id)
+                        },
+                        onDismiss: { project.dismissSuccessToast(toast.id) })
+                    .transition(.asymmetric(
+                        insertion: .move(edge: .trailing).combined(with: .opacity),
+                        removal: .opacity))
+                }
             }
+            .animation(.spring(response: 0.35, dampingFraction: 0.8), value: project.successToasts.count)
             .padding(.trailing, 16)
             .padding(.bottom, 16)
         }
         .overlay(alignment: .bottomTrailing) {
-            SaveToastStack()
-                .environmentObject(project)
-                .padding(.trailing, 16)
-                .padding(.bottom, 48)
+            if project.importToastMessage != nil {
+                ImportToastBubble()
+                    .environmentObject(project)
+                    .padding(.trailing, 16)
+                    .padding(.bottom, 48)
+                    .transition(.move(edge: .trailing).combined(with: .opacity))
+                    .animation(.easeInOut(duration: 0.25), value: project.importToastMessage)
+            }
         }
         .environmentObject(project)
         .environmentObject(project.clock)
@@ -198,7 +220,12 @@ struct ContentView: View {
             }
         }
         .animation(.easeOut(duration: 0.25), value: project.showWelcome)
-        .onAppear { setupEscMonitor() }
+        .onAppear {
+            setupEscMonitor()
+            exportManager.onSuccess = { [weak project] filename, url in
+                project?.showSuccessToast(icon: "checkmark", title: filename, subtitle: "导出完成", revealURL: url)
+            }
+        }
         .onReceive(NotificationCenter.default.publisher(for: .menuImportFiles)) { note in
             if let urls = note.object as? [URL] {
                 urls.forEach { project.importFile($0) }
@@ -267,10 +294,11 @@ struct ContentView: View {
 
     private func setupEscMonitor() {
         NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
-            if event.keyCode == 53 && project.showWelcome {
-                project.showWelcome = false
-                return nil
-            }
+            guard event.keyCode == 53 else { return event }
+            if project.showExportSheet { project.showExportSheet = false; return nil }
+            if project.showWelcome { project.showWelcome = false; return nil }
+            if project.showClearLibraryConfirm { project.showClearLibraryConfirm = false; return nil }
+            if project.showAssetDeleteConfirm { project.showAssetDeleteConfirm = false; project.pendingDeleteAssetID = nil; return nil }
             return event
         }
     }
@@ -302,54 +330,91 @@ extension Comparable {
     func clamped(to r: ClosedRange<Self>) -> Self { min(max(self, r.lowerBound), r.upperBound) }
 }
 
-// MARK: - Save Toast Stack
+// MARK: - Import Toast Bubble
 
-struct SaveToastStack: View {
+private struct ImportToastBubble: View {
     @EnvironmentObject private var project: ProjectState
 
     var body: some View {
-        VStack(spacing: 6) {
-            ForEach(project.saveToasts) { toast in
-                VStack(alignment: .leading, spacing: 3) {
-                    HStack(spacing: 6) {
-                        Image(systemName: "checkmark.circle.fill")
-                            .font(.system(size: 12))
-                            .foregroundColor(.green)
-                        Text("已保存")
-                            .font(.system(size: 12, weight: .medium))
-                            .foregroundColor(.white)
-                    }
-                    Text(toast.path)
-                        .font(.system(size: 10))
-                        .foregroundColor(Color.labelSecondary)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                }
-                .padding(.horizontal, 14)
-                .padding(.vertical, 8)
-                .background(Color(white: 0.15).opacity(0.95))
-                .clipShape(RoundedRectangle(cornerRadius: 8))
-                .shadow(color: .black.opacity(0.3), radius: 4, y: 2)
-                .transition(.move(edge: .trailing).combined(with: .opacity))
+        if let msg = project.importToastMessage {
+            HStack(spacing: 6) {
+                Image(systemName: "exclamationmark.circle.fill")
+                    .font(.system(size: 12))
+                    .foregroundColor(.orange)
+                Text(msg)
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundColor(.white)
             }
-            if let msg = project.importToastMessage {
-                HStack(spacing: 6) {
-                    Image(systemName: "exclamationmark.circle.fill")
-                        .font(.system(size: 12))
-                        .foregroundColor(.orange)
-                    Text(msg)
-                        .font(.system(size: 12, weight: .medium))
-                        .foregroundColor(.white)
-                }
-                .padding(.horizontal, 14)
-                .padding(.vertical, 8)
-                .background(Color(white: 0.15).opacity(0.95))
-                .clipShape(RoundedRectangle(cornerRadius: 8))
-                .shadow(color: .black.opacity(0.3), radius: 4, y: 2)
-                .transition(.move(edge: .trailing).combined(with: .opacity))
-            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 8)
+            .background(Color(white: 0.15).opacity(0.95))
+            .clipShape(RoundedRectangle(cornerRadius: 8))
+            .shadow(color: .black.opacity(0.3), radius: 4, y: 2)
         }
-        .animation(.easeInOut(duration: 0.25), value: project.saveToasts.count)
-        .animation(.easeInOut(duration: 0.25), value: project.importToastMessage)
+    }
+}
+
+// MARK: - Success Toast Bubble (右下角，带倒计时)
+
+private struct SuccessToastBubble: View {
+    let toast: ProjectState.SuccessToastItem
+    let onTap: () -> Void
+    let onDismiss: () -> Void
+
+    var body: some View {
+        Button(action: onTap) {
+            HStack(spacing: 10) {
+                ZStack {
+                    Circle()
+                        .fill(toast.iconColor.opacity(0.2))
+                        .frame(width: 28, height: 28)
+                    Image(systemName: toast.icon)
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundColor(toast.iconColor)
+                }
+
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(toast.title)
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundColor(Color.labelPrimary)
+                        .lineLimit(1)
+                    Text(toast.subtitle + (toast.revealURL != nil ? " · 点击查看" : ""))
+                        .font(.system(size: 10))
+                        .foregroundColor(toast.revealURL != nil ? Color.accent : .green)
+                        .lineLimit(1)
+                }
+
+                Spacer(minLength: 4)
+
+                // 倒计时圆环
+                ZStack {
+                    Circle()
+                        .stroke(Color.white.opacity(0.1), lineWidth: 2)
+                        .frame(width: 22, height: 22)
+                    Circle()
+                        .trim(from: 0, to: CGFloat(toast.countdown) / 5.0)
+                        .stroke(Color.labelSecondary, style: StrokeStyle(lineWidth: 2, lineCap: .round))
+                        .frame(width: 22, height: 22)
+                        .rotationEffect(.degrees(-90))
+                        .animation(.linear(duration: 1), value: toast.countdown)
+                    Text("\(toast.countdown)")
+                        .font(.system(size: 9, weight: .bold).monospacedDigit())
+                        .foregroundColor(Color.labelSecondary)
+                }
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
+            .frame(maxWidth: 260)
+            .background(
+                RoundedRectangle(cornerRadius: 10)
+                    .fill(Color(red: 0.16, green: 0.16, blue: 0.17))
+                    .shadow(color: .black.opacity(0.5), radius: 8, y: 4)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 10)
+                    .stroke(Color.white.opacity(0.12), lineWidth: 0.5)
+            )
+        }
+        .buttonStyle(.plain)
     }
 }

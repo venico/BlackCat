@@ -15,6 +15,8 @@ struct InspectorView: View {
             ScrollView(showsIndicators: false) {
                 if let transID = project.selectedTransitionClipID {
                     TransitionInspector(clipID: transID)
+                } else if let clip = project.selectedTextClip {
+                    TextInspector(clip: clip).id(clip.id)
                 } else if let clip = project.selectedSubtitleClip {
                     SubtitleInspector(clip: clip).id(clip.id)
                 } else if let clip = project.selectedImageClip {
@@ -75,6 +77,7 @@ struct InspectorView: View {
 
     private var tag: String {
         if project.selectedTransitionClipID != nil { return "转场" }
+        if project.selectedTextClipID       != nil { return "文字片段" }
         if project.selectedSubtitleClipID   != nil { return "字幕片段" }
         if project.selectedImageClipID      != nil { return "图片片段" }
         if project.selectedVideoClipID      != nil { return "视频片段" }
@@ -399,6 +402,174 @@ enum Translator {
 // MARK: - Video Inspector
 
 // MARK: - Image Inspector
+
+private struct TextInspector: View {
+    @EnvironmentObject private var project: ProjectState
+    let clip: TextClip
+
+    @State private var text = ""
+    @State private var startTime: Double = 0
+    @State private var endTime: Double = 0
+    @State private var fontName = "PingFang SC"
+    @State private var fontSize: Double = 64
+    @State private var bold = true
+    @State private var italic = false
+    @State private var textColor: Color = .white
+    @State private var strokeColor: Color = .black
+    @State private var strokeWidth: Double = 0
+    @State private var bgColor: Color = .black
+    @State private var bgOpacity: Double = 0
+    @State private var alignment = "center"
+    @State private var posX: Double = 0.5
+    @State private var posY: Double = 0.5
+    @State private var rotation: Double = 0
+    @State private var opacity: Double = 1
+    @State private var animation: TextAnimation = .none
+    @State private var syncing = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            ISection(title: "时间") {
+                HStack(spacing: 8) {
+                    IField(label: "开始") {
+                        MiniStepper(value: $startTime, step: 0.1, decimals: 2)
+                            .onChange(of: startTime) { _ in
+                                if endTime <= startTime { endTime = startTime + 0.5 }
+                                write { $0.startTime = startTime; $0.endTime = endTime }
+                            }
+                    }
+                    IField(label: "持续") {
+                        MiniStepper(value: Binding(
+                            get: { max(endTime - startTime, 0) },
+                            set: { endTime = startTime + max($0, 0.1) }
+                        ), step: 0.1, decimals: 2)
+                        .onChange(of: endTime) { _ in write { $0.endTime = endTime } }
+                    }
+                }
+            }
+
+            ISection(title: "文字内容") {
+                TextEditor(text: $text)
+                    .font(.system(size: 13))
+                    .frame(height: 60)
+                    .scrollContentBackground(.hidden)
+                    .padding(6)
+                    .background(Color.white.opacity(0.06))
+                    .cornerRadius(6)
+                    .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.white.opacity(0.10)))
+                    .onChange(of: text) { _ in write { $0.text = text } }
+            }
+
+            ISection(title: "字体") {
+                HStack(alignment: .bottom, spacing: 8) {
+                    IField(label: "字体") {
+                        IPicker(selection: $fontName,
+                                options: ["PingFang SC","思源黑体","Helvetica Neue","Arial","Times New Roman"].map { ($0,$0) })
+                            .onChange(of: fontName) { _ in write { $0.fontName = fontName } }
+                    }
+                    IField(label: "字号") {
+                        MiniStepper(value: $fontSize, step: 1, decimals: 0, minValue: 8, maxValue: 300)
+                            .onChange(of: fontSize) { _ in write { $0.fontSize = CGFloat(fontSize) } }
+                    }.frame(width: 92)
+                }
+                HStack(spacing: 8) {
+                    styleToggle("粗体", isOn: bold) { bold.toggle(); write { $0.bold = bold } }
+                    styleToggle("斜体", isOn: italic) { italic.toggle(); write { $0.italic = italic } }
+                    Spacer()
+                }
+                .padding(.top, 6)
+            }
+
+            ISection(title: "颜色与描边") {
+                colorRow("文字颜色", $textColor) { write { $0.textColor = textColor } }
+                colorRow("描边颜色", $strokeColor) { write { $0.strokeColor = strokeColor } }
+                ISlider(label: "描边宽度", value: $strokeWidth, range: 0...10, unit: "px")
+                    .onChange(of: strokeWidth) { _ in write { $0.strokeWidth = strokeWidth } }
+                colorRow("背景颜色", $bgColor) { write { $0.bgColor = bgColor } }
+                ISlider(label: "背景不透明", value: Binding(get:{bgOpacity*100}, set:{bgOpacity=$0/100}), range: 0...100, unit: "%")
+                    .onChange(of: bgOpacity) { _ in write { $0.bgOpacity = bgOpacity } }
+            }
+
+            ISection(title: "位置与变换") {
+                ISlider(label: "水平位置", value: Binding(get:{posX*100}, set:{posX=$0/100}), range: 0...100, unit: "%")
+                    .onChange(of: posX) { _ in write { $0.posX = posX } }
+                ISlider(label: "垂直位置", value: Binding(get:{posY*100}, set:{posY=$0/100}), range: 0...100, unit: "%")
+                    .onChange(of: posY) { _ in write { $0.posY = posY } }
+                ISlider(label: "旋转", value: $rotation, range: -180...180, unit: "°")
+                    .onChange(of: rotation) { _ in write { $0.rotation = rotation } }
+                ISlider(label: "不透明度", value: Binding(get:{opacity*100}, set:{opacity=$0/100}), range: 0...100, unit: "%")
+                    .onChange(of: opacity) { _ in write { $0.opacity = opacity } }
+                HStack(spacing: 12) {
+                    Text("对齐方式").font(.system(size:11)).foregroundColor(Color.labelSecondary).frame(width:68, alignment:.leading)
+                    HStack(spacing: 4) {
+                        ForEach([("text.alignleft","left"),("text.aligncenter","center"),("text.alignright","right")], id:\.1) { icon, val in
+                            Button { alignment = val; write { $0.alignment = val } } label: {
+                                Image(systemName: icon).font(.system(size:12,weight:.light))
+                                    .foregroundColor(alignment==val ? Color.accent : Color.labelSecondary)
+                                    .frame(width:34,height:26)
+                                    .background(alignment==val ? Color.accent.opacity(0.15) : Color.white.opacity(0.05))
+                                    .cornerRadius(5)
+                            }.buttonStyle(.plain)
+                        }
+                        Spacer(minLength:0)
+                    }
+                }
+            }
+
+            ISection(title: "入场动画") {
+                IPicker(selection: $animation, options: TextAnimation.allCases.map { ($0, $0.label) })
+                    .onChange(of: animation) { _ in write { $0.animation = animation } }
+            }
+
+            ISection(title: nil) {
+                Button { project.deleteTextClip(id: clip.id) } label: {
+                    HStack { Spacer(); Image(systemName: "trash"); Text("删除文字"); Spacer() }
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundColor(.red.opacity(0.9))
+                        .frame(height: 32)
+                        .background(Color.red.opacity(0.12))
+                        .clipShape(RoundedRectangle(cornerRadius: 8))
+                }.buttonStyle(.plain)
+            }
+        }
+        .onAppear { syncAll() }
+        .onChange(of: clip.id) { _ in syncAll() }
+    }
+
+    private func write(_ mutate: (inout TextClip) -> Void) {
+        guard !syncing else { return }
+        project.updateTextClip(id: clip.id, mutate)
+        project.pushUndoThrottled()
+    }
+    private func syncAll() {
+        syncing = true
+        text = clip.text; startTime = clip.startTime; endTime = clip.endTime
+        fontName = clip.fontName; fontSize = Double(clip.fontSize)
+        bold = clip.bold; italic = clip.italic
+        textColor = clip.textColor; strokeColor = clip.strokeColor; strokeWidth = clip.strokeWidth
+        bgColor = clip.bgColor; bgOpacity = clip.bgOpacity
+        alignment = clip.alignment; posX = clip.posX; posY = clip.posY
+        rotation = clip.rotation; opacity = clip.opacity; animation = clip.animation
+        DispatchQueue.main.async { syncing = false }
+    }
+
+    @ViewBuilder private func colorRow(_ label: String, _ binding: Binding<Color>, _ onChange: @escaping () -> Void) -> some View {
+        HStack(spacing: 12) {
+            Text(label).font(.system(size: 11)).foregroundColor(Color.labelSecondary).frame(width: 68, alignment: .leading)
+            ColorPicker("", selection: binding).labelsHidden().onChange(of: binding.wrappedValue) { _ in onChange() }
+            Spacer(minLength: 0)
+        }
+    }
+    @ViewBuilder private func styleToggle(_ label: String, isOn: Bool, _ action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Text(label).font(.system(size: 11, weight: .medium))
+                .foregroundColor(isOn ? .black : Color.labelSecondary)
+                .padding(.horizontal, 14).frame(height: 26)
+                .background(isOn ? Color(hex: "#E8A54B") : Color.white.opacity(0.08))
+                .cornerRadius(5)
+        }.buttonStyle(.plain)
+    }
+}
 
 private struct ImageInspector: View {
     @EnvironmentObject private var project: ProjectState

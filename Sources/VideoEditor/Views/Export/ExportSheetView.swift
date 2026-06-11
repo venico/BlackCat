@@ -20,11 +20,26 @@ final class ExportManager: ObservableObject {
     enum JobState { case running, done, failed }
 
     @Published var jobs: [Job] = []
+    private var exportTasks: [UUID: Task<Void, Never>] = [:]
+    private var exporters: [UUID: TimelineExporter] = [:]
+    var onSuccess: ((String, URL?) -> Void)?
 
-    /// 从列表移除已完成/失败的 job
     func dismiss(_ id: UUID) {
         withAnimation(.easeOut(duration: 0.25)) {
             jobs.removeAll { $0.id == id }
+        }
+    }
+
+    func cancelExport(_ id: UUID) {
+        exportTasks[id]?.cancel()
+        exportTasks.removeValue(forKey: id)
+        if let exp = exporters.removeValue(forKey: id) {
+            Task { await exp.cancel() }
+        }
+        if let i = jobs.firstIndex(where: { $0.id == id }) {
+            let url = jobs[i].outputURL
+            withAnimation(.easeOut(duration: 0.25)) { jobs.remove(at: i) }
+            if let url { try? FileManager.default.removeItem(at: url) }
         }
     }
 
@@ -40,14 +55,17 @@ final class ExportManager: ObservableObject {
         DispatchQueue.main.asyncAfter(deadline: .now() + 5, execute: item)
     }
 
-    /// 启动一个新的导出任务，立即返回
     func startExport(snapshot: ExportInput) {
         let job = Job(filename: snapshot.outputURL.lastPathComponent, outputURL: snapshot.outputURL)
         let jobID = job.id
+        let filename = job.filename
         withAnimation(.easeOut(duration: 0.25)) { jobs.append(job) }
 
-        Task.detached {
-            let exporter = TimelineExporter()
+        let exporter = TimelineExporter()
+        exporters[jobID] = exporter
+
+        let task = Task.detached { [weak self] in
+            guard let self else { return }
             do {
                 let url = try await exporter.export(snapshot) { p in
                     Task { @MainActor in
@@ -57,12 +75,10 @@ final class ExportManager: ObservableObject {
                     }
                 }
                 await MainActor.run {
-                    if let i = self.jobs.firstIndex(where: { $0.id == jobID }) {
-                        self.jobs[i].progress = 1
-                        self.jobs[i].state = .done
-                        self.jobs[i].outputURL = url
-                    }
-                    self.scheduleAutoDismiss(id: jobID)
+                    self.dismiss(jobID)
+                    self.exportTasks.removeValue(forKey: jobID)
+                    self.exporters.removeValue(forKey: jobID)
+                    self.onSuccess?(filename, url)
                 }
             } catch {
                 await MainActor.run {
@@ -70,9 +86,13 @@ final class ExportManager: ObservableObject {
                         self.jobs[i].state = .failed
                         self.jobs[i].error = error.localizedDescription
                     }
+                    self.exportTasks.removeValue(forKey: jobID)
+                    self.exporters.removeValue(forKey: jobID)
+                    self.scheduleAutoDismiss(id: jobID)
                 }
             }
         }
+        exportTasks[jobID] = task
     }
 }
 
@@ -84,97 +104,87 @@ struct ExportProgressOverlay: View {
     var body: some View {
         VStack(alignment: .trailing, spacing: 8) {
             ForEach(manager.jobs) { job in
-                ExportJobBubble(job: job) {
-                    if job.state == .done, let url = job.outputURL {
-                        NSWorkspace.shared.activateFileViewerSelecting([url])
-                    }
-                    manager.dismiss(job.id)
-                }
+                ExportJobBubble(job: job, onCancel: { manager.cancelExport(job.id) }, onDismiss: { manager.dismiss(job.id) })
                 .transition(.asymmetric(
                     insertion: .move(edge: .trailing).combined(with: .opacity),
                     removal: .opacity))
             }
         }
-        .padding(.trailing, 16)
-        .padding(.bottom, 16)
         .animation(.spring(response: 0.35, dampingFraction: 0.8), value: manager.jobs.count)
     }
 }
 
 private struct ExportJobBubble: View {
     let job: ExportManager.Job
-    let onTap: () -> Void
+    let onCancel: () -> Void
+    let onDismiss: () -> Void
     @State private var hovering = false
+    @State private var xHovering = false
 
     var body: some View {
-        Button(action: onTap) {
-            HStack(spacing: 10) {
-                // Icon
-                ZStack {
-                    Circle()
-                        .fill(iconBgColor)
-                        .frame(width: 28, height: 28)
-                    Image(systemName: iconName)
-                        .font(.system(size: 12, weight: .semibold))
-                        .foregroundColor(iconFgColor)
-                }
+        HStack(spacing: 10) {
+            ZStack {
+                Circle()
+                    .fill(iconBgColor)
+                    .frame(width: 28, height: 28)
+                Image(systemName: iconName)
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundColor(iconFgColor)
+            }
 
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(Self.truncatedFilename(job.filename))
-                        .font(.system(size: 11, weight: .medium))
-                        .foregroundColor(Color.labelPrimary)
-                        .lineLimit(1)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(Self.truncatedFilename(job.filename))
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundColor(Color.labelPrimary)
+                    .lineLimit(1)
 
-                    switch job.state {
-                    case .running:
-                        GeometryReader { geo in
-                            HStack(spacing: 6) {
-                                ProgressView(value: job.progress)
-                                    .progressViewStyle(.linear)
-                                    .tint(Color.accent)
-                                Text("\(Int(job.progress * 100))%")
-                                    .font(.system(size: 10).monospacedDigit())
-                                    .foregroundColor(Color.labelSecondary)
-                                    .fixedSize()
-                            }
-                            .frame(width: geo.size.width)
+                switch job.state {
+                case .running:
+                    GeometryReader { geo in
+                        HStack(spacing: 6) {
+                            ProgressView(value: job.progress)
+                                .progressViewStyle(.linear)
+                                .tint(Color.accent)
+                            Text("\(Int(job.progress * 100))%")
+                                .font(.system(size: 10).monospacedDigit())
+                                .foregroundColor(Color.labelSecondary)
+                                .fixedSize()
                         }
-                        .frame(height: 14)
-                    case .done:
-                        Text("导出完成 · 点击查看")
-                            .font(.system(size: 10))
-                            .foregroundColor(Color.accent)
-                    case .failed:
-                        Text("导出失败")
-                            .font(.system(size: 10))
-                            .foregroundColor(.red.opacity(0.8))
+                        .frame(width: geo.size.width)
                     }
-                }
-
-                if job.state != .running {
-                    Image(systemName: "xmark")
-                        .font(.system(size: 9, weight: .bold))
-                        .foregroundColor(Color.labelSecondary)
-                        .frame(width: 18, height: 18)
-                        .background(Color.white.opacity(hovering ? 0.15 : 0.08))
-                        .clipShape(Circle())
+                    .frame(height: 14)
+                case .failed:
+                    Text(job.error ?? "导出失败")
+                        .font(.system(size: 10))
+                        .foregroundColor(.red.opacity(0.8))
+                        .lineLimit(2)
+                default: EmptyView()
                 }
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 10)
-            .frame(maxWidth: 260)
-            .background(
-                RoundedRectangle(cornerRadius: 10)
-                    .fill(Color(red: 0.16, green: 0.16, blue: 0.17))
-                    .shadow(color: .black.opacity(0.5), radius: 8, y: 4)
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 10)
-                    .stroke(Color.white.opacity(0.12), lineWidth: 0.5)
-            )
+
+            Button(action: job.state == .running ? onCancel : onDismiss) {
+                Image(systemName: "xmark")
+                    .font(.system(size: 9, weight: .bold))
+                    .foregroundColor(xHovering ? Color.labelPrimary : Color.labelSecondary)
+                    .frame(width: 18, height: 18)
+                    .background(Color.white.opacity(xHovering ? 0.15 : 0.08))
+                    .clipShape(Circle())
+            }
+            .buttonStyle(.plain)
+            .onHover { xHovering = $0 }
         }
-        .buttonStyle(.plain)
-        .onHover { hovering = $0 }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .frame(maxWidth: 260)
+        .background(
+            RoundedRectangle(cornerRadius: 10)
+                .fill(Color(red: 0.16, green: 0.16, blue: 0.17))
+                .shadow(color: .black.opacity(0.5), radius: 8, y: 4)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 10)
+                .stroke(Color.white.opacity(0.12), lineWidth: 0.5)
+        )
     }
 
     private var iconName: String {
@@ -565,7 +575,18 @@ struct ExportInput {
     let outputURL:      URL
 }
 
+private final class CancelFlag: @unchecked Sendable {
+    private var _value = false
+    private let lock = NSLock()
+    var value: Bool { lock.withLock { _value } }
+    func set() { lock.withLock { _value = true } }
+}
+
 actor TimelineExporter {
+
+    private let _cancelFlag = CancelFlag()
+    nonisolated var isCancelled: Bool { _cancelFlag.value }
+    func cancel() { _cancelFlag.set() }
 
     // ── ffmpeg 变速音频预处理（与 ProjectState.generateSpeedAudio 逻辑相同，独立缓存）──
     private var speedAudioCache: [String: URL] = [:]
@@ -1358,8 +1379,14 @@ actor TimelineExporter {
                     var currentReaderTime: Double = 0
                     var nextSB: CMSampleBuffer? = videoOutput.copyNextSampleBuffer()
 
+                    let cancelRef = self._cancelFlag
                     videoInput.requestMediaDataWhenReady(on: videoQueue) {
                         while videoInput.isReadyForMoreMediaData {
+                            if cancelRef.value {
+                                videoInput.markAsFinished()
+                                cont.resume()
+                                return
+                            }
                             let targetTime = Double(frameIndex) / Double(targetFps)
                             guard targetTime < totalDuration + 0.1 else {
                                 videoInput.markAsFinished()
@@ -1438,7 +1465,11 @@ actor TimelineExporter {
             }
         }
 
-        // 完成写入
+        if _cancelFlag.value {
+            writer.cancelWriting()
+            throw CancellationError()
+        }
+
         await writer.finishWriting()
 
         guard writer.status == .completed else {
@@ -1519,8 +1550,11 @@ actor TimelineExporter {
             var ctFont = CTFontCreateWithName(item.style.fontName as CFString, scaledSize, nil)
             if item.style.bold,
                let bf = CTFontCreateCopyWithSymbolicTraits(ctFont, scaledSize, nil, .boldTrait, .boldTrait) { ctFont = bf }
-            if item.style.italic,
-               let itf = CTFontCreateCopyWithSymbolicTraits(ctFont, scaledSize, nil, .italicTrait, .italicTrait) { ctFont = itf }
+            if item.style.italic {
+                // 矩阵斜切合成斜体（中文字体无 italic face，symbolic traits 会失败）
+                var skew = CGAffineTransform(a: 1, b: 0, c: 0.21, d: 1, tx: 0, ty: 0)
+                ctFont = CTFontCreateCopyWithAttributes(ctFont, scaledSize, &skew, nil)
+            }
 
             let tc = NSColor(item.style.textColor).usingColorSpace(.sRGB) ?? .white
             var tr: CGFloat = 1, tg: CGFloat = 1, tb: CGFloat = 1, ta: CGFloat = 1
@@ -1661,9 +1695,9 @@ actor TimelineExporter {
             }
         }
         if style.italic {
-            if let italicFont = CTFontCreateCopyWithSymbolicTraits(ctFont, scaledFontSize, nil, .italicTrait, .italicTrait) {
-                ctFont = italicFont
-            }
+            // 矩阵斜切合成斜体（中文字体无 italic face，symbolic traits 会失败）
+            var skew = CGAffineTransform(a: 1, b: 0, c: 0.21, d: 1, tx: 0, ty: 0)
+            ctFont = CTFontCreateCopyWithAttributes(ctFont, scaledFontSize, &skew, nil)
         }
 
         var alignment: CTTextAlignment

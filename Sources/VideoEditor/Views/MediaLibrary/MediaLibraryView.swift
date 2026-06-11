@@ -6,6 +6,7 @@ struct MediaLibraryView: View {
     @State private var isDragOver = false
 
     private var isTransitionTab: Bool { project.mediaLibraryTab == "transition" }
+    private var isTextTab: Bool { project.mediaLibraryTab == "text" }
 
     private var selectedAssetType: AssetType {
         switch project.mediaLibraryTab {
@@ -17,7 +18,26 @@ struct MediaLibraryView: View {
     }
 
     private var filteredAssets: [MediaAsset] {
-        project.mediaAssets.filter { $0.type == selectedAssetType }
+        var result = project.mediaAssets.filter { $0.type == selectedAssetType }
+        let q = project.mediaSearchText.trimmingCharacters(in: .whitespaces).lowercased()
+        if !q.isEmpty {
+            result = result.filter { $0.name.lowercased().contains(q) }
+        }
+        let asc = project.mediaSortAscending
+        switch project.mediaSortOrder {
+        case .name:
+            result.sort { asc ? $0.name.localizedCompare($1.name) == .orderedAscending
+                              : $0.name.localizedCompare($1.name) == .orderedDescending }
+        case .duration:
+            result.sort { asc ? $0.duration < $1.duration : $0.duration > $1.duration }
+        case .importDate:
+            result.sort { asc ? ($0.importDate ?? .distantPast) < ($1.importDate ?? .distantPast)
+                              : ($0.importDate ?? .distantPast) > ($1.importDate ?? .distantPast) }
+        case .fileSize:
+            result.sort { asc ? ($0.fileSize ?? 0) < ($1.fileSize ?? 0)
+                              : ($0.fileSize ?? 0) > ($1.fileSize ?? 0) }
+        }
+        return result
     }
 
     private func countFor(_ type: AssetType) -> Int {
@@ -34,7 +54,7 @@ struct MediaLibraryView: View {
                     .textCase(.uppercase)
                 Spacer()
                 Button { project.showClearLibraryConfirm = true } label: {
-                    Image(systemName: "trash")
+                    Image(systemName: "paintbrush")
                         .font(.system(size: 11, weight: .medium))
                         .foregroundColor(project.mediaAssets.isEmpty ? Color.labelSecondary.opacity(0.3) : Color.labelSecondary)
                 }
@@ -61,15 +81,56 @@ struct MediaLibraryView: View {
                 tabBtn("image", icon: "photo")
                 tabBtn("subtitle", icon: "captions.bubble")
                 tabBtn("transition", icon: "arrow.left.arrow.right")
+                tabBtnT("text")
             }
             .background(Color.white.opacity(0.06))
             .clipShape(Capsule())
             .padding(.horizontal, 8)
             .padding(.bottom, 6)
 
+            // Search + Sort bar
+            if !isTransitionTab && !isTextTab {
+                HStack(spacing: 4) {
+                    HStack(spacing: 4) {
+                        Image(systemName: "magnifyingglass")
+                            .font(.system(size: 10))
+                            .foregroundColor(Color.labelSecondary)
+                        TextField("搜索", text: $project.mediaSearchText)
+                            .textFieldStyle(.plain)
+                            .font(.system(size: 11))
+                            .foregroundColor(Color.labelPrimary)
+                        if !project.mediaSearchText.isEmpty {
+                            Button { project.mediaSearchText = "" } label: {
+                                Image(systemName: "xmark.circle.fill")
+                                    .font(.system(size: 9))
+                                    .foregroundColor(Color.labelSecondary)
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 4)
+                    .background(Color.white.opacity(0.06))
+                    .clipShape(RoundedRectangle(cornerRadius: 6))
+
+                    Button {
+                        showSortNSMenu(project: project)
+                    } label: {
+                        Image(systemName: "arrow.up.arrow.down")
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundColor(Color.labelSecondary)
+                    }
+                    .buttonStyle(.plain)
+                }
+                .padding(.horizontal, 8)
+                .padding(.bottom, 6)
+            }
+
             // Asset list + drag-drop target
             ZStack {
-                if isTransitionTab {
+                if isTextTab {
+                    TextLayerPanel()
+                } else if isTransitionTab {
                     TransitionPanel()
                 } else if filteredAssets.isEmpty {
                     emptyState
@@ -146,6 +207,22 @@ struct MediaLibraryView: View {
             .padding(.horizontal, 8)
             .padding(.bottom, 8)
         }
+    }
+
+    @ViewBuilder
+    private func tabBtnT(_ tab: String) -> some View {
+        let isActive = project.mediaLibraryTab == tab
+        Button { project.mediaLibraryTab = tab } label: {
+            Text("T")
+                .font(.system(size: 13, weight: .bold, design: .serif))
+                .foregroundColor(isActive ? .white : Color.labelSecondary)
+                .frame(maxWidth: .infinity)
+                .frame(height: 26)
+                .background(isActive ? Color.white.opacity(0.15) : Color.clear)
+                .clipShape(Capsule())
+                .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
     }
 
     @ViewBuilder
@@ -322,7 +399,7 @@ private struct AssetRow: View {
                     .font(.system(size: 12))
                     .foregroundColor(asset.fileExists ? Color.labelPrimary : Color.labelSecondary)
                     .lineLimit(2)
-                    .frame(minHeight: 32, alignment: .topLeading)
+                    .fixedSize(horizontal: false, vertical: true)
                     .help(asset.name)
 
                 if !asset.fileExists {
@@ -487,67 +564,89 @@ private struct ExportButton: View {
 
 struct TranscribeOverlay: View {
     @EnvironmentObject private var project: ProjectState
+    @State private var autoDismissWork: DispatchWorkItem? = nil
 
     var body: some View {
         VStack(alignment: .trailing, spacing: 8) {
-            if project.transcribeState != .idle {
-                TranscribeBubble(state: project.transcribeState) {
-                    project.transcribeState = .idle
-                }
+            if project.isTranscribing {
+                TranscribeBubble(state: project.transcribeState, onCancel: { project.cancelTranscribe() })
+                .transition(.asymmetric(
+                    insertion: .move(edge: .trailing).combined(with: .opacity),
+                    removal: .opacity))
+            }
+            if case .failed(let msg) = project.transcribeState {
+                TranscribeFailBubble(message: msg, onDismiss: { project.transcribeState = .idle })
                 .transition(.asymmetric(
                     insertion: .move(edge: .trailing).combined(with: .opacity),
                     removal: .opacity))
             }
         }
         .animation(.spring(response: 0.35, dampingFraction: 0.8), value: project.transcribeState)
+        .onChange(of: project.transcribeState) { newState in
+            autoDismissWork?.cancel()
+            autoDismissWork = nil
+            if case .failed = newState {
+                let work = DispatchWorkItem { project.transcribeState = .idle }
+                autoDismissWork = work
+                DispatchQueue.main.asyncAfter(deadline: .now() + 5, execute: work)
+            }
+        }
     }
 }
 
 private struct TranscribeBubble: View {
     let state: ProjectState.TranscribeState
-    let onDismiss: () -> Void
-    @State private var hovering = false
+    let onCancel: () -> Void
+    @State private var xHovering = false
 
-    private var isBusy: Bool {
-        switch state { case .running, .downloading: return true; default: return false }
+    private var progressValue: Double {
+        switch state {
+        case .downloading(let p): return p * 0.05
+        case .running(let p): return 0.05 + p * 0.95
+        default: return 0
+        }
     }
 
     var body: some View {
         HStack(spacing: 10) {
             ZStack {
-                Circle().fill(iconBg).frame(width: 28, height: 28)
-                if isBusy {
-                    ProgressView().controlSize(.small).scaleEffect(0.7)
-                } else {
-                    Image(systemName: iconName)
-                        .font(.system(size: 12, weight: .semibold))
-                        .foregroundColor(iconFg)
-                }
+                Circle().fill(Color.accent.opacity(0.2)).frame(width: 28, height: 28)
+                Image(systemName: "waveform")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundColor(Color.accent)
             }
+
             VStack(alignment: .leading, spacing: 3) {
                 Text("语音识别")
                     .font(.system(size: 11, weight: .medium))
                     .foregroundColor(Color.labelPrimary)
                     .lineLimit(1)
-                Text(statusText)
-                    .font(.system(size: 10))
-                    .foregroundColor(statusColor)
-                    .lineLimit(2)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            Spacer(minLength: 8)
-            if !isBusy {
-                Button(action: onDismiss) {
-                    Image(systemName: "xmark")
-                        .font(.system(size: 9, weight: .bold))
-                        .foregroundColor(hovering ? Color.labelPrimary : Color.labelSecondary)
-                        .frame(width: 18, height: 18)
-                        .background(Color.white.opacity(hovering ? 0.15 : 0.08))
-                        .clipShape(Circle())
+
+                GeometryReader { geo in
+                    HStack(spacing: 6) {
+                        ProgressView(value: progressValue)
+                            .progressViewStyle(.linear)
+                            .tint(Color.accent)
+                        Text("\(Int(progressValue * 100))%")
+                            .font(.system(size: 10).monospacedDigit())
+                            .foregroundColor(Color.labelSecondary)
+                            .fixedSize()
+                    }
+                    .frame(width: geo.size.width)
                 }
-                .buttonStyle(.plain)
-                .onHover { hovering = $0 }
+                .frame(height: 14)
             }
+
+            Button(action: onCancel) {
+                Image(systemName: "xmark")
+                    .font(.system(size: 9, weight: .bold))
+                    .foregroundColor(xHovering ? Color.labelPrimary : Color.labelSecondary)
+                    .frame(width: 18, height: 18)
+                    .background(Color.white.opacity(xHovering ? 0.15 : 0.08))
+                    .clipShape(Circle())
+            }
+            .buttonStyle(.plain)
+            .onHover { xHovering = $0 }
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 10)
@@ -562,44 +661,55 @@ private struct TranscribeBubble: View {
                 .stroke(Color.white.opacity(0.12), lineWidth: 0.5)
         )
     }
+}
 
-    private var iconName: String {
-        switch state {
-        case .done:   return "checkmark"
-        case .failed: return "exclamationmark.triangle"
-        default:      return "waveform"
+private struct TranscribeFailBubble: View {
+    let message: String
+    let onDismiss: () -> Void
+    @State private var xHovering = false
+
+    var body: some View {
+        HStack(spacing: 10) {
+            ZStack {
+                Circle().fill(Color.red.opacity(0.2)).frame(width: 28, height: 28)
+                Image(systemName: "exclamationmark.triangle")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundColor(.red.opacity(0.8))
+            }
+            VStack(alignment: .leading, spacing: 3) {
+                Text("语音识别")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundColor(Color.labelPrimary)
+                    .lineLimit(1)
+                Text(message)
+                    .font(.system(size: 10))
+                    .foregroundColor(.red.opacity(0.8))
+                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Button(action: onDismiss) {
+                Image(systemName: "xmark")
+                    .font(.system(size: 9, weight: .bold))
+                    .foregroundColor(xHovering ? Color.labelPrimary : Color.labelSecondary)
+                    .frame(width: 18, height: 18)
+                    .background(Color.white.opacity(xHovering ? 0.15 : 0.08))
+                    .clipShape(Circle())
+            }
+            .buttonStyle(.plain)
+            .onHover { xHovering = $0 }
         }
-    }
-    private var iconBg: Color {
-        switch state {
-        case .running, .downloading: return Color.accent.opacity(0.2)
-        case .done:    return Color.green.opacity(0.2)
-        case .failed:  return Color.red.opacity(0.2)
-        case .idle:    return Color.clear
-        }
-    }
-    private var iconFg: Color {
-        switch state {
-        case .done:   return .green
-        case .failed: return .red.opacity(0.8)
-        default:      return Color.accent
-        }
-    }
-    private var statusText: String {
-        switch state {
-        case .downloading(let p): return "下载识别模型 \(Int(p * 100))%（约 466MB，仅首次）"
-        case .running:       return "正在识别…"
-        case .done(let n):   return "完成，生成 \(n) 条字幕"
-        case .failed(let m): return m
-        case .idle:          return ""
-        }
-    }
-    private var statusColor: Color {
-        switch state {
-        case .done:   return .green
-        case .failed: return .red.opacity(0.8)
-        default:      return Color.labelSecondary
-        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .frame(maxWidth: 260)
+        .background(
+            RoundedRectangle(cornerRadius: 10)
+                .fill(Color(red: 0.16, green: 0.16, blue: 0.17))
+                .shadow(color: .black.opacity(0.5), radius: 8, y: 4)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 10)
+                .stroke(Color.white.opacity(0.12), lineWidth: 0.5)
+        )
     }
 }
 
@@ -734,6 +844,102 @@ private extension Character {
             || (0x3040...0x309F).contains(v)    // 平假名
             || (0x30A0...0x30FF).contains(v)    // 片假名
             || (0xAC00...0xD7AF).contains(v)    // 韩文
+    }
+}
+
+// MARK: - Text Layer Panel
+
+private struct TextLayerPanel: View {
+    @EnvironmentObject private var project: ProjectState
+
+    var body: some View {
+        VStack(spacing: 0) {
+            if project.textTemplates.isEmpty {
+                VStack(spacing: 10) {
+                    Text("T")
+                        .font(.system(size: 32, weight: .bold, design: .serif))
+                        .foregroundColor(Color.labelSecondary.opacity(0.30))
+                    Text("右键文字片段\n「保存为文字模板」")
+                        .font(.system(size: 11))
+                        .foregroundColor(Color.labelSecondary.opacity(0.45))
+                        .multilineTextAlignment(.center)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                ScrollView(showsIndicators: false) {
+                    VStack(alignment: .leading, spacing: 6) {
+                        ForEach(project.textTemplates) { tmpl in
+                            TextTemplateCard(template: tmpl)
+                        }
+                    }
+                    .padding(.horizontal, 8)
+                    .padding(.top, 6)
+                    .padding(.bottom, 8)
+                }
+            }
+        }
+    }
+}
+
+private struct TextTemplateCard: View {
+    let template: TextTemplate
+    @EnvironmentObject private var project: ProjectState
+    @State private var isHovered = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 6) {
+                Text("T")
+                    .font(.system(size: 14, weight: .bold, design: .serif))
+                    .foregroundColor(Color(hex: template.textColorHex))
+                    .frame(width: 22, height: 22)
+                    .background(
+                        RoundedRectangle(cornerRadius: 4)
+                            .fill(Color(hex: template.bgColorHex).opacity(template.bgOpacity))
+                            .overlay(RoundedRectangle(cornerRadius: 4)
+                                .stroke(Color(hex: "#D4668E").opacity(0.3), lineWidth: 0.5))
+                    )
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(template.name)
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundColor(Color.labelPrimary)
+                        .lineLimit(1)
+                    Text("\(template.fontName) \(Int(template.fontSize))pt")
+                        .font(.system(size: 9))
+                        .foregroundColor(Color.labelSecondary)
+                }
+                Spacer()
+                if isHovered {
+                    Button {
+                        project.deleteTextTemplate(id: template.id)
+                    } label: {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 8, weight: .bold))
+                            .foregroundColor(Color.labelSecondary)
+                            .frame(width: 16, height: 16)
+                            .background(Color.white.opacity(0.1))
+                            .clipShape(Circle())
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
+        .background(
+            RoundedRectangle(cornerRadius: 6)
+                .fill(Color.white.opacity(isHovered ? 0.08 : 0.04))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 6)
+                .stroke(Color(hex: "#D4668E").opacity(0.3), lineWidth: 0.5)
+        )
+        .onHover { isHovered = $0 }
+        .onTapGesture {
+            if let clipID = project.selectedTextClipID {
+                project.applyTextTemplate(template, to: clipID)
+            }
+        }
     }
 }
 
@@ -919,4 +1125,47 @@ private struct TransitionPreviewCard: View {
                 .offset(y: -(1 - p) * 50)
         }
     }
+}
+
+// MARK: - 排序下拉菜单
+
+private class SortMenuTarget: NSObject {
+    let project: ProjectState
+    init(_ project: ProjectState) { self.project = project }
+
+    @objc func pick(_ sender: NSMenuItem) {
+        let allCases = ProjectState.MediaSortOrder.allCases
+        guard sender.tag >= 0, sender.tag < allCases.count else { return }
+        let order = allCases[sender.tag]
+        if project.mediaSortOrder == order {
+            project.mediaSortAscending.toggle()
+        } else {
+            project.mediaSortOrder = order
+            project.mediaSortAscending = order == .name
+        }
+    }
+}
+
+private var _sortMenuTarget: SortMenuTarget?
+
+func showSortNSMenu(project: ProjectState) {
+    let target = SortMenuTarget(project)
+    _sortMenuTarget = target
+
+    let menu = NSMenu()
+    for (i, order) in ProjectState.MediaSortOrder.allCases.enumerated() {
+        let arrow = project.mediaSortOrder == order
+            ? (project.mediaSortAscending ? " ↑" : " ↓") : ""
+        let item = NSMenuItem(title: order.rawValue + arrow, action: #selector(SortMenuTarget.pick(_:)), keyEquivalent: "")
+        item.target = target
+        item.tag = i
+        if project.mediaSortOrder == order { item.state = .on }
+        menu.addItem(item)
+    }
+
+    guard let window = NSApp.keyWindow, let contentView = window.contentView else { return }
+    let loc = NSEvent.mouseLocation
+    let winPoint = window.convertPoint(fromScreen: loc)
+    let viewPoint = contentView.convert(winPoint, from: nil)
+    menu.popUp(positioning: nil, at: viewPoint, in: contentView)
 }

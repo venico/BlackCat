@@ -28,6 +28,7 @@ struct PlayerView: View {
                     Color.black
                 }
                 SubtitleOverlay()
+                TextOverlay()
                 VideoTransformOverlay()
                 ImageTransformOverlay()
             }
@@ -157,18 +158,99 @@ private struct SubtitleOverlay: View {
     }
 }
 
+/// 合成斜体：中文字体无 italic face，SwiftUI .italic() 不生效，统一用矩阵斜切（与导出端一致）。
+/// SwiftUI 坐标 y 向下，c 取负 = 顶部右斜；tx 按单行高补偿一半偏移。
+fileprivate func italicSkew(_ on: Bool, fontSize: CGFloat) -> CGAffineTransform {
+    guard on else { return .identity }
+    return CGAffineTransform(a: 1, b: 0, c: -0.21, d: 1, tx: 0.105 * fontSize * 1.2, ty: 0)
+}
+
 private struct SubtitleLabel: View {
     let text: String; let style: SubtitleStyle; var scale: CGFloat = 1.0
     var body: some View {
         Text(text)
             .font(.custom(style.fontName, size: style.fontSize * scale).weight(style.bold ? .bold : .regular))
-            .italic(style.italic)
+            .transformEffect(italicSkew(style.italic, fontSize: style.fontSize * scale))
             .foregroundColor(style.textColor)
             .shadow(color: .black.opacity(0.8), radius: 1 * scale, x: 1 * scale, y: 1 * scale)
             .shadow(color: .black.opacity(0.8), radius: 1 * scale, x: -1 * scale, y: -1 * scale)
             .padding(.horizontal, 10 * scale).padding(.vertical, 3 * scale)
             .background(style.backgroundColor.opacity(style.backgroundOpacity))
             .cornerRadius(3 * scale)
+    }
+}
+
+// MARK: - 文字/标题图层 Overlay
+
+private struct TextOverlay: View {
+    @EnvironmentObject private var project: ProjectState
+    @EnvironmentObject private var clock: PlaybackClock
+
+    private var activeClips: [TextClip] {
+        project.textTracks
+            .filter { $0.isVisible }
+            .flatMap { $0.clips }
+            .filter { $0.startTime <= clock.currentTime && $0.endTime > clock.currentTime }
+    }
+
+    var body: some View {
+        GeometryReader { geo in
+            let scale = geo.size.width / max(project.previewRenderSize.width, 1)
+            ForEach(activeClips, id: \.id) { clip in
+                TextLabel(clip: clip, scale: scale,
+                          selected: project.selectedTextClipID == clip.id)
+                    .position(x: geo.size.width * clip.posX,
+                              y: geo.size.height * clip.posY)
+                    .gesture(
+                        DragGesture()
+                            .onChanged { v in
+                                project.selectedTextClipID = clip.id
+                                project.updateTextClip(id: clip.id) {
+                                    $0.posX = min(1, max(0, v.location.x / geo.size.width))
+                                    $0.posY = min(1, max(0, v.location.y / geo.size.height))
+                                }
+                            }
+                    )
+                    .onTapGesture { project.selectedTextClipID = clip.id }
+            }
+        }
+    }
+}
+
+private struct TextLabel: View {
+    let clip: TextClip
+    var scale: CGFloat = 1.0
+    var selected: Bool = false
+
+    private var strokeRadius: CGFloat { max(0.6, clip.strokeWidth * 0.5) * scale }
+    private var strokeOffset: CGFloat { max(0.6, clip.strokeWidth * 0.4) * scale }
+
+    var body: some View {
+        Text(clip.text.isEmpty ? " " : clip.text)
+            .font(.custom(clip.fontName, size: clip.fontSize * scale)
+                    .weight(clip.bold ? .bold : .regular))
+            .transformEffect(italicSkew(clip.italic, fontSize: clip.fontSize * scale))
+            .foregroundColor(clip.textColor)
+            // 描边近似：四向阴影（strokeWidth>0 时不透明，否则淡阴影提升可读性）
+            .shadow(color: clip.strokeColor.opacity(clip.strokeWidth > 0 ? 1 : 0.6),
+                    radius: strokeRadius, x: strokeOffset, y: strokeOffset)
+            .shadow(color: clip.strokeColor.opacity(clip.strokeWidth > 0 ? 1 : 0.6),
+                    radius: strokeRadius, x: -strokeOffset, y: -strokeOffset)
+            .multilineTextAlignment(textAlign(clip.alignment))
+            .padding(.horizontal, 10 * scale).padding(.vertical, 5 * scale)
+            .background(clip.bgColor.opacity(clip.bgOpacity))
+            .cornerRadius(4 * scale)
+            .rotationEffect(.degrees(clip.rotation))
+            .opacity(clip.opacity)
+            .overlay(
+                selected
+                ? RoundedRectangle(cornerRadius: 4 * scale)
+                    .strokeBorder(Color.accent, lineWidth: 1.5)
+                : nil
+            )
+    }
+    private func textAlign(_ a: String) -> TextAlignment {
+        switch a { case "left": return .leading; case "right": return .trailing; default: return .center }
     }
 }
 

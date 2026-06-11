@@ -210,7 +210,7 @@ enum WhisperTranscriber {
         ffArgs += ["-i", mediaURL.path, "-vn",
                    "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", wavURL.path]
         let extractOK = await Task.detached(priority: .userInitiated) {
-            ProjectState.runFFmpegSync(ffmpeg: ffmpeg, arguments: ffArgs)
+            runProcess(ffmpeg, ffArgs)
         }.value
         guard extractOK, FileManager.default.fileExists(atPath: wavURL.path) else {
             throw TranscribeError.audioExtractFailed
@@ -240,17 +240,32 @@ enum WhisperTranscriber {
 
     // MARK: - Process helper
 
+    private static let processLock = NSLock()
+    private static var _currentProcess: Process?
+    static var currentProcess: Process? {
+        get { processLock.withLock { _currentProcess } }
+        set { processLock.withLock { _currentProcess = newValue } }
+    }
+
+    static func killCurrentProcess() {
+        if let p = currentProcess, p.isRunning { p.terminate() }
+        currentProcess = nil
+    }
+
     private static func runProcess(_ exe: URL, _ args: [String]) -> Bool {
         let p = Process()
         p.executableURL = exe
         p.arguments = args
         p.standardOutput = FileHandle.nullDevice
         p.standardError = FileHandle.nullDevice
+        currentProcess = p
         do {
             try p.run()
             p.waitUntilExit()
+            currentProcess = nil
             return p.terminationStatus == 0
         } catch {
+            currentProcess = nil
             return false
         }
     }
