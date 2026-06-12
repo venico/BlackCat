@@ -4326,13 +4326,13 @@ final class ProjectState: ObservableObject {
             transcribeState = .failed("请先选择一个视频或音频片段")
             return
         }
-        guard WhisperTranscriber.whisperReady else {
-            transcribeState = .failed("语音识别引擎未就绪（whisper-cli 缺失）")
+        if !WhisperTranscriber.modelReady {
+            showWhisperModelPicker = true
             return
         }
 
-        if !WhisperTranscriber.modelReady {
-            showWhisperModelPicker = true
+        guard WhisperTranscriber.whisperReady else {
+            transcribeState = .failed("语音识别引擎未就绪（whisper-cli 缺失）")
             return
         }
 
