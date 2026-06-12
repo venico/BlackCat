@@ -494,6 +494,7 @@ struct ProjectDocument: Codable {
     var previewResolution: String
     var subtitleBottomMargin: Double?
     var subtitleLineSpacing: Double?
+    var overlayTrackOrder: [ProjectState.OverlayTrackRef]?
 }
 
 extension ExportSettings: Codable {}
@@ -506,6 +507,7 @@ struct ProjectSnapshot {
     var imageTracks: [Track<ImageClip>]
     var subtitleTracks: [Track<SubtitleClip>]
     var textTracks: [Track<TextClip>]
+    var overlayTrackOrder: [ProjectState.OverlayTrackRef]
     var subtitleBottomMargin: Double
     var subtitleLineSpacing: Double
     var duration: Double
@@ -525,6 +527,40 @@ final class ProjectState: ObservableObject {
     @Published var subtitleTracks: [Track<SubtitleClip>] = []
     @Published var textTracks: [Track<TextClip>] = []
     @Published var textTemplates: [TextTemplate] = []  // 文字样式模板
+
+    enum OverlayTrackRef: Equatable, Codable {
+        case image(UUID)
+        case subtitle(UUID)
+        case text(UUID)
+
+        var trackID: UUID {
+            switch self {
+            case .image(let id), .subtitle(let id), .text(let id): return id
+            }
+        }
+    }
+    @Published var overlayTrackOrder: [OverlayTrackRef] = []
+
+    func syncOverlayOrder() {
+        var currentIDs = Set<UUID>()
+        var newOrder: [OverlayTrackRef] = []
+        for t in imageTracks { currentIDs.insert(t.id) }
+        for t in subtitleTracks { currentIDs.insert(t.id) }
+        for t in textTracks { currentIDs.insert(t.id) }
+        for ref in overlayTrackOrder {
+            let rid: UUID
+            switch ref {
+            case .image(let id): rid = id
+            case .subtitle(let id): rid = id
+            case .text(let id): rid = id
+            }
+            if currentIDs.contains(rid) { newOrder.append(ref); currentIDs.remove(rid) }
+        }
+        for t in imageTracks where currentIDs.contains(t.id) { newOrder.append(.image(t.id)); currentIDs.remove(t.id) }
+        for t in subtitleTracks where currentIDs.contains(t.id) { newOrder.append(.subtitle(t.id)); currentIDs.remove(t.id) }
+        for t in textTracks where currentIDs.contains(t.id) { newOrder.append(.text(t.id)); currentIDs.remove(t.id) }
+        overlayTrackOrder = newOrder
+    }
     @Published var subtitleBottomMargin: Double = 5   // 全局：所有字幕整体距下边缘 %
     @Published var subtitleLineSpacing: Double  = 6   // 全局：字幕轨道之间的间距 pt
 
@@ -664,6 +700,8 @@ final class ProjectState: ObservableObject {
         case failed(String)       // 失败原因
     }
     @Published var transcribeState: TranscribeState = .idle
+    @Published var showWhisperModelPicker = false
+    @Published var selectedWhisperModel: WhisperTranscriber.ModelSize = .small
     var transcribeTask: Task<Void, Never>? = nil
     var isTranscribing: Bool {
         switch transcribeState {
@@ -674,7 +712,9 @@ final class ProjectState: ObservableObject {
     func cancelTranscribe() {
         transcribeTask?.cancel()
         transcribeTask = nil
+        WhisperTranscriber.killCurrentProcess()
         transcribeState = .idle
+        showSuccessToast(icon: "stop.fill", iconColor: .yellow, title: "语音识别", subtitle: "已停止", autoCountdown: false)
     }
     @Published var mediaLibraryTab: String = "video"      // 素材库当前标签（提升到 ProjectState，转场图标点击可切换）
     enum MediaSortOrder: String, CaseIterable {
@@ -697,9 +737,9 @@ final class ProjectState: ObservableObject {
         case subtitle(SubtitleClip, trackIndex: Int)
         case text(TextClip, trackIndex: Int)
     }
-    var clipboard: ClipboardItem?
+    var clipboard: [ClipboardItem] = []
     @Published var clipboardIsCut: Bool = false
-    @Published var clipboardSourceID: UUID?
+    @Published var clipboardSourceIDs: Set<UUID> = []
 
     // Project file management
     @Published var projectName: String = "未命名项目"
@@ -722,15 +762,23 @@ final class ProjectState: ObservableObject {
         let title: String
         let subtitle: String
         var countdown: Int = 5
+        var autoCountdown: Bool = true
         var revealURL: URL? = nil
     }
     @Published var successToasts: [SuccessToastItem] = []
     private var successTimer: Timer?
 
-    func showSuccessToast(icon: String, iconColor: Color = .green, title: String, subtitle: String, revealURL: URL? = nil) {
-        let item = SuccessToastItem(icon: icon, iconColor: iconColor, title: title, subtitle: subtitle, revealURL: revealURL)
+    func showSuccessToast(icon: String, iconColor: Color = .green, title: String, subtitle: String, autoCountdown: Bool = true, revealURL: URL? = nil) {
+        let item = SuccessToastItem(icon: icon, iconColor: iconColor, title: title, subtitle: subtitle, countdown: autoCountdown ? 5 : 0, autoCountdown: autoCountdown, revealURL: revealURL)
         withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) { successToasts.append(item) }
-        startSuccessTimerIfNeeded()
+        if autoCountdown {
+            startSuccessTimerIfNeeded()
+        } else {
+            let id = item.id
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+                self?.dismissSuccessToast(id)
+            }
+        }
     }
 
     func dismissSuccessToast(_ id: UUID) {
@@ -743,12 +791,13 @@ final class ProjectState: ObservableObject {
         successTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] timer in
             guard let self else { timer.invalidate(); return }
             for i in self.successToasts.indices.reversed() {
+                guard self.successToasts[i].autoCountdown else { continue }
                 self.successToasts[i].countdown -= 1
                 if self.successToasts[i].countdown <= 0 {
                     withAnimation(.easeOut(duration: 0.25)) { self.successToasts.remove(at: i) }
                 }
             }
-            if self.successToasts.isEmpty { timer.invalidate(); self.successTimer = nil }
+            if self.successToasts.filter({ $0.autoCountdown }).isEmpty { timer.invalidate(); self.successTimer = nil }
         }
     }
 
@@ -763,6 +812,7 @@ final class ProjectState: ObservableObject {
         @Published var progress: Double = 0
         var process: Process?
         var isRunning: Bool = false
+        var isCancelled: Bool = false
         init(inputURL: URL, outputURL: URL, type: AssetType, displayName: String) {
             self.inputURL = inputURL; self.outputURL = outputURL
             self.type = type; self.displayName = displayName
@@ -828,6 +878,17 @@ final class ProjectState: ObservableObject {
     @Published var translationProgress: Double = 0         // 0...1
     @Published var translationTotal: Int = 0               // 总字幕数
     @Published var translationDone: Int = 0                // 已完成数
+    var translationTask: Task<Void, Never>? = nil
+
+    func cancelTranslation() {
+        translationTask?.cancel()
+        translationTask = nil
+        translationTotal = 0
+        translationDone = 0
+        translationProgress = 0
+        translatingTrackIndices.removeAll()
+        showSuccessToast(icon: "stop.fill", iconColor: .yellow, title: "翻译", subtitle: "已停止", autoCountdown: false)
+    }
     /// 占位字幕 ID 集合（翻译中显示呼吸效果）
     @Published var placeholderClipIDs: Set<UUID> = []
     static let supportedLanguages = [
@@ -964,6 +1025,7 @@ final class ProjectState: ObservableObject {
         textTemplates = doc.textTemplates ?? []
         subtitleBottomMargin = doc.subtitleBottomMargin ?? doc.subtitleStyles.first?.bottomMargin ?? 5
         subtitleLineSpacing = doc.subtitleLineSpacing ?? doc.subtitleStyles.first?.lineSpacing ?? 6
+        overlayTrackOrder = doc.overlayTrackOrder ?? []
         exportSettings = doc.exportSettings
         previewResolution = doc.previewResolution
 
@@ -994,6 +1056,7 @@ final class ProjectState: ObservableObject {
             }
         }
 
+        syncOverlayOrder()
         undoStack.removeAll(); redoStack.removeAll()
         undoCount = 0; redoCount = 0
         currentTime = 0
@@ -1043,7 +1106,8 @@ final class ProjectState: ObservableObject {
             exportSettings: exportSettings,
             previewResolution: previewResolution,
             subtitleBottomMargin: subtitleBottomMargin,
-            subtitleLineSpacing: subtitleLineSpacing
+            subtitleLineSpacing: subtitleLineSpacing,
+            overlayTrackOrder: overlayTrackOrder.isEmpty ? nil : overlayTrackOrder
         )
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
@@ -1617,6 +1681,7 @@ final class ProjectState: ObservableObject {
                     var newTrack = Track<ImageClip>(label: "图片")
                     newTrack.clips.append(removed)
                     imageTracks.append(newTrack)
+                    syncOverlayOrder()
                 }
             }
             return
@@ -1680,6 +1745,7 @@ final class ProjectState: ObservableObject {
                     newTrack.clips.append(removed)
                     newTrack.subtitleStyle = newSubtitleStyle()
                     subtitleTracks.append(newTrack)
+                    syncOverlayOrder()
                 }
             }
             return
@@ -1716,6 +1782,7 @@ final class ProjectState: ObservableObject {
                     var newTrack = Track<TextClip>(label: "文字")
                     newTrack.clips.append(removed)
                     textTracks.append(newTrack)
+                    syncOverlayOrder()
                 }
             }
             return
@@ -2708,9 +2775,11 @@ final class ProjectState: ObservableObject {
     /// 取消单个转码任务
     func cancelTranscodeTask(_ taskID: UUID) {
         if let task = activeTasks.first(where: { $0.id == taskID }) {
+            task.isCancelled = true
             task.process?.terminate()
             task.process = nil
             try? FileManager.default.removeItem(at: task.outputURL)
+            showSuccessToast(icon: "stop.fill", iconColor: .yellow, title: task.displayName, subtitle: "已停止", autoCountdown: false)
         }
         activeTasks.removeAll { $0.id == taskID }
         pendingTasks.removeAll { $0.id == taskID }
@@ -2740,10 +2809,20 @@ final class ProjectState: ObservableObject {
     }
 
     private func finishTranscodeTask(_ taskID: UUID) {
-        let name = activeTasks.first(where: { $0.id == taskID })?.displayName ?? "转码"
+        guard let task = activeTasks.first(where: { $0.id == taskID }) else {
+            drainPendingTasks()
+            if activeTasks.isEmpty && pendingTasks.isEmpty {
+                isTranscoding = false; transcodingProgress = 0; transcodingFileName = ""
+            }
+            return
+        }
+        let name = task.displayName
+        let wasCancelled = task.isCancelled
         activeTasks.removeAll { $0.id == taskID }
         drainPendingTasks()
-        showSuccessToast(icon: "checkmark", title: name, subtitle: "转码完成")
+        if !wasCancelled {
+            showSuccessToast(icon: "checkmark", title: name, subtitle: "转码完成")
+        }
         if activeTasks.isEmpty && pendingTasks.isEmpty {
             isTranscoding = false
             transcodingProgress = 0
@@ -2781,6 +2860,7 @@ final class ProjectState: ObservableObject {
                 "-y", task.outputURL.path
             ])
             await MainActor.run {
+                guard !task.isCancelled else { return }
                 if ok {
                     self?.importFileDirectly(url: task.outputURL, type: .audio, displayName: task.displayName)
                 } else {
@@ -2873,9 +2953,10 @@ final class ProjectState: ObservableObject {
 
             await MainActor.run {
                 task.process = nil
+                guard !task.isCancelled else { return }
                 if process.terminationStatus == 0 {
                     self?.importFileDirectly(url: task.outputURL, type: .video)
-                } else if process.terminationStatus != 15 {
+                } else {
                     self?.showImportToast("转码失败")
                 }
                 self?.finishTranscodeTask(task.id)
@@ -3155,6 +3236,7 @@ final class ProjectState: ObservableObject {
                 var newTrack = Track<SubtitleClip>(clips: clips, label: "字幕")
                 newTrack.subtitleStyle = newSubtitleStyle()
                 subtitleTracks.append(newTrack)
+                syncOverlayOrder()
             }
             if let mx = clips.map(\.endTime).max() { duration = max(duration, mx) }
             if let i = mediaAssets.firstIndex(where:{ $0.id == asset.id }) {
@@ -3166,6 +3248,7 @@ final class ProjectState: ObservableObject {
                 trackIdx = emptyIdx
             } else {
                 imageTracks.append(Track(label: "图片"))
+                syncOverlayOrder()
                 trackIdx = imageTracks.count - 1
             }
             let dur = 5.0
@@ -3258,6 +3341,7 @@ final class ProjectState: ObservableObject {
                 trackIdx = emptyIdx
             } else {
                 imageTracks.append(Track(label: "图片"))
+                syncOverlayOrder()
                 trackIdx = imageTracks.count - 1
             }
             let dur = 5.0
@@ -3588,6 +3672,7 @@ final class ProjectState: ObservableObject {
                         imageTracks: imageTracks,
                         subtitleTracks: subtitleTracks,
                         textTracks: textTracks,
+                        overlayTrackOrder: overlayTrackOrder,
                         subtitleBottomMargin: subtitleBottomMargin,
                         subtitleLineSpacing: subtitleLineSpacing,
                         duration: duration,
@@ -3599,6 +3684,7 @@ final class ProjectState: ObservableObject {
         imageTracks    = s.imageTracks
         subtitleTracks = s.subtitleTracks
         textTracks     = s.textTracks
+        overlayTrackOrder = s.overlayTrackOrder
         subtitleBottomMargin = s.subtitleBottomMargin
         subtitleLineSpacing  = s.subtitleLineSpacing
         duration       = s.duration
@@ -3757,212 +3843,190 @@ final class ProjectState: ObservableObject {
 
     /// 复制当前选中的片段到剪贴板
     func copySelected() {
-        if let id = selectedVideoClipID {
-            for (ti, track) in videoTracks.enumerated() {
-                if let clip = track.clips.first(where: { $0.id == id }) {
-                    clipboard = .video(clip, trackIndex: ti)
-                    clipboardIsCut = false; clipboardSourceID = nil; return
-                }
-            }
-        }
-        if let id = selectedImageClipID {
-            for (ti, track) in imageTracks.enumerated() {
-                if let clip = track.clips.first(where: { $0.id == id }) {
-                    clipboard = .image(clip, trackIndex: ti)
-                    clipboardIsCut = false; clipboardSourceID = nil; return
-                }
-            }
-        }
-        if let id = selectedAudioClipID {
-            for (ti, track) in audioTracks.enumerated() {
-                if let clip = track.clips.first(where: { $0.id == id }) {
-                    clipboard = .audio(clip, trackIndex: ti)
-                    clipboardIsCut = false
-                    clipboardSourceID = nil
-                    return
-                }
-            }
-        }
-        if let id = selectedSubtitleClipID {
-            for (ti, track) in subtitleTracks.enumerated() {
-                if let clip = track.clips.first(where: { $0.id == id }) {
-                    clipboard = .subtitle(clip, trackIndex: ti)
-                    clipboardIsCut = false
-                    clipboardSourceID = nil
-                    return
-                }
-            }
-        }
-        if let id = selectedTextClipID {
-            for (ti, track) in textTracks.enumerated() {
-                if let clip = track.clips.first(where: { $0.id == id }) {
-                    clipboard = .text(clip, trackIndex: ti)
-                    clipboardIsCut = false
-                    clipboardSourceID = nil
-                    return
-                }
-            }
-        }
+        collectToClipboard(isCut: false)
     }
 
-    /// 剪切当前选中的片段（粘贴时移除原始片段）
     func cutSelected() {
-        if let id = selectedVideoClipID {
-            for (ti, track) in videoTracks.enumerated() {
-                if let clip = track.clips.first(where: { $0.id == id }) {
-                    clipboard = .video(clip, trackIndex: ti)
-                    clipboardIsCut = true; clipboardSourceID = id; return
-                }
-            }
-        }
-        if let id = selectedImageClipID {
-            for (ti, track) in imageTracks.enumerated() {
-                if let clip = track.clips.first(where: { $0.id == id }) {
-                    clipboard = .image(clip, trackIndex: ti)
-                    clipboardIsCut = true; clipboardSourceID = id; return
-                }
-            }
-        }
-        if let id = selectedAudioClipID {
-            for (ti, track) in audioTracks.enumerated() {
-                if let clip = track.clips.first(where: { $0.id == id }) {
-                    clipboard = .audio(clip, trackIndex: ti)
-                    clipboardIsCut = true
-                    clipboardSourceID = id
-                    return
-                }
-            }
-        }
-        if let id = selectedSubtitleClipID {
-            for (ti, track) in subtitleTracks.enumerated() {
-                if let clip = track.clips.first(where: { $0.id == id }) {
-                    clipboard = .subtitle(clip, trackIndex: ti)
-                    clipboardIsCut = true
-                    clipboardSourceID = id
-                    return
-                }
-            }
-        }
-        if let id = selectedTextClipID {
-            for (ti, track) in textTracks.enumerated() {
-                if let clip = track.clips.first(where: { $0.id == id }) {
-                    clipboard = .text(clip, trackIndex: ti)
-                    clipboardIsCut = true
-                    clipboardSourceID = id
-                    return
-                }
-            }
-        }
+        collectToClipboard(isCut: true)
     }
 
-    /// 粘贴剪贴板内容到当前播放头位置，放在同类型的当前选中轨道或原始轨道
+    private func collectToClipboard(isCut: Bool) {
+        var items: [ClipboardItem] = []
+        var srcIDs: Set<UUID> = []
+
+        var allIDs = selectedClipIDs
+        if let id = selectedVideoClipID    { allIDs.insert(id) }
+        if let id = selectedImageClipID    { allIDs.insert(id) }
+        if let id = selectedAudioClipID    { allIDs.insert(id) }
+        if let id = selectedSubtitleClipID { allIDs.insert(id) }
+        if let id = selectedTextClipID     { allIDs.insert(id) }
+
+        for id in allIDs {
+            for (ti, track) in videoTracks.enumerated() {
+                if let clip = track.clips.first(where: { $0.id == id }) {
+                    items.append(.video(clip, trackIndex: ti)); srcIDs.insert(id)
+                }
+            }
+            for (ti, track) in imageTracks.enumerated() {
+                if let clip = track.clips.first(where: { $0.id == id }) {
+                    items.append(.image(clip, trackIndex: ti)); srcIDs.insert(id)
+                }
+            }
+            for (ti, track) in audioTracks.enumerated() {
+                if let clip = track.clips.first(where: { $0.id == id }) {
+                    items.append(.audio(clip, trackIndex: ti)); srcIDs.insert(id)
+                }
+            }
+            for (ti, track) in subtitleTracks.enumerated() {
+                if let clip = track.clips.first(where: { $0.id == id }) {
+                    items.append(.subtitle(clip, trackIndex: ti)); srcIDs.insert(id)
+                }
+            }
+            for (ti, track) in textTracks.enumerated() {
+                if let clip = track.clips.first(where: { $0.id == id }) {
+                    items.append(.text(clip, trackIndex: ti)); srcIDs.insert(id)
+                }
+            }
+        }
+
+        guard !items.isEmpty else { return }
+        clipboard = items
+        clipboardIsCut = isCut
+        clipboardSourceIDs = isCut ? srcIDs : []
+    }
+
+    /// 粘贴剪贴板内容到当前播放头位置
     func pasteAtPlayhead() {
-        guard let item = clipboard else { return }
+        guard !clipboard.isEmpty else { return }
         let snap = currentSnapshot()
         let t = currentTime
 
         // 如果是剪切，先删除原始片段
-        if clipboardIsCut, let srcID = clipboardSourceID {
-            for i in videoTracks.indices {
-                videoTracks[i].clips.removeAll { $0.id == srcID }
-            }
-            for i in imageTracks.indices {
-                imageTracks[i].clips.removeAll { $0.id == srcID }
-            }
-            for i in audioTracks.indices {
-                audioTracks[i].clips.removeAll { $0.id == srcID }
-            }
-            for i in subtitleTracks.indices {
-                subtitleTracks[i].clips.removeAll { $0.id == srcID }
-            }
-            for i in textTracks.indices {
-                textTracks[i].clips.removeAll { $0.id == srcID }
-            }
-            // 剪切只能粘贴一次
+        if clipboardIsCut, !clipboardSourceIDs.isEmpty {
+            let srcIDs = clipboardSourceIDs
+            for i in videoTracks.indices    { videoTracks[i].clips.removeAll    { srcIDs.contains($0.id) } }
+            for i in imageTracks.indices    { imageTracks[i].clips.removeAll    { srcIDs.contains($0.id) } }
+            for i in audioTracks.indices    { audioTracks[i].clips.removeAll    { srcIDs.contains($0.id) } }
+            for i in subtitleTracks.indices { subtitleTracks[i].clips.removeAll { srcIDs.contains($0.id) } }
+            for i in textTracks.indices     { textTracks[i].clips.removeAll     { srcIDs.contains($0.id) } }
             clipboardIsCut = false
-            clipboardSourceID = nil
+            clipboardSourceIDs = []
         }
 
-        switch item {
-        case .video(let clip, let trackIdx):
-            var newClip = VideoClip(assetID: clip.assetID, name: clip.name, url: clip.url,
-                                    startTime: t, endTime: t + clip.duration, trimStart: clip.trimStart)
-            newClip.volume = clip.volume
-            newClip.videoWidth = clip.videoWidth; newClip.videoHeight = clip.videoHeight
-            newClip.overrideResolution = clip.overrideResolution
-            newClip.overrideFPS = clip.overrideFPS
-            newClip.overrideBitrate = clip.overrideBitrate
-            newClip.scaleX = clip.scaleX; newClip.scaleY = clip.scaleY
-            newClip.lockAspect = clip.lockAspect
-            newClip.offsetX = clip.offsetX; newClip.offsetY = clip.offsetY
-            newClip.cropTop = clip.cropTop; newClip.cropBottom = clip.cropBottom
-            newClip.cropLeft = clip.cropLeft; newClip.cropRight = clip.cropRight
-            let idx = videoTracks.indices.contains(trackIdx) ? trackIdx : 0
-            if videoTracks.indices.contains(idx) {
-                videoTracks[idx].clips.append(newClip)
-                selectedVideoClipID = newClip.id
-                selectedAudioClipID = nil
-                selectedSubtitleClipID = nil
+        func startOf(_ item: ClipboardItem) -> Double {
+            switch item {
+            case .video(let c, _): return c.startTime
+            case .image(let c, _): return c.startTime
+            case .audio(let c, _): return c.startTime
+            case .subtitle(let c, _): return c.startTime
+            case .text(let c, _): return c.startTime
             }
+        }
+        let earliest = clipboard.map { startOf($0) }.min() ?? 0
 
-        case .image(let clip, let trackIdx):
-            var newClip = ImageClip(assetID: clip.assetID, name: clip.name, imageURL: clip.imageURL,
-                                     videoURL: clip.videoURL, startTime: t, endTime: t + clip.duration,
-                                     imageWidth: clip.imageWidth, imageHeight: clip.imageHeight)
-            newClip.scaleX = clip.scaleX; newClip.scaleY = clip.scaleY
-            newClip.lockAspect = clip.lockAspect
-            newClip.offsetX = clip.offsetX; newClip.offsetY = clip.offsetY
-            newClip.cropTop = clip.cropTop; newClip.cropBottom = clip.cropBottom
-            newClip.cropLeft = clip.cropLeft; newClip.cropRight = clip.cropRight
-            let idx = imageTracks.indices.contains(trackIdx) ? trackIdx : 0
-            if imageTracks.indices.contains(idx) {
-                imageTracks[idx].clips.append(newClip)
-                selectedImageClipID = newClip.id
-                selectedVideoClipID = nil; selectedAudioClipID = nil; selectedSubtitleClipID = nil
-            }
+        selectedClipIDs.removeAll()
+        selectedVideoClipID = nil
+        selectedImageClipID = nil
+        selectedAudioClipID = nil
+        selectedSubtitleClipID = nil
+        selectedTextClipID = nil
+        for item in clipboard {
+            let offset = startOf(item) - earliest
 
-        case .audio(let clip, let trackIdx):
-            var newClip = AudioClip(assetID: clip.assetID, name: clip.name, url: clip.url,
-                                    startTime: t, endTime: t + clip.duration, trimStart: clip.trimStart)
-            newClip.volume = clip.volume
-            newClip.leftChannel = clip.leftChannel
-            newClip.rightChannel = clip.rightChannel
-            newClip.sampleRate = clip.sampleRate
-            newClip.format = clip.format
-            let idx = audioTracks.indices.contains(trackIdx) ? trackIdx : 0
-            if audioTracks.indices.contains(idx) {
-                audioTracks[idx].clips.append(newClip)
-                selectedAudioClipID = newClip.id
-                selectedVideoClipID = nil
-                selectedSubtitleClipID = nil
-            }
+            switch item {
+            case .video(let clip, let trackIdx):
+                var newClip = VideoClip(assetID: clip.assetID, name: clip.name, url: clip.url,
+                                        startTime: t + offset, endTime: t + offset + clip.duration, trimStart: clip.trimStart)
+                newClip.volume = clip.volume
+                newClip.videoWidth = clip.videoWidth; newClip.videoHeight = clip.videoHeight
+                newClip.overrideResolution = clip.overrideResolution
+                newClip.overrideFPS = clip.overrideFPS
+                newClip.overrideBitrate = clip.overrideBitrate
+                newClip.scaleX = clip.scaleX; newClip.scaleY = clip.scaleY
+                newClip.lockAspect = clip.lockAspect
+                newClip.offsetX = clip.offsetX; newClip.offsetY = clip.offsetY
+                newClip.cropTop = clip.cropTop; newClip.cropBottom = clip.cropBottom
+                newClip.cropLeft = clip.cropLeft; newClip.cropRight = clip.cropRight
+                let idx = videoTracks.indices.contains(trackIdx) ? trackIdx : 0
+                if videoTracks.indices.contains(idx) {
+                    videoTracks[idx].clips.append(newClip)
+                    selectedClipIDs.insert(newClip.id)
+                }
 
-        case .subtitle(let clip, let trackIdx):
-            var newClip = SubtitleClip(text: clip.text, startTime: t, endTime: t + clip.duration)
-            newClip.assetID = clip.assetID
-            let idx = subtitleTracks.indices.contains(trackIdx) ? trackIdx : 0
-            if subtitleTracks.indices.contains(idx) {
-                subtitleTracks[idx].clips.append(newClip)
-                selectedSubtitleClipID = newClip.id
-                selectedVideoClipID = nil
-                selectedAudioClipID = nil
-            }
+            case .image(let clip, let trackIdx):
+                var newClip = ImageClip(assetID: clip.assetID, name: clip.name, imageURL: clip.imageURL,
+                                         videoURL: clip.videoURL, startTime: t + offset, endTime: t + offset + clip.duration,
+                                         imageWidth: clip.imageWidth, imageHeight: clip.imageHeight)
+                newClip.scaleX = clip.scaleX; newClip.scaleY = clip.scaleY
+                newClip.lockAspect = clip.lockAspect
+                newClip.offsetX = clip.offsetX; newClip.offsetY = clip.offsetY
+                newClip.cropTop = clip.cropTop; newClip.cropBottom = clip.cropBottom
+                newClip.cropLeft = clip.cropLeft; newClip.cropRight = clip.cropRight
+                let idx = imageTracks.indices.contains(trackIdx) ? trackIdx : 0
+                if imageTracks.indices.contains(idx) {
+                    imageTracks[idx].clips.append(newClip)
+                    selectedClipIDs.insert(newClip.id)
+                }
 
-        case .text(let clip, let trackIdx):
-            var newClip = TextClip(text: clip.text, startTime: t, endTime: t + clip.duration)
-            newClip.fontName = clip.fontName; newClip.fontSize = clip.fontSize
-            newClip.bold = clip.bold; newClip.italic = clip.italic
-            newClip.textColor = clip.textColor; newClip.strokeColor = clip.strokeColor
-            newClip.strokeWidth = clip.strokeWidth; newClip.bgColor = clip.bgColor
-            newClip.bgOpacity = clip.bgOpacity; newClip.alignment = clip.alignment
-            newClip.rotation = clip.rotation; newClip.opacity = clip.opacity
-            newClip.posX = clip.posX; newClip.posY = clip.posY
-            newClip.animation = clip.animation
-            let idx = textTracks.indices.contains(trackIdx) ? trackIdx : 0
-            if textTracks.indices.contains(idx) {
-                textTracks[idx].clips.append(newClip)
-                selectedTextClipID = newClip.id
-                selectedVideoClipID = nil; selectedAudioClipID = nil; selectedSubtitleClipID = nil
+            case .audio(let clip, let trackIdx):
+                var newClip = AudioClip(assetID: clip.assetID, name: clip.name, url: clip.url,
+                                        startTime: t + offset, endTime: t + offset + clip.duration, trimStart: clip.trimStart)
+                newClip.volume = clip.volume
+                newClip.leftChannel = clip.leftChannel
+                newClip.rightChannel = clip.rightChannel
+                newClip.sampleRate = clip.sampleRate
+                newClip.format = clip.format
+                let idx = audioTracks.indices.contains(trackIdx) ? trackIdx : 0
+                if audioTracks.indices.contains(idx) {
+                    audioTracks[idx].clips.append(newClip)
+                    selectedClipIDs.insert(newClip.id)
+                }
+
+            case .subtitle(let clip, let trackIdx):
+                let st = t + offset
+                var newClip = SubtitleClip(text: clip.text, startTime: st, endTime: st + clip.duration)
+                newClip.assetID = clip.assetID
+                var idx = subtitleTracks.indices.contains(trackIdx) ? trackIdx : 0
+                if subtitleTracks.indices.contains(idx) {
+                    let hasOverlap = subtitleTracks[idx].clips.contains {
+                        $0.startTime < newClip.endTime - 0.001 && $0.endTime > newClip.startTime + 0.001
+                    }
+                    if hasOverlap {
+                        var placed = false
+                        for dti in subtitleTracks.indices where dti != idx {
+                            let noOverlap = !subtitleTracks[dti].clips.contains {
+                                $0.startTime < newClip.endTime - 0.001 && $0.endTime > newClip.startTime + 0.001
+                            }
+                            if noOverlap { idx = dti; placed = true; break }
+                        }
+                        if !placed {
+                            var newTrack = Track<SubtitleClip>(label: "字幕")
+                            newTrack.subtitleStyle = newSubtitleStyle()
+                            subtitleTracks.append(newTrack)
+                            syncOverlayOrder()
+                            idx = subtitleTracks.count - 1
+                        }
+                    }
+                    subtitleTracks[idx].clips.append(newClip)
+                    selectedClipIDs.insert(newClip.id)
+                }
+
+            case .text(let clip, let trackIdx):
+                let st = t + offset
+                var newClip = TextClip(text: clip.text, startTime: st, endTime: st + clip.duration)
+                newClip.fontName = clip.fontName; newClip.fontSize = clip.fontSize
+                newClip.bold = clip.bold; newClip.italic = clip.italic
+                newClip.textColor = clip.textColor; newClip.strokeColor = clip.strokeColor
+                newClip.strokeWidth = clip.strokeWidth; newClip.bgColor = clip.bgColor
+                newClip.bgOpacity = clip.bgOpacity; newClip.alignment = clip.alignment
+                newClip.rotation = clip.rotation; newClip.opacity = clip.opacity
+                newClip.posX = clip.posX; newClip.posY = clip.posY
+                newClip.animation = clip.animation
+                let idx = textTracks.indices.contains(trackIdx) ? trackIdx : 0
+                if textTracks.indices.contains(idx) {
+                    textTracks[idx].clips.append(newClip)
+                    selectedClipIDs.insert(newClip.id)
+                }
             }
         }
 
@@ -4103,6 +4167,7 @@ final class ProjectState: ObservableObject {
             var newTrack = Track<SubtitleClip>(label: "字幕")
             newTrack.subtitleStyle = newSubtitleStyle()
             subtitleTracks.append(newTrack)
+            syncOverlayOrder()
             trackIdx = subtitleTracks.count - 1
         }
 
@@ -4133,6 +4198,7 @@ final class ProjectState: ObservableObject {
             trackIdx = textTracks.count - 1
         } else {
             textTracks.append(Track<TextClip>(label: "文字"))
+            syncOverlayOrder()
             trackIdx = textTracks.count - 1
         }
         let start = currentTime
@@ -4212,6 +4278,29 @@ final class ProjectState: ObservableObject {
 
     // MARK: - 自动语音识别（Whisper）
 
+    func downloadModelAndTranscribe() {
+        guard !isTranscribing else { return }
+        let model = selectedWhisperModel
+        transcribeState = .downloading(0)
+        transcribeTask = Task {
+            do {
+                try await WhisperTranscriber.downloadModel(model) { p in
+                    DispatchQueue.main.async { self.transcribeState = .downloading(p) }
+                }
+                await MainActor.run {
+                    self.transcribeState = .idle
+                    self.autoTranscribeSelectedClip()
+                }
+            } catch is CancellationError {
+                await MainActor.run { self.transcribeState = .idle }
+            } catch {
+                await MainActor.run {
+                    self.transcribeState = .failed("模型下载失败: \(error.localizedDescription)")
+                }
+            }
+        }
+    }
+
     /// 对选中的视频/音频片段做语音识别并生成字幕轨道。
     /// 未选中片段时，识别时间轴上第一个视频片段。
     func autoTranscribeSelectedClip() {
@@ -4242,8 +4331,12 @@ final class ProjectState: ObservableObject {
             return
         }
 
-        // 模型未下载则进入下载态，否则直接识别
-        transcribeState = WhisperTranscriber.modelReady ? .running(0) : .downloading(0)
+        if !WhisperTranscriber.modelReady {
+            showWhisperModelPicker = true
+            return
+        }
+
+        transcribeState = .running(0)
 
         // 识别用自动检测原声，再按需翻译到「翻译目标语言」
         let displayName = translationTargetLang
@@ -4253,12 +4346,6 @@ final class ProjectState: ObservableObject {
         let capSpeed = speed, capOffset = offset
         transcribeTask = Task {
             do {
-                if !WhisperTranscriber.modelReady {
-                    try await WhisperTranscriber.downloadModel { p in
-                        DispatchQueue.main.async { self.transcribeState = .downloading(p) }
-                    }
-                    await MainActor.run { self.transcribeState = .running(0.05) }
-                }
                 try Task.checkCancellation()
                 await MainActor.run { self.transcribeState = .running(0.1) }
                 let segs = try await WhisperTranscriber.transcribe(
@@ -4306,6 +4393,7 @@ final class ProjectState: ObservableObject {
                     }
                     track.clips.sort { $0.startTime < $1.startTime }
                     self.subtitleTracks.append(track)
+                    self.syncOverlayOrder()
                     self.transcribeState = .idle
                     self.transcribeTask = nil
                     self.showSuccessToast(icon: "checkmark", title: "语音识别", subtitle: "完成，生成 \(finalSegs.count) 条字幕")

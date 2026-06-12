@@ -171,6 +171,10 @@ struct ContentView: View {
                     TranscribeOverlay()
                         .environmentObject(project)
                 }
+                if project.translationTotal > 0 {
+                    TranslationBubble()
+                        .environmentObject(project)
+                }
                 if !exportManager.jobs.isEmpty {
                     ExportProgressOverlay(manager: exportManager)
                 }
@@ -211,12 +215,18 @@ struct ContentView: View {
         }
         .overlay {
             if project.showWelcome {
-                Color.black.opacity(0.5)
-                    .ignoresSafeArea()
-                    .onTapGesture { }
-                WelcomeView()
-                    .environmentObject(project)
-                    .transition(.opacity.combined(with: .scale(scale: 0.95)))
+                ZStack {
+                    Color.black.opacity(0.5)
+                        .ignoresSafeArea()
+                        .onTapGesture { }
+                    WelcomeView()
+                        .environmentObject(project)
+                        .transition(.opacity.combined(with: .scale(scale: 0.95)))
+                    Button("") { project.showWelcome = false }
+                        .keyboardShortcut(.escape, modifiers: [])
+                        .opacity(0)
+                        .frame(width: 0, height: 0)
+                }
             }
         }
         .animation(.easeOut(duration: 0.25), value: project.showWelcome)
@@ -224,6 +234,9 @@ struct ContentView: View {
             setupEscMonitor()
             exportManager.onSuccess = { [weak project] filename, url in
                 project?.showSuccessToast(icon: "checkmark", title: filename, subtitle: "导出完成", revealURL: url)
+            }
+            exportManager.onCancel = { [weak project] filename in
+                project?.showSuccessToast(icon: "stop.fill", iconColor: .yellow, title: filename, subtitle: "已停止", autoCountdown: false)
             }
         }
         .onReceive(NotificationCenter.default.publisher(for: .menuImportFiles)) { note in
@@ -282,6 +295,10 @@ struct ContentView: View {
             } else {
                 Text("确定要移除该素材吗？")
             }
+        }
+        .sheet(isPresented: $project.showWhisperModelPicker) {
+            WhisperModelPickerSheet()
+                .environmentObject(project)
         }
         .onAppear {
             if let url = AppDelegate.pendingOpenURL {
@@ -380,26 +397,27 @@ private struct SuccessToastBubble: View {
                         .lineLimit(1)
                     Text(toast.subtitle + (toast.revealURL != nil ? " · 点击查看" : ""))
                         .font(.system(size: 10))
-                        .foregroundColor(toast.revealURL != nil ? Color.accent : .green)
+                        .foregroundColor(toast.revealURL != nil ? Color.accent : toast.iconColor)
                         .lineLimit(1)
                 }
 
                 Spacer(minLength: 4)
 
-                // 倒计时圆环
-                ZStack {
-                    Circle()
-                        .stroke(Color.white.opacity(0.1), lineWidth: 2)
-                        .frame(width: 22, height: 22)
-                    Circle()
-                        .trim(from: 0, to: CGFloat(toast.countdown) / 5.0)
-                        .stroke(Color.labelSecondary, style: StrokeStyle(lineWidth: 2, lineCap: .round))
-                        .frame(width: 22, height: 22)
-                        .rotationEffect(.degrees(-90))
-                        .animation(.linear(duration: 1), value: toast.countdown)
-                    Text("\(toast.countdown)")
-                        .font(.system(size: 9, weight: .bold).monospacedDigit())
-                        .foregroundColor(Color.labelSecondary)
+                if toast.autoCountdown {
+                    ZStack {
+                        Circle()
+                            .stroke(Color.white.opacity(0.1), lineWidth: 2)
+                            .frame(width: 22, height: 22)
+                        Circle()
+                            .trim(from: 0, to: CGFloat(toast.countdown) / 5.0)
+                            .stroke(Color.labelSecondary, style: StrokeStyle(lineWidth: 2, lineCap: .round))
+                            .frame(width: 22, height: 22)
+                            .rotationEffect(.degrees(-90))
+                            .animation(.linear(duration: 1), value: toast.countdown)
+                        Text("\(toast.countdown)")
+                            .font(.system(size: 9, weight: .bold).monospacedDigit())
+                            .foregroundColor(Color.labelSecondary)
+                    }
                 }
             }
             .padding(.horizontal, 12)
@@ -416,5 +434,67 @@ private struct SuccessToastBubble: View {
             )
         }
         .buttonStyle(.plain)
+    }
+}
+
+struct TranslationBubble: View {
+    @EnvironmentObject private var project: ProjectState
+    @State private var xHovering = false
+
+    var body: some View {
+        HStack(spacing: 10) {
+            ZStack {
+                Circle()
+                    .fill(Color.accent.opacity(0.2))
+                    .frame(width: 28, height: 28)
+                Image(systemName: "translate")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundColor(Color.accent)
+            }
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text("翻译")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundColor(Color.labelPrimary)
+                    .lineLimit(1)
+
+                GeometryReader { geo in
+                    HStack(spacing: 6) {
+                        ProgressView(value: project.translationProgress)
+                            .progressViewStyle(.linear)
+                            .tint(Color.accent)
+                        Text("\(Int(project.translationProgress * 100))%")
+                            .font(.system(size: 10).monospacedDigit())
+                            .foregroundColor(Color.labelSecondary)
+                            .fixedSize()
+                    }
+                    .frame(width: geo.size.width)
+                }
+                .frame(height: 14)
+            }
+
+            Button { project.cancelTranslation() } label: {
+                Image(systemName: "xmark")
+                    .font(.system(size: 9, weight: .bold))
+                    .foregroundColor(xHovering ? Color.labelPrimary : Color.labelSecondary)
+                    .frame(width: 18, height: 18)
+                    .background(Color.white.opacity(xHovering ? 0.15 : 0.08))
+                    .clipShape(Circle())
+            }
+            .buttonStyle(.plain)
+            .onHover { xHovering = $0 }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .frame(maxWidth: 260)
+        .background(
+            RoundedRectangle(cornerRadius: 10)
+                .fill(Color(red: 0.16, green: 0.16, blue: 0.17))
+                .shadow(color: .black.opacity(0.5), radius: 8, y: 4)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 10)
+                .stroke(Color.white.opacity(0.12), lineWidth: 0.5)
+        )
     }
 }

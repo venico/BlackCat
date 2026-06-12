@@ -185,6 +185,8 @@ private struct SubtitleLabel: View {
 private struct TextOverlay: View {
     @EnvironmentObject private var project: ProjectState
     @EnvironmentObject private var clock: PlaybackClock
+    @State private var editingID: UUID? = nil
+    @State private var editText: String = ""
 
     private var activeClips: [TextClip] {
         project.textTracks
@@ -193,26 +195,132 @@ private struct TextOverlay: View {
             .filter { $0.startTime <= clock.currentTime && $0.endTime > clock.currentTime }
     }
 
+    private func commitEdit() {
+        guard let id = editingID else { return }
+        project.updateTextClip(id: id) { $0.text = editText }
+        editingID = nil
+    }
+
     var body: some View {
         GeometryReader { geo in
             let scale = geo.size.width / max(project.previewRenderSize.width, 1)
-            ForEach(activeClips, id: \.id) { clip in
-                TextLabel(clip: clip, scale: scale,
-                          selected: project.selectedTextClipID == clip.id)
-                    .position(x: geo.size.width * clip.posX,
-                              y: geo.size.height * clip.posY)
-                    .gesture(
-                        DragGesture()
-                            .onChanged { v in
-                                project.selectedTextClipID = clip.id
-                                project.updateTextClip(id: clip.id) {
-                                    $0.posX = min(1, max(0, v.location.x / geo.size.width))
-                                    $0.posY = min(1, max(0, v.location.y / geo.size.height))
-                                }
-                            }
-                    )
-                    .onTapGesture { project.selectedTextClipID = clip.id }
+
+            // 编辑模式时，点击空白处结束输入
+            if editingID != nil {
+                Color.clear
+                    .contentShape(Rectangle())
+                    .onTapGesture { commitEdit() }
             }
+
+            ForEach(activeClips, id: \.id) { clip in
+                if editingID == clip.id {
+                    TextEditField(text: $editText, clip: clip, scale: scale,
+                                  onCommit: { commitEdit() })
+                        .fixedSize()
+                        .overlay(RoundedRectangle(cornerRadius: 4 * scale)
+                            .strokeBorder(Color.accent, lineWidth: 1.5))
+                        .position(x: geo.size.width * clip.posX,
+                                  y: geo.size.height * clip.posY)
+                } else {
+                    TextLabel(clip: clip, scale: scale,
+                              selected: project.selectedTextClipID == clip.id)
+                        .position(x: geo.size.width * clip.posX,
+                                  y: geo.size.height * clip.posY)
+                        .gesture(
+                            DragGesture()
+                                .onChanged { v in
+                                    project.selectedTextClipID = clip.id
+                                    project.updateTextClip(id: clip.id) {
+                                        $0.posX = min(1, max(0, v.location.x / geo.size.width))
+                                        $0.posY = min(1, max(0, v.location.y / geo.size.height))
+                                    }
+                                }
+                        )
+                        .onTapGesture(count: 2) {
+                            editText = clip.text
+                            editingID = clip.id
+                            project.selectedTextClipID = clip.id
+                        }
+                        .onTapGesture { project.selectedTextClipID = clip.id }
+                }
+            }
+        }
+    }
+}
+
+private struct TextEditField: NSViewRepresentable {
+    @Binding var text: String
+    let clip: TextClip
+    let scale: CGFloat
+    let onCommit: () -> Void
+
+    func makeNSView(context: Context) -> NSScrollView {
+        let sv = NSTextView.scrollableTextView()
+        let tv = sv.documentView as! NSTextView
+        tv.delegate = context.coordinator
+        tv.isRichText = false
+        tv.isAutomaticQuoteSubstitutionEnabled = false
+        tv.isAutomaticDashSubstitutionEnabled = false
+        tv.drawsBackground = false
+        sv.drawsBackground = false
+        sv.hasVerticalScroller = false
+        sv.hasHorizontalScroller = false
+        sv.borderType = .noBorder
+        tv.textContainerInset = NSSize(width: 4 * scale, height: 2 * scale)
+        tv.textContainer?.widthTracksTextView = false
+        tv.textContainer?.size = NSSize(width: 10000, height: 10000)
+        tv.maxSize = NSSize(width: 10000, height: 10000)
+        tv.isHorizontallyResizable = true
+        tv.focusRingType = .none
+        tv.string = text
+        applyStyle(tv)
+        DispatchQueue.main.async { tv.window?.makeFirstResponder(tv) }
+        return sv
+    }
+
+    func updateNSView(_ sv: NSScrollView, context: Context) {
+        guard let tv = sv.documentView as? NSTextView else { return }
+        if tv.string != text { tv.string = text }
+        applyStyle(tv)
+    }
+
+    func sizeThatFits(_ proposal: ProposedViewSize, nsView: NSScrollView, context: Context) -> CGSize? {
+        guard let tv = nsView.documentView as? NSTextView,
+              let lm = tv.layoutManager, let tc = tv.textContainer else { return nil }
+        lm.ensureLayout(for: tc)
+        let r = lm.usedRect(for: tc)
+        let pad = tv.textContainerInset
+        let w = max(ceil(r.width) + pad.width * 2 + 4, 50 * scale)
+        let h = max(ceil(r.height) + pad.height * 2, clip.fontSize * scale * 1.5)
+        return CGSize(width: w, height: h)
+    }
+
+    private func applyStyle(_ tv: NSTextView) {
+        let sz = clip.fontSize * scale
+        var font = NSFont(name: clip.fontName, size: sz) ?? NSFont.systemFont(ofSize: sz)
+        if clip.bold { font = NSFontManager.shared.convert(font, toHaveTrait: .boldFontMask) }
+        let c = NSColor(clip.textColor)
+        tv.font = font
+        tv.textColor = c
+        tv.insertionPointColor = c
+        tv.alignment = clip.alignment == "left" ? .left : clip.alignment == "right" ? .right : .center
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator(self) }
+
+    class Coordinator: NSObject, NSTextViewDelegate {
+        var parent: TextEditField
+        init(_ parent: TextEditField) { self.parent = parent }
+        func textDidChange(_ notification: Notification) {
+            guard let tv = notification.object as? NSTextView else { return }
+            parent.text = tv.string
+        }
+        func textView(_ textView: NSTextView, doCommandBy sel: Selector) -> Bool {
+            if sel == #selector(NSResponder.cancelOperation(_:)) {
+                parent.onCommit()
+                return true
+            }
+            return false
         }
     }
 }

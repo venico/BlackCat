@@ -27,58 +27,98 @@ enum WhisperTranscriber {
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir
     }
-    static var downloadedModelURL: URL { supportDir.appendingPathComponent("ggml-small.bin") }
+    // MARK: - 模型规格
+
+    enum ModelSize: String, CaseIterable {
+        case tiny, base, small, medium, large = "large-v3-turbo"
+        var fileName: String { "ggml-\(rawValue).bin" }
+        var displayName: String {
+            switch self {
+            case .tiny:   return "Tiny"
+            case .base:   return "Base"
+            case .small:  return "Small"
+            case .medium: return "Medium"
+            case .large:  return "Large v3 Turbo"
+            }
+        }
+        var sizeDesc: String {
+            switch self {
+            case .tiny:   return "75 MB · 最快速度，适合短句/简单内容"
+            case .base:   return "142 MB · 较快，日常够用"
+            case .small:  return "466 MB · 均衡之选，推荐大多数场景"
+            case .medium: return "1.5 GB · 高精度，适合复杂/多语言内容"
+            case .large:  return "1.6 GB · 最高精度，速度优化版"
+            }
+        }
+        var minFileSize: Int {
+            switch self {
+            case .tiny: return 30_000_000
+            case .base: return 100_000_000
+            case .small: return 300_000_000
+            case .medium: return 1_000_000_000
+            case .large: return 1_000_000_000
+            }
+        }
+        var sourceURLs: [String] {
+            [
+                "https://hf-mirror.com/ggerganov/whisper.cpp/resolve/main/\(fileName)",
+                "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/\(fileName)"
+            ]
+        }
+    }
+
+    static func downloadedModelURL(_ size: ModelSize) -> URL {
+        supportDir.appendingPathComponent(size.fileName)
+    }
 
     static func findModel() -> URL? {
-        // 1. 已下载的（Application Support）
-        if FileManager.default.fileExists(atPath: downloadedModelURL.path) { return downloadedModelURL }
-        // 2. 打包进 bundle 的
-        if let r = Bundle.main.resourceURL?.appendingPathComponent("ggml-small.bin"),
-           FileManager.default.fileExists(atPath: r.path) { return r }
-        if let dir = Bundle.main.executableURL?.deletingLastPathComponent() {
-            let p = dir.appendingPathComponent("ggml-small.bin")
-            if FileManager.default.fileExists(atPath: p.path) { return p }
+        for size in ModelSize.allCases.reversed() {
+            let dl = downloadedModelURL(size)
+            if FileManager.default.fileExists(atPath: dl.path) { return dl }
         }
-        // 3. 开发期 devDir
-        let dev = URL(fileURLWithPath: devDir).appendingPathComponent("ggml-small.bin")
-        if FileManager.default.fileExists(atPath: dev.path) { return dev }
+        let names = ModelSize.allCases.reversed().map(\.fileName)
+        for name in names {
+            if let r = Bundle.main.resourceURL?.appendingPathComponent(name),
+               FileManager.default.fileExists(atPath: r.path) { return r }
+            if let dir = Bundle.main.executableURL?.deletingLastPathComponent() {
+                let p = dir.appendingPathComponent(name)
+                if FileManager.default.fileExists(atPath: p.path) { return p }
+            }
+            let dev = URL(fileURLWithPath: devDir).appendingPathComponent(name)
+            if FileManager.default.fileExists(atPath: dev.path) { return dev }
+        }
         return nil
     }
 
-    /// whisper-cli 是否就绪（必须随 app 打包/签名，沙盒不允许执行下载的二进制）
     static var whisperReady: Bool { findWhisper() != nil }
-    /// 模型是否就绪（可按需下载）
     static var modelReady: Bool { findModel() != nil }
-    /// 整体可触发（cli 就绪即可；模型缺失会先下载）
     static var isAvailable: Bool { findWhisper() != nil }
 
     // MARK: - 模型按需下载
 
-    /// 模型下载源（多源 fallback：国内镜像优先，再官方）
-    static let modelSourceURLs = [
-        "https://hf-mirror.com/ggerganov/whisper.cpp/resolve/main/ggml-small.bin",
-        "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin"
-    ]
-
-    /// 下载模型到 Application Support（progress 回调 0~1）
-    static func downloadModel(progress: @escaping (Double) -> Void) async throws {
+    static func downloadModel(_ size: ModelSize, progress: @escaping (Double) -> Void) async throws {
+        let dest = downloadedModelURL(size)
         var lastError: Error?
-        for src in modelSourceURLs {
+        for src in size.sourceURLs {
             guard let url = URL(string: src) else { continue }
             do {
-                try await downloadFile(url, to: downloadedModelURL, progress: progress)
-                // 校验大小，避免下到错误页/不完整文件（small 模型 ~466MB）
-                let attrs = try? FileManager.default.attributesOfItem(atPath: downloadedModelURL.path)
-                let size = (attrs?[.size] as? Int) ?? 0
-                if size > 100_000_000 { return }
-                try? FileManager.default.removeItem(at: downloadedModelURL)
+                try await downloadFile(url, to: dest, progress: progress)
+                let attrs = try? FileManager.default.attributesOfItem(atPath: dest.path)
+                let fileSize = (attrs?[.size] as? Int) ?? 0
+                if fileSize > size.minFileSize { return }
+                try? FileManager.default.removeItem(at: dest)
                 lastError = TranscribeError.downloadFailed
             } catch {
                 lastError = error
-                try? FileManager.default.removeItem(at: downloadedModelURL)
+                try? FileManager.default.removeItem(at: dest)
             }
         }
         throw lastError ?? TranscribeError.downloadFailed
+    }
+
+    @available(*, deprecated, message: "Use downloadModel(_:progress:) with ModelSize")
+    static func downloadModel(progress: @escaping (Double) -> Void) async throws {
+        try await downloadModel(.small, progress: progress)
     }
 
     private static func downloadFile(_ url: URL, to dest: URL, progress: @escaping (Double) -> Void) async throws {

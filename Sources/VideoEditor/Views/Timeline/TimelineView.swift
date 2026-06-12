@@ -48,10 +48,11 @@ struct TimelineView: View {
     @State private var lastThumbPPS: Double = 0
 
     // 轨道标签拖拽排序
-    private enum TrackDragType: Equatable { case video, audio, subtitle, text }
+    private enum TrackDragType: Equatable { case video, audio, overlay }
     @State private var trackLabelDragType: TrackDragType? = nil
     @State private var trackLabelDragSrc: Int = 0
     @State private var trackLabelDragOffset: CGFloat = 0
+    @State private var trackLabelDropIdx: Int? = nil
 
     private enum DragOp {
         case moveVideo(id: UUID, originStart: Double, originDur: Double, srcTrack: Int)
@@ -82,6 +83,7 @@ struct TimelineView: View {
         let kind: Kind
         let originStart: Double
         let originDur: Double
+        var srcTrack: Int = 0
     }
 
     private enum ClipHit {
@@ -197,17 +199,7 @@ struct TimelineView: View {
         })
         .clipped()
         // 播放头三角和竖线都在 DraggablePlayhead 内部（ScrollView 内），完全同步不分离
-        .overlay(alignment: .bottomTrailing) {
-            if project.translationTotal > 0 {
-                TranslationProgressBubble()
-                    .padding(.trailing, 12)
-                    .padding(.bottom, 8)
-                    .transition(.asymmetric(
-                        insertion: .move(edge: .trailing).combined(with: .opacity),
-                        removal: .opacity))
-            }
-        }
-        .animation(.spring(response: 0.35, dampingFraction: 0.8), value: project.translationTotal)
+        // 翻译进度已移至右下角全局浮层
         .onAppear { setupMonitors(); lastThumbPPS = project.pixelsPerSecond }
         .onDisappear { teardownMonitors() }
         .onChange(of: project.pixelsPerSecond) { newPPS in
@@ -312,14 +304,15 @@ struct TimelineView: View {
             // "+" dropdown to add tracks
             Menu {
                 Button("添加视频轨道") { project.videoTracks.append(Track(label: "视频")) }
-                Button("添加图片轨道") { project.imageTracks.append(Track(label: "图片")) }
+                Button("添加图片轨道") { project.imageTracks.append(Track(label: "图片")); project.syncOverlayOrder() }
                 Button("添加音频轨道") { project.audioTracks.append(Track(label: "音频")) }
                 Button("添加字幕轨道") {
                     var newTrack = Track<SubtitleClip>(label: "字幕")
                     newTrack.subtitleStyle = SubtitleStyle()
                     project.subtitleTracks.append(newTrack)
+                    project.syncOverlayOrder()
                 }
-                Button("添加文字轨道") { project.textTracks.append(Track(label: "文字")) }
+                Button("添加文字轨道") { project.textTracks.append(Track(label: "文字")); project.syncOverlayOrder() }
             } label: {
                 Image(systemName: "plus")
                     .font(.system(size: 13, weight: .light))
@@ -332,16 +325,13 @@ struct TimelineView: View {
             .frame(height: rulerH)
 
             VStack(spacing: 1) {
-            if project.showImageTracks {
-                ForEach(project.imageTracks.indices, id:\.self) { i in
-                    TrackLabel(icon:"photo", title: project.imageTracks[i].label,
-                               count: project.imageTracks[i].clips.count, hasMute: false,
-                               isMuted: false, isVis: project.imageTracks[i].isVisible,
-                               onMute: nil,
-                               onVis:  { project.pushUndo(); project.imageTracks[i].isVisible.toggle(); project.rebuildTimelinePreview() },
-                               onDel:  { project.pushUndo(); project.imageTracks.remove(at:i); project.rebuildTimelinePreview() })
-                        .frame(height: imgH(i))
-                }
+            // Overlay tracks (image/subtitle/text) — unified order
+            ForEach(Array(visibleOverlays.enumerated()), id:\.element.trackID) { ovIdx, entry in
+                overlayLabel(entry: entry, overlayIndex: ovIdx)
+                    .frame(height: overlayH(entry))
+                    .offset(y: isTrackDragging(.overlay, ovIdx) ? trackLabelDragOffset : 0)
+                    .zIndex(isTrackDragging(.overlay, ovIdx) ? 10 : 0)
+                    .opacity(isTrackDragging(.overlay, ovIdx) ? 0.55 : 1.0)
             }
             if project.showVideoTracks {
                 ForEach(project.videoTracks.indices, id:\.self) { i in
@@ -350,11 +340,13 @@ struct TimelineView: View {
                                isMuted: project.videoTracks[i].isMuted, isVis: project.videoTracks[i].isVisible,
                                onMute: { project.pushUndo(); project.videoTracks[i].isMuted.toggle(); project.rebuildTimelinePreview() },
                                onVis:  { project.pushUndo(); project.videoTracks[i].isVisible.toggle(); project.rebuildTimelinePreview() },
-                               onDel:  { project.pushUndo(); project.videoTracks.remove(at:i); project.rebuildTimelinePreview() })
+                               onDel:  { project.pushUndo(); project.videoTracks.remove(at:i); project.rebuildTimelinePreview() },
+                               onDragChanged: { handleDragChanged(type: .video, index: i, offsetY: $0) },
+                               onDragEnded:   { handleDragEnded(type: .video, index: i, offsetY: $0) })
                         .frame(height: vidH(i))
-                        .offset(y: trackLabelDragType == .video && trackLabelDragSrc == i ? trackLabelDragOffset : 0)
-                        .zIndex(trackLabelDragType == .video && trackLabelDragSrc == i ? 10 : 0)
-                        .gesture(trackLabelDragGesture(type: .video, index: i))
+                        .offset(y: isTrackDragging(.video, i) ? trackLabelDragOffset : 0)
+                        .zIndex(isTrackDragging(.video, i) ? 10 : 0)
+                        .opacity(isTrackDragging(.video, i) ? 0.55 : 1.0)
                 }
             }
             if project.showAudioTracks {
@@ -364,108 +356,205 @@ struct TimelineView: View {
                                isMuted: project.audioTracks[i].isMuted, isVis: true, hasVis: false,
                                onMute: { project.pushUndo(); project.audioTracks[i].isMuted.toggle(); project.rebuildTimelinePreview() },
                                onVis:  {},
-                               onDel:  { project.pushUndo(); project.audioTracks.remove(at:i); project.rebuildTimelinePreview() })
+                               onDel:  { project.pushUndo(); project.audioTracks.remove(at:i); project.rebuildTimelinePreview() },
+                               onDragChanged: { handleDragChanged(type: .audio, index: i, offsetY: $0) },
+                               onDragEnded:   { handleDragEnded(type: .audio, index: i, offsetY: $0) })
                         .frame(height: audH(i))
-                        .offset(y: trackLabelDragType == .audio && trackLabelDragSrc == i ? trackLabelDragOffset : 0)
-                        .zIndex(trackLabelDragType == .audio && trackLabelDragSrc == i ? 10 : 0)
-                        .gesture(trackLabelDragGesture(type: .audio, index: i))
-                }
-            }
-            if project.showSubtitleTracks {
-                ForEach(project.subtitleTracks.indices, id:\.self) { i in
-                    TrackLabel(icon:"text.bubble", title: project.subtitleTracks[i].label,
-                               count: project.subtitleTracks[i].clips.count, hasMute: false,
-                               isMuted: false, isVis: project.subtitleTracks[i].isVisible,
-                               onMute: nil,
-                               onVis:  { project.pushUndo(); project.subtitleTracks[i].isVisible.toggle() },
-                               onDel:  { project.pushUndo(); project.subtitleTracks.remove(at:i); project.rebuildTimelinePreview() })
-                        .frame(height: subH(i))
-                        .offset(y: trackLabelDragType == .subtitle && trackLabelDragSrc == i ? trackLabelDragOffset : 0)
-                        .zIndex(trackLabelDragType == .subtitle && trackLabelDragSrc == i ? 10 : 0)
-                        .gesture(trackLabelDragGesture(type: .subtitle, index: i))
-                }
-            }
-            if project.showTextTracks {
-                ForEach(project.textTracks.indices, id:\.self) { i in
-                    TextTrackLabel(title: project.textTracks[i].label,
-                               count: project.textTracks[i].clips.count,
-                               isVis: project.textTracks[i].isVisible,
-                               onVis:  { project.pushUndo(); project.textTracks[i].isVisible.toggle() },
-                               onDel:  { project.pushUndo(); project.textTracks.remove(at:i) })
-                        .frame(height: txtH(i))
-                        .offset(y: trackLabelDragType == .text && trackLabelDragSrc == i ? trackLabelDragOffset : 0)
-                        .zIndex(trackLabelDragType == .text && trackLabelDragSrc == i ? 10 : 0)
-                        .gesture(trackLabelDragGesture(type: .text, index: i))
+                        .offset(y: isTrackDragging(.audio, i) ? trackLabelDragOffset : 0)
+                        .zIndex(isTrackDragging(.audio, i) ? 10 : 0)
+                        .opacity(isTrackDragging(.audio, i) ? 0.55 : 1.0)
                 }
             }
             } // end inner VStack
+            .overlay(trackDropIndicatorLine())
             .background(Color(red:0.09,green:0.09,blue:0.10))
         }
         .frame(width: labelW)
         .frame(maxHeight: .infinity, alignment: .top)
     }
 
+    private struct ResolvedOverlay {
+        enum Kind { case image, subtitle, text }
+        let kind: Kind
+        let index: Int
+        let trackID: UUID
+    }
+
+    private var resolvedOverlays: [ResolvedOverlay] {
+        project.overlayTrackOrder.compactMap { ref in
+            switch ref {
+            case .image(let id):
+                guard let i = project.imageTracks.firstIndex(where: { $0.id == id }) else { return nil }
+                return ResolvedOverlay(kind: .image, index: i, trackID: id)
+            case .subtitle(let id):
+                guard let i = project.subtitleTracks.firstIndex(where: { $0.id == id }) else { return nil }
+                return ResolvedOverlay(kind: .subtitle, index: i, trackID: id)
+            case .text(let id):
+                guard let i = project.textTracks.firstIndex(where: { $0.id == id }) else { return nil }
+                return ResolvedOverlay(kind: .text, index: i, trackID: id)
+            }
+        }
+    }
+
+    private var visibleOverlays: [ResolvedOverlay] {
+        resolvedOverlays.filter { entry in
+            switch entry.kind {
+            case .image: return project.showImageTracks
+            case .subtitle: return project.showSubtitleTracks
+            case .text: return project.showTextTracks
+            }
+        }
+    }
+
+    private func overlayH(_ entry: ResolvedOverlay) -> CGFloat {
+        switch entry.kind {
+        case .image: return imgH(entry.index)
+        case .subtitle: return subH(entry.index)
+        case .text: return txtH(entry.index)
+        }
+    }
+
     private func trackLabelDropTarget(type: TrackDragType, source: Int, offset: CGFloat) -> Int {
         let count: Int
-        let hFn: (Int) -> CGFloat
+        let heights: [CGFloat]
         switch type {
-        case .video:    count = project.videoTracks.count;    hFn = vidH
-        case .audio:    count = project.audioTracks.count;    hFn = audH
-        case .subtitle: count = project.subtitleTracks.count; hFn = subH
-        case .text:     count = project.textTracks.count;     hFn = txtH
+        case .video:
+            count = project.videoTracks.count
+            heights = (0..<count).map { vidH($0) }
+        case .audio:
+            count = project.audioTracks.count
+            heights = (0..<count).map { audH($0) }
+        case .overlay:
+            let ovs = visibleOverlays
+            count = ovs.count
+            heights = ovs.map { overlayH($0) }
         }
         guard count > 1 else { return source }
         var centerY: CGFloat = 0
-        for j in 0..<source { centerY += hFn(j) + 1 }
-        centerY += hFn(source) / 2 + offset
+        for j in 0..<source { centerY += heights[j] + 1 }
+        centerY += heights[source] / 2 + offset
         var top: CGFloat = 0
         for j in 0..<count {
-            let h = hFn(j)
-            if centerY < top + h / 2 { return j }
-            top += h + 1
+            if centerY < top + heights[j] / 2 { return j }
+            top += heights[j] + 1
         }
         return count - 1
     }
 
-    private func trackLabelDragGesture(type: TrackDragType, index: Int) -> some Gesture {
-        LongPressGesture(minimumDuration: 0.3)
-            .sequenced(before: DragGesture())
-            .onChanged { value in
-                switch value {
-                case .second(true, let drag):
-                    if trackLabelDragType == nil {
-                        trackLabelDragType = type
-                        trackLabelDragSrc = index
-                    }
-                    trackLabelDragOffset = drag?.translation.height ?? 0
-                default: break
+    private func handleDragChanged(type: TrackDragType, index: Int, offsetY: CGFloat) {
+        if trackLabelDragType == nil {
+            trackLabelDragType = type
+            trackLabelDragSrc = index
+        }
+        trackLabelDragOffset = offsetY
+        let target = trackLabelDropTarget(type: type, source: trackLabelDragSrc, offset: offsetY)
+        trackLabelDropIdx = target != trackLabelDragSrc ? target : nil
+    }
+
+    private func handleDragEnded(type: TrackDragType, index: Int, offsetY: CGFloat) {
+        let target = trackLabelDropTarget(type: type, source: trackLabelDragSrc, offset: offsetY)
+        if target != trackLabelDragSrc {
+            project.pushUndo()
+            switch type {
+            case .video:
+                let t = project.videoTracks.remove(at: trackLabelDragSrc)
+                project.videoTracks.insert(t, at: target)
+            case .audio:
+                let t = project.audioTracks.remove(at: trackLabelDragSrc)
+                project.audioTracks.insert(t, at: target)
+            case .overlay:
+                let ovs = visibleOverlays
+                guard trackLabelDragSrc < ovs.count, target < ovs.count else { break }
+                let srcID = ovs[trackLabelDragSrc].trackID
+                let dstID = ovs[target].trackID
+                if let si = project.overlayTrackOrder.firstIndex(where: { $0.trackID == srcID }),
+                   let di = project.overlayTrackOrder.firstIndex(where: { $0.trackID == dstID }) {
+                    let item = project.overlayTrackOrder.remove(at: si)
+                    project.overlayTrackOrder.insert(item, at: di)
                 }
             }
-            .onEnded { value in
-                if case .second(true, let drag) = value, let d = drag {
-                    let target = trackLabelDropTarget(type: type, source: trackLabelDragSrc, offset: d.translation.height)
-                    if target != trackLabelDragSrc {
-                        project.pushUndo()
-                        switch type {
-                        case .video:
-                            let t = project.videoTracks.remove(at: trackLabelDragSrc)
-                            project.videoTracks.insert(t, at: target)
-                        case .audio:
-                            let t = project.audioTracks.remove(at: trackLabelDragSrc)
-                            project.audioTracks.insert(t, at: target)
-                        case .subtitle:
-                            let t = project.subtitleTracks.remove(at: trackLabelDragSrc)
-                            project.subtitleTracks.insert(t, at: target)
-                        case .text:
-                            let t = project.textTracks.remove(at: trackLabelDragSrc)
-                            project.textTracks.insert(t, at: target)
-                        }
-                        project.rebuildTimelinePreview()
-                    }
-                }
-                trackLabelDragType = nil
-                trackLabelDragOffset = 0
+            project.rebuildTimelinePreview()
+        }
+        trackLabelDragType = nil
+        trackLabelDragOffset = 0
+        trackLabelDropIdx = nil
+    }
+
+    @ViewBuilder
+    private func overlayLabel(entry: ResolvedOverlay, overlayIndex: Int) -> some View {
+        let i = entry.index
+        let ovIdx = overlayIndex
+        switch entry.kind {
+        case .image:
+            TrackLabel(icon:"photo", title: project.imageTracks[i].label,
+                       count: project.imageTracks[i].clips.count, hasMute: false,
+                       isMuted: false, isVis: project.imageTracks[i].isVisible,
+                       onMute: nil,
+                       onVis:  { project.pushUndo(); project.imageTracks[i].isVisible.toggle(); project.rebuildTimelinePreview() },
+                       onDel:  { project.pushUndo(); project.imageTracks.remove(at:i); project.syncOverlayOrder(); project.rebuildTimelinePreview() },
+                       onDragChanged: { handleDragChanged(type: .overlay, index: ovIdx, offsetY: $0) },
+                       onDragEnded:   { handleDragEnded(type: .overlay, index: ovIdx, offsetY: $0) })
+        case .subtitle:
+            TrackLabel(icon:"text.bubble", title: project.subtitleTracks[i].label,
+                       count: project.subtitleTracks[i].clips.count, hasMute: false,
+                       isMuted: false, isVis: project.subtitleTracks[i].isVisible,
+                       onMute: nil,
+                       onVis:  { project.pushUndo(); project.subtitleTracks[i].isVisible.toggle() },
+                       onDel:  { project.pushUndo(); project.subtitleTracks.remove(at:i); project.syncOverlayOrder(); project.rebuildTimelinePreview() },
+                       onDragChanged: { handleDragChanged(type: .overlay, index: ovIdx, offsetY: $0) },
+                       onDragEnded:   { handleDragEnded(type: .overlay, index: ovIdx, offsetY: $0) })
+        case .text:
+            TextTrackLabel(title: project.textTracks[i].label,
+                       count: project.textTracks[i].clips.count,
+                       isVis: project.textTracks[i].isVisible,
+                       onVis:  { project.pushUndo(); project.textTracks[i].isVisible.toggle() },
+                       onDel:  { project.pushUndo(); project.textTracks.remove(at:i); project.syncOverlayOrder() },
+                       onDragChanged: { handleDragChanged(type: .overlay, index: ovIdx, offsetY: $0) },
+                       onDragEnded:   { handleDragEnded(type: .overlay, index: ovIdx, offsetY: $0) })
+        }
+    }
+
+    private func trackDropLineY() -> CGFloat? {
+        guard let dragType = trackLabelDragType, let dropIdx = trackLabelDropIdx else { return nil }
+        let heights: [CGFloat]
+        var baseY: CGFloat
+        switch dragType {
+        case .overlay:
+            let ovs = visibleOverlays
+            heights = ovs.map { overlayH($0) }
+            baseY = 0
+        case .video:
+            heights = project.videoTracks.indices.map { vidH($0) }
+            let ovs = visibleOverlays
+            baseY = ovs.reduce(CGFloat(0)) { $0 + overlayH($1) } + (ovs.isEmpty ? 0 : CGFloat(ovs.count))
+        case .audio:
+            heights = project.audioTracks.indices.map { audH($0) }
+            let ovs = visibleOverlays
+            baseY = ovs.reduce(CGFloat(0)) { $0 + overlayH($1) } + (ovs.isEmpty ? 0 : CGFloat(ovs.count))
+            if project.showVideoTracks {
+                baseY += project.videoTracks.indices.reduce(CGFloat(0)) { $0 + vidH($1) } + CGFloat(project.videoTracks.count)
             }
+        }
+        let insertBefore = dropIdx < trackLabelDragSrc
+        let lineIdx = insertBefore ? dropIdx : dropIdx + 1
+        var lineY = baseY
+        for j in 0..<min(lineIdx, heights.count) {
+            lineY += heights[j] + 1
+        }
+        return lineY
+    }
+
+    @ViewBuilder
+    private func trackDropIndicatorLine() -> some View {
+        if let lineY = trackDropLineY() {
+            Rectangle()
+                .fill(Color.accent)
+                .frame(height: 1)
+                .frame(maxWidth: .infinity)
+                .offset(y: lineY - 0.5)
+                .frame(maxHeight: .infinity, alignment: .top)
+                .allowsHitTesting(false)
+        }
     }
 
     private func updateVisibleWidth(_ w: Double) {
@@ -771,6 +860,31 @@ struct TimelineView: View {
                         if let dst = destTrack.textIndex, dst != srcTrack {
                             project.moveTextClipToTrack(id: id, from: srcTrack, to: dst)
                         }
+                    case .moveMulti(let items):
+                        for it in items {
+                            switch it.kind {
+                            case .subtitle:
+                                if let dst = destTrack.subtitleIndex, dst != it.srcTrack {
+                                    project.moveSubtitleClipToTrack(id: it.id, from: it.srcTrack, to: dst)
+                                }
+                            case .text:
+                                if let dst = destTrack.textIndex, dst != it.srcTrack {
+                                    project.moveTextClipToTrack(id: it.id, from: it.srcTrack, to: dst)
+                                }
+                            case .image:
+                                if let dst = destTrack.imageIndex, dst != it.srcTrack {
+                                    project.moveImageClipToTrack(id: it.id, from: it.srcTrack, to: dst)
+                                }
+                            case .video:
+                                if let dst = destTrack.videoIndex, dst != it.srcTrack {
+                                    project.moveVideoClipToTrack(id: it.id, from: it.srcTrack, to: dst)
+                                }
+                            case .audio:
+                                if let dst = destTrack.audioIndex, dst != it.srcTrack {
+                                    project.moveAudioClipToTrack(id: it.id, from: it.srcTrack, to: dst)
+                                }
+                            }
+                        }
                     default: break
                     }
                 }
@@ -1030,34 +1144,34 @@ struct TimelineView: View {
     private func collectMultiDragItems() -> [DragItem] {
         var items: [DragItem] = []
         for id in project.selectedClipIDs {
-            for t in project.videoTracks {
+            for (ti, t) in project.videoTracks.enumerated() {
                 if let c = t.clips.first(where: { $0.id == id }) {
                     items.append(DragItem(id: id, kind: .video,
-                                          originStart: c.startTime, originDur: c.duration))
+                                          originStart: c.startTime, originDur: c.duration, srcTrack: ti))
                 }
             }
-            for t in project.imageTracks {
+            for (ti, t) in project.imageTracks.enumerated() {
                 if let c = t.clips.first(where: { $0.id == id }) {
                     items.append(DragItem(id: id, kind: .image,
-                                          originStart: c.startTime, originDur: c.duration))
+                                          originStart: c.startTime, originDur: c.duration, srcTrack: ti))
                 }
             }
-            for t in project.audioTracks {
+            for (ti, t) in project.audioTracks.enumerated() {
                 if let c = t.clips.first(where: { $0.id == id }) {
                     items.append(DragItem(id: id, kind: .audio,
-                                          originStart: c.startTime, originDur: c.duration))
+                                          originStart: c.startTime, originDur: c.duration, srcTrack: ti))
                 }
             }
-            for t in project.subtitleTracks {
+            for (ti, t) in project.subtitleTracks.enumerated() {
                 if let c = t.clips.first(where: { $0.id == id }) {
                     items.append(DragItem(id: id, kind: .subtitle,
-                                          originStart: c.startTime, originDur: c.duration))
+                                          originStart: c.startTime, originDur: c.duration, srcTrack: ti))
                 }
             }
-            for t in project.textTracks {
+            for (ti, t) in project.textTracks.enumerated() {
                 if let c = t.clips.first(where: { $0.id == id }) {
                     items.append(DragItem(id: id, kind: .text,
-                                          originStart: c.startTime, originDur: c.duration))
+                                          originStart: c.startTime, originDur: c.duration, srcTrack: ti))
                 }
             }
         }
@@ -1287,12 +1401,9 @@ struct TimelineView: View {
         let pps = project.pixelsPerSecond
         var rowTop: CGFloat = rulerH
         var first = true
-        // 跳过图片轨道
-        if project.showImageTracks {
-            for i in project.imageTracks.indices {
-                if !first { rowTop += 1 }; first = false
-                rowTop += imgH(i)
-            }
+        for entry in visibleOverlays {
+            if !first { rowTop += 1 }; first = false
+            rowTop += overlayH(entry)
         }
         // 视频轨道
         for ti in project.videoTracks.indices {
@@ -1365,18 +1476,27 @@ struct TimelineView: View {
             return insideMatch ?? edgeMatch
         }
 
-        if project.showImageTracks {
-            for ti in project.imageTracks.indices {
-                if !first { rowTop += 1 }; first = false
-                let h = imgH(ti)
-                if pt.y >= rowTop && pt.y < rowTop + h {
-                    if let m = bestMatch(project.imageTracks[ti].clips, x: pt.x,
+        for entry in visibleOverlays {
+            if !first { rowTop += 1 }; first = false
+            let h = overlayH(entry)
+            if pt.y >= rowTop && pt.y < rowTop + h {
+                switch entry.kind {
+                case .image:
+                    if let m = bestMatch(project.imageTracks[entry.index].clips, x: pt.x,
                         { c, _, _ in .image(id: c.id, start: c.startTime, dur: c.duration) },
                         { $0.startTime }, { $0.endTime }) { return m }
-                    return nil
+                case .subtitle:
+                    if let m = bestMatch(project.subtitleTracks[entry.index].clips, x: pt.x,
+                        { c, _, _ in .subtitle(id: c.id, start: c.startTime, dur: c.duration) },
+                        { $0.startTime }, { $0.endTime }) { return m }
+                case .text:
+                    if let m = bestMatch(project.textTracks[entry.index].clips, x: pt.x,
+                        { c, _, _ in .text(id: c.id, start: c.startTime, dur: c.duration) },
+                        { $0.startTime }, { $0.endTime }) { return m }
                 }
-                rowTop += h
+                return nil
             }
+            rowTop += h
         }
         if project.showVideoTracks {
             for ti in project.videoTracks.indices {
@@ -1404,32 +1524,6 @@ struct TimelineView: View {
                 rowTop += h
             }
         }
-        if project.showSubtitleTracks {
-            for ti in project.subtitleTracks.indices {
-                if !first { rowTop += 1 }; first = false
-                let h = subH(ti)
-                if pt.y >= rowTop && pt.y < rowTop + h {
-                    if let m = bestMatch(project.subtitleTracks[ti].clips, x: pt.x,
-                        { c, _, _ in .subtitle(id: c.id, start: c.startTime, dur: c.duration) },
-                        { $0.startTime }, { $0.endTime }) { return m }
-                    return nil
-                }
-                rowTop += h
-            }
-        }
-        if project.showTextTracks {
-            for ti in project.textTracks.indices {
-                if !first { rowTop += 1 }; first = false
-                let h = txtH(ti)
-                if pt.y >= rowTop && pt.y < rowTop + h {
-                    if let m = bestMatch(project.textTracks[ti].clips, x: pt.x,
-                        { c, _, _ in .text(id: c.id, start: c.startTime, dur: c.duration) },
-                        { $0.startTime }, { $0.endTime }) { return m }
-                    return nil
-                }
-                rowTop += h
-            }
-        }
         return nil
     }
 
@@ -1439,18 +1533,28 @@ struct TimelineView: View {
         var rowTop = rulerH
         var first = true
 
-        if project.showImageTracks {
-            for ti in project.imageTracks.indices {
-                if !first { rowTop += 1 }; first = false
-                let h = imgH(ti)
-                let yRange = rowTop ... (rowTop + h)
-                for c in project.imageTracks[ti].clips {
+        for entry in visibleOverlays {
+            if !first { rowTop += 1 }; first = false
+            let h = overlayH(entry)
+            let yRange = rowTop ... (rowTop + h)
+            switch entry.kind {
+            case .image:
+                for c in project.imageTracks[entry.index].clips {
                     let xEnd = max(c.startTime*pps, c.endTime*pps)
-                    let xRange = (c.startTime*pps) ... xEnd
-                    if rectIntersects(rect, xRange: xRange, yRange: yRange) { ids.insert(c.id) }
+                    if rectIntersects(rect, xRange: (c.startTime*pps)...xEnd, yRange: yRange) { ids.insert(c.id) }
                 }
-                rowTop += h
+            case .subtitle:
+                for c in project.subtitleTracks[entry.index].clips {
+                    let xEnd = max(c.startTime*pps, c.endTime*pps)
+                    if rectIntersects(rect, xRange: (c.startTime*pps)...xEnd, yRange: yRange) { ids.insert(c.id) }
+                }
+            case .text:
+                for c in project.textTracks[entry.index].clips {
+                    let xEnd = max(c.startTime*pps, c.endTime*pps)
+                    if rectIntersects(rect, xRange: (c.startTime*pps)...xEnd, yRange: yRange) { ids.insert(c.id) }
+                }
             }
+            rowTop += h
         }
         if project.showVideoTracks {
             for ti in project.videoTracks.indices {
@@ -1478,32 +1582,6 @@ struct TimelineView: View {
                 rowTop += h
             }
         }
-        if project.showSubtitleTracks {
-            for ti in project.subtitleTracks.indices {
-                if !first { rowTop += 1 }; first = false
-                let h = subH(ti)
-                let yRange = rowTop ... (rowTop + h)
-                for c in project.subtitleTracks[ti].clips {
-                    let xEnd = max(c.startTime*pps, c.endTime*pps)
-                    let xRange = (c.startTime*pps) ... xEnd
-                    if rectIntersects(rect, xRange: xRange, yRange: yRange) { ids.insert(c.id) }
-                }
-                rowTop += h
-            }
-        }
-        if project.showTextTracks {
-            for ti in project.textTracks.indices {
-                if !first { rowTop += 1 }; first = false
-                let h = txtH(ti)
-                let yRange = rowTop ... (rowTop + h)
-                for c in project.textTracks[ti].clips {
-                    let xEnd = max(c.startTime*pps, c.endTime*pps)
-                    let xRange = (c.startTime*pps) ... xEnd
-                    if rectIntersects(rect, xRange: xRange, yRange: yRange) { ids.insert(c.id) }
-                }
-                rowTop += h
-            }
-        }
 
         project.selectedClipIDs = ids
     }
@@ -1523,11 +1601,13 @@ struct TimelineView: View {
         let threshold: CGFloat = 3
         var top = rulerH
         var first = true
-        if project.showImageTracks {
-            for i in project.imageTracks.indices {
-                if !first { top += 1 }; first = false
-                top += imgH(i)
-                if abs(y - top) <= threshold { return .image(i) }
+        for entry in visibleOverlays {
+            if !first { top += 1 }; first = false
+            top += overlayH(entry)
+            switch entry.kind {
+            case .image: if abs(y - top) <= threshold { return .image(entry.index) }
+            case .subtitle: if abs(y - top) <= threshold { return .subtitle(entry.index) }
+            case .text: if abs(y - top) <= threshold { return .text(entry.index) }
             }
         }
         if project.showVideoTracks {
@@ -1544,32 +1624,16 @@ struct TimelineView: View {
                 if abs(y - top) <= threshold { return .audio(i) }
             }
         }
-        if project.showSubtitleTracks {
-            for i in project.subtitleTracks.indices {
-                if !first { top += 1 }; first = false
-                top += subH(i)
-                if abs(y - top) <= threshold { return .subtitle(i) }
-            }
-        }
-        if project.showTextTracks {
-            for i in project.textTracks.indices {
-                if !first { top += 1 }; first = false
-                top += txtH(i)
-                if abs(y - top) <= threshold { return .text(i) }
-            }
-        }
         return nil
     }
 
     private func totalContentH() -> CGFloat {
         var h = rulerH
         var trackCount = 0
-        if project.showImageTracks    { for i in project.imageTracks.indices    { h += imgH(i) }; trackCount += project.imageTracks.count }
+        for entry in visibleOverlays { h += overlayH(entry); trackCount += 1 }
         if project.showVideoTracks    { for i in project.videoTracks.indices    { h += vidH(i) }; trackCount += project.videoTracks.count }
         if project.showAudioTracks    { for i in project.audioTracks.indices    { h += audH(i) }; trackCount += project.audioTracks.count }
-        if project.showSubtitleTracks { for i in project.subtitleTracks.indices { h += subH(i) }; trackCount += project.subtitleTracks.count }
-        if project.showTextTracks     { for i in project.textTracks.indices     { h += txtH(i) }; trackCount += project.textTracks.count }
-        if trackCount > 1 { h += CGFloat(trackCount - 1) } // 1px gaps
+        if trackCount > 1 { h += CGFloat(trackCount - 1) }
         return h
     }
 
@@ -1585,19 +1649,18 @@ struct TimelineView: View {
         return clipRight >= visibleLeft && clipLeft <= visibleRight
     }
 
+    private func isTrackDragging(_ type: TrackDragType, _ idx: Int) -> Bool {
+        trackLabelDragType == type && trackLabelDragSrc == idx
+    }
+
     private var trackRows: some View {
         VStack(spacing: 1) {
-        if project.showImageTracks {
-            ForEach(project.imageTracks.indices, id:\.self) { i in
-                trackRow(height: imgH(i), hidden: !project.imageTracks[i].isVisible, tint: Color(hex: "#E8A54B")) {
-                    ForEach(project.imageTracks[i].clips.filter { isClipVisible(startTime: $0.startTime, endTime: $0.endTime) }) { clip in
-                        ImageClipView(clip: clip, pps: project.pixelsPerSecond, h: imgH(i),
-                                      sel: isSelected(clip.id, primary: project.selectedImageClipID),
-                                      isDragging: draggingClipID == clip.id,
-                                      scrollOffsetX: scrollOffsetX)
-                    }
-                }
-            }
+        // Overlay tracks (image/subtitle/text) — unified order
+        ForEach(Array(visibleOverlays.enumerated()), id:\.element.trackID) { ovIdx, entry in
+            overlayClipRow(entry: entry)
+                .offset(y: isTrackDragging(.overlay, ovIdx) ? trackLabelDragOffset : 0)
+                .zIndex(isTrackDragging(.overlay, ovIdx) ? 10 : 0)
+                .opacity(isTrackDragging(.overlay, ovIdx) ? 0.55 : 1.0)
         }
         if project.showVideoTracks {
             ForEach(project.videoTracks.indices, id:\.self) { i in
@@ -1608,9 +1671,11 @@ struct TimelineView: View {
                                       isDragging: draggingClipID == clip.id,
                                       scrollOffsetX: scrollOffsetX)
                     }
-                    // 转场图标：相邻视频片段之间
                     transitionIcons(trackIndex: i, trackHeight: vidH(i))
                 }
+                .offset(y: isTrackDragging(.video, i) ? trackLabelDragOffset : 0)
+                .zIndex(isTrackDragging(.video, i) ? 10 : 0)
+                .opacity(isTrackDragging(.video, i) ? 0.55 : 1.0)
             }
         }
         if project.showAudioTracks {
@@ -1623,32 +1688,46 @@ struct TimelineView: View {
                                       scrollOffsetX: scrollOffsetX)
                     }
                 }
+                .offset(y: isTrackDragging(.audio, i) ? trackLabelDragOffset : 0)
+                .zIndex(isTrackDragging(.audio, i) ? 10 : 0)
+                .opacity(isTrackDragging(.audio, i) ? 0.55 : 1.0)
             }
         }
-        if project.showSubtitleTracks {
-            ForEach(project.subtitleTracks.indices, id:\.self) { i in
-                trackRow(height: subH(i), hidden: !project.subtitleTracks[i].isVisible, tint: Color(hex: "#7B6FC4")) {
-                    ForEach(project.subtitleTracks[i].clips.filter { isClipVisible(startTime: $0.startTime, endTime: $0.endTime) }) { clip in
-                        SubtitleClipView(clip: clip, pps: project.pixelsPerSecond, h: subH(i),
-                                         sel: isSelected(clip.id, primary: project.selectedSubtitleClipID),
-                                         isDragging: draggingClipID == clip.id,
-                                         scrollOffsetX: scrollOffsetX)
-                    }
+        }
+        .overlay(trackDropIndicatorLine())
+    }
+
+    @ViewBuilder
+    private func overlayClipRow(entry: ResolvedOverlay) -> some View {
+        let i = entry.index
+        switch entry.kind {
+        case .image:
+            trackRow(height: imgH(i), hidden: !project.imageTracks[i].isVisible, tint: Color(hex: "#E8A54B")) {
+                ForEach(project.imageTracks[i].clips.filter { isClipVisible(startTime: $0.startTime, endTime: $0.endTime) }) { clip in
+                    ImageClipView(clip: clip, pps: project.pixelsPerSecond, h: imgH(i),
+                                  sel: isSelected(clip.id, primary: project.selectedImageClipID),
+                                  isDragging: draggingClipID == clip.id,
+                                  scrollOffsetX: scrollOffsetX)
                 }
             }
-        }
-        if project.showTextTracks {
-            ForEach(project.textTracks.indices, id:\.self) { i in
-                trackRow(height: txtH(i), hidden: !project.textTracks[i].isVisible, tint: Color(hex: "#D4668E")) {
-                    ForEach(project.textTracks[i].clips.filter { isClipVisible(startTime: $0.startTime, endTime: $0.endTime) }) { clip in
-                        TextClipView(clip: clip, pps: project.pixelsPerSecond, h: txtH(i),
-                                     sel: isSelected(clip.id, primary: project.selectedTextClipID),
+        case .subtitle:
+            trackRow(height: subH(i), hidden: !project.subtitleTracks[i].isVisible, tint: Color(hex: "#7B6FC4")) {
+                ForEach(project.subtitleTracks[i].clips.filter { isClipVisible(startTime: $0.startTime, endTime: $0.endTime) }) { clip in
+                    SubtitleClipView(clip: clip, pps: project.pixelsPerSecond, h: subH(i),
+                                     sel: isSelected(clip.id, primary: project.selectedSubtitleClipID),
                                      isDragging: draggingClipID == clip.id,
                                      scrollOffsetX: scrollOffsetX)
-                    }
                 }
             }
-        }
+        case .text:
+            trackRow(height: txtH(i), hidden: !project.textTracks[i].isVisible, tint: Color(hex: "#D4668E")) {
+                ForEach(project.textTracks[i].clips.filter { isClipVisible(startTime: $0.startTime, endTime: $0.endTime) }) { clip in
+                    TextClipView(clip: clip, pps: project.pixelsPerSecond, h: txtH(i),
+                                 sel: isSelected(clip.id, primary: project.selectedTextClipID),
+                                 isDragging: draggingClipID == clip.id,
+                                 scrollOffsetX: scrollOffsetX)
+                }
+            }
         }
     }
 
@@ -1700,63 +1779,66 @@ struct TimelineView: View {
     }
 
     private func trackRowForClip(_ hit: ClipHit) -> Int {
-        let iCount = project.imageTracks.count
+        let overlays = resolvedOverlays
+        let oCount = overlays.count
         let vCount = project.videoTracks.count
-        let aCount = project.audioTracks.count
-        let sCount = project.subtitleTracks.count
         switch hit {
         case .image(let id, _, _):
             let ti = project.imageTracks.firstIndex { $0.clips.contains { $0.id == id } } ?? 0
-            return ti
-        case .video(let id, _, _):
-            let ti = project.videoTracks.firstIndex { $0.clips.contains { $0.id == id } } ?? 0
-            return iCount + ti
-        case .audio(let id, _, _):
-            let ti = project.audioTracks.firstIndex { $0.clips.contains { $0.id == id } } ?? 0
-            return iCount + vCount + ti
+            let trackID = project.imageTracks[ti].id
+            return overlays.firstIndex { $0.trackID == trackID } ?? 0
         case .subtitle(let id, _, _):
             let ti = project.subtitleTracks.firstIndex { $0.clips.contains { $0.id == id } } ?? 0
-            return iCount + vCount + aCount + ti
+            let trackID = project.subtitleTracks[ti].id
+            return overlays.firstIndex { $0.trackID == trackID } ?? 0
         case .text(let id, _, _):
             let ti = project.textTracks.firstIndex { $0.clips.contains { $0.id == id } } ?? 0
-            return iCount + vCount + aCount + sCount + ti
+            let trackID = project.textTracks[ti].id
+            return overlays.firstIndex { $0.trackID == trackID } ?? 0
+        case .video(let id, _, _):
+            let ti = project.videoTracks.firstIndex { $0.clips.contains { $0.id == id } } ?? 0
+            return oCount + ti
+        case .audio(let id, _, _):
+            let ti = project.audioTracks.firstIndex { $0.clips.contains { $0.id == id } } ?? 0
+            return oCount + vCount + ti
         }
     }
 
     private func trackCenterY(row: Int) -> CGFloat {
-        let iCount = project.showImageTracks ? project.imageTracks.count : 0
+        let overlays = resolvedOverlays
+        let oCount = overlays.count
         let vCount = project.showVideoTracks ? project.videoTracks.count : 0
-        let aCount = project.showAudioTracks ? project.audioTracks.count : 0
-        let sCount = project.showSubtitleTracks ? project.subtitleTracks.count : 0
         var top = rulerH
+
+        func heightForRow(_ r: Int) -> CGFloat {
+            if r < oCount { return overlayH(overlays[r]) }
+            let afterOverlay = r - oCount
+            if afterOverlay < vCount { return vidH(afterOverlay) }
+            return audH(afterOverlay - vCount)
+        }
+
         for r in 0..<row {
             if r > 0 { top += 1 }
-            if r < iCount { top += imgH(r) }
-            else if r < iCount + vCount { top += vidH(r - iCount) }
-            else if r < iCount + vCount + aCount { top += audH(r - iCount - vCount) }
-            else if r < iCount + vCount + aCount + sCount { top += subH(r - iCount - vCount - aCount) }
-            else { top += txtH(r - iCount - vCount - aCount - sCount) }
+            top += heightForRow(r)
         }
         if row > 0 { top += 1 }
-        let h: CGFloat
-        if row < iCount { h = imgH(row) }
-        else if row < iCount + vCount { h = vidH(row - iCount) }
-        else if row < iCount + vCount + aCount { h = audH(row - iCount - vCount) }
-        else if row < iCount + vCount + aCount + sCount { h = subH(row - iCount - vCount - aCount) }
-        else { h = txtH(row - iCount - vCount - aCount - sCount) }
-        return top + h / 2
+        return top + heightForRow(row) / 2
     }
 
     private func trackIndexFromY(_ y: CGFloat) -> TrackTarget {
         var top = rulerH
         var first = true
-        if project.showImageTracks {
-            for i in project.imageTracks.indices {
-                if !first { top += 1 }; first = false
-                let h = imgH(i)
-                if y < top + h { return TrackTarget(imageIndex: i) }
-                top += h
+        for entry in visibleOverlays {
+            if !first { top += 1 }; first = false
+            let h = overlayH(entry)
+            if y < top + h {
+                switch entry.kind {
+                case .image: return TrackTarget(imageIndex: entry.index)
+                case .subtitle: return TrackTarget(subtitleIndex: entry.index)
+                case .text: return TrackTarget(textIndex: entry.index)
+                }
             }
+            top += h
         }
         if project.showVideoTracks {
             for i in project.videoTracks.indices {
@@ -1771,22 +1853,6 @@ struct TimelineView: View {
                 if !first { top += 1 }; first = false
                 let h = audH(i)
                 if y < top + h { return TrackTarget(audioIndex: i) }
-                top += h
-            }
-        }
-        if project.showSubtitleTracks {
-            for i in project.subtitleTracks.indices {
-                if !first { top += 1 }; first = false
-                let h = subH(i)
-                if y < top + h { return TrackTarget(subtitleIndex: i) }
-                top += h
-            }
-        }
-        if project.showTextTracks {
-            for i in project.textTracks.indices {
-                if !first { top += 1 }; first = false
-                let h = txtH(i)
-                if y < top + h { return TrackTarget(textIndex: i) }
                 top += h
             }
         }
@@ -1883,8 +1949,13 @@ private struct TrackLabel: View {
     var hasVis: Bool = true
     let onMute: (() -> Void)?
     let onVis: () -> Void; let onDel: () -> Void
+    var onDragChanged: ((CGFloat) -> Void)? = nil
+    var onDragEnded: ((CGFloat) -> Void)? = nil
 
     @State private var isHovered = false
+    @State private var isDragging = false
+
+    private var showHandle: Bool { (isHovered || isDragging) && onDragChanged != nil }
 
     var body: some View {
         ZStack {
@@ -1898,14 +1969,12 @@ private struct TrackLabel: View {
                     .font(.system(size: 9, weight: .medium).monospacedDigit())
                     .foregroundColor(Color.labelSecondary.opacity(0.6))
             }
-            .padding(.horizontal, 8)
+            .padding(.leading, 8)
+            .padding(.trailing, 8)
             .opacity(isHovered ? 0 : 1)
 
-            // hover 时：操作按钮（提亮背景 + 按钮浮层）
             if isHovered {
-                Color.white.opacity(0.06)
-
-                HStack(spacing: 3) {
+                HStack(spacing: 2) {
                     if hasMute, let onMute {
                         OverlayBtn(icon: isMuted ? "speaker.slash" : "speaker.wave.2",
                                    action: onMute)
@@ -1918,13 +1987,28 @@ private struct TrackLabel: View {
                                action: onDel)
                 }
             }
+
+            // 拖拽手柄（overlay 不影响布局）
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color.white.opacity(0.02))
+        .overlay(alignment: .topLeading) {
+            if showHandle {
+                Image(systemName: "line.3.horizontal")
+                    .font(.system(size: 7, weight: .medium))
+                    .foregroundColor(Color.labelSecondary.opacity(0.5))
+                    .frame(width: 14, height: 14)
+                    .contentShape(Rectangle())
+                    .gesture(DragGesture()
+                        .onChanged { v in isDragging = true; onDragChanged?(v.translation.height) }
+                        .onEnded { v in isDragging = false; onDragEnded?(v.translation.height) })
+            }
+        }
         .overlay(
             RoundedRectangle(cornerRadius: 0)
                 .stroke(Color.white.opacity(isHovered ? 0.08 : 0), lineWidth: 0.5)
         )
+        .contentShape(Rectangle())
         .onHover { isHovered = $0 }
         .animation(.easeInOut(duration: 0.15), value: isHovered)
     }
@@ -1965,7 +2049,13 @@ private struct TextTrackLabel: View {
     let title: String; let count: Int
     let isVis: Bool
     let onVis: () -> Void; let onDel: () -> Void
+    var onDragChanged: ((CGFloat) -> Void)? = nil
+    var onDragEnded: ((CGFloat) -> Void)? = nil
     @State private var isHovered = false
+    @State private var isDragging = false
+
+    private var showHandle: Bool { (isHovered || isDragging) && onDragChanged != nil }
+
     var body: some View {
         ZStack {
             HStack {
@@ -1977,20 +2067,35 @@ private struct TextTrackLabel: View {
                     .font(.system(size: 9, weight: .medium).monospacedDigit())
                     .foregroundColor(Color.labelSecondary.opacity(0.6))
             }
-            .padding(.horizontal, 8)
+            .padding(.leading, 8)
+            .padding(.trailing, 8)
             .opacity(isHovered ? 0 : 1)
+
             if isHovered {
-                Color.white.opacity(0.06)
-                HStack(spacing: 3) {
+                HStack(spacing: 2) {
                     OverlayBtn(icon: isVis ? "eye" : "eye.slash", action: onVis)
                     OverlayBtn(icon: "trash", destructive: true, action: onDel)
                 }
             }
+
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color.white.opacity(0.02))
+        .overlay(alignment: .topLeading) {
+            if showHandle {
+                Image(systemName: "line.3.horizontal")
+                    .font(.system(size: 7, weight: .medium))
+                    .foregroundColor(Color.labelSecondary.opacity(0.5))
+                    .frame(width: 14, height: 14)
+                    .contentShape(Rectangle())
+                    .gesture(DragGesture()
+                        .onChanged { v in isDragging = true; onDragChanged?(v.translation.height) }
+                        .onEnded { v in isDragging = false; onDragEnded?(v.translation.height) })
+            }
+        }
         .overlay(RoundedRectangle(cornerRadius: 0)
             .stroke(Color.white.opacity(isHovered ? 0.08 : 0), lineWidth: 0.5))
+        .contentShape(Rectangle())
         .onHover { isHovered = $0 }
         .animation(.easeInOut(duration: 0.15), value: isHovered)
     }
@@ -2006,15 +2111,7 @@ private struct OverlayBtn: View {
             Image(systemName: icon)
                 .font(.system(size: 9, weight: .medium))
                 .foregroundColor(hov ? (destructive ? .red.opacity(0.9) : .white.opacity(0.95)) : Color.labelSecondary)
-                .frame(width: 22, height: 22)
-                .background(
-                    RoundedRectangle(cornerRadius: 6)
-                        .fill(hov ? Color.white.opacity(0.16) : Color.white.opacity(0.07))
-                )
-                .overlay(
-                    RoundedRectangle(cornerRadius: 6)
-                        .stroke(Color.white.opacity(hov ? 0.15 : 0.05), lineWidth: 0.5)
-                )
+                .frame(width: 20, height: 20)
         }
         .buttonStyle(.plain)
         .onHover { hov = $0 }
@@ -2114,7 +2211,7 @@ private struct VideoClipView: View {
         }
         .frame(width: w, height: h-4)
         .clipShape(RoundedRectangle(cornerRadius: 6))
-        .opacity(isDragging ? 0 : (project.clipboardIsCut && project.clipboardSourceID == clip.id ? 0.35 : 1.0))
+        .opacity(isDragging ? 0 : (project.clipboardIsCut && project.clipboardSourceIDs.contains(clip.id) ? 0.35 : 1.0))
         .animation(isReloading ? .easeInOut(duration: 0.8).repeatForever(autoreverses: true) : .default, value: thumbBreathing)
         .onChange(of: isReloading) { loading in thumbBreathing = loading }
         .offset(x: clip.startTime*pps + 1)
@@ -2208,7 +2305,7 @@ private struct ImageClipView: View {
         }
         .frame(width: w, height: h-4)
         .clipShape(RoundedRectangle(cornerRadius: 6))
-        .opacity(isDragging ? 0 : (project.clipboardIsCut && project.clipboardSourceID == clip.id ? 0.35 : 1.0))
+        .opacity(isDragging ? 0 : (project.clipboardIsCut && project.clipboardSourceIDs.contains(clip.id) ? 0.35 : 1.0))
         .offset(x: clip.startTime*pps + 1)
         .allowsHitTesting(false)
     }
@@ -2269,7 +2366,7 @@ private struct AudioClipView: View {
         }
         .frame(width: w, height: h-4)
         .clipShape(RoundedRectangle(cornerRadius: 6))
-        .opacity(isDragging ? 0 : (project.clipboardIsCut && project.clipboardSourceID == clip.id ? 0.35 : 1.0))
+        .opacity(isDragging ? 0 : (project.clipboardIsCut && project.clipboardSourceIDs.contains(clip.id) ? 0.35 : 1.0))
         .offset(x: clip.startTime*pps + 1)
         .onAppear {
             if let url = clip.url {
@@ -2379,7 +2476,7 @@ private struct SubtitleClipView: View {
         }
         .frame(width: w, height: clipH)
         .opacity(isDragging ? 0 : isPlaceholder ? (breathing ? 0.7 : 0.3) :
-                 (project.clipboardIsCut && project.clipboardSourceID == clip.id ? 0.35 : 1.0))
+                 (project.clipboardIsCut && project.clipboardSourceIDs.contains(clip.id) ? 0.35 : 1.0))
         .animation(isPlaceholder ? .easeInOut(duration: 0.8).repeatForever(autoreverses: true) : .default, value: breathing)
         .onAppear { if isPlaceholder { breathing = true } }
         .onChange(of: isPlaceholder) { ph in breathing = ph }
@@ -2428,7 +2525,7 @@ private struct TextClipView: View {
         }
         .frame(width: w, height: clipH)
         .opacity(isDragging ? 0 :
-                 (project.clipboardIsCut && project.clipboardSourceID == clip.id ? 0.35 : 1.0))
+                 (project.clipboardIsCut && project.clipboardSourceIDs.contains(clip.id) ? 0.35 : 1.0))
         .offset(x: clip.startTime*pps + 1)
         .allowsHitTesting(false)
     }
@@ -2587,7 +2684,7 @@ struct TimelineToolbar: View {
     private var hasSelection: Bool {
         project.selectedVideoClipID != nil || project.selectedImageClipID != nil ||
         project.selectedAudioClipID != nil || project.selectedSubtitleClipID != nil ||
-        !project.selectedClipIDs.isEmpty
+        project.selectedTextClipID != nil || !project.selectedClipIDs.isEmpty
     }
     var body: some View {
         HStack(spacing:0) {
@@ -2596,19 +2693,11 @@ struct TimelineToolbar: View {
                 TBtn(icon:"arrow.uturn.backward", help:"撤销", enabled: project.undoCount > 0) { project.undo() }
                 TBtn(icon:"arrow.uturn.forward",  help:"重做", enabled: project.redoCount > 0) { project.redo() }
                 Divider().frame(height:16).padding(.horizontal,4)
-                TBtn(icon:"scissors",         help:"在播放头分割片段", enabled: hasSelection && project.selectedImageClipID == nil) { project.splitAtPlayhead() }
+                TBtn(icon:"scissors",         help:"在播放头分割片段", enabled: hasSelection && project.selectedImageClipID == nil && project.selectedTextClipID == nil) { project.splitAtPlayhead() }
                 TBtn(icon:"trash",            help:"删除选中片段", enabled: hasSelection)   { project.deleteSelected() }
                 TBtn(icon:"text.alignleft",   help:"将选中片段对齐到播放头", enabled: hasSelection) { project.alignSelectedToPlayhead() }
                 TBtn(icon:"character.bubble", help:"在当前字幕轨道插入字幕")  { project.insertSubtitleAtPlayhead() }
-                Button { project.addTextAtPlayhead() } label: {
-                    Text("T").font(.system(size: 14, weight: .bold, design: .serif))
-                        .foregroundColor(Color.labelSecondary)
-                        .frame(width: 28, height: 28)
-                        .background(Color.clear)
-                        .cornerRadius(5)
-                }
-                .buttonStyle(.plain)
-                .help("添加文字/标题图层")
+                TextToolBtn { project.addTextAtPlayhead() }
 
                 Divider().frame(height:16).padding(.horizontal,4)
 
@@ -2826,8 +2915,9 @@ private struct TranslateToolGroup: View {
         project.translationDone = 0
         project.translationProgress = 0
 
-        Task {
+        project.translationTask = Task {
             let translated = await Translator.translateSmart(clip.text, to: lang)
+            guard !Task.isCancelled else { return }
             await MainActor.run {
                 if let ci = project.subtitleTracks[destIdx].clips.firstIndex(where: { $0.id == placeholder.id }) {
                     project.subtitleTracks[destIdx].clips[ci] = SubtitleClip(
@@ -2835,16 +2925,11 @@ private struct TranslateToolGroup: View {
                 }
                 project.placeholderClipIDs.remove(placeholder.id)
                 project.translatingTrackIndices.remove(destIdx)
-                project.translationDone = 1
-                project.translationProgress = 1
-                // 延迟清除进度
-                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
-                    if project.translatingTrackIndices.isEmpty {
-                        project.translationTotal = 0
-                        project.translationDone = 0
-                        project.translationProgress = 0
-                    }
-                }
+                project.translationTotal = 0
+                project.translationDone = 0
+                project.translationProgress = 0
+                project.translationTask = nil
+                project.showSuccessToast(icon: "checkmark", title: "翻译", subtitle: "翻译完成")
             }
         }
     }
@@ -2870,9 +2955,11 @@ private struct TranslateToolGroup: View {
         project.translationDone = 0
         project.translationProgress = 0
 
-        Task {
+        project.translationTask = Task {
             for (i, c) in originals.enumerated() {
+                guard !Task.isCancelled else { return }
                 let t = await Translator.translateSmart(c.text, to: lang)
+                guard !Task.isCancelled else { return }
                 await MainActor.run {
                     let phID = placeholders[i].id
                     if let ci = project.subtitleTracks[destIdx].clips.firstIndex(where: { $0.id == phID }) {
@@ -2884,16 +2971,14 @@ private struct TranslateToolGroup: View {
                     project.translationProgress = Double(i + 1) / Double(originals.count)
                 }
             }
+            guard !Task.isCancelled else { return }
             await MainActor.run {
                 project.translatingTrackIndices.remove(destIdx)
-                // 延迟清除进度
-                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
-                    if project.translatingTrackIndices.isEmpty {
-                        project.translationTotal = 0
-                        project.translationDone = 0
-                        project.translationProgress = 0
-                    }
-                }
+                project.translationTotal = 0
+                project.translationDone = 0
+                project.translationProgress = 0
+                project.translationTask = nil
+                project.showSuccessToast(icon: "checkmark", title: "翻译", subtitle: "翻译完成")
             }
         }
     }
@@ -2919,6 +3004,23 @@ private struct TBtn: View {
         .disabled(!enabled)
         .onHover { hov = $0 }
         .help(help ?? "")
+    }
+}
+
+private struct TextToolBtn: View {
+    let action: () -> Void
+    @State private var hov = false
+    var body: some View {
+        Button(action: action) {
+            Text("T").font(.system(size: 14, weight: .bold, design: .serif))
+                .foregroundColor(hov ? Color.labelPrimary : Color.labelSecondary)
+                .frame(width: 28, height: 28)
+                .background(hov ? Color.white.opacity(0.08) : Color.clear)
+                .cornerRadius(5)
+        }
+        .buttonStyle(.plain)
+        .onHover { hov = $0 }
+        .help("添加文字/标题图层")
     }
 }
 

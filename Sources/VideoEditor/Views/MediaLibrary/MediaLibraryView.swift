@@ -53,21 +53,12 @@ struct MediaLibraryView: View {
                     .foregroundColor(Color.labelSecondary)
                     .textCase(.uppercase)
                 Spacer()
-                Button { project.showClearLibraryConfirm = true } label: {
-                    Image(systemName: "paintbrush")
-                        .font(.system(size: 11, weight: .medium))
-                        .foregroundColor(project.mediaAssets.isEmpty ? Color.labelSecondary.opacity(0.3) : Color.labelSecondary)
+                MediaToolBtn(icon: "paintbrush", enabled: !project.mediaAssets.isEmpty, help: "清空素材库") {
+                    project.showClearLibraryConfirm = true
                 }
-                .buttonStyle(.plain)
-                .disabled(project.mediaAssets.isEmpty)
-                .help("清空素材库")
-                Button { project.refreshMediaLibrary() } label: {
-                    Image(systemName: "arrow.clockwise")
-                        .font(.system(size: 11, weight: .medium))
-                        .foregroundColor(Color.labelSecondary)
+                MediaToolBtn(icon: "arrow.clockwise", help: "刷新素材库") {
+                    project.refreshMediaLibrary()
                 }
-                .buttonStyle(.plain)
-                .help("刷新素材库")
             }
             .padding(.leading, 10)
             .padding(.trailing, 8)
@@ -80,7 +71,7 @@ struct MediaLibraryView: View {
                 tabBtn("audio", icon: "music.note")
                 tabBtn("image", icon: "photo")
                 tabBtn("subtitle", icon: "captions.bubble")
-                tabBtn("transition", icon: "arrow.left.arrow.right")
+                tabBtnBowtie("transition")
                 tabBtnT("text")
             }
             .background(Color.white.opacity(0.06))
@@ -113,14 +104,9 @@ struct MediaLibraryView: View {
                     .background(Color.white.opacity(0.06))
                     .clipShape(RoundedRectangle(cornerRadius: 6))
 
-                    Button {
+                    MediaToolBtn(icon: "arrow.up.arrow.down", help: "排序") {
                         showSortNSMenu(project: project)
-                    } label: {
-                        Image(systemName: "arrow.up.arrow.down")
-                            .font(.system(size: 11, weight: .medium))
-                            .foregroundColor(Color.labelSecondary)
                     }
-                    .buttonStyle(.plain)
                 }
                 .padding(.horizontal, 8)
                 .padding(.bottom, 6)
@@ -226,6 +212,20 @@ struct MediaLibraryView: View {
     }
 
     @ViewBuilder
+    private func tabBtnBowtie(_ tab: String) -> some View {
+        let isActive = project.mediaLibraryTab == tab
+        Button { project.mediaLibraryTab = tab } label: {
+            BowtieIcon(size: 12, color: isActive ? .white : Color.labelSecondary)
+                .frame(maxWidth: .infinity)
+                .frame(height: 26)
+                .background(isActive ? Color.white.opacity(0.15) : Color.clear)
+                .clipShape(Capsule())
+                .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+    }
+
+    @ViewBuilder
     private func tabBtn(_ tab: String, icon: String) -> some View {
         let isActive = project.mediaLibraryTab == tab
         Button { project.mediaLibraryTab = tab } label: {
@@ -242,8 +242,17 @@ struct MediaLibraryView: View {
     }
 
     private var emptyState: some View {
-        VStack(spacing: 10) {
-            Image(systemName: "photo.badge.plus")
+        let icon: String = {
+            switch project.mediaLibraryTab {
+            case "video":    return "film"
+            case "audio":    return "music.note"
+            case "image":    return "photo"
+            case "subtitle": return "captions.bubble"
+            default:         return "photo.badge.plus"
+            }
+        }()
+        return VStack(spacing: 10) {
+            Image(systemName: icon)
                 .font(.system(size: 28, weight: .ultraLight))
                 .foregroundColor(Color.labelSecondary.opacity(0.30))
             Text("拖入文件或点击导入")
@@ -953,57 +962,44 @@ private struct TransitionPanel: View {
         return project.videoTracks.flatMap(\.clips).first(where: { $0.id == id })?.inTransition
     }
 
-    var body: some View {
-        VStack(spacing: 0) {
-            if project.selectedTransitionClipID == nil {
-                // 未选中转场图标
-                VStack(spacing: 10) {
-                    Image(systemName: "arrow.left.arrow.right")
-                        .font(.system(size: 28, weight: .ultraLight))
-                        .foregroundColor(Color.labelSecondary.opacity(0.30))
-                    Text("点击时间轴中片段间的\n菱形图标选择转场")
-                        .font(.system(size: 11))
-                        .foregroundColor(Color.labelSecondary.opacity(0.45))
-                        .multilineTextAlignment(.center)
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else {
-                ScrollView(showsIndicators: false) {
-                    VStack(alignment: .leading, spacing: 10) {
-                        // 效果列表
-                        Text("选择效果")
-                            .font(.system(size: 10, weight: .medium))
-                            .foregroundColor(Color.labelSecondary)
-                            .padding(.horizontal, 10)
-                            .padding(.top, 4)
+    private var hasSelection: Bool { project.selectedTransitionClipID != nil }
 
-                        LazyVGrid(columns: [GridItem(.flexible(), spacing: 6),
-                                            GridItem(.flexible(), spacing: 6)], spacing: 6) {
-                            ForEach(TransitionType.allCases, id: \.self) { type in
-                                TransitionPreviewCard(
-                                    type: type,
-                                    isSelected: selectedClipTransition?.type == type,
-                                    onSelect: {
-                                        guard let clipID = project.selectedTransitionClipID else { return }
-                                        project.pushUndo()
-                                        project.updateVideoClip(id: clipID) {
-                                            if $0.inTransition == nil {
-                                                $0.inTransition = Transition(type: type)
-                                            } else {
-                                                $0.inTransition?.type = type
-                                            }
-                                        }
-                                        project.rebuildTimelinePreviewDebounced()
-                                    }
-                                )
-                            }
-                        }
-                        .padding(.horizontal, 8)
-                    }
-                    .padding(.top, 6)
-                    .padding(.bottom, 8)
+    var body: some View {
+        ScrollView(showsIndicators: false) {
+            VStack(alignment: .leading, spacing: 10) {
+                if hasSelection {
+                    Text("选择转场")
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundColor(Color.labelSecondary)
+                        .padding(.horizontal, 10)
+                        .padding(.top, 4)
                 }
+
+                LazyVGrid(columns: [GridItem(.flexible(), spacing: 6),
+                                    GridItem(.flexible(), spacing: 6)], spacing: 6) {
+                    ForEach(TransitionType.allCases, id: \.self) { type in
+                        TransitionPreviewCard(
+                            type: type,
+                            isSelected: hasSelection && selectedClipTransition?.type == type,
+                            onSelect: {
+                                guard let clipID = project.selectedTransitionClipID else { return }
+                                project.pushUndo()
+                                project.updateVideoClip(id: clipID) {
+                                    if $0.inTransition == nil {
+                                        $0.inTransition = Transition(type: type)
+                                    } else {
+                                        $0.inTransition?.type = type
+                                    }
+                                }
+                                project.rebuildTimelinePreviewDebounced()
+                            }
+                        )
+                    }
+                }
+                .padding(.horizontal, 8)
             }
+            .padding(.top, 6)
+            .padding(.bottom, 8)
         }
     }
 }
@@ -1168,4 +1164,55 @@ func showSortNSMenu(project: ProjectState) {
     let winPoint = window.convertPoint(fromScreen: loc)
     let viewPoint = contentView.convert(winPoint, from: nil)
     menu.popUp(positioning: nil, at: viewPoint, in: contentView)
+}
+
+private struct MediaToolBtn: View {
+    let icon: String
+    var enabled: Bool = true
+    var help: String = ""
+    let action: () -> Void
+    @State private var hov = false
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: icon)
+                .font(.system(size: 11, weight: .medium))
+                .foregroundColor(enabled ? (hov ? Color.labelPrimary : Color.labelSecondary)
+                                         : Color.labelSecondary.opacity(0.3))
+                .frame(width: 24, height: 24)
+                .background((enabled && hov) ? Color.white.opacity(0.08) : Color.clear)
+                .cornerRadius(4)
+        }
+        .buttonStyle(.plain)
+        .disabled(!enabled)
+        .onHover { hov = $0 }
+        .help(help)
+    }
+}
+
+// MARK: - Bowtie Transition Icon
+
+private struct BowtieIcon: View {
+    let size: CGFloat
+    let color: Color
+
+    var body: some View {
+        Canvas { ctx, sz in
+            let w = sz.width, h = sz.height
+            let mx = w / 2
+            let inset = w * 0.08
+            var left = Path()
+            left.move(to: CGPoint(x: inset, y: 0))
+            left.addLine(to: CGPoint(x: mx, y: h / 2))
+            left.addLine(to: CGPoint(x: inset, y: h))
+            left.closeSubpath()
+            var right = Path()
+            right.move(to: CGPoint(x: w - inset, y: 0))
+            right.addLine(to: CGPoint(x: mx, y: h / 2))
+            right.addLine(to: CGPoint(x: w - inset, y: h))
+            right.closeSubpath()
+            ctx.fill(left, with: .color(color))
+            ctx.fill(right, with: .color(color))
+        }
+        .frame(width: size, height: size)
+    }
 }
