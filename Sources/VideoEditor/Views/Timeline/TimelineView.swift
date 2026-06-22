@@ -2833,8 +2833,8 @@ private struct TranslateToolGroup: View {
             }
             .buttonStyle(.plain)
 
-            TBtn(icon: "translate", help: "翻译当前字幕",
-                 enabled: project.selectedSubtitleClip != nil) { translateCurrent() }
+            TBtn(icon: "translate", help: "翻译选中字幕",
+                 enabled: project.selectedSubtitleClipID != nil) { translateCurrent() }
             TBtn(icon: "list.bullet.rectangle", help: "翻译整条轨道",
                  enabled: translateAllEnabled) { translateAll() }
             TBtn(icon: project.isTranscribing ? "waveform" : "waveform.badge.mic",
@@ -2890,41 +2890,68 @@ private struct TranslateToolGroup: View {
     }
 
     /// 在源轨道下方新建翻译轨道，返回新轨道 index
-    private func createTranslationTrack(after srcIdx: Int) -> Int {
+    private func createTranslationTrack(before srcIdx: Int) -> Int {
         let lang = shortLang(project.translationTargetLang)
         var newTrack = Track<SubtitleClip>(label: "字幕(\(lang))")
         newTrack.subtitleStyle = SubtitleStyle()
-        let insertIdx = srcIdx + 1
-        project.subtitleTracks.insert(newTrack, at: insertIdx)
-        return insertIdx
+        let srcTrackID = project.subtitleTracks[srcIdx].id
+        project.subtitleTracks.insert(newTrack, at: srcIdx)
+        let newRef = ProjectState.OverlayTrackRef.subtitle(newTrack.id)
+        if let oi = project.overlayTrackOrder.firstIndex(where: { $0 == .subtitle(srcTrackID) }) {
+            project.overlayTrackOrder.insert(newRef, at: oi)
+        } else {
+            project.syncOverlayOrder()
+        }
+        return srcIdx
     }
 
     private func translateCurrent() {
-        guard let clip = project.selectedSubtitleClip,
-              let srcIdx = sourceTrackIndex() else { return }
+        guard let srcIdx = sourceTrackIndex() else { return }
+
+        var allSelectedIDs = project.selectedClipIDs
+        if let pid = project.selectedSubtitleClipID { allSelectedIDs.insert(pid) }
+        let srcClips = project.subtitleTracks[srcIdx].clips
+        let clips = srcClips.filter { allSelectedIDs.contains($0.id) }
+            .sorted { $0.startTime < $1.startTime }
+        guard !clips.isEmpty else { return }
+
         let lang = project.translationTargetLang
         project.pushUndo()
-        let destIdx = createTranslationTrack(after: srcIdx)
+        let destIdx = createTranslationTrack(before: srcIdx)
+        let destTrackID = project.subtitleTracks[destIdx].id
 
-        // 插入占位字幕
-        let placeholder = SubtitleClip(text: "", startTime: clip.startTime, endTime: clip.endTime)
-        project.subtitleTracks[destIdx].clips.append(placeholder)
-        project.placeholderClipIDs.insert(placeholder.id)
-        project.translatingTrackIndices.insert(destIdx)
-        project.translationTotal = 1
+        var placeholders: [SubtitleClip] = []
+        for c in clips {
+            let ph = SubtitleClip(text: "", startTime: c.startTime, endTime: c.endTime)
+            placeholders.append(ph)
+            project.placeholderClipIDs.insert(ph.id)
+        }
+        project.subtitleTracks[destIdx].clips = placeholders
+        project.translatingTrackIDs.insert(destTrackID)
+        project.translationTotal = clips.count
         project.translationDone = 0
         project.translationProgress = 0
 
         project.translationTask = Task {
-            let translated = await Translator.translateSmart(clip.text, to: lang)
+            for (i, c) in clips.enumerated() {
+                guard !Task.isCancelled else { return }
+                let translated = await Translator.translateSmart(c.text, to: lang)
+                guard !Task.isCancelled else { return }
+                await MainActor.run {
+                    guard let ti = project.subtitleTracks.firstIndex(where: { $0.id == destTrackID }) else { return }
+                    let phID = placeholders[i].id
+                    if let ci = project.subtitleTracks[ti].clips.firstIndex(where: { $0.id == phID }) {
+                        project.subtitleTracks[ti].clips[ci] = SubtitleClip(
+                            text: translated, startTime: c.startTime, endTime: c.endTime)
+                    }
+                    project.placeholderClipIDs.remove(phID)
+                    project.translationDone = i + 1
+                    project.translationProgress = Double(i + 1) / Double(clips.count)
+                }
+            }
             guard !Task.isCancelled else { return }
             await MainActor.run {
-                if let ci = project.subtitleTracks[destIdx].clips.firstIndex(where: { $0.id == placeholder.id }) {
-                    project.subtitleTracks[destIdx].clips[ci] = SubtitleClip(
-                        text: translated, startTime: clip.startTime, endTime: clip.endTime)
-                }
-                project.placeholderClipIDs.remove(placeholder.id)
-                project.translatingTrackIndices.remove(destIdx)
+                project.translatingTrackIDs.remove(destTrackID)
                 project.translationTotal = 0
                 project.translationDone = 0
                 project.translationProgress = 0
@@ -2940,9 +2967,9 @@ private struct TranslateToolGroup: View {
         let originals = project.subtitleTracks[srcIdx].clips
         guard !originals.isEmpty else { return }
         project.pushUndo()
-        let destIdx = createTranslationTrack(after: srcIdx)
+        let destIdx = createTranslationTrack(before: srcIdx)
+        let destTrackID = project.subtitleTracks[destIdx].id
 
-        // 插入所有占位字幕
         var placeholders: [SubtitleClip] = []
         for c in originals {
             let ph = SubtitleClip(text: "", startTime: c.startTime, endTime: c.endTime)
@@ -2950,7 +2977,7 @@ private struct TranslateToolGroup: View {
             project.placeholderClipIDs.insert(ph.id)
         }
         project.subtitleTracks[destIdx].clips = placeholders
-        project.translatingTrackIndices.insert(destIdx)
+        project.translatingTrackIDs.insert(destTrackID)
         project.translationTotal = originals.count
         project.translationDone = 0
         project.translationProgress = 0
@@ -2961,9 +2988,10 @@ private struct TranslateToolGroup: View {
                 let t = await Translator.translateSmart(c.text, to: lang)
                 guard !Task.isCancelled else { return }
                 await MainActor.run {
+                    guard let ti = project.subtitleTracks.firstIndex(where: { $0.id == destTrackID }) else { return }
                     let phID = placeholders[i].id
-                    if let ci = project.subtitleTracks[destIdx].clips.firstIndex(where: { $0.id == phID }) {
-                        project.subtitleTracks[destIdx].clips[ci] = SubtitleClip(
+                    if let ci = project.subtitleTracks[ti].clips.firstIndex(where: { $0.id == phID }) {
+                        project.subtitleTracks[ti].clips[ci] = SubtitleClip(
                             text: t, startTime: c.startTime, endTime: c.endTime)
                     }
                     project.placeholderClipIDs.remove(phID)
@@ -2973,7 +3001,7 @@ private struct TranslateToolGroup: View {
             }
             guard !Task.isCancelled else { return }
             await MainActor.run {
-                project.translatingTrackIndices.remove(destIdx)
+                project.translatingTrackIDs.remove(destTrackID)
                 project.translationTotal = 0
                 project.translationDone = 0
                 project.translationProgress = 0

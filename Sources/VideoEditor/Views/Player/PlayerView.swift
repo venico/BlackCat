@@ -109,7 +109,7 @@ private struct SubtitleOverlay: View {
     var body: some View {
         GeometryReader { geo in
             let scale = geo.size.width / project.previewRenderSize.width
-            let pairs: [(String, SubtitleStyle)] = project.subtitleTracks.indices.compactMap { i in
+            let pairs: [(String, SubtitleStyle)] = project.orderedSubtitleIndices.compactMap { i in
                 guard project.subtitleTracks[i].isVisible else { return nil }
                 let style = project.subtitleTracks[i].subtitleStyle ?? SubtitleStyle()
                 guard let clip = project.subtitleTracks[i].clips.first(where: {

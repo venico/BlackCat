@@ -561,6 +561,19 @@ final class ProjectState: ObservableObject {
         for t in textTracks where currentIDs.contains(t.id) { newOrder.append(.text(t.id)); currentIDs.remove(t.id) }
         overlayTrackOrder = newOrder
     }
+    var orderedSubtitleIndices: [Int] {
+        var result: [Int] = []
+        for ref in overlayTrackOrder {
+            if case .subtitle(let id) = ref,
+               let i = subtitleTracks.firstIndex(where: { $0.id == id }) {
+                result.append(i)
+            }
+        }
+        let existing = Set(result)
+        for i in subtitleTracks.indices where !existing.contains(i) { result.append(i) }
+        return result
+    }
+
     @Published var subtitleBottomMargin: Double = 5   // 全局：所有字幕整体距下边缘 %
     @Published var subtitleLineSpacing: Double  = 6   // 全局：字幕轨道之间的间距 pt
 
@@ -874,7 +887,7 @@ final class ProjectState: ObservableObject {
 
     // Translation
     @Published var translationTargetLang: String = "中文（简体）"
-    @Published var translatingTrackIndices: Set<Int> = []  // 正在翻译中的轨道 index
+    @Published var translatingTrackIDs: Set<UUID> = []
     @Published var translationProgress: Double = 0         // 0...1
     @Published var translationTotal: Int = 0               // 总字幕数
     @Published var translationDone: Int = 0                // 已完成数
@@ -886,7 +899,7 @@ final class ProjectState: ObservableObject {
         translationTotal = 0
         translationDone = 0
         translationProgress = 0
-        translatingTrackIndices.removeAll()
+        translatingTrackIDs.removeAll()
         showSuccessToast(icon: "stop.fill", iconColor: .yellow, title: "翻译", subtitle: "已停止", autoCountdown: false)
     }
     /// 占位字幕 ID 集合（翻译中显示呼吸效果）

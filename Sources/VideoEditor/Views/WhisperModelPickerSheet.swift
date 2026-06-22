@@ -59,6 +59,7 @@ struct WhisperModelPickerSheet: View {
                         .cornerRadius(8)
                 }
                 .buttonStyle(.plain)
+                .keyboardShortcut(.cancelAction)
 
                 Button {
                     project.selectedWhisperModel = selected

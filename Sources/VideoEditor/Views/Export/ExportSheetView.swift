@@ -547,10 +547,11 @@ struct ExportSheetView: View {
         let cleanName = baseName.hasSuffix(ext) ? baseName : "\(baseName)\(ext)"
         let outputURL = outputDir.appendingPathComponent(cleanName)
 
+        let orderedSubs = project.orderedSubtitleIndices.map { project.subtitleTracks[$0] }
         let snapshot = ExportInput(
             videoTracks: project.videoTracks,
             audioTracks: project.audioTracks,
-            subtitleTracks: project.subtitleTracks,
+            subtitleTracks: orderedSubs,
             imageTracks: project.imageTracks,
             textTracks: project.textTracks,
             subtitleBottomMargin: project.subtitleBottomMargin,
