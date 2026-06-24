@@ -254,13 +254,15 @@ extension ProjectState {
         transcribeTask = Task {
             do {
                 try Task.checkCancellation()
-                await MainActor.run { self.transcribeState = .running(0.1) }
                 let segs = try await WhisperTranscriber.transcribe(
                     mediaURL: mediaURL, trimStart: trimStart,
-                    duration: srcDur, language: "auto", prompt: nil)
+                    duration: srcDur, language: "auto", prompt: nil
+                ) { pct in
+                    DispatchQueue.main.async { self.transcribeState = .running(pct) }
+                }
                 try Task.checkCancellation()
 
-                await MainActor.run { self.transcribeState = .running(0.7) }
+                await MainActor.run { self.transcribeState = .running(0.95) }
                 let sample = segs.prefix(12).map(\.text).joined(separator: " ")
                 let recog = NLLanguageRecognizer()
                 recog.processString(sample)
@@ -271,20 +273,22 @@ extension ProjectState {
 
                 var finalSegs: [(start: Double, end: Double, text: String)] = []
                 if sameLang {
-                    for (i, s) in segs.enumerated() {
+                    for s in segs {
                         try Task.checkCancellation()
                         let text = isTargetSimplified ? OpenCC.toSimplified(s.text) : s.text
                         finalSegs.append((s.start, s.end, text))
-                        let p = 0.7 + 0.25 * Double(i + 1) / Double(max(segs.count, 1))
-                        await MainActor.run { self.transcribeState = .running(p) }
                     }
                 } else {
+                    let texts = segs.map(\.text)
+                    let translated = await Translator.translateConcurrent(
+                        texts, to: displayName, batchSize: 15, concurrency: 6
+                    ) { done in
+                        let p = 0.95 + 0.04 * Double(min(done, segs.count)) / Double(max(segs.count, 1))
+                        await MainActor.run { self.transcribeState = .running(p) }
+                    }
                     for (i, s) in segs.enumerated() {
                         try Task.checkCancellation()
-                        let t = await Translator.translate(s.text, to: displayName)
-                        finalSegs.append((s.start, s.end, t))
-                        let p = 0.7 + 0.25 * Double(i + 1) / Double(max(segs.count, 1))
-                        await MainActor.run { self.transcribeState = .running(p) }
+                        finalSegs.append((s.start, s.end, translated[i]))
                     }
                 }
 

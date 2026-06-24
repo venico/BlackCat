@@ -2933,20 +2933,35 @@ private struct TranslateToolGroup: View {
         project.translationProgress = 0
 
         project.translationTask = Task {
-            for (i, c) in clips.enumerated() {
-                guard !Task.isCancelled else { return }
-                let translated = await Translator.translateSmart(c.text, to: lang)
-                guard !Task.isCancelled else { return }
-                await MainActor.run {
-                    guard let ti = project.subtitleTracks.firstIndex(where: { $0.id == destTrackID }) else { return }
-                    let phID = placeholders[i].id
-                    if let ci = project.subtitleTracks[ti].clips.firstIndex(where: { $0.id == phID }) {
-                        project.subtitleTracks[ti].clips[ci] = SubtitleClip(
-                            text: translated, startTime: c.startTime, endTime: c.endTime)
+            let maxConcurrent = 6
+            let total = clips.count
+            var done = 0
+            await withTaskGroup(of: (Int, String).self) { group in
+                var nextIdx = 0
+                for _ in 0..<min(maxConcurrent, total) {
+                    let idx = nextIdx; let text = clips[idx].text
+                    group.addTask { (idx, await Translator.translateSmart(text, to: lang)) }
+                    nextIdx += 1
+                }
+                for await (i, translated) in group {
+                    guard !Task.isCancelled else { return }
+                    done += 1
+                    await MainActor.run {
+                        guard let ti = project.subtitleTracks.firstIndex(where: { $0.id == destTrackID }) else { return }
+                        let phID = placeholders[i].id
+                        if let ci = project.subtitleTracks[ti].clips.firstIndex(where: { $0.id == phID }) {
+                            project.subtitleTracks[ti].clips[ci] = SubtitleClip(
+                                text: translated, startTime: clips[i].startTime, endTime: clips[i].endTime)
+                        }
+                        project.placeholderClipIDs.remove(phID)
+                        project.translationDone = done
+                        project.translationProgress = Double(done) / Double(total)
                     }
-                    project.placeholderClipIDs.remove(phID)
-                    project.translationDone = i + 1
-                    project.translationProgress = Double(i + 1) / Double(clips.count)
+                    if nextIdx < total {
+                        let idx = nextIdx; let text = clips[idx].text
+                        group.addTask { (idx, await Translator.translateSmart(text, to: lang)) }
+                        nextIdx += 1
+                    }
                 }
             }
             guard !Task.isCancelled else { return }
@@ -2983,20 +2998,35 @@ private struct TranslateToolGroup: View {
         project.translationProgress = 0
 
         project.translationTask = Task {
-            for (i, c) in originals.enumerated() {
-                guard !Task.isCancelled else { return }
-                let t = await Translator.translateSmart(c.text, to: lang)
-                guard !Task.isCancelled else { return }
-                await MainActor.run {
-                    guard let ti = project.subtitleTracks.firstIndex(where: { $0.id == destTrackID }) else { return }
-                    let phID = placeholders[i].id
-                    if let ci = project.subtitleTracks[ti].clips.firstIndex(where: { $0.id == phID }) {
-                        project.subtitleTracks[ti].clips[ci] = SubtitleClip(
-                            text: t, startTime: c.startTime, endTime: c.endTime)
+            let maxConcurrent = 6
+            let total = originals.count
+            var done = 0
+            await withTaskGroup(of: (Int, String).self) { group in
+                var nextIdx = 0
+                for _ in 0..<min(maxConcurrent, total) {
+                    let idx = nextIdx; let text = originals[idx].text
+                    group.addTask { (idx, await Translator.translateSmart(text, to: lang)) }
+                    nextIdx += 1
+                }
+                for await (i, translated) in group {
+                    guard !Task.isCancelled else { return }
+                    done += 1
+                    await MainActor.run {
+                        guard let ti = project.subtitleTracks.firstIndex(where: { $0.id == destTrackID }) else { return }
+                        let phID = placeholders[i].id
+                        if let ci = project.subtitleTracks[ti].clips.firstIndex(where: { $0.id == phID }) {
+                            project.subtitleTracks[ti].clips[ci] = SubtitleClip(
+                                text: translated, startTime: originals[i].startTime, endTime: originals[i].endTime)
+                        }
+                        project.placeholderClipIDs.remove(phID)
+                        project.translationDone = done
+                        project.translationProgress = Double(done) / Double(total)
                     }
-                    project.placeholderClipIDs.remove(phID)
-                    project.translationDone = i + 1
-                    project.translationProgress = Double(i + 1) / Double(originals.count)
+                    if nextIdx < total {
+                        let idx = nextIdx; let text = originals[idx].text
+                        group.addTask { (idx, await Translator.translateSmart(text, to: lang)) }
+                        nextIdx += 1
+                    }
                 }
             }
             guard !Task.isCancelled else { return }

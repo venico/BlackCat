@@ -380,6 +380,78 @@ enum Translator {
         }
     }
 
+    /// 批量翻译：多条文本用 \n 拼接成一次请求，翻译后按行还原。
+    /// 如果行数不匹配则回退到逐条翻译。
+    static func translateBatch(_ texts: [String], to lang: String) async -> [String] {
+        guard !texts.isEmpty else { return texts }
+        if texts.count == 1 { return [await translate(texts[0], to: lang)] }
+
+        let lineCounts = texts.map { $0.components(separatedBy: "\n").count }
+        let combined = texts.joined(separator: "\n")
+        let result = await translate(combined, to: lang)
+        let allLines = result.components(separatedBy: "\n")
+
+        let expectedTotal = lineCounts.reduce(0, +)
+        if allLines.count == expectedTotal {
+            var output: [String] = []
+            var offset = 0
+            for count in lineCounts {
+                let segment = allLines[offset..<(offset + count)].joined(separator: "\n")
+                output.append(segment.trimmingCharacters(in: .whitespaces))
+                offset += count
+            }
+            return output
+        }
+
+        var results: [String] = []
+        for text in texts {
+            results.append(await translate(text, to: lang))
+        }
+        return results
+    }
+
+    /// 并发 + 批量翻译：分批（每批 batchSize 条），最多 concurrency 路同时发。
+    /// onProgress 在每批完成时回调已翻译总数。
+    static func translateConcurrent(
+        _ texts: [String], to lang: String,
+        batchSize: Int = 15, concurrency: Int = 6,
+        onProgress: (@Sendable (Int) async -> Void)? = nil
+    ) async -> [String] {
+        guard !texts.isEmpty else { return texts }
+
+        var batches: [(offset: Int, texts: [String])] = []
+        for i in stride(from: 0, to: texts.count, by: batchSize) {
+            let end = min(i + batchSize, texts.count)
+            batches.append((i, Array(texts[i..<end])))
+        }
+
+        var results = Array(repeating: "", count: texts.count)
+        var completed = 0
+
+        await withTaskGroup(of: (Int, [String]).self) { group in
+            var launched = 0
+            for batch in batches.prefix(concurrency) {
+                let b = batch
+                group.addTask { (b.offset, await translateBatch(b.texts, to: lang)) }
+                launched += 1
+            }
+            for await (offset, translated) in group {
+                for (j, t) in translated.enumerated() where offset + j < results.count {
+                    results[offset + j] = t
+                }
+                completed += translated.count
+                await onProgress?(completed)
+
+                if launched < batches.count {
+                    let b = batches[launched]
+                    group.addTask { (b.offset, await translateBatch(b.texts, to: lang)) }
+                    launched += 1
+                }
+            }
+        }
+        return results
+    }
+
     private static func languageCode(_ label: String) -> String {
         switch label {
         case "中文（简体）": return "zh-CN"

@@ -1179,7 +1179,22 @@ actor TimelineExporter {
                 .filter { $0.isVisible }
                 .flatMap { $0.clips }
 
-            // ── 用 AVAssetWriter 导出（精确控制帧率）──
+            // ── 快速路径：无 overlay 时用 AVAssetExportSession（5-10x 加速）──
+            let needsPerFrameProcessing = subRenderInfo.hasSubtitles || !visibleTextClips.isEmpty || !colorRanges.isEmpty
+            if !needsPerFrameProcessing {
+                try? FileManager.default.removeItem(at: input.outputURL)
+                try await fastExportSession(
+                    composition: composition,
+                    videoComposition: videoComposition!,
+                    audioMix: audioMix,
+                    outputURL: input.outputURL,
+                    progress: progress
+                )
+                progress(1.0)
+                return input.outputURL
+            }
+
+            // ── 用 AVAssetWriter 导出（逐帧处理：字幕/文字/色调）──
             try? FileManager.default.removeItem(at: input.outputURL)
             try await writerExport(
                 composition: composition,
@@ -1225,6 +1240,58 @@ actor TimelineExporter {
         default:
             throw exporter.error ?? NSError(domain: "Export", code: 3,
                 userInfo: [NSLocalizedDescriptionKey: "导出失败 (\(exporter.status.rawValue))"])
+        }
+    }
+
+    // ── 快速导出：AVAssetExportSession（无需逐帧处理时使用）──
+    private func fastExportSession(
+        composition: AVMutableComposition,
+        videoComposition: AVMutableVideoComposition,
+        audioMix: AVMutableAudioMix,
+        outputURL: URL,
+        progress: @escaping (Double) -> Void
+    ) async throws {
+        guard let exporter = AVAssetExportSession(asset: composition,
+                                                   presetName: AVAssetExportPresetHighestQuality)
+        else {
+            throw NSError(domain: "Export", code: 1,
+                          userInfo: [NSLocalizedDescriptionKey: "无法创建视频快速导出会话"])
+        }
+        exporter.outputURL = outputURL
+        exporter.outputFileType = .mp4
+        exporter.shouldOptimizeForNetworkUse = true
+        exporter.videoComposition = videoComposition
+        exporter.audioMix = audioMix
+
+        // 进度轮询 + 取消检测
+        let cancelRef = self._cancelFlag
+        let progressTimer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .utility))
+        progressTimer.schedule(deadline: .now(), repeating: .milliseconds(100))
+        progressTimer.setEventHandler {
+            if cancelRef.value {
+                exporter.cancelExport()
+            } else {
+                let p = Double(exporter.progress)
+                progress(min(p, 0.99))
+            }
+        }
+        progressTimer.resume()
+
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            exporter.exportAsynchronously { continuation.resume() }
+        }
+
+        progressTimer.cancel()
+
+        switch exporter.status {
+        case .completed:
+            break
+        case .cancelled:
+            throw NSError(domain: "Export", code: 2,
+                          userInfo: [NSLocalizedDescriptionKey: "导出已取消"])
+        default:
+            throw exporter.error ?? NSError(domain: "Export", code: 3,
+                userInfo: [NSLocalizedDescriptionKey: "快速导出失败 (\(exporter.status.rawValue))"])
         }
     }
 
@@ -1383,16 +1450,21 @@ actor TimelineExporter {
         let videoQueue = DispatchQueue(label: "export.video")
         let audioQueue = DispatchQueue(label: "export.audio")
         let targetFps = fps
+        let ciCtx = ExportCIContext.shared
 
         // 音视频必须并行消费，否则 AVAssetReader 内部缓冲区满会死锁
         await withTaskGroup(of: Void.self) { group in
-            // 视频帧处理：按目标帧率重采样（源帧不够则重复，多则丢弃）
+            // 视频帧处理：按目标帧率重采样 + CIImage GPU 管线
             group.addTask {
                 await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
                     var frameIndex: Int64 = 0
                     var currentPB: CVPixelBuffer? = nil
                     var currentReaderTime: Double = 0
                     var nextSB: CMSampleBuffer? = videoOutput.copyNextSampleBuffer()
+
+                    // 字幕缓存：同一字幕段内复用 overlay CIImage
+                    var cachedSubOverlay: CIImage? = nil
+                    var cachedSubKey: String = ""
 
                     let cancelRef = self._cancelFlag
                     videoInput.requestMediaDataWhenReady(on: videoQueue) {
@@ -1437,22 +1509,49 @@ actor TimelineExporter {
 
                                 let needsExtra = hasSubtitles || hasTextOverlays || (activeAdj != nil && activeAdj?.isIdentity == false)
                                 if needsExtra {
-                                    let renderPB = Self.copyPixelBuffer(pb) ?? pb
-                                    // 1. 色调调节
+                                    // GPU 管线：CIImage 零拷贝包装 → CIFilter 链 → 一次 render
+                                    var image = CIImage(cvPixelBuffer: pb)
+
+                                    // 1. 色调调节（CIFilter GPU）
                                     if let adj = activeAdj, !adj.isIdentity {
-                                        let src = CIImage(cvPixelBuffer: renderPB)
-                                        let dst = ColorAdjust.apply(src, adj)
-                                        ExportCIContext.shared.render(dst, to: renderPB)
+                                        image = ColorAdjust.apply(image, adj)
                                     }
-                                    // 2. 文字图层
-                                    if hasTextOverlays {
-                                        self.drawTextOverlaysOnPixelBuffer(renderPB, atTime: targetTime, clips: textClips, fontScale: subtitleInfo.fontScale)
+
+                                    // 2. 文字图层 overlay（CPU 渲染透明 CGImage → GPU 合成）
+                                    if hasTextOverlays,
+                                       let textOverlay = self.renderTextOverlay(
+                                           atTime: targetTime, clips: textClips,
+                                           fontScale: subtitleInfo.fontScale, renderSize: renderSize) {
+                                        image = textOverlay.composited(over: image)
                                     }
-                                    // 3. 字幕
+
+                                    // 3. 字幕 overlay（带缓存：同一字幕段内只渲染 1 次）
                                     if hasSubtitles {
-                                        self.drawSubtitlesOnPixelBuffer(renderPB, atTime: targetTime, info: subtitleInfo)
+                                        // 构建缓存 key：用活跃字幕文本拼接
+                                        var subKey = ""
+                                        for (track, _) in subtitleInfo.tracks {
+                                            if let clip = track.clips.first(where: { $0.startTime <= targetTime && $0.endTime > targetTime }) {
+                                                subKey += "\(clip.id)|\(clip.text)|"
+                                            }
+                                        }
+                                        if subKey != cachedSubKey {
+                                            cachedSubOverlay = self.renderSubtitleOverlay(atTime: targetTime, info: subtitleInfo)
+                                            cachedSubKey = subKey
+                                        }
+                                        if let subOverlay = cachedSubOverlay {
+                                            image = subOverlay.composited(over: image)
+                                        }
                                     }
-                                    adaptor.append(renderPB, withPresentationTime: outputPTS)
+
+                                    // 4. 从 adaptor pool 取 buffer，一次 GPU render
+                                    if let pool = adaptor.pixelBufferPool {
+                                        var outBuf: CVPixelBuffer?
+                                        CVPixelBufferPoolCreatePixelBuffer(nil, pool, &outBuf)
+                                        if let outBuf = outBuf {
+                                            ciCtx.render(image, to: outBuf)
+                                            adaptor.append(outBuf, withPresentationTime: outputPTS)
+                                        }
+                                    }
                                 } else {
                                     adaptor.append(pb, withPresentationTime: outputPTS)
                                 }
@@ -1497,7 +1596,264 @@ actor TimelineExporter {
         }
     }
 
-    // MARK: - 逐帧字幕绘制
+    // MARK: - GPU overlay 渲染（CIImage 管线）
+
+    /// 渲染字幕为透明背景 CIImage overlay（用于 CISourceOverCompositing GPU 合成）
+    private nonisolated func renderSubtitleOverlay(
+        atTime time: Double, info: SubtitleRenderInfo
+    ) -> CIImage? {
+        // 找出当前时间活跃的字幕
+        var activeItems: [(text: String, style: SubtitleStyle)] = []
+        for (track, style) in info.tracks {
+            if let clip = track.clips.first(where: { $0.startTime <= time && $0.endTime > time }) {
+                let text = style.mergeLineBreaks ? Self.mergeBreaks(clip.text) : clip.text
+                activeItems.append((text, style))
+            }
+        }
+        guard !activeItems.isEmpty else { return nil }
+
+        let w = Int(info.renderSize.width)
+        let h = Int(info.renderSize.height)
+        guard w > 0, h > 0 else { return nil }
+
+        let space = CGColorSpaceCreateDeviceRGB()
+        guard let ctx = CGContext(
+            data: nil, width: w, height: h,
+            bitsPerComponent: 8, bytesPerRow: 0, space: space,
+            bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue
+                      | CGBitmapInfo.byteOrder32Little.rawValue
+        ) else { return nil }
+
+        // 透明背景（默认就是全 0）
+        ctx.clear(CGRect(x: 0, y: 0, width: w, height: h))
+
+        // CGContext 默认 y-up → 翻转为 y-down
+        ctx.translateBy(x: 0, y: CGFloat(h))
+        ctx.scaleBy(x: 1.0, y: -1.0)
+
+        let scale = info.fontScale
+        let padH: CGFloat = 10 * scale, padV: CGFloat = 3 * scale
+        let bottomPad = CGFloat(h) * CGFloat(info.bottomMargin) / 100.0
+
+        struct SubLayout {
+            let text: String; let style: SubtitleStyle; let ctFont: CTFont
+            let layerW: CGFloat; let layerH: CGFloat
+            let setter: CTFramesetter
+        }
+
+        var layouts: [SubLayout] = []
+        for item in activeItems {
+            let scaledSize = item.style.fontSize * scale
+            var ctFont = CTFontCreateWithName(item.style.fontName as CFString, scaledSize, nil)
+            if item.style.bold,
+               let bf = CTFontCreateCopyWithSymbolicTraits(ctFont, scaledSize, nil, .boldTrait, .boldTrait) { ctFont = bf }
+            if item.style.italic {
+                var skew = CGAffineTransform(a: 1, b: 0, c: 0.21, d: 1, tx: 0, ty: 0)
+                ctFont = CTFontCreateCopyWithAttributes(ctFont, scaledSize, &skew, nil)
+            }
+
+            let tc = NSColor(item.style.textColor).usingColorSpace(.sRGB) ?? .white
+            var tr: CGFloat = 1, tg: CGFloat = 1, tb: CGFloat = 1, ta: CGFloat = 1
+            tc.getRed(&tr, green: &tg, blue: &tb, alpha: &ta)
+            let textCGColor = CGColor(red: tr, green: tg, blue: tb, alpha: ta)
+
+            var alignment: CTTextAlignment
+            switch item.style.alignment {
+            case "left":  alignment = .left
+            case "right": alignment = .right
+            default:      alignment = .center
+            }
+            let ctPS: CTParagraphStyle = withUnsafeBytes(of: &alignment) { ptr in
+                var setting = CTParagraphStyleSetting(
+                    spec: .alignment,
+                    valueSize: MemoryLayout<CTTextAlignment>.size,
+                    value: ptr.baseAddress!)
+                return CTParagraphStyleCreate(&setting, 1)
+            }
+
+            let maxW = CGFloat(w) * item.style.widthPercent / 100
+            let attrs: [NSAttributedString.Key: Any] = [
+                .init(kCTFontAttributeName as String): ctFont,
+                .init(kCTForegroundColorAttributeName as String): textCGColor,
+                .init(kCTParagraphStyleAttributeName as String): ctPS
+            ]
+            let attrStr = NSAttributedString(string: item.text, attributes: attrs)
+            let setter = CTFramesetterCreateWithAttributedString(attrStr)
+            let constraint = CGSize(width: maxW - padH * 2, height: CGFloat.greatestFiniteMagnitude)
+            let textSize = CTFramesetterSuggestFrameSizeWithConstraints(setter, CFRange(), nil, constraint, nil)
+            let layerW = ceil(textSize.width) + padH * 2
+            let layerH = ceil(textSize.height) + padV * 2
+            layouts.append(SubLayout(text: item.text, style: item.style, ctFont: ctFont,
+                                     layerW: layerW, layerH: layerH, setter: setter))
+        }
+
+        var yPos = CGFloat(h) - bottomPad
+        for layout in layouts.reversed() {
+            yPos -= layout.layerH
+            let xOrig = (CGFloat(w) - layout.layerW) / 2
+
+            ctx.saveGState()
+            ctx.setShadow(offset: CGSize(width: 1 * scale, height: 1 * scale),
+                          blur: 1 * scale,
+                          color: CGColor(red: 0, green: 0, blue: 0, alpha: 0.8))
+
+            if layout.style.backgroundOpacity > 0 {
+                let nc = NSColor(layout.style.backgroundColor).usingColorSpace(.sRGB) ?? .black
+                var br: CGFloat = 0, bg: CGFloat = 0, bb: CGFloat = 0, ba: CGFloat = 0
+                nc.getRed(&br, green: &bg, blue: &bb, alpha: &ba)
+                ctx.setFillColor(CGColor(red: br, green: bg, blue: bb,
+                                         alpha: CGFloat(layout.style.backgroundOpacity)))
+                let bgPath = CGPath(roundedRect: CGRect(x: xOrig, y: yPos, width: layout.layerW, height: layout.layerH),
+                                     cornerWidth: 3 * scale, cornerHeight: 3 * scale, transform: nil)
+                ctx.addPath(bgPath)
+                ctx.fillPath()
+            }
+            ctx.restoreGState()
+
+            ctx.saveGState()
+            ctx.translateBy(x: 0, y: CGFloat(h))
+            ctx.scaleBy(x: 1.0, y: -1.0)
+            let textRectYUp = CGFloat(h) - yPos - layout.layerH + padV
+            let textRect = CGRect(x: xOrig + padH, y: textRectYUp,
+                                  width: layout.layerW - padH * 2, height: layout.layerH - padV * 2)
+            let ctFrame = CTFramesetterCreateFrame(layout.setter, CFRange(),
+                                                    CGPath(rect: textRect, transform: nil), nil)
+            CTFrameDraw(ctFrame, ctx)
+            ctx.restoreGState()
+
+            yPos -= info.lineSpacing
+        }
+
+        guard let cgImage = ctx.makeImage() else { return nil }
+        return CIImage(cgImage: cgImage)
+    }
+
+    /// 渲染文字图层为透明背景 CIImage overlay（用于 CISourceOverCompositing GPU 合成）
+    private nonisolated func renderTextOverlay(
+        atTime time: Double, clips: [TextClip], fontScale: CGFloat, renderSize: CGSize
+    ) -> CIImage? {
+        let active = clips.filter { $0.startTime <= time && $0.endTime > time }
+        guard !active.isEmpty else { return nil }
+
+        let w = Int(renderSize.width)
+        let h = Int(renderSize.height)
+        guard w > 0, h > 0 else { return nil }
+
+        let space = CGColorSpaceCreateDeviceRGB()
+        guard let ctx = CGContext(
+            data: nil, width: w, height: h,
+            bitsPerComponent: 8, bytesPerRow: 0, space: space,
+            bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue
+                      | CGBitmapInfo.byteOrder32Little.rawValue
+        ) else { return nil }
+
+        ctx.clear(CGRect(x: 0, y: 0, width: w, height: h))
+        ctx.translateBy(x: 0, y: CGFloat(h))
+        ctx.scaleBy(x: 1.0, y: -1.0)
+
+        let scale = fontScale
+
+        for clip in active {
+            let scaledSize = clip.fontSize * scale
+            var ctFont = CTFontCreateWithName(clip.fontName as CFString, scaledSize, nil)
+            if clip.bold,
+               let bf = CTFontCreateCopyWithSymbolicTraits(ctFont, scaledSize, nil, .boldTrait, .boldTrait) { ctFont = bf }
+            if clip.italic {
+                var skew = CGAffineTransform(a: 1, b: 0, c: 0.21, d: 1, tx: 0, ty: 0)
+                ctFont = CTFontCreateCopyWithAttributes(ctFont, scaledSize, &skew, nil)
+            }
+
+            let tc = NSColor(clip.textColor).usingColorSpace(.sRGB) ?? .white
+            var tr: CGFloat = 1, tg: CGFloat = 1, tb: CGFloat = 1, ta: CGFloat = 1
+            tc.getRed(&tr, green: &tg, blue: &tb, alpha: &ta)
+            let textCGColor = CGColor(red: tr, green: tg, blue: tb, alpha: ta)
+
+            var alignment: CTTextAlignment
+            switch clip.alignment {
+            case "left":  alignment = .left
+            case "right": alignment = .right
+            default:      alignment = .center
+            }
+            let ctPS: CTParagraphStyle = withUnsafeBytes(of: &alignment) { ptr in
+                var setting = CTParagraphStyleSetting(
+                    spec: .alignment,
+                    valueSize: MemoryLayout<CTTextAlignment>.size,
+                    value: ptr.baseAddress!)
+                return CTParagraphStyleCreate(&setting, 1)
+            }
+
+            let padH: CGFloat = 10 * scale, padV: CGFloat = 5 * scale
+            let maxW = CGFloat(w) * 0.9
+            let attrs: [NSAttributedString.Key: Any] = [
+                .init(kCTFontAttributeName as String): ctFont,
+                .init(kCTForegroundColorAttributeName as String): textCGColor,
+                .init(kCTParagraphStyleAttributeName as String): ctPS
+            ]
+            let attrStr = NSAttributedString(string: clip.text.isEmpty ? " " : clip.text, attributes: attrs)
+            let setter = CTFramesetterCreateWithAttributedString(attrStr)
+            let constraint = CGSize(width: maxW - padH * 2, height: CGFloat.greatestFiniteMagnitude)
+            let textSize = CTFramesetterSuggestFrameSizeWithConstraints(setter, CFRange(), nil, constraint, nil)
+            let layerW = ceil(textSize.width) + padH * 2
+            let layerH = ceil(textSize.height) + padV * 2
+
+            let centerX = CGFloat(w) * clip.posX
+            let centerY = CGFloat(h) * clip.posY
+            let xOrig = centerX - layerW / 2
+            let yOrig = centerY - layerH / 2
+
+            ctx.saveGState()
+            ctx.setAlpha(clip.opacity)
+
+            if clip.rotation != 0 {
+                ctx.translateBy(x: centerX, y: centerY)
+                ctx.rotate(by: -clip.rotation * .pi / 180)
+                ctx.translateBy(x: -centerX, y: -centerY)
+            }
+
+            if clip.strokeWidth > 0 {
+                let sc = NSColor(clip.strokeColor).usingColorSpace(.sRGB) ?? .black
+                var sr: CGFloat = 0, sg: CGFloat = 0, sb: CGFloat = 0, sa: CGFloat = 0
+                sc.getRed(&sr, green: &sg, blue: &sb, alpha: &sa)
+                let strokeCG = CGColor(red: sr, green: sg, blue: sb, alpha: sa)
+                let r = max(0.6, clip.strokeWidth * 0.5) * scale
+                let off = max(0.6, clip.strokeWidth * 0.4) * scale
+                ctx.setShadow(offset: CGSize(width: off, height: off), blur: r, color: strokeCG)
+            } else {
+                ctx.setShadow(offset: CGSize(width: 1 * scale, height: 1 * scale),
+                              blur: 1 * scale,
+                              color: CGColor(red: 0, green: 0, blue: 0, alpha: 0.6))
+            }
+
+            if clip.bgOpacity > 0 {
+                let nc = NSColor(clip.bgColor).usingColorSpace(.sRGB) ?? .black
+                var br: CGFloat = 0, bg: CGFloat = 0, bb: CGFloat = 0, ba: CGFloat = 0
+                nc.getRed(&br, green: &bg, blue: &bb, alpha: &ba)
+                ctx.setFillColor(CGColor(red: br, green: bg, blue: bb, alpha: clip.bgOpacity))
+                let bgPath = CGPath(roundedRect: CGRect(x: xOrig, y: yOrig, width: layerW, height: layerH),
+                                     cornerWidth: 4 * scale, cornerHeight: 4 * scale, transform: nil)
+                ctx.addPath(bgPath)
+                ctx.fillPath()
+            }
+
+            ctx.saveGState()
+            ctx.translateBy(x: 0, y: CGFloat(h))
+            ctx.scaleBy(x: 1.0, y: -1.0)
+            let textRectYUp = CGFloat(h) - yOrig - layerH + padV
+            let textRect = CGRect(x: xOrig + padH, y: textRectYUp,
+                                  width: layerW - padH * 2, height: layerH - padV * 2)
+            let ctFrame = CTFramesetterCreateFrame(setter, CFRange(),
+                                                    CGPath(rect: textRect, transform: nil), nil)
+            CTFrameDraw(ctFrame, ctx)
+            ctx.restoreGState()
+
+            ctx.restoreGState()
+        }
+
+        guard let cgImage = ctx.makeImage() else { return nil }
+        return CIImage(cgImage: cgImage)
+    }
+
+    // MARK: - 逐帧字幕绘制（旧版 CPU 方法，保留兼容）
 
     /// 复制 pixel buffer（32BGRA），用于在副本上绘制字幕，不污染原始帧
     private static nonisolated func copyPixelBuffer(_ src: CVPixelBuffer) -> CVPixelBuffer? {

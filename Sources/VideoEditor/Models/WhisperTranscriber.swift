@@ -226,7 +226,8 @@ enum WhisperTranscriber {
     ///   - timelineOffset: 时间轴起始位置（秒），加到每段时间戳上
     static func transcribe(
         mediaURL: URL, trimStart: Double, duration: Double,
-        language: String, prompt: String? = nil
+        language: String, prompt: String? = nil,
+        onProgress: (@Sendable (Double) -> Void)? = nil
     ) async throws -> [(start: Double, end: Double, text: String)] {
 
         guard let whisper = findWhisper() else { throw TranscribeError.whisperNotFound }
@@ -243,7 +244,8 @@ enum WhisperTranscriber {
             try? FileManager.default.removeItem(at: srtURL)
         }
 
-        // 1. ffmpeg 提取 16kHz 单声道 PCM wav（whisper 要求的格式）
+        // 1. ffmpeg 提取音频（0% ~ 5%）
+        onProgress?(0)
         var ffArgs = ["-y"]
         if trimStart > 0.001 { ffArgs += ["-ss", String(format: "%.3f", trimStart)] }
         if duration  > 0.001 { ffArgs += ["-t",  String(format: "%.3f", duration)] }
@@ -255,26 +257,32 @@ enum WhisperTranscriber {
         guard extractOK, FileManager.default.fileExists(atPath: wavURL.path) else {
             throw TranscribeError.audioExtractFailed
         }
+        onProgress?(0.05)
 
-        // 2. whisper-cli 识别 → SRT（prompt 引导输出语言/简繁，可为空）
+        // 2. whisper-cli 识别（5% ~ 90%），解析实时进度
         var wArgs = ["-m", model.path, "-f", wavURL.path,
-                     "-l", language, "-osrt", "-of", outPrefix.path, "-np"]
+                     "-l", language, "-pp",
+                     "-osrt", "-of", outPrefix.path, "-np"]
         if let prompt, !prompt.isEmpty {
             wArgs += ["--prompt", prompt]
         }
         let recOK = await Task.detached(priority: .userInitiated) {
-            runProcess(whisper, wArgs)
+            runProcessWithProgress(whisper, wArgs) { whisperPct in
+                onProgress?(0.05 + whisperPct * 0.85)
+            }
         }.value
         guard recOK, FileManager.default.fileExists(atPath: srtURL.path) else {
             throw TranscribeError.recognizeFailed
         }
+        onProgress?(0.90)
 
-        // 3. 解析 SRT，加时间轴偏移
+        // 3. 解析 SRT（90% ~ 95%）
         guard let srtText = try? String(contentsOf: srtURL, encoding: .utf8) else {
             throw TranscribeError.recognizeFailed
         }
         let segs = parseSRT(srtText)
         guard !segs.isEmpty else { throw TranscribeError.noResult }
+        onProgress?(0.95)
         return segs
     }
 
@@ -305,6 +313,49 @@ enum WhisperTranscriber {
             currentProcess = nil
             return p.terminationStatus == 0
         } catch {
+            currentProcess = nil
+            return false
+        }
+    }
+
+    private static func runProcessWithProgress(_ exe: URL, _ args: [String],
+                                                onProgress: @escaping (Double) -> Void) -> Bool {
+        let p = Process()
+        p.executableURL = exe
+        p.arguments = args
+        p.standardOutput = FileHandle.nullDevice
+
+        let pipe = Pipe()
+        p.standardError = pipe
+        currentProcess = p
+
+        var buffer = ""
+        pipe.fileHandleForReading.readabilityHandler = { handle in
+            let data = handle.availableData
+            guard !data.isEmpty, let chunk = String(data: data, encoding: .utf8) else { return }
+            buffer += chunk
+            while let newline = buffer.firstIndex(of: "\n") {
+                let line = String(buffer[buffer.startIndex..<newline])
+                buffer = String(buffer[buffer.index(after: newline)...])
+                // whisper-cli 输出: "whisper_print_progress_callback: progress =  42%"
+                if line.contains("progress") {
+                    let digits = line.components(separatedBy: CharacterSet.decimalDigits.inverted)
+                        .filter { !$0.isEmpty }
+                    if let last = digits.last, let pct = Double(last), pct >= 0, pct <= 100 {
+                        onProgress(pct / 100.0)
+                    }
+                }
+            }
+        }
+
+        do {
+            try p.run()
+            p.waitUntilExit()
+            pipe.fileHandleForReading.readabilityHandler = nil
+            currentProcess = nil
+            return p.terminationStatus == 0
+        } catch {
+            pipe.fileHandleForReading.readabilityHandler = nil
             currentProcess = nil
             return false
         }
