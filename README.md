@@ -18,6 +18,12 @@
 
 ---
 
+<p align="center">
+  <img src="screenshot.png" width="900" alt="黑猫剪辑界面截图">
+</p>
+
+---
+
 ## 功能特性
 
 ### 多轨时间轴编辑
