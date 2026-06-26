@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://github.com/venico/BlackCat/raw/main/%E9%BB%91%E7%8C%AB%E5%89%AA%E8%BE%91.app/Contents/Resources/AppIcon.icns" width="128" alt="黑猫剪辑">
+  <img src="icon.png" width="128" alt="黑猫剪辑">
 </p>
 
 <h1 align="center">黑猫剪辑 BlackCat</h1>
