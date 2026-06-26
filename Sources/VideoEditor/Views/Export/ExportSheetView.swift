@@ -1469,96 +1469,89 @@ actor TimelineExporter {
                     let cancelRef = self._cancelFlag
                     videoInput.requestMediaDataWhenReady(on: videoQueue) {
                         while videoInput.isReadyForMoreMediaData {
-                            if cancelRef.value {
-                                videoInput.markAsFinished()
-                                cont.resume()
-                                return
-                            }
-                            let targetTime = Double(frameIndex) / Double(targetFps)
-                            guard targetTime < totalDuration + 0.1 else {
-                                videoInput.markAsFinished()
-                                cont.resume()
-                                return
-                            }
-
-                            // 推进 reader 直到找到覆盖 targetTime 的帧
-                            while let sb = nextSB {
-                                let pts = CMSampleBufferGetPresentationTimeStamp(sb).seconds
-                                if pts <= targetTime {
-                                    currentPB = CMSampleBufferGetImageBuffer(sb)
-                                    currentReaderTime = pts
-                                    nextSB = videoOutput.copyNextSampleBuffer()
-                                } else {
-                                    break
+                            autoreleasepool {
+                                if cancelRef.value {
+                                    videoInput.markAsFinished()
+                                    cont.resume()
+                                    return
                                 }
-                            }
+                                let targetTime = Double(frameIndex) / Double(targetFps)
+                                guard targetTime < totalDuration + 0.1 else {
+                                    videoInput.markAsFinished()
+                                    cont.resume()
+                                    return
+                                }
 
-                            // reader 耗尽且没有当前帧
-                            if currentPB == nil && nextSB == nil {
-                                videoInput.markAsFinished()
-                                cont.resume()
-                                return
-                            }
-
-                            let outputPTS = CMTime(value: frameIndex, timescale: Int32(targetFps))
-                            if let pb = currentPB {
-                                // 查找当前帧的色调调节
-                                let activeAdj = colorRanges.first {
-                                    targetTime >= $0.start && targetTime < $0.end
-                                }?.adj
-
-                                let needsExtra = hasSubtitles || hasTextOverlays || (activeAdj != nil && activeAdj?.isIdentity == false)
-                                if needsExtra {
-                                    // GPU 管线：CIImage 零拷贝包装 → CIFilter 链 → 一次 render
-                                    var image = CIImage(cvPixelBuffer: pb)
-
-                                    // 1. 色调调节（CIFilter GPU）
-                                    if let adj = activeAdj, !adj.isIdentity {
-                                        image = ColorAdjust.apply(image, adj)
+                                while let sb = nextSB {
+                                    let pts = CMSampleBufferGetPresentationTimeStamp(sb).seconds
+                                    if pts <= targetTime {
+                                        currentPB = CMSampleBufferGetImageBuffer(sb)
+                                        currentReaderTime = pts
+                                        nextSB = videoOutput.copyNextSampleBuffer()
+                                    } else {
+                                        break
                                     }
+                                }
 
-                                    // 2. 文字图层 overlay（CPU 渲染透明 CGImage → GPU 合成）
-                                    if hasTextOverlays,
-                                       let textOverlay = self.renderTextOverlay(
-                                           atTime: targetTime, clips: textClips,
-                                           fontScale: subtitleInfo.fontScale, renderSize: renderSize) {
-                                        image = textOverlay.composited(over: image)
-                                    }
+                                if currentPB == nil && nextSB == nil {
+                                    videoInput.markAsFinished()
+                                    cont.resume()
+                                    return
+                                }
 
-                                    // 3. 字幕 overlay（带缓存：同一字幕段内只渲染 1 次）
-                                    if hasSubtitles {
-                                        // 构建缓存 key：用活跃字幕文本拼接
-                                        var subKey = ""
-                                        for (track, _) in subtitleInfo.tracks {
-                                            if let clip = track.clips.first(where: { $0.startTime <= targetTime && $0.endTime > targetTime }) {
-                                                subKey += "\(clip.id)|\(clip.text)|"
+                                let outputPTS = CMTime(value: frameIndex, timescale: Int32(targetFps))
+                                if let pb = currentPB {
+                                    let activeAdj = colorRanges.first {
+                                        targetTime >= $0.start && targetTime < $0.end
+                                    }?.adj
+
+                                    let needsExtra = hasSubtitles || hasTextOverlays || (activeAdj != nil && activeAdj?.isIdentity == false)
+                                    if needsExtra {
+                                        var image = CIImage(cvPixelBuffer: pb)
+
+                                        if let adj = activeAdj, !adj.isIdentity {
+                                            image = ColorAdjust.apply(image, adj)
+                                        }
+
+                                        if hasTextOverlays,
+                                           let textOverlay = self.renderTextOverlay(
+                                               atTime: targetTime, clips: textClips,
+                                               fontScale: subtitleInfo.fontScale, renderSize: renderSize) {
+                                            image = textOverlay.composited(over: image)
+                                        }
+
+                                        if hasSubtitles {
+                                            var subKey = ""
+                                            for (track, _) in subtitleInfo.tracks {
+                                                if let clip = track.clips.first(where: { $0.startTime <= targetTime && $0.endTime > targetTime }) {
+                                                    subKey += "\(clip.id)|\(clip.text)|"
+                                                }
+                                            }
+                                            if subKey != cachedSubKey {
+                                                cachedSubOverlay = self.renderSubtitleOverlay(atTime: targetTime, info: subtitleInfo)
+                                                cachedSubKey = subKey
+                                            }
+                                            if let subOverlay = cachedSubOverlay {
+                                                image = subOverlay.composited(over: image)
                                             }
                                         }
-                                        if subKey != cachedSubKey {
-                                            cachedSubOverlay = self.renderSubtitleOverlay(atTime: targetTime, info: subtitleInfo)
-                                            cachedSubKey = subKey
-                                        }
-                                        if let subOverlay = cachedSubOverlay {
-                                            image = subOverlay.composited(over: image)
-                                        }
-                                    }
 
-                                    // 4. 从 adaptor pool 取 buffer，一次 GPU render
-                                    if let pool = adaptor.pixelBufferPool {
-                                        var outBuf: CVPixelBuffer?
-                                        CVPixelBufferPoolCreatePixelBuffer(nil, pool, &outBuf)
-                                        if let outBuf = outBuf {
-                                            ciCtx.render(image, to: outBuf)
-                                            adaptor.append(outBuf, withPresentationTime: outputPTS)
+                                        if let pool = adaptor.pixelBufferPool {
+                                            var outBuf: CVPixelBuffer?
+                                            CVPixelBufferPoolCreatePixelBuffer(nil, pool, &outBuf)
+                                            if let outBuf = outBuf {
+                                                ciCtx.render(image, to: outBuf)
+                                                adaptor.append(outBuf, withPresentationTime: outputPTS)
+                                            }
                                         }
+                                    } else {
+                                        adaptor.append(pb, withPresentationTime: outputPTS)
                                     }
-                                } else {
-                                    adaptor.append(pb, withPresentationTime: outputPTS)
                                 }
+                                frameIndex += 1
+                                let pct = min(targetTime / max(totalDuration, 0.01), 0.99)
+                                progress(pct)
                             }
-                            frameIndex += 1
-                            let pct = min(targetTime / max(totalDuration, 0.01), 0.99)
-                            progress(pct)
                         }
                     }
                 }

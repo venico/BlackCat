@@ -107,7 +107,8 @@ enum WhisperTranscriber {
                 let fileSize = (attrs?[.size] as? Int) ?? 0
                 if fileSize > size.minFileSize { return }
                 try? FileManager.default.removeItem(at: dest)
-                lastError = TranscribeError.downloadFailed
+                lastError = NSError(domain: "Whisper", code: 4,
+                    userInfo: [NSLocalizedDescriptionKey: "下载文件不完整（\(fileSize/1_000_000)MB），请检查网络后重试"])
             } catch {
                 lastError = error
                 try? FileManager.default.removeItem(at: dest)
@@ -123,35 +124,55 @@ enum WhisperTranscriber {
 
     private static func downloadFile(_ url: URL, to dest: URL, progress: @escaping (Double) -> Void) async throws {
         let delegate = DownloadProgressDelegate(dest: dest, progress: progress)
-        let session = URLSession(configuration: .default, delegate: delegate, delegateQueue: nil)
+        let config = URLSessionConfiguration.default
+        config.timeoutIntervalForRequest = 30
+        config.timeoutIntervalForResource = 3600
+        let session = URLSession(configuration: config, delegate: delegate, delegateQueue: nil)
         defer { session.finishTasksAndInvalidate() }
+        var request = URLRequest(url: url)
+        request.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) BlackCat/3.5", forHTTPHeaderField: "User-Agent")
         try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
             delegate.continuation = cont
-            session.downloadTask(with: url).resume()
+            session.downloadTask(with: request).resume()
         }
     }
 
-    /// URLSession 下载进度代理（流式写盘 + 进度回调）
     private final class DownloadProgressDelegate: NSObject, URLSessionDownloadDelegate {
         let dest: URL
         let progress: (Double) -> Void
         var continuation: CheckedContinuation<Void, Error>?
+        private var httpError: Error?
         init(dest: URL, progress: @escaping (Double) -> Void) {
             self.dest = dest; self.progress = progress
         }
         private var lastReported: Double = -1
+
+        func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask,
+                        didReceive response: URLResponse) {
+            if let http = response as? HTTPURLResponse, http.statusCode != 200 {
+                httpError = NSError(domain: "Whisper", code: http.statusCode,
+                    userInfo: [NSLocalizedDescriptionKey: "服务器返回 \(http.statusCode)，请检查网络或更换镜像"])
+                downloadTask.cancel()
+            }
+        }
+
         func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask,
                         didWriteData bytesWritten: Int64, totalBytesWritten: Int64,
                         totalBytesExpectedToWrite: Int64) {
             guard totalBytesExpectedToWrite > 0 else { return }
             let p = Double(totalBytesWritten) / Double(totalBytesExpectedToWrite)
-            if p - lastReported >= 0.01 || p >= 1.0 {   // 每 1% 回调一次，避免 flood
+            if p - lastReported >= 0.01 || p >= 1.0 {
                 lastReported = p
                 progress(p)
             }
         }
         func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask,
                         didFinishDownloadingTo location: URL) {
+            if let httpErr = httpError {
+                continuation?.resume(throwing: httpErr)
+                continuation = nil
+                return
+            }
             do {
                 try? FileManager.default.removeItem(at: dest)
                 try FileManager.default.moveItem(at: location, to: dest)
@@ -163,8 +184,8 @@ enum WhisperTranscriber {
             continuation = nil
         }
         func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
-            if let error {
-                continuation?.resume(throwing: error)
+            if let err = httpError ?? error {
+                continuation?.resume(throwing: err)
                 continuation = nil
             }
         }
