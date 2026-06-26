@@ -5,8 +5,11 @@ import AVFoundation
 
 enum WhisperTranscriber {
 
-    // 开发期固定路径（最终捆绑进 app bundle 后走 bundle 查找）
-    private static let devDir = "/Users/Venico/claude/VideoEditor/Vendor/whisper"
+    private static var devDir: String {
+        Bundle.main.bundlePath
+            .components(separatedBy: "/").dropLast().joined(separator: "/")
+            + "/Vendor/whisper"
+    }
 
     // MARK: - 查找二进制与模型
 
