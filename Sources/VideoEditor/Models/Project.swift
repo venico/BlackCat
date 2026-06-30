@@ -361,6 +361,7 @@ final class ProjectState: ObservableObject {
     // Export
     @Published var exportSettings  = ExportSettings()
     @Published var showExportSheet = false
+    @Published var showSettings = false
 
     // Preview resolution (for subtitle/image scaling to match export)
     @Published var previewResolution: String = "1080p  1920×1080"

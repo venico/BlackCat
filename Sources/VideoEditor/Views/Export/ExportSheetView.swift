@@ -254,8 +254,12 @@ private struct ExportJobBubble: View {
 
 struct ExportSheetView: View {
     @EnvironmentObject private var project: ProjectState
-    @Environment(\.dismiss) private var dismiss
+    private func dismiss() { project.showExportSheet = false }
     @State private var exportError: String?
+
+    private var effectiveOutputPath: URL {
+        project.exportSettings.outputPath ?? AppSettings.shared.effectiveExportDir
+    }
 
     /// 预估导出文件大小
     private var estimatedFileSize: String {
@@ -277,7 +281,7 @@ struct ExportSheetView: View {
             HStack {
                 Text("导出视频")
                     .font(.system(size: 15, weight: .semibold))
-                    .foregroundColor(Color.labelPrimary)
+                    .foregroundColor(Color.labelSecondary)
                 Spacer()
                 Button { dismiss() } label: {
                     Image(systemName: "xmark")
@@ -305,11 +309,9 @@ struct ExportSheetView: View {
                                 Image(systemName: "folder")
                                     .font(.system(size: 12, weight: .light))
                                     .foregroundColor(Color.labelSecondary)
-                                Text(project.exportSettings.outputPath?.path ?? "未选择")
+                                Text(effectiveOutputPath.path)
                                     .font(.system(size: 11))
-                                    .foregroundColor(project.exportSettings.outputPath == nil
-                                                     ? Color.labelSecondary.opacity(0.5)
-                                                     : Color.labelPrimary)
+                                    .foregroundColor(Color.labelPrimary)
                                     .lineLimit(1).truncationMode(.middle)
                                 Spacer()
                             }
@@ -324,6 +326,7 @@ struct ExportSheetView: View {
                                 panel.canChooseDirectories = true
                                 panel.canCreateDirectories = true
                                 panel.prompt = "选择"
+                                panel.directoryURL = effectiveOutputPath
                                 if panel.runModal() == .OK {
                                     project.exportSettings.outputPath = panel.url
                                 }
@@ -343,18 +346,7 @@ struct ExportSheetView: View {
                     // File name
                     ESection(title: "文件名") {
                         HStack(spacing: 6) {
-                            TextField("", text: $project.exportSettings.filename,
-                                      prompt: Text(defaultFilename())
-                                        .foregroundColor(Color.labelSecondary.opacity(0.5)))
-                                .textFieldStyle(.plain)
-                                .font(.system(size: 12))
-                                .foregroundColor(Color.labelPrimary)
-                                .padding(.horizontal, 10)
-                                .frame(height: 32)
-                                .background(Color.white.opacity(0.06))
-                                .cornerRadius(7)
-                                .overlay(RoundedRectangle(cornerRadius: 7)
-                                    .stroke(Color.white.opacity(0.10)))
+                            FocusTextField(text: $project.exportSettings.filename, placeholder: defaultFilename())
                             Text(extLabel)
                                 .font(.system(size: 11))
                                 .foregroundColor(Color.labelSecondary)
@@ -461,16 +453,13 @@ struct ExportSheetView: View {
 
             // Action row
             HStack(spacing: 16) {
-                Group {
-                    if let err = exportError {
-                        Text(err)
-                            .font(.system(size: 11)).foregroundColor(.red.opacity(0.85))
-                            .lineLimit(2)
-                    } else {
-                        Color.clear
-                    }
+                if let err = exportError {
+                    Text(err)
+                        .font(.system(size: 11)).foregroundColor(.red.opacity(0.85))
+                        .lineLimit(2)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                 }
-                .frame(maxWidth: .infinity, alignment: .leading)
+                Spacer()
 
                 Button { dismiss() } label: {
                     Text("取消").font(.system(size: 13))
@@ -486,13 +475,12 @@ struct ExportSheetView: View {
                 } label: {
                     Text("开始导出")
                         .font(.system(size: 13, weight: .semibold))
-                        .foregroundColor(project.exportSettings.outputPath == nil ? .gray : .black)
+                        .foregroundColor(.black)
                         .frame(width: 120, height: 36)
-                        .background(project.exportSettings.outputPath == nil ? Color.white.opacity(0.08) : Color.accent)
+                        .background(Color.accent)
                         .cornerRadius(8)
                 }
                 .buttonStyle(.plain)
-                .disabled(project.exportSettings.outputPath == nil)
             }
             .padding(.horizontal, 24)
             .padding(.vertical, 16)
@@ -532,10 +520,7 @@ struct ExportSheetView: View {
     }
 
     private func startExport() {
-        guard let outputDir = project.exportSettings.outputPath else {
-            exportError = "请先选择输出位置"
-            return
-        }
+        let outputDir = effectiveOutputPath
         let raw = project.exportSettings.filename.trimmingCharacters(in: .whitespaces)
         let baseName = raw.isEmpty ? defaultFilename() : raw
         let ext: String

@@ -1808,10 +1808,9 @@ struct IPicker<T: Hashable>: View {
                     .foregroundColor(Color.labelSecondary)
             }
             .padding(.horizontal, 10)
-            .frame(maxWidth: .infinity, minHeight: 26, maxHeight: 26)
+            .frame(maxWidth: .infinity, minHeight: 32, maxHeight: 32)
             .background(Color.white.opacity(hov ? 0.10 : 0.06))
-            .cornerRadius(5)
-            .overlay(RoundedRectangle(cornerRadius: 5).stroke(Color.white.opacity(0.10)))
+            .cornerRadius(7)
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)

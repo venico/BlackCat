@@ -20,6 +20,7 @@ struct ContentView: View {
     @State private var dragOriginSidebar: CGFloat = 220
     @State private var dragOriginInspector: CGFloat = 280
     @State private var dragOriginTop: CGFloat = 420
+    @State private var settingsVisible = false
 
     // Height of the shared "title-bar" row that contains traffic lights + toggle
     private let toolbarH: CGFloat = 28
@@ -210,8 +211,40 @@ struct ContentView: View {
         .environmentObject(project.clock)
         .ignoresSafeArea()
         .animation(.spring(response: 0.28, dampingFraction: 0.82), value: sidebarVisible)
-        .sheet(isPresented: $project.showExportSheet) {
-            ExportSheetView().environmentObject(project)
+        .overlay {
+            if project.showExportSheet {
+                Color.black.opacity(0.4).ignoresSafeArea()
+                    .onTapGesture { project.showExportSheet = false }
+                ExportSheetView().environmentObject(project)
+                    .clipShape(RoundedRectangle(cornerRadius: 14))
+                    .overlay(RoundedRectangle(cornerRadius: 14)
+                        .stroke(Color.white.opacity(0.15), lineWidth: 0.5))
+                    .shadow(color: .black.opacity(0.6), radius: 30, y: 10)
+                    .transition(.opacity.combined(with: .scale(scale: 0.95)))
+            }
+        }
+        .animation(.easeOut(duration: 0.2), value: project.showExportSheet)
+        .overlay {
+            if project.showSettings {
+                Color.black.opacity(0.4 * (settingsVisible ? 1 : 0))
+                    .ignoresSafeArea()
+                    .allowsHitTesting(settingsVisible)
+                    .onTapGesture { closeSettings() }
+                SettingsView(dismiss: { closeSettings() })
+                    .environmentObject(project)
+                    .clipShape(RoundedRectangle(cornerRadius: 14))
+                    .overlay(RoundedRectangle(cornerRadius: 14)
+                        .stroke(Color.white.opacity(0.15), lineWidth: 0.5))
+                    .shadow(color: .black.opacity(0.6), radius: 30, y: 10)
+                    .opacity(settingsVisible ? 1 : 0)
+                    .scaleEffect(settingsVisible ? 1 : 0.95)
+                    .onAppear {
+                        withAnimation(.easeOut(duration: 0.2)) { settingsVisible = true }
+                    }
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .showSettings)) { _ in
+            project.showSettings = true
         }
         .overlay {
             if project.showWelcome {
@@ -309,10 +342,18 @@ struct ContentView: View {
         }
     }
 
+    private func closeSettings() {
+        withAnimation(.easeOut(duration: 0.2)) { settingsVisible = false }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.22) {
+            project.showSettings = false
+        }
+    }
+
     private func setupEscMonitor() {
         NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
             guard event.keyCode == 53 else { return event }
             if project.showExportSheet { project.showExportSheet = false; return nil }
+            if project.showSettings { closeSettings(); return nil }
             if project.showWelcome { project.showWelcome = false; return nil }
             if project.showClearLibraryConfirm { project.showClearLibraryConfirm = false; return nil }
             if project.showAssetDeleteConfirm { project.showAssetDeleteConfirm = false; project.pendingDeleteAssetID = nil; return nil }
@@ -341,6 +382,31 @@ extension Color {
     static let labelSecondary = Color.white.opacity(0.45)
     static let accent         = Color(hex: "#F5B942")
     static let hoverBg        = Color.white.opacity(0.07)
+}
+
+extension Notification.Name {
+    static let showSettings = Notification.Name("showSettings")
+}
+
+struct FocusTextField: View {
+    @Binding var text: String
+    var placeholder: String
+    @FocusState private var focused: Bool
+
+    var body: some View {
+        TextField("", text: $text,
+                  prompt: Text(placeholder).foregroundColor(Color.labelSecondary.opacity(0.5)))
+            .textFieldStyle(.plain)
+            .font(.system(size: 13))
+            .foregroundColor(Color.labelPrimary)
+            .padding(.horizontal, 10)
+            .frame(height: 34)
+            .background(Color.white.opacity(0.06))
+            .cornerRadius(7)
+            .overlay(RoundedRectangle(cornerRadius: 7)
+                .stroke(focused ? Color.accent : Color.clear, lineWidth: 1))
+            .focused($focused)
+    }
 }
 
 extension Comparable {

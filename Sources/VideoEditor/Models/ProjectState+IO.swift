@@ -152,7 +152,9 @@ extension ProjectState {
     /// Each call resets the timer, so rapid edits are batched.
     func scheduleAutoSave() {
         autoSaveTimer?.invalidate()
-        autoSaveTimer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: false) { [weak self] _ in
+        let interval = AppSettings.shared.autoSaveInterval
+        guard interval > 0 else { return }
+        autoSaveTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: false) { [weak self] _ in
             guard let self = self, !self.isSaved, self.projectFileURL != nil else { return }
             self.saveProject(silent: true)
         }
@@ -165,12 +167,12 @@ extension ProjectState {
             panel.nameFieldStringValue = (projectName.trimmingCharacters(in: .whitespaces).isEmpty ? "未命名项目" : projectName) + ".bcj"
             panel.allowedContentTypes = [.init(filenameExtension: "bcj") ?? .json]
             panel.canCreateDirectories = true
+            panel.directoryURL = AppSettings.shared.effectiveProjectDir
             guard panel.runModal() == .OK, let url = panel.url else { return }
             projectName = url.deletingPathExtension().lastPathComponent
             projectFileURL = url
         } else if projectFileURL == nil {
-            let docDir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
-                ?? FileManager.default.temporaryDirectory
+            let docDir = AppSettings.shared.effectiveProjectDir
             let name = projectName.trimmingCharacters(in: .whitespaces).isEmpty ? "未命名项目" : projectName
             projectName = name
             projectFileURL = docDir.appendingPathComponent("\(name).bcj")

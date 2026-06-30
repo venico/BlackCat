@@ -6,7 +6,7 @@ struct WelcomeView: View {
     @EnvironmentObject private var project: ProjectState
     @State private var selectedTab = 0  // 0 = 新建, 1 = 打开
     @State private var newProjectName = ""
-    @State private var saveDirectory: URL? = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
+    @State private var saveDirectory: URL? = AppSettings.shared.effectiveProjectDir
     @State private var errorMessage: String?
 
     var body: some View {
@@ -109,17 +109,7 @@ struct WelcomeView: View {
                 Text("项目名称")
                     .font(.system(size: 11, weight: .medium))
                     .foregroundColor(Color.labelSecondary)
-                TextField("", text: $newProjectName,
-                          prompt: Text("输入项目名称").foregroundColor(Color.labelSecondary.opacity(0.5)))
-                    .textFieldStyle(.plain)
-                    .font(.system(size: 13))
-                    .foregroundColor(Color.labelPrimary)
-                    .padding(.horizontal, 10)
-                    .frame(height: 34)
-                    .background(Color.white.opacity(0.06))
-                    .cornerRadius(7)
-                    .overlay(RoundedRectangle(cornerRadius: 7)
-                        .stroke(Color.white.opacity(0.10)))
+                FocusTextField(text: $newProjectName, placeholder: "输入项目名称")
             }
 
             // 保存位置

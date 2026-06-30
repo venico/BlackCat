@@ -63,6 +63,8 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate 
         let appItem = NSMenuItem(); appItem.submenu = appMenu
         appMenu.addItem(withTitle: "关于 黑猫剪辑", action: #selector(showAbout), keyEquivalent: "")
         appMenu.addItem(.separator())
+        appMenu.addItem(NSMenuItem(title: "设置…", action: #selector(showSettings), keyEquivalent: ","))
+        appMenu.addItem(.separator())
         appMenu.addItem(NSMenuItem(title: "隐藏 黑猫剪辑", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h"))
         let hideOthers = NSMenuItem(title: "隐藏其他", action: #selector(NSApplication.hideOtherApplications(_:)), keyEquivalent: "h")
         hideOthers.keyEquivalentModifierMask = [.command, .option]
@@ -268,10 +270,14 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate 
         NotificationCenter.default.post(name: .menuExportVideo, object: nil)
     }
 
+    @objc private func showSettings() {
+        NotificationCenter.default.post(name: .showSettings, object: nil)
+    }
+
     @objc private func showAbout() {
         NSApp.orderFrontStandardAboutPanel(options: [
             .applicationName: "黑猫剪辑",
-            .applicationVersion: "3.5.2",
+            .applicationVersion: "3.6.0",
             .version: "",
             .credits: NSAttributedString(string: "")
         ])
