@@ -3,6 +3,10 @@ import AppKit
 import AVFoundation
 import CoreMedia
 import NaturalLanguage
+import CryptoKit
+#if canImport(Translation)
+import Translation
+#endif
 
 // MARK: - Root
 
@@ -354,13 +358,23 @@ enum Translator {
         }
     }
 
-    /// Plain translation of a single text via Google Translate's public endpoint.
-    /// Returns the original text on any failure so subtitles never go blank.
     static func translate(_ text: String, to lang: String) async -> String {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return text }
+        switch AppSettings.shared.translateProvider {
+        case .google:   return await translateGoogle(text, to: lang)
+        case .deepL:    return await translateDeepL(text, to: lang)
+        case .apple:    return await translateApple(text, to: lang)
+        case .youdao:   return await translateYoudao(text, to: lang)
+        case .volcano:  return await translateVolcano(text, to: lang)
+        }
+    }
+
+    // MARK: - Google 翻译
+
+    private static func translateGoogle(_ text: String, to lang: String) async -> String {
         let code = languageCode(lang)
-        guard let q = trimmed.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
+        guard let q = text.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
               let url = URL(string:
                 "https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=\(code)&dt=t&q=\(q)")
         else { return text }
@@ -368,7 +382,6 @@ enum Translator {
             let (data, _) = try await URLSession.shared.data(from: url)
             guard let outer = try JSONSerialization.jsonObject(with: data) as? [Any],
                   let segs = outer.first as? [Any] else { return text }
-            // Each seg is [translatedText, originalText, ...]
             let parts: [String] = segs.compactMap {
                 guard let arr = $0 as? [Any], let s = arr.first as? String else { return nil }
                 return s
@@ -378,6 +391,225 @@ enum Translator {
         } catch {
             return text
         }
+    }
+
+    // MARK: - DeepL 翻译
+
+    private static func translateDeepL(_ text: String, to lang: String) async -> String {
+        let key = AppSettings.shared.deeplAPIKey
+        guard !key.isEmpty else { return text }
+        let targetCode = deeplLanguageCode(lang)
+        let base = key.hasSuffix(":fx") ? "https://api-free.deepl.com" : "https://api.deepl.com"
+        guard let url = URL(string: "\(base)/v2/translate") else { return text }
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("DeepL-Auth-Key \(key)", forHTTPHeaderField: "Authorization")
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = try? JSONSerialization.data(withJSONObject: ["text": [text], "target_lang": targetCode])
+        do {
+            let (data, _) = try await URLSession.shared.data(for: req)
+            if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let arr = json["translations"] as? [[String: Any]],
+               let t = arr.first?["text"] as? String { return t }
+            return text
+        } catch { return text }
+    }
+
+    private static func deeplLanguageCode(_ label: String) -> String {
+        switch label {
+        case "中文（简体）": return "ZH-HANS"
+        case "中文（繁体）": return "ZH-HANT"
+        case "English":     return "EN"
+        case "日本語":       return "JA"
+        case "한국어":       return "KO"
+        case "Français":    return "FR"
+        case "Deutsch":     return "DE"
+        case "Español":     return "ES"
+        case "Русский":     return "RU"
+        case "العربية":      return "AR"
+        case "Português":   return "PT"
+        case "Italiano":    return "IT"
+        default:            return "ZH-HANS"
+        }
+    }
+
+    // MARK: - Apple 翻译
+
+    private static func translateApple(_ text: String, to lang: String) async -> String {
+        #if canImport(Translation)
+        if #available(macOS 26, *) {
+            let code = appleLanguageCode(lang)
+            let target = Locale.Language(identifier: code)
+            let recognizer = NLLanguageRecognizer()
+            recognizer.processString(text)
+            let detected = recognizer.dominantLanguage?.rawValue ?? "en"
+            let source = Locale.Language(identifier: detected)
+            do {
+                let session = TranslationSession(installedSource: source, target: target)
+                try await session.prepareTranslation()
+                let resp = try await session.translate(text)
+                return resp.targetText
+            } catch {
+                return text
+            }
+        }
+        #endif
+        return text
+    }
+
+    private static func appleLanguageCode(_ label: String) -> String {
+        switch label {
+        case "中文（简体）": return "zh-Hans"
+        case "中文（繁体）": return "zh-Hant"
+        case "English":     return "en"
+        case "日本語":       return "ja"
+        case "한국어":       return "ko"
+        case "Français":    return "fr"
+        case "Deutsch":     return "de"
+        case "Español":     return "es"
+        case "Русский":     return "ru"
+        case "العربية":      return "ar"
+        case "Português":   return "pt"
+        case "Italiano":    return "it"
+        default:            return "zh-Hans"
+        }
+    }
+
+    // MARK: - 有道翻译
+
+    private static func translateYoudao(_ text: String, to lang: String) async -> String {
+        let appKey = AppSettings.shared.youdaoAppKey
+        let appSecret = AppSettings.shared.youdaoAppSecret
+        guard !appKey.isEmpty, !appSecret.isEmpty else { return text }
+        let targetCode = youdaoLanguageCode(lang)
+        let salt = UUID().uuidString
+        let curtime = String(Int(Date().timeIntervalSince1970))
+        let input: String
+        if text.count > 20 {
+            input = String(text.prefix(10)) + String(text.count) + String(text.suffix(10))
+        } else {
+            input = text
+        }
+        let signStr = appKey + input + salt + curtime + appSecret
+        let sign = sha256Hex(Data(signStr.utf8))
+        var comps = URLComponents(string: "https://openapi.youdao.com/api")!
+        comps.queryItems = [
+            .init(name: "q", value: text),
+            .init(name: "from", value: "auto"),
+            .init(name: "to", value: targetCode),
+            .init(name: "appKey", value: appKey),
+            .init(name: "salt", value: salt),
+            .init(name: "sign", value: sign),
+            .init(name: "signType", value: "v3"),
+            .init(name: "curtime", value: curtime),
+        ]
+        guard let url = comps.url else { return text }
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+        do {
+            let (data, _) = try await URLSession.shared.data(for: req)
+            if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let arr = json["translation"] as? [String],
+               let first = arr.first { return first }
+            return text
+        } catch { return text }
+    }
+
+    private static func youdaoLanguageCode(_ label: String) -> String {
+        switch label {
+        case "中文（简体）": return "zh-CHS"
+        case "中文（繁体）": return "zh-CHT"
+        case "English":     return "en"
+        case "日本語":       return "ja"
+        case "한국어":       return "ko"
+        case "Français":    return "fr"
+        case "Deutsch":     return "de"
+        case "Español":     return "es"
+        case "Русский":     return "ru"
+        case "العربية":      return "ar"
+        case "Português":   return "pt"
+        case "Italiano":    return "it"
+        default:            return "zh-CHS"
+        }
+    }
+
+    // MARK: - 火山翻译
+
+    private static func translateVolcano(_ text: String, to lang: String) async -> String {
+        let accessKey = AppSettings.shared.volcanoAccessKeyId
+        let secretKey = AppSettings.shared.volcanoSecretAccessKey
+        guard !accessKey.isEmpty, !secretKey.isEmpty else { return text }
+        let targetCode = volcanoLanguageCode(lang)
+        let host = "open.volcengineapi.com"
+        let service = "translate"
+        let region = "cn-north-1"
+        let action = "TranslateText"
+        let version = "2020-06-01"
+        let body: [String: Any] = ["SourceLanguage": "", "TargetLanguage": targetCode, "TextList": [text]]
+        guard let bodyData = try? JSONSerialization.data(withJSONObject: body) else { return text }
+        let now = Date()
+        let fmt = DateFormatter()
+        fmt.dateFormat = "yyyyMMdd'T'HHmmss'Z'"
+        fmt.timeZone = TimeZone(identifier: "UTC")
+        let dateTime = fmt.string(from: now)
+        let dateOnly = String(dateTime.prefix(8))
+        let credScope = "\(dateOnly)/\(region)/\(service)/request"
+        let query = "Action=\(action)&Version=\(version)"
+        let payloadHash = sha256Hex(bodyData)
+        let canonHeaders = "content-type:application/json\nhost:\(host)\nx-date:\(dateTime)\n"
+        let signedHeaders = "content-type;host;x-date"
+        let canonReq = "POST\n/\n\(query)\n\(canonHeaders)\n\(signedHeaders)\n\(payloadHash)"
+        let strToSign = "HMAC-SHA256\n\(dateTime)\n\(credScope)\n\(sha256Hex(Data(canonReq.utf8)))"
+        let kDate = hmacSHA256(key: Data(secretKey.utf8), msg: Data(dateOnly.utf8))
+        let kRegion = hmacSHA256(key: kDate, msg: Data(region.utf8))
+        let kService = hmacSHA256(key: kRegion, msg: Data(service.utf8))
+        let kSigning = hmacSHA256(key: kService, msg: Data("request".utf8))
+        let sig = hmacSHA256(key: kSigning, msg: Data(strToSign.utf8)).map { String(format: "%02x", $0) }.joined()
+        let auth = "HMAC-SHA256 Credential=\(accessKey)/\(credScope), SignedHeaders=\(signedHeaders), Signature=\(sig)"
+        guard let url = URL(string: "https://\(host)/?Action=\(action)&Version=\(version)") else { return text }
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.setValue(host, forHTTPHeaderField: "Host")
+        req.setValue(dateTime, forHTTPHeaderField: "X-Date")
+        req.setValue(auth, forHTTPHeaderField: "Authorization")
+        req.httpBody = bodyData
+        do {
+            let (data, _) = try await URLSession.shared.data(for: req)
+            if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let list = json["TranslationList"] as? [[String: Any]],
+               let t = list.first?["Translation"] as? String { return t }
+            return text
+        } catch { return text }
+    }
+
+    private static func volcanoLanguageCode(_ label: String) -> String {
+        switch label {
+        case "中文（简体）": return "zh"
+        case "中文（繁体）": return "zh-Hant"
+        case "English":     return "en"
+        case "日本語":       return "ja"
+        case "한국어":       return "ko"
+        case "Français":    return "fr"
+        case "Deutsch":     return "de"
+        case "Español":     return "es"
+        case "Русский":     return "ru"
+        case "العربية":      return "ar"
+        case "Português":   return "pt"
+        case "Italiano":    return "it"
+        default:            return "zh"
+        }
+    }
+
+    // MARK: - Crypto helpers
+
+    private static func sha256Hex(_ data: Data) -> String {
+        SHA256.hash(data: data).compactMap { String(format: "%02x", $0) }.joined()
+    }
+
+    private static func hmacSHA256(key: Data, msg: Data) -> Data {
+        Data(HMAC<SHA256>.authenticationCode(for: msg, using: SymmetricKey(data: key)))
     }
 
     /// 批量翻译：多条文本用 \n 拼接成一次请求，翻译后按行还原。

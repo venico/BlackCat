@@ -202,7 +202,8 @@ extension ProjectState {
                 await MainActor.run { self.transcribeState = .idle }
             } catch {
                 await MainActor.run {
-                    self.transcribeState = .failed("模型下载失败: \(error.localizedDescription)")
+                    self.transcribeState = .idle
+                    self.showSuccessToast(icon: "exclamationmark.triangle", iconColor: .red, title: "语音识别", subtitle: "模型下载失败: \(error.localizedDescription)", autoCountdown: false)
                 }
             }
         }
@@ -230,7 +231,7 @@ extension ProjectState {
         }
 
         guard let mediaURL = url else {
-            transcribeState = .failed("请先选择一个视频或音频片段")
+            showSuccessToast(icon: "exclamationmark.triangle", iconColor: .red, title: "语音识别", subtitle: "请先选择一个视频或音频片段", autoCountdown: false)
             return
         }
         if !WhisperTranscriber.modelReady {
@@ -239,7 +240,7 @@ extension ProjectState {
         }
 
         guard WhisperTranscriber.whisperReady else {
-            transcribeState = .failed("语音识别引擎未就绪（whisper-cli 缺失）")
+            showSuccessToast(icon: "exclamationmark.triangle", iconColor: .red, title: "语音识别", subtitle: "语音识别引擎未就绪（whisper-cli 缺失）", autoCountdown: false)
             return
         }
 
@@ -317,10 +318,9 @@ extension ProjectState {
                 }
             } catch {
                 await MainActor.run {
-                    if self.transcribeState != .idle {
-                        self.transcribeState = .failed(error.localizedDescription)
-                    }
+                    self.transcribeState = .idle
                     self.transcribeTask = nil
+                    self.showSuccessToast(icon: "exclamationmark.triangle", iconColor: .red, title: "语音识别", subtitle: error.localizedDescription, autoCountdown: false)
                 }
             }
         }

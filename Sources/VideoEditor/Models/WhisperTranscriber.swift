@@ -75,6 +75,10 @@ enum WhisperTranscriber {
     }
 
     static func findModel() -> URL? {
+        let preferred = AppSettings.shared.selectedWhisperModel
+        let preferredURL = downloadedModelURL(preferred)
+        if FileManager.default.fileExists(atPath: preferredURL.path) { return preferredURL }
+
         for size in ModelSize.allCases.reversed() {
             let dl = downloadedModelURL(size)
             if FileManager.default.fileExists(atPath: dl.path) { return dl }
@@ -225,13 +229,14 @@ enum WhisperTranscriber {
 
     enum TranscribeError: Error, LocalizedError {
         case whisperNotFound, modelNotFound, ffmpegNotFound
-        case audioExtractFailed, recognizeFailed, noResult, downloadFailed
+        case audioExtractFailed(String), recognizeFailed, noResult, downloadFailed
         var errorDescription: String? {
             switch self {
             case .whisperNotFound:    return "找不到 whisper-cli 可执行文件"
-            case .modelNotFound:      return "找不到语音识别模型 (ggml-small.bin)"
+            case .modelNotFound:      return "找不到语音识别模型"
             case .ffmpegNotFound:     return "找不到 ffmpeg"
-            case .audioExtractFailed: return "音频提取失败"
+            case .audioExtractFailed(let detail):
+                return detail.isEmpty ? "音频提取失败" : "音频提取失败: \(detail)"
             case .recognizeFailed:    return "语音识别失败"
             case .noResult:           return "未识别到任何语音内容"
             case .downloadFailed:     return "模型下载失败，请检查网络后重试"
@@ -257,6 +262,7 @@ enum WhisperTranscriber {
         guard let whisper = findWhisper() else { throw TranscribeError.whisperNotFound }
         guard let model   = findModel()   else { throw TranscribeError.modelNotFound }
         guard let ffmpeg  = ProjectState.findFFmpeg() else { throw TranscribeError.ffmpegNotFound }
+        NSLog("[Whisper] 使用模型: %@", model.lastPathComponent)
 
         let tmp = FileManager.default.temporaryDirectory
         let uid = UUID().uuidString
@@ -279,7 +285,11 @@ enum WhisperTranscriber {
             runProcess(ffmpeg, ffArgs)
         }.value
         guard extractOK, FileManager.default.fileExists(atPath: wavURL.path) else {
-            throw TranscribeError.audioExtractFailed
+            let lines = (lastProcessError ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                .components(separatedBy: "\n")
+            let detail = lines.last(where: { !$0.isEmpty }) ?? ""
+            NSLog("[Whisper] ffmpeg failed: \(detail)")
+            throw TranscribeError.audioExtractFailed(detail)
         }
         onProgress?(0.05)
 
@@ -324,19 +334,25 @@ enum WhisperTranscriber {
         currentProcess = nil
     }
 
+    static var lastProcessError: String?
+
     private static func runProcess(_ exe: URL, _ args: [String]) -> Bool {
         let p = Process()
         p.executableURL = exe
         p.arguments = args
         p.standardOutput = FileHandle.nullDevice
-        p.standardError = FileHandle.nullDevice
+        let errPipe = Pipe()
+        p.standardError = errPipe
         currentProcess = p
         do {
             try p.run()
             p.waitUntilExit()
+            let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+            lastProcessError = String(data: errData, encoding: .utf8)
             currentProcess = nil
             return p.terminationStatus == 0
         } catch {
+            lastProcessError = error.localizedDescription
             currentProcess = nil
             return false
         }
