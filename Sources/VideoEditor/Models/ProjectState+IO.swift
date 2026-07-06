@@ -15,6 +15,7 @@ extension ProjectState {
         imageTracks = []
         subtitleTracks = []
         textTracks = []
+        shapeTracks = []
         subtitleBottomMargin = 5
         subtitleLineSpacing = 6
         undoStack.removeAll(); redoStack.removeAll()
@@ -22,7 +23,7 @@ extension ProjectState {
         currentTime = 0; duration = 60
         selectedVideoClipID = nil; selectedAudioClipID = nil
         selectedImageClipID = nil; selectedSubtitleClipID = nil
-        selectedTextClipID = nil
+        selectedTextClipID = nil; selectedShapeClipID = nil
         selectedClipIDs.removeAll()
         assetThumbnails.removeAll()
         waveformCache.removeAll()
@@ -106,6 +107,7 @@ extension ProjectState {
         subtitleTracks = loadedSubtitleTracks
         textTracks = doc.textTracks ?? []
         textTemplates = doc.textTemplates ?? []
+        shapeTracks = doc.shapeTracks ?? []
         subtitleBottomMargin = doc.subtitleBottomMargin ?? doc.subtitleStyles.first?.bottomMargin ?? 5
         subtitleLineSpacing = doc.subtitleLineSpacing ?? doc.subtitleStyles.first?.lineSpacing ?? 6
         overlayTrackOrder = doc.overlayTrackOrder ?? []
@@ -187,6 +189,7 @@ extension ProjectState {
             subtitleStyles: subtitleTracks.map { $0.subtitleStyle ?? SubtitleStyle() },  // 向后兼容旧格式
             textTracks: textTracks,
             textTemplates: textTemplates.isEmpty ? nil : textTemplates,
+            shapeTracks: shapeTracks.isEmpty ? nil : shapeTracks,
             mediaAssets: mediaAssets,
             exportSettings: exportSettings,
             previewResolution: previewResolution,

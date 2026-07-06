@@ -7,6 +7,7 @@ struct MediaLibraryView: View {
 
     private var isTransitionTab: Bool { project.mediaLibraryTab == "transition" }
     private var isTextTab: Bool { project.mediaLibraryTab == "text" }
+    private var isShapeTab: Bool { project.mediaLibraryTab == "shape" }
 
     private var selectedAssetType: AssetType {
         switch project.mediaLibraryTab {
@@ -45,10 +46,12 @@ struct MediaLibraryView: View {
     }
 
     var body: some View {
-        VStack(spacing: 0) {
+        HStack(spacing: 0) {
+            verticalTabBar
+            VStack(spacing: 0) {
             // Section header
             HStack {
-                Text("素材库")
+                Text(tabName(project.mediaLibraryTab))
                     .font(.system(size: 11, weight: .semibold))
                     .foregroundColor(Color.labelSecondary)
                     .textCase(.uppercase)
@@ -65,22 +68,8 @@ struct MediaLibraryView: View {
             .padding(.top, 8)
             .padding(.bottom, 8)
 
-            // Tab bar — Finder-style segmented icons
-            HStack(spacing: 0) {
-                tabBtn("video", icon: "film")
-                tabBtn("audio", icon: "music.note")
-                tabBtn("image", icon: "photo")
-                tabBtn("subtitle", icon: "captions.bubble")
-                tabBtnBowtie("transition")
-                tabBtnT("text")
-            }
-            .background(Color.white.opacity(0.06))
-            .clipShape(Capsule())
-            .padding(.horizontal, 8)
-            .padding(.bottom, 6)
-
             // Search + Sort bar
-            if !isTransitionTab && !isTextTab {
+            if !isTransitionTab && !isTextTab && !isShapeTab {
                 HStack(spacing: 4) {
                     HStack(spacing: 4) {
                         Image(systemName: "magnifyingglass")
@@ -114,7 +103,9 @@ struct MediaLibraryView: View {
 
             // Asset list + drag-drop target
             ZStack {
-                if isTextTab {
+                if isShapeTab {
+                    ShapePanel()
+                } else if isTextTab {
                     TextLayerPanel()
                 } else if isTransitionTab {
                     TransitionPanel()
@@ -192,6 +183,39 @@ struct MediaLibraryView: View {
             }
             .padding(.horizontal, 8)
             .padding(.bottom, 8)
+            }
+        }
+    }
+
+    // 左侧竖排图标标签栏
+    private var verticalTabBar: some View {
+        VStack(spacing: 4) {
+            tabBtn("video", icon: "film")
+            tabBtn("audio", icon: "music.note")
+            tabBtn("image", icon: "photo")
+            tabBtn("subtitle", icon: "captions.bubble")
+            tabBtnBowtie("transition")
+            tabBtnT("text")
+            tabBtnShape("shape")
+            Spacer()
+        }
+        .padding(.top, 10)
+        .padding(.horizontal, 6)
+        .frame(width: 44)
+        .frame(maxHeight: .infinity)
+        .background(Color.black.opacity(0.15))
+    }
+
+    private func tabName(_ tab: String) -> String {
+        switch tab {
+        case "video": return "视频"
+        case "audio": return "音频"
+        case "image": return "图片"
+        case "subtitle": return "字幕"
+        case "transition": return "转场"
+        case "text": return "文字"
+        case "shape": return "图形"
+        default: return ""
         }
     }
 
@@ -200,29 +224,45 @@ struct MediaLibraryView: View {
         let isActive = project.mediaLibraryTab == tab
         Button { project.mediaLibraryTab = tab } label: {
             Text("T")
-                .font(.system(size: 13, weight: .bold, design: .serif))
+                .font(.system(size: 15, weight: .bold, design: .serif))
                 .foregroundColor(isActive ? .white : Color.labelSecondary)
-                .frame(maxWidth: .infinity)
-                .frame(height: 26)
+                .frame(width: 30, height: 30)
                 .background(isActive ? Color.white.opacity(0.15) : Color.clear)
-                .clipShape(Capsule())
-                .contentShape(Capsule())
+                .clipShape(RoundedRectangle(cornerRadius: 7))
+                .contentShape(RoundedRectangle(cornerRadius: 7))
         }
         .buttonStyle(.plain)
+        .help(tabName(tab))
     }
 
     @ViewBuilder
     private func tabBtnBowtie(_ tab: String) -> some View {
         let isActive = project.mediaLibraryTab == tab
         Button { project.mediaLibraryTab = tab } label: {
-            BowtieIcon(size: 12, color: isActive ? .white : Color.labelSecondary)
-                .frame(maxWidth: .infinity)
-                .frame(height: 26)
+            BowtieIcon(size: 14, color: isActive ? .white : Color.labelSecondary)
+                .frame(width: 30, height: 30)
                 .background(isActive ? Color.white.opacity(0.15) : Color.clear)
-                .clipShape(Capsule())
-                .contentShape(Capsule())
+                .clipShape(RoundedRectangle(cornerRadius: 7))
+                .contentShape(RoundedRectangle(cornerRadius: 7))
         }
         .buttonStyle(.plain)
+        .help(tabName(tab))
+    }
+
+    @ViewBuilder
+    private func tabBtnShape(_ tab: String) -> some View {
+        let isActive = project.mediaLibraryTab == tab
+        Button { project.mediaLibraryTab = tab } label: {
+            Image(systemName: "square.on.circle")
+                .font(.system(size: 14, weight: .medium))
+                .foregroundColor(isActive ? .white : Color.labelSecondary)
+                .frame(width: 30, height: 30)
+                .background(isActive ? Color.white.opacity(0.15) : Color.clear)
+                .clipShape(RoundedRectangle(cornerRadius: 7))
+                .contentShape(RoundedRectangle(cornerRadius: 7))
+        }
+        .buttonStyle(.plain)
+        .help(tabName(tab))
     }
 
     @ViewBuilder
@@ -230,15 +270,15 @@ struct MediaLibraryView: View {
         let isActive = project.mediaLibraryTab == tab
         Button { project.mediaLibraryTab = tab } label: {
             Image(systemName: icon)
-                .font(.system(size: 12, weight: .medium))
+                .font(.system(size: 14, weight: .medium))
                 .foregroundColor(isActive ? .white : Color.labelSecondary)
-                .frame(maxWidth: .infinity)
-                .frame(height: 26)
+                .frame(width: 30, height: 30)
                 .background(isActive ? Color.white.opacity(0.15) : Color.clear)
-                .clipShape(Capsule())
-                .contentShape(Capsule())
+                .clipShape(RoundedRectangle(cornerRadius: 7))
+                .contentShape(RoundedRectangle(cornerRadius: 7))
         }
         .buttonStyle(.plain)
+        .help(tabName(tab))
     }
 
     private var emptyState: some View {
@@ -1012,6 +1052,7 @@ private struct TransitionPreviewCard: View {
     let onSelect: () -> Void
     @State private var phase: Double = 0
     @State private var hoverTask: Task<Void, Never>? = nil
+    @State private var hover = false
 
     var body: some View {
         Button(action: onSelect) {
@@ -1032,15 +1073,17 @@ private struct TransitionPreviewCard: View {
                     .lineLimit(1)
             }
             .padding(6)
-            .background(isSelected ? Color.accent.opacity(0.15) : Color.clear)
+            .background(isSelected ? Color.accent.opacity(0.15) : (hover ? Color.white.opacity(0.08) : Color.clear))
             .cornerRadius(6)
             .overlay(
                 RoundedRectangle(cornerRadius: 6)
                     .stroke(isSelected ? Color.accent : Color.clear, lineWidth: 1)
             )
+            .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         .onHover { hovering in
+            hover = hovering
             if hovering {
                 // hover 进入：启动独立 Task 循环播放，不污染其他卡片
                 hoverTask = Task {
@@ -1186,6 +1229,86 @@ private struct MediaToolBtn: View {
         .disabled(!enabled)
         .onHover { hov = $0 }
         .help(help)
+    }
+}
+
+// MARK: - Shape Panel（图形素材面板）
+
+private struct ShapePanel: View {
+    @EnvironmentObject private var project: ProjectState
+
+    var body: some View {
+        ScrollView(showsIndicators: false) {
+            LazyVGrid(columns: [GridItem(.flexible(), spacing: 8),
+                                GridItem(.flexible(), spacing: 8)], spacing: 8) {
+                ForEach(ShapeType.allCases, id: \.self) { type in
+                    ShapeCard(type: type) { project.addShapeAtPlayhead(type: type) }
+                }
+            }
+            .padding(.horizontal, 8)
+            .padding(.top, 6)
+            .padding(.bottom, 8)
+        }
+    }
+}
+
+private struct ShapeCard: View {
+    let type: ShapeType
+    let onAdd: () -> Void
+    @State private var hover = false
+
+    var body: some View {
+        VStack(spacing: 4) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 6).fill(Color.white.opacity(0.05))
+                GeometryReader { geo in
+                    let r = CGRect(x: geo.size.width * 0.2, y: geo.size.height * 0.28,
+                                   width: geo.size.width * 0.6, height: geo.size.height * 0.44)
+                    let col = Color.labelSecondary.opacity(0.85)
+                    if type == .arrow {
+                        let ar = CGRect(x: r.midX - r.width * 0.25, y: r.midY - r.height * 0.25,
+                                        width: r.width * 0.5, height: r.height * 0.5)
+                        let y = ar.midY
+                        let headLen = ar.width * 0.5
+                        let wing = min(ar.height * 0.44, headLen * 0.62)
+                        ZStack {
+                            Path { p in
+                                p.move(to: CGPoint(x: ar.minX, y: y))
+                                p.addLine(to: CGPoint(x: ar.maxX - headLen, y: y))
+                            }.stroke(col, lineWidth: 2)
+                            Path { p in
+                                p.move(to: CGPoint(x: ar.maxX - headLen, y: y - wing))
+                                p.addLine(to: CGPoint(x: ar.maxX, y: y))
+                                p.addLine(to: CGPoint(x: ar.maxX - headLen, y: y + wing))
+                                p.closeSubpath()
+                            }.fill(col)
+                        }
+                    } else if type.isClosed {
+                        ShapeGeometry.path(for: type, in: r).fill(col)
+                    } else {
+                        ShapeGeometry.path(for: type, in: r).stroke(col, lineWidth: 2)
+                    }
+                }
+            }
+            .frame(height: 54)
+            .overlay(alignment: .bottomTrailing) {
+                if hover {
+                    VideoMiniBtnView(icon: "plus.circle", action: onAdd)
+                        .padding(2)
+                }
+            }
+            Text(type.label)
+                .font(.system(size: 9))
+                .foregroundColor(Color.labelSecondary)
+                .lineLimit(1)
+        }
+        .padding(6)
+        .background(hover ? Color.white.opacity(0.08) : Color.clear)
+        .cornerRadius(8)
+        .contentShape(Rectangle())
+        .onHover { hover = $0 }
+        .gesture(TapGesture(count: 2).onEnded { onAdd() })
+        .help("双击添加\(type.label)")
     }
 }
 

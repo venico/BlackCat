@@ -65,6 +65,7 @@ extension ProjectState {
                         imageTracks: imageTracks,
                         subtitleTracks: subtitleTracks,
                         textTracks: textTracks,
+                        shapeTracks: shapeTracks,
                         overlayTrackOrder: overlayTrackOrder,
                         subtitleBottomMargin: subtitleBottomMargin,
                         subtitleLineSpacing: subtitleLineSpacing,
@@ -189,6 +190,7 @@ extension ProjectState {
         if let id = selectedAudioClipID    { ids.insert(id) }
         if let id = selectedSubtitleClipID { ids.insert(id) }
         if let id = selectedTextClipID     { ids.insert(id) }
+        if let id = selectedShapeClipID    { ids.insert(id) }
         guard !ids.isEmpty else { return }
 
         for i in videoTracks.indices {
@@ -216,12 +218,18 @@ extension ProjectState {
             textTracks[i].clips.removeAll { ids.contains($0.id) }
             if textTracks[i].clips.count != before { changed = true }
         }
+        for i in shapeTracks.indices {
+            let before = shapeTracks[i].clips.count
+            shapeTracks[i].clips.removeAll { ids.contains($0.id) }
+            if shapeTracks[i].clips.count != before { changed = true }
+        }
 
         selectedVideoClipID    = nil
         selectedImageClipID    = nil
         selectedAudioClipID    = nil
         selectedSubtitleClipID = nil
         selectedTextClipID     = nil
+        selectedShapeClipID    = nil
         selectedClipIDs.removeAll()
 
         if changed {

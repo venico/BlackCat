@@ -21,6 +21,8 @@ struct InspectorView: View {
                     TransitionInspector(clipID: transID)
                 } else if let clip = project.selectedTextClip {
                     TextInspector(clip: clip).id(clip.id)
+                } else if let clip = project.selectedShapeClip {
+                    ShapeInspector(clip: clip).id(clip.id)
                 } else if let clip = project.selectedSubtitleClip {
                     SubtitleInspector(clip: clip).id(clip.id)
                 } else if let clip = project.selectedImageClip {
@@ -82,6 +84,7 @@ struct InspectorView: View {
     private var tag: String {
         if project.selectedTransitionClipID != nil { return "转场" }
         if project.selectedTextClipID       != nil { return "文字片段" }
+        if project.selectedShapeClipID      != nil { return "图形片段" }
         if project.selectedSubtitleClipID   != nil { return "字幕片段" }
         if project.selectedImageClipID      != nil { return "图片片段" }
         if project.selectedVideoClipID      != nil { return "视频片段" }
@@ -188,7 +191,7 @@ private struct SubtitleInspector: View {
                 HStack(alignment: .bottom, spacing: 8) {
                     IField(label: "字体") {
                         IPicker(selection: $ls.fontName,
-                                options: ["PingFang SC","思源黑体","Helvetica Neue","Arial","Times New Roman"].map { ($0, $0) })
+                                options: FontHelper.fontOptions)
                             .onChange(of: ls.fontName) { _ in writeStyle() }
                     }
                     IField(label: "字号") {
@@ -768,7 +771,7 @@ private struct TextInspector: View {
                 HStack(alignment: .bottom, spacing: 8) {
                     IField(label: "字体") {
                         IPicker(selection: $fontName,
-                                options: ["PingFang SC","思源黑体","Helvetica Neue","Arial","Times New Roman"].map { ($0,$0) })
+                                options: FontHelper.fontOptions)
                             .onChange(of: fontName) { _ in write { $0.fontName = fontName } }
                     }
                     IField(label: "字号") {
@@ -872,6 +875,348 @@ private struct TextInspector: View {
                 .background(isOn ? Color(hex: "#E8A54B") : Color.white.opacity(0.08))
                 .cornerRadius(5)
         }.buttonStyle(.plain)
+    }
+}
+
+private struct ShapeInspector: View {
+    @EnvironmentObject private var project: ProjectState
+    let clip: ShapeClip
+
+    @State private var startTime = 0.0
+    @State private var endTime = 0.0
+    @State private var width = 100.0
+    @State private var height = 100.0
+    @State private var scale = 100.0
+    @State private var scaleXPct = 100.0
+    @State private var scaleYPct = 100.0
+    @State private var lockAspect = true
+    @State private var posX = 0.5
+    @State private var posY = 0.5
+    @State private var rotation = 0.0
+    @State private var opacity = 1.0
+    @State private var fillEnabled = true
+    @State private var fillColor = Color.white
+    @State private var fillOpacity = 1.0
+    @State private var strokeEnabled = false
+    @State private var strokeColor = Color.white
+    @State private var strokeWidth = 4.0
+    @State private var strokeOpacity = 1.0
+    @State private var strokeDashed = false
+    @State private var capStartV: LineCapStyle = .none
+    @State private var capEndV: LineCapStyle = .none
+    @State private var cornerRadius = 0.0
+    @State private var shadowEnabled = false
+    @State private var shadowColor = Color.black
+    @State private var shadowRadius = 8.0
+    @State private var shadowOffsetX = 0.0
+    @State private var shadowOffsetY = 4.0
+    @State private var shadowOpacityV = 0.5
+    @State private var shadowDistance = 0.0
+    @State private var shadowAngle = 45.0
+    @State private var syncing = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            ISection(title: "时间") {
+                HStack(spacing: 8) {
+                    IField(label: "开始") {
+                        MiniStepper(value: $startTime, step: 0.1, decimals: 2)
+                            .onChange(of: startTime) { _ in
+                                if endTime <= startTime { endTime = startTime + 0.5 }
+                                write { $0.startTime = startTime; $0.endTime = endTime }
+                            }
+                    }
+                    IField(label: "持续") {
+                        MiniStepper(value: Binding(
+                            get: { max(endTime - startTime, 0) },
+                            set: { endTime = startTime + max($0, 0.1) }
+                        ), step: 0.1, decimals: 2)
+                        .onChange(of: endTime) { _ in write { $0.endTime = endTime } }
+                    }
+                }
+            }
+
+            ISection(title: "大小与位置") {
+                HStack(spacing: 8) {
+                    IField(label: "宽") {
+                        MiniStepper(value: Binding(
+                            get: { (clipNow.width * clipNow.scaleX).rounded() },
+                            set: { nw in write { $0.width = nw / max($0.scaleX, 0.01) } }
+                        ), step: 1, decimals: 0, minValue: 1, maxValue: 8000)
+                    }
+                    IField(label: "高") {
+                        MiniStepper(value: Binding(
+                            get: { (clipNow.height * clipNow.scaleY).rounded() },
+                            set: { nh in write { $0.height = nh / max($0.scaleY, 0.01) } }
+                        ), step: 1, decimals: 0, minValue: 1, maxValue: 8000)
+                    }
+                }
+                HStack {
+                    Text("等比缩放").font(.system(size: 11)).foregroundColor(Color.labelSecondary)
+                    Spacer()
+                    Toggle("", isOn: $lockAspect).labelsHidden().toggleStyle(.switch).scaleEffect(0.8)
+                        .onChange(of: lockAspect) { _ in write { $0.lockAspect = lockAspect } }
+                }
+                if lockAspect {
+                    ISlider(label: "缩放", value: $scale, range: 5...400, unit: "%")
+                        .onChange(of: scale) { _ in
+                            scaleXPct = scale; scaleYPct = scale
+                            write { $0.scaleX = scale / 100; $0.scaleY = scale / 100 }
+                        }
+                        .dimNonUniform(dim(\.scaleX))
+                } else {
+                    ISlider(label: "宽度缩放", value: $scaleXPct, range: 5...400, unit: "%")
+                        .onChange(of: scaleXPct) { _ in write { $0.scaleX = scaleXPct / 100 } }
+                    ISlider(label: "高度缩放", value: $scaleYPct, range: 5...400, unit: "%")
+                        .onChange(of: scaleYPct) { _ in write { $0.scaleY = scaleYPct / 100 } }
+                }
+                ISlider(label: "水平位置", value: Binding(get: { posX * 100 }, set: { posX = $0 / 100 }), range: 0...100, unit: "%")
+                    .onChange(of: posX) { _ in write { $0.posX = posX } }
+                ISlider(label: "垂直位置", value: Binding(get: { posY * 100 }, set: { posY = $0 / 100 }), range: 0...100, unit: "%")
+                    .onChange(of: posY) { _ in write { $0.posY = posY } }
+                ISlider(label: "旋转", value: $rotation, range: -180...180, unit: "°")
+                    .onChange(of: rotation) { _ in write { $0.rotation = rotation } }
+                ISlider(label: "不透明度", value: Binding(get: { opacity * 100 }, set: { opacity = $0 / 100 }), range: 0...100, unit: "%")
+                    .onChange(of: opacity) { _ in write { $0.opacity = opacity } }
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("对齐").font(.system(size: 11)).foregroundColor(Color.labelSecondary)
+                    HStack(spacing: 3) {
+                        alignBtn("align.horizontal.left.fill", .left)
+                        alignBtn("align.horizontal.center.fill", .hcenter)
+                        alignBtn("align.horizontal.right.fill", .right)
+                        alignBtn("align.vertical.top.fill", .top)
+                        alignBtn("align.vertical.center.fill", .vcenter)
+                        alignBtn("align.vertical.bottom.fill", .bottom)
+                        Rectangle().fill(Color.white.opacity(0.15)).frame(width: 1, height: 18).padding(.horizontal, 2)
+                        alignBtn("arrow.left.and.right", .hdist)
+                        alignBtn("arrow.up.and.down", .vdist)
+                        Spacer(minLength: 0)
+                    }
+                }
+            }
+
+            if clip.type.isClosed {
+                ISection(title: "填充") {
+                    toggleRow("启用填充", $fillEnabled, dimKP: \.fillEnabled) { write { $0.fillEnabled = fillEnabled } }
+                    if fillEnabled {
+                        colorRow("颜色", $fillColor, dimKP: \.fillColor) { write { $0.fillColor = fillColor } }
+                        ISlider(label: "不透明度", value: Binding(get: { fillOpacity * 100 }, set: { fillOpacity = $0 / 100 }), range: 0...100, unit: "%")
+                            .onChange(of: fillOpacity) { _ in write { $0.fillOpacity = fillOpacity } }
+                    }
+                }
+            }
+
+            ISection(title: "描边") {
+                toggleRow("启用描边", $strokeEnabled, dimKP: \.strokeEnabled) { write { $0.strokeEnabled = strokeEnabled } }
+                if strokeEnabled {
+                    HStack(spacing: 12) {
+                        Text("样式").font(.system(size: 11)).foregroundColor(Color.labelSecondary).frame(width: 68, alignment: .leading)
+                        IPicker(selection: Binding(
+                            get: { strokeDashed ? "虚线" : "直线" },
+                            set: { strokeDashed = ($0 == "虚线"); write { $0.strokeDashed = strokeDashed } }
+                        ), options: [("直线", "直线"), ("虚线", "虚线")])
+                    }
+                    colorRow("颜色", $strokeColor, dimKP: \.strokeColor) { write { $0.strokeColor = strokeColor } }
+                    ISlider(label: "粗细", value: $strokeWidth, range: 1...30, unit: "px")
+                        .onChange(of: strokeWidth) { _ in write { $0.strokeWidth = strokeWidth } }
+                        .dimNonUniform(dim(\.strokeWidth))
+                    ISlider(label: "不透明度", value: Binding(get: { strokeOpacity * 100 }, set: { strokeOpacity = $0 / 100 }), range: 0...100, unit: "%")
+                        .onChange(of: strokeOpacity) { _ in write { $0.strokeOpacity = strokeOpacity } }
+                    if !clip.type.isClosed {
+                        HStack(spacing: 12) {
+                            Text("起点").font(.system(size: 11)).foregroundColor(Color.labelSecondary).frame(width: 68, alignment: .leading)
+                            IPicker(selection: Binding(get: { capStartV.label }, set: { setCap($0, start: true) }), options: LineCapStyle.allCases.map { ($0.label, $0.label) })
+                        }
+                        HStack(spacing: 12) {
+                            Text("终点").font(.system(size: 11)).foregroundColor(Color.labelSecondary).frame(width: 68, alignment: .leading)
+                            IPicker(selection: Binding(get: { capEndV.label }, set: { setCap($0, start: false) }), options: LineCapStyle.allCases.map { ($0.label, $0.label) })
+                        }
+                    }
+                }
+            }
+
+            if [.rectangle, .triangle, .parallelogram, .trapezoid].contains(clip.type) {
+                ISection(title: "圆角") {
+                    ISlider(label: "圆角", value: $cornerRadius, range: 0...200, unit: "px")
+                        .onChange(of: cornerRadius) { _ in write { $0.cornerRadius = cornerRadius } }
+                        .dimNonUniform(dim(\.cornerRadius))
+                }
+            }
+
+            ISection(title: "投影") {
+                toggleRow("启用投影", $shadowEnabled, dimKP: \.shadowEnabled) { write { $0.shadowEnabled = shadowEnabled } }
+                if shadowEnabled {
+                    colorRow("颜色", $shadowColor, dimKP: \.shadowColor) { write { $0.shadowColor = shadowColor } }
+                    ISlider(label: "不透明度", value: Binding(get: { shadowOpacityV * 100 }, set: { shadowOpacityV = $0 / 100 }), range: 0...100, unit: "%")
+                        .onChange(of: shadowOpacityV) { _ in write { $0.shadowOpacity = shadowOpacityV } }
+                    ISlider(label: "距离", value: $shadowDistance, range: 0...100, unit: "px")
+                        .onChange(of: shadowDistance) { _ in applyShadowVector() }
+                    ISlider(label: "角度", value: $shadowAngle, range: 0...360, unit: "°")
+                        .onChange(of: shadowAngle) { _ in applyShadowVector() }
+                }
+            }
+
+            ISection(title: nil) {
+                Button { project.deleteShapeClip(id: clip.id) } label: {
+                    HStack { Spacer(); Image(systemName: "trash"); Text("删除图形"); Spacer() }
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundColor(.red.opacity(0.9))
+                        .frame(height: 32)
+                        .background(Color.red.opacity(0.12))
+                        .clipShape(RoundedRectangle(cornerRadius: 8))
+                }.buttonStyle(.plain)
+            }
+        }
+        .onAppear { syncAll() }
+        .onChange(of: clip.id) { _ in syncAll() }
+    }
+
+    private var clipNow: ShapeClip { project.selectedShapeClip ?? clip }
+
+    // 多选时的目标集合；单选时只有当前
+    private var targetIDs: [UUID] {
+        project.selectedClipIDs.count > 1 ? Array(project.selectedClipIDs) : [clip.id]
+    }
+    private var isMulti: Bool { project.selectedClipIDs.count > 1 }
+    /// 选中集在某属性上是否一致（不一致 → 该属性置灰）
+    private func uniform<T: Equatable>(_ kp: KeyPath<ShapeClip, T>) -> Bool {
+        let all = project.shapeTracks.flatMap { $0.clips }
+        let vals = targetIDs.compactMap { id in all.first { $0.id == id }?[keyPath: kp] }
+        guard let f = vals.first else { return true }
+        return vals.allSatisfy { $0 == f }
+    }
+    private func dim(_ kp: KeyPath<ShapeClip, some Equatable>) -> Bool {
+        isMulti && !uniform(kp)
+    }
+
+    private func write(_ mutate: (inout ShapeClip) -> Void) {
+        guard !syncing else { return }
+        for id in targetIDs { project.updateShapeClip(id: id, mutate) }
+        project.pushUndoThrottled()
+    }
+
+    private func applyShadowVector() {
+        let rad = shadowAngle * .pi / 180
+        write {
+            $0.shadowOffsetX = shadowDistance * cos(rad)
+            $0.shadowOffsetY = shadowDistance * sin(rad)
+        }
+    }
+
+    enum AlignMode {
+        case left, hcenter, right, top, vcenter, bottom, hdist, vdist
+        var needsThree: Bool { self == .hdist || self == .vdist }
+    }
+
+    @ViewBuilder
+    private func alignBtn(_ icon: String, _ mode: AlignMode) -> some View {
+        let enabled = mode.needsThree ? project.selectedClipIDs.count >= 3 : true
+        Button { alignShapes(mode) } label: {
+            Image(systemName: icon).font(.system(size: 11))
+                .foregroundColor(enabled ? Color.labelPrimary : Color.labelSecondary.opacity(0.3))
+                .frame(width: 28, height: 24)
+                .background(Color.white.opacity(enabled ? 0.06 : 0.02)).cornerRadius(4)
+        }.buttonStyle(.plain).disabled(!enabled)
+    }
+
+    /// 单选=对齐预览画面；多选=对齐选中包围盒；分布需≥3
+    private func alignShapes(_ mode: AlignMode) {
+        let ids = project.selectedClipIDs.count > 1 ? Array(project.selectedClipIDs) : [clip.id]
+        let all = project.shapeTracks.flatMap { $0.clips }
+        let shapes = ids.compactMap { id in all.first { $0.id == id } }
+        guard !shapes.isEmpty else { return }
+        let rw = Double(project.previewRenderSize.width)
+        let rh = Double(project.previewRenderSize.height)
+        func hw(_ s: ShapeClip) -> Double { s.width * s.scaleX / 2 }
+        func hh(_ s: ShapeClip) -> Double { s.height * s.scaleY / 2 }
+        func cx(_ s: ShapeClip) -> Double { s.posX * rw }
+        func cy(_ s: ShapeClip) -> Double { s.posY * rh }
+        let single = shapes.count <= 1
+        let left = single ? 0 : shapes.map { cx($0) - hw($0) }.min()!
+        let right = single ? rw : shapes.map { cx($0) + hw($0) }.max()!
+        let top = single ? 0 : shapes.map { cy($0) - hh($0) }.min()!
+        let bottom = single ? rh : shapes.map { cy($0) + hh($0) }.max()!
+        project.pushUndo()
+        switch mode {
+        case .left:
+            for s in shapes { let v = (left + hw(s)) / rw; project.updateShapeClip(id: s.id) { $0.posX = v } }
+        case .hcenter:
+            let c = (left + right) / 2 / rw; for s in shapes { project.updateShapeClip(id: s.id) { $0.posX = c } }
+        case .right:
+            for s in shapes { let v = (right - hw(s)) / rw; project.updateShapeClip(id: s.id) { $0.posX = v } }
+        case .top:
+            for s in shapes { let v = (top + hh(s)) / rh; project.updateShapeClip(id: s.id) { $0.posY = v } }
+        case .vcenter:
+            let c = (top + bottom) / 2 / rh; for s in shapes { project.updateShapeClip(id: s.id) { $0.posY = c } }
+        case .bottom:
+            for s in shapes { let v = (bottom - hh(s)) / rh; project.updateShapeClip(id: s.id) { $0.posY = v } }
+        case .hdist:
+            let sorted = shapes.sorted { cx($0) < cx($1) }
+            guard sorted.count >= 3 else { return }
+            let totalW = sorted.reduce(0.0) { $0 + hw($1) * 2 }
+            let spanL = cx(sorted.first!) - hw(sorted.first!)
+            let spanR = cx(sorted.last!) + hw(sorted.last!)
+            let gap = (spanR - spanL - totalW) / Double(sorted.count - 1)
+            var cur = spanL
+            for s in sorted { let v = (cur + hw(s)) / rw; project.updateShapeClip(id: s.id) { $0.posX = v }; cur += hw(s) * 2 + gap }
+        case .vdist:
+            let sorted = shapes.sorted { cy($0) < cy($1) }
+            guard sorted.count >= 3 else { return }
+            let totalH = sorted.reduce(0.0) { $0 + hh($1) * 2 }
+            let spanT = cy(sorted.first!) - hh(sorted.first!)
+            let spanB = cy(sorted.last!) + hh(sorted.last!)
+            let gap = (spanB - spanT - totalH) / Double(sorted.count - 1)
+            var cur = spanT
+            for s in sorted { let v = (cur + hh(s)) / rh; project.updateShapeClip(id: s.id) { $0.posY = v }; cur += hh(s) * 2 + gap }
+        }
+    }
+
+    private func setCap(_ label: String, start: Bool) {
+        guard let c = LineCapStyle.allCases.first(where: { $0.label == label }) else { return }
+        if start { capStartV = c; write { $0.capStart = c } }
+        else { capEndV = c; write { $0.capEnd = c } }
+    }
+    private func syncAll() {
+        syncing = true
+        startTime = clip.startTime; endTime = clip.endTime
+        width = clip.width; height = clip.height
+        scale = clip.scaleX * 100; scaleXPct = clip.scaleX * 100; scaleYPct = clip.scaleY * 100
+        lockAspect = clip.lockAspect
+        posX = clip.posX; posY = clip.posY; rotation = clip.rotation; opacity = clip.opacity
+        fillEnabled = clip.fillEnabled; fillColor = clip.fillColor; fillOpacity = clip.fillOpacity
+        strokeEnabled = clip.strokeEnabled; strokeColor = clip.strokeColor
+        strokeWidth = clip.strokeWidth; strokeOpacity = clip.strokeOpacity; strokeDashed = clip.strokeDashed
+        capStartV = clip.capStart; capEndV = clip.capEnd
+        cornerRadius = clip.cornerRadius
+        shadowEnabled = clip.shadowEnabled; shadowColor = clip.shadowColor
+        shadowRadius = clip.shadowRadius; shadowOffsetX = clip.shadowOffsetX; shadowOffsetY = clip.shadowOffsetY
+        shadowOpacityV = clip.shadowOpacity
+        shadowDistance = hypot(clip.shadowOffsetX, clip.shadowOffsetY)
+        shadowAngle = atan2(clip.shadowOffsetY, clip.shadowOffsetX) * 180 / .pi
+        DispatchQueue.main.async { syncing = false }
+    }
+
+    @ViewBuilder private func colorRow(_ label: String, _ binding: Binding<Color>, dimKP: KeyPath<ShapeClip, Color>? = nil, _ onChange: @escaping () -> Void) -> some View {
+        HStack(spacing: 12) {
+            Text(label).font(.system(size: 11)).foregroundColor(Color.labelSecondary).frame(width: 68, alignment: .leading)
+            ColorPicker("", selection: binding).labelsHidden().onChange(of: binding.wrappedValue) { _ in onChange() }
+            Spacer(minLength: 0)
+        }
+        .dimNonUniform(dimKP.map { isMulti && !uniform($0) } ?? false)
+    }
+    @ViewBuilder private func toggleRow(_ label: String, _ isOn: Binding<Bool>, dimKP: KeyPath<ShapeClip, Bool>? = nil, _ onChange: @escaping () -> Void) -> some View {
+        HStack {
+            Text(label).font(.system(size: 11)).foregroundColor(Color.labelSecondary)
+            Spacer()
+            Toggle("", isOn: isOn).labelsHidden().toggleStyle(.switch).scaleEffect(0.8).onChange(of: isOn.wrappedValue) { _ in onChange() }
+        }
+        .dimNonUniform(dimKP.map { isMulti && !uniform($0) } ?? false)
+    }
+}
+
+private extension View {
+    @ViewBuilder func dimNonUniform(_ shouldDim: Bool) -> some View {
+        disabled(shouldDim).opacity(shouldDim ? 0.4 : 1)
     }
 }
 
@@ -2082,6 +2427,21 @@ final class IPickerItemHandler: NSObject {
     @objc func pick(_ sender: NSMenuItem) {
         actions[sender.tag]?()
     }
+}
+
+// MARK: - FontHelper
+
+private enum FontHelper {
+    static let fontOptions: [(String, String)] = {
+        let all = NSFontManager.shared.availableFontFamilies
+        let cjk = all.filter { name in
+            name.contains("SC") || name.contains("TC") || name.contains("CN") ||
+            name.contains("JP") || name.contains("KR") ||
+            name.unicodeScalars.contains { $0.value > 0x3000 }
+        }.sorted()
+        let rest = all.filter { !cjk.contains($0) }.sorted()
+        return (cjk + rest).map { ($0, $0) }
+    }()
 }
 
 // MARK: - SubtitleTextBox

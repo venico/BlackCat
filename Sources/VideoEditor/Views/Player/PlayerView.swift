@@ -29,8 +29,10 @@ struct PlayerView: View {
                 }
                 SubtitleOverlay()
                 TextOverlay()
+                ShapeOverlay()
                 VideoTransformOverlay()
                 ImageTransformOverlay()
+                ShapeTransformOverlay()
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .overlay(alignment: .top) {
@@ -1019,6 +1021,413 @@ private extension View {
         self.onHover { inside in
             if inside { cursor.push() } else { NSCursor.pop() }
         }
+    }
+}
+
+// MARK: - Shape Overlay（图形渲染 + 拖动移动 + 选中）
+
+private struct ShapeShadow: ViewModifier {
+    let clip: ShapeClip
+    let scale: CGFloat
+    func body(content: Content) -> some View {
+        if clip.shadowEnabled {
+            content.compositingGroup()
+                .shadow(color: clip.shadowColor.opacity(clip.shadowOpacity),
+                        radius: clip.shadowRadius * scale,
+                        x: clip.shadowOffsetX * scale,
+                        y: clip.shadowOffsetY * scale)
+        } else {
+            content
+        }
+    }
+}
+
+struct ShapeClipView: View {
+    let clip: ShapeClip
+    let scale: CGFloat
+    var selected: Bool = false
+
+    var body: some View {
+        let w = max(clip.width * clip.scaleX * scale, 2)
+        let h = max(clip.height * clip.scaleY * scale, 2)
+        shapeBody(w: w, h: h)
+            .frame(width: w, height: h)
+            .overlay {
+                if selected {
+                    Rectangle().strokeBorder(Color.accent.opacity(0.9), lineWidth: 1.5)
+                }
+            }
+            .modifier(ShapeShadow(clip: clip, scale: scale))
+            .frame(width: max(w, 28), height: max(h, 28))   // 扩大点击热区（线段等细图形好点）
+            .contentShape(Rectangle())
+            .rotationEffect(.degrees(clip.rotation))
+            .opacity(clip.opacity)
+    }
+
+    @ViewBuilder
+    private func shapeBody(w: CGFloat, h: CGFloat) -> some View {
+        if !clip.type.isClosed {
+            lineBody(w: w, h: h)
+        } else if clip.type == .rectangle && clip.cornerRadius > 0 {
+            let rr = RoundedRectangle(cornerRadius: min(clip.cornerRadius * scale, min(w, h) / 2))
+            ZStack {
+                if clip.fillEnabled { rr.fill(clip.fillColor.opacity(clip.fillOpacity)) }
+                if clip.strokeEnabled {
+                    rr.stroke(clip.strokeColor.opacity(clip.strokeOpacity),
+                              style: StrokeStyle(lineWidth: clip.strokeWidth * scale,
+                                                 dash: clip.strokeDashed ? [clip.strokeWidth * 2.5 * scale, clip.strokeWidth * 1.6 * scale] : []))
+                }
+            }
+        } else {
+            let rect = CGRect(x: 0, y: 0, width: w, height: h)
+            let path: Path = (clip.cornerRadius > 0 ? ShapeGeometry.polygonPoints(for: clip.type, in: rect) : nil)
+                .map { ShapeGeometry.roundedPolygon($0, radius: clip.cornerRadius * scale) }
+                ?? ShapeGeometry.path(for: clip.type, in: rect)
+            ZStack {
+                if clip.fillEnabled && clip.type.isClosed {
+                    path.fill(clip.fillColor.opacity(clip.fillOpacity))
+                }
+                if clip.strokeEnabled || !clip.type.isClosed {
+                    path.stroke(clip.strokeColor.opacity(clip.strokeOpacity),
+                                style: StrokeStyle(lineWidth: max(clip.strokeWidth * scale, 1),
+                                                   lineCap: .round, lineJoin: .round,
+                                                   dash: clip.strokeDashed ? [clip.strokeWidth * 2.5 * scale, clip.strokeWidth * 1.6 * scale] : []))
+                }
+            }
+        }
+    }
+
+    // 线段/箭头：主干 + 两端端点样式（无端点/箭头/圆头/方头）
+    @ViewBuilder
+    private func lineBody(w: CGFloat, h: CGFloat) -> some View {
+        let y = h / 2
+        let sw = max(clip.strokeWidth * scale, 1)
+        let col = clip.strokeColor.opacity(clip.strokeOpacity)
+        let headLen = min(max(w * 0.42, sw * 3), h * 1.6) * 0.5
+        let startInset = clip.capStart == .arrow ? headLen : 0
+        let endInset = clip.capEnd == .arrow ? headLen : 0
+        ZStack {
+            Path { p in
+                p.move(to: CGPoint(x: startInset, y: y))
+                p.addLine(to: CGPoint(x: max(w - endInset, startInset), y: y))
+            }
+            .stroke(col, style: StrokeStyle(lineWidth: sw, lineCap: .butt,
+                                            dash: clip.strokeDashed ? [clip.strokeWidth * 2.5 * scale, clip.strokeWidth * 1.6 * scale] : []))
+            capShape(clip.capStart, at: CGPoint(x: 0, y: y), dir: -1, sw: sw, headLen: headLen, col: col)
+            capShape(clip.capEnd, at: CGPoint(x: w, y: y), dir: 1, sw: sw, headLen: headLen, col: col)
+        }
+    }
+
+    @ViewBuilder
+    private func capShape(_ cap: LineCapStyle, at pt: CGPoint, dir: CGFloat, sw: CGFloat, headLen: CGFloat, col: Color) -> some View {
+        switch cap {
+        case .none:
+            EmptyView()
+        case .round:
+            Circle().fill(col).frame(width: headLen, height: headLen).position(pt)
+        case .square:
+            Rectangle().fill(col).frame(width: headLen, height: headLen).position(pt)
+        case .arrow:
+            let wing = headLen * 0.5
+            Path { p in
+                p.move(to: CGPoint(x: pt.x - dir * headLen, y: pt.y - wing))
+                p.addLine(to: pt)
+                p.addLine(to: CGPoint(x: pt.x - dir * headLen, y: pt.y + wing))
+                p.closeSubpath()
+            }.fill(col)
+        }
+    }
+}
+
+private struct ShapeOverlay: View {
+    @EnvironmentObject private var project: ProjectState
+    @EnvironmentObject private var clock: PlaybackClock
+    @State private var dragStart: [UUID: CGPoint] = [:]
+
+    private var activeClips: [ShapeClip] {
+        project.shapeTracks
+            .filter { $0.isVisible }
+            .flatMap { $0.clips }
+            .filter { $0.startTime <= clock.currentTime && $0.endTime > clock.currentTime }
+    }
+
+    var body: some View {
+        GeometryReader { geo in
+            let scale = geo.size.width / max(project.previewRenderSize.width, 1)
+            ZStack {
+                // 有选中图形时，点击空白处取消选择
+                if project.selectedShapeClipID != nil {
+                    Color.clear.contentShape(Rectangle())
+                        .onTapGesture {
+                            project.selectedShapeClipID = nil
+                            project.selectedClipIDs.removeAll()
+                        }
+                }
+                ForEach(activeClips, id: \.id) { clip in
+                    ShapeClipView(clip: clip, scale: scale,
+                                  selected: project.selectedClipIDs.contains(clip.id) && project.selectedShapeClipID != clip.id)
+                        .position(x: geo.size.width * clip.posX, y: geo.size.height * clip.posY)
+                        .gesture(
+                            DragGesture(minimumDistance: 1)
+                                .onChanged { v in
+                                    if dragStart.isEmpty {
+                                        let multi = project.selectedClipIDs.contains(clip.id) && project.selectedClipIDs.count > 1
+                                        if multi {
+                                            for id in project.selectedClipIDs {
+                                                if let c = shapeByID(id) { dragStart[id] = CGPoint(x: c.posX, y: c.posY) }
+                                            }
+                                        } else {
+                                            if project.selectedShapeClipID != clip.id { selectExclusive(clip.id) }
+                                            if let c = shapeByID(clip.id) { dragStart[clip.id] = CGPoint(x: c.posX, y: c.posY) }
+                                        }
+                                    }
+                                    let dx = v.translation.width / geo.size.width
+                                    let dy = v.translation.height / geo.size.height
+                                    for (id, s) in dragStart {
+                                        project.updateShapeClip(id: id) {
+                                            $0.posX = min(1, max(0, Double(s.x) + Double(dx)))
+                                            $0.posY = min(1, max(0, Double(s.y) + Double(dy)))
+                                        }
+                                    }
+                                }
+                                .onEnded { _ in dragStart = [:] }
+                        )
+                        .onTapGesture {
+                            if NSEvent.modifierFlags.contains(.shift) {
+                                project.shiftToggleClip(clip.id)
+                            } else {
+                                selectExclusive(clip.id)
+                            }
+                        }
+                }
+            }
+        }
+    }
+
+    private func selectExclusive(_ id: UUID) {
+        project.selectedShapeClipID = id
+        project.selectedVideoClipID = nil; project.selectedImageClipID = nil
+        project.selectedAudioClipID = nil; project.selectedSubtitleClipID = nil
+        project.selectedTextClipID = nil
+    }
+
+    private func shapeByID(_ id: UUID) -> ShapeClip? {
+        project.shapeTracks.flatMap { $0.clips }.first { $0.id == id }
+    }
+}
+
+// MARK: - Shape Transform Overlay（选中边框；缩放/旋转手柄见 2b）
+
+private struct ShapeTransformOverlay: View {
+    @EnvironmentObject private var project: ProjectState
+    @EnvironmentObject private var clock: PlaybackClock
+
+    @State private var dragMode = 0   // 0=none 1=scale 2=rotate 3=endpoint
+    @State private var didPushUndo = false
+    @State private var startClip: ShapeClip? = nil
+    @State private var startRotation = 0.0
+    @State private var startAngle = 0.0
+
+    private let accent = Color.accent
+
+    var body: some View {
+        GeometryReader { geo in
+            if let clip = project.selectedShapeClip,
+               clip.startTime <= clock.currentTime, clip.endTime > clock.currentTime {
+                let scale = geo.size.width / max(project.previewRenderSize.width, 1)
+                let center = CGPoint(x: geo.size.width * clip.posX, y: geo.size.height * clip.posY)
+                let w = max(clip.width * clip.scaleX * scale, 8)
+                let h = max(clip.height * clip.scaleY * scale, 8)
+                let isMulti = project.selectedClipIDs.count > 1
+
+                ZStack {
+                    // 边框
+                    Rectangle().stroke(accent, lineWidth: 1.5)
+                        .frame(width: w, height: h)
+                        .rotationEffect(.degrees(clip.rotation))
+                        .position(center)
+                        .allowsHitTesting(false)
+
+                    if !isMulti {
+                    if clip.type.isClosed {
+                        // 四边单向缩放条（橙色，和图片一致）
+                        ForEach(0..<4, id: \.self) { e in
+                            let horiz = e < 2
+                            let len = horiz ? min(w * 0.4, 44) : min(h * 0.4, 44)
+                            edgeBar(horizontal: horiz, length: len, rot: clip.rotation)
+                                .position(edgeMid(e, center: center, w: w, h: h, rot: clip.rotation))
+                                .gesture(edgeScaleGesture(clip: clip, center: center, scale: scale, edge: e, geo: geo.size))
+                        }
+                        // 四角缩放手柄
+                        ForEach(0..<4, id: \.self) { i in
+                            handleDot()
+                                .position(rotatedCorner(i, center: center, w: w, h: h, rot: clip.rotation))
+                                .gesture(scaleGesture(clip: clip, center: center, scale: scale))
+                        }
+                    } else {
+                        // 线段/箭头：两端控制点（拖动改长度/方向/位置）
+                        let pL = endpoint(center: center, w: w, rot: clip.rotation, right: false)
+                        let pR = endpoint(center: center, w: w, rot: clip.rotation, right: true)
+                        handleDot().position(pL)
+                            .gesture(endpointGesture(clip: clip, fixed: pR, draggingRight: false, scale: scale, geo: geo.size))
+                        handleDot().position(pR)
+                            .gesture(endpointGesture(clip: clip, fixed: pL, draggingRight: true, scale: scale, geo: geo.size))
+                    }
+
+                    // 旋转手柄
+                    rotHandleView()
+                        .position(rotationHandlePos(center: center, h: h, rot: clip.rotation))
+                        .gesture(rotateGesture(clip: clip, center: center))
+                    }
+                }
+            }
+        }
+    }
+
+    // MARK: 手柄视图
+
+    private func handleDot() -> some View {
+        ZStack {
+            Circle().fill(Color.white).frame(width: 11, height: 11)
+            Circle().stroke(accent, lineWidth: 1.5).frame(width: 11, height: 11)
+        }
+        .shadow(color: .black.opacity(0.3), radius: 2, y: 1)
+        .frame(width: 26, height: 26)
+        .contentShape(Circle())
+    }
+
+    private func rotHandleView() -> some View {
+        ZStack {
+            Circle().fill(Color.white).frame(width: 14, height: 14)
+            Image(systemName: "arrow.triangle.2.circlepath")
+                .font(.system(size: 8, weight: .bold)).foregroundColor(accent)
+        }
+        .shadow(color: .black.opacity(0.3), radius: 2, y: 1)
+        .frame(width: 28, height: 28)
+        .contentShape(Circle())
+    }
+
+    // MARK: 位置计算
+
+    private func rotate(_ dx: CGFloat, _ dy: CGFloat, _ deg: Double) -> CGPoint {
+        let r = CGFloat(deg * .pi / 180)
+        return CGPoint(x: dx * cos(r) - dy * sin(r), y: dx * sin(r) + dy * cos(r))
+    }
+    private func rotatedCorner(_ i: Int, center: CGPoint, w: CGFloat, h: CGFloat, rot: Double) -> CGPoint {
+        let hw = w / 2, hh = h / 2
+        let offs = [(-hw, -hh), (hw, -hh), (-hw, hh), (hw, hh)][i]
+        let p = rotate(offs.0, offs.1, rot)
+        return CGPoint(x: center.x + p.x, y: center.y + p.y)
+    }
+    private func endpoint(center: CGPoint, w: CGFloat, rot: Double, right: Bool) -> CGPoint {
+        let p = rotate(right ? w / 2 : -w / 2, 0, rot)
+        return CGPoint(x: center.x + p.x, y: center.y + p.y)
+    }
+    private func rotationHandlePos(center: CGPoint, h: CGFloat, rot: Double) -> CGPoint {
+        let p = rotate(0, -h / 2 - 26, rot)
+        return CGPoint(x: center.x + p.x, y: center.y + p.y)
+    }
+    private func edgeMid(_ e: Int, center: CGPoint, w: CGFloat, h: CGFloat, rot: Double) -> CGPoint {
+        let offs = [(0, -h / 2), (0, h / 2), (-w / 2, 0), (w / 2, 0)][e]
+        let p = rotate(offs.0, offs.1, rot)
+        return CGPoint(x: center.x + p.x, y: center.y + p.y)
+    }
+    private func edgeBar(horizontal: Bool, length: CGFloat, rot: Double) -> some View {
+        RoundedRectangle(cornerRadius: 1.5).fill(Color.orange)
+            .frame(width: horizontal ? length : 3, height: horizontal ? 3 : length)
+            .shadow(color: .black.opacity(0.4), radius: 2, y: 1)
+            .frame(width: horizontal ? length + 16 : 28, height: horizontal ? 28 : length + 16)
+            .contentShape(Rectangle())
+            .rotationEffect(.degrees(rot))
+    }
+
+    private func pushUndoOnce() {
+        if !didPushUndo { project.pushUndo(); didPushUndo = true }
+    }
+
+    private func edgeNormal(_ e: Int, _ rot: Double) -> CGPoint {
+        let base = [(CGFloat(0), CGFloat(-1)), (0, 1), (-1, 0), (1, 0)][e]
+        return rotate(base.0, base.1, rot)
+    }
+
+    // 四边单向缩放：对边固定，只拖动的那条边移动（和图片裁剪条一致的手感）
+    private func edgeScaleGesture(clip: ShapeClip, center: CGPoint, scale: CGFloat, edge: Int, geo: CGSize) -> some Gesture {
+        DragGesture(minimumDistance: 1)
+            .onChanged { v in
+                if dragMode != 1 { pushUndoOnce(); dragMode = 1; startClip = clip }
+                let vertical = edge < 2
+                let n = edgeNormal(edge, Double(clip.rotation))
+                let dimView = vertical ? clip.height * clip.scaleY * scale : clip.width * clip.scaleX * scale
+                let opp = CGPoint(x: center.x - dimView / 2 * n.x, y: center.y - dimView / 2 * n.y)
+                let t = (v.location.x - opp.x) * n.x + (v.location.y - opp.y) * n.y
+                let tt = max(t, 8)
+                let newCenter = CGPoint(x: opp.x + tt / 2 * n.x, y: opp.y + tt / 2 * n.y)
+                let baseDim = vertical ? clip.height : clip.width
+                let newScale = max(0.05, Double(tt) / (Double(max(baseDim, 1)) * Double(scale)))
+                project.updateShapeClip(id: clip.id) {
+                    if vertical { $0.scaleY = newScale } else { $0.scaleX = newScale }
+                    $0.posX = min(1, max(0, Double(newCenter.x) / Double(max(geo.width, 1))))
+                    $0.posY = min(1, max(0, Double(newCenter.y) / Double(max(geo.height, 1))))
+                }
+            }
+            .onEnded { _ in dragMode = 0; didPushUndo = false; startClip = nil }
+    }
+
+    // MARK: 手势
+
+    private func scaleGesture(clip: ShapeClip, center: CGPoint, scale: CGFloat) -> some Gesture {
+        DragGesture(minimumDistance: 1)
+            .onChanged { v in
+                if dragMode != 1 { pushUndoOnce(); dragMode = 1; startClip = clip }
+                guard let sc = startClip else { return }
+                let d0 = hypot(v.startLocation.x - center.x, v.startLocation.y - center.y)
+                let d1 = hypot(v.location.x - center.x, v.location.y - center.y)
+                guard d0 > 1 else { return }
+                let ratio = d1 / d0
+                project.updateShapeClip(id: clip.id) {
+                    $0.scaleX = max(0.05, sc.scaleX * ratio)
+                    $0.scaleY = max(0.05, sc.scaleY * ratio)
+                }
+            }
+            .onEnded { _ in dragMode = 0; didPushUndo = false; startClip = nil }
+    }
+
+    private func rotateGesture(clip: ShapeClip, center: CGPoint) -> some Gesture {
+        DragGesture(minimumDistance: 1)
+            .onChanged { v in
+                if dragMode != 2 {
+                    pushUndoOnce(); dragMode = 2
+                    startRotation = clip.rotation
+                    startAngle = atan2(Double(v.startLocation.y - center.y), Double(v.startLocation.x - center.x)) * 180 / .pi
+                }
+                let cur = atan2(Double(v.location.y - center.y), Double(v.location.x - center.x)) * 180 / .pi
+                project.updateShapeClip(id: clip.id) { $0.rotation = startRotation + (cur - startAngle) }
+            }
+            .onEnded { _ in dragMode = 0; didPushUndo = false }
+    }
+
+    private func endpointGesture(clip: ShapeClip, fixed: CGPoint, draggingRight: Bool,
+                                 scale: CGFloat, geo: CGSize) -> some Gesture {
+        DragGesture(minimumDistance: 1)
+            .onChanged { v in
+                if dragMode != 3 { pushUndoOnce(); dragMode = 3; startClip = clip }
+                guard let sc = startClip else { return }
+                let drag = v.location
+                let viewLen = hypot(drag.x - fixed.x, drag.y - fixed.y)
+                // 方向：从左端指向右端
+                let dir = draggingRight
+                    ? atan2(Double(drag.y - fixed.y), Double(drag.x - fixed.x))
+                    : atan2(Double(fixed.y - drag.y), Double(fixed.x - drag.x))
+                let newCenter = CGPoint(x: (fixed.x + drag.x) / 2, y: (fixed.y + drag.y) / 2)
+                let newWidth = max(viewLen / (sc.scaleX * scale), 10)
+                project.updateShapeClip(id: clip.id) {
+                    $0.width = newWidth
+                    $0.rotation = dir * 180 / .pi
+                    $0.posX = min(1, max(0, newCenter.x / geo.width))
+                    $0.posY = min(1, max(0, newCenter.y / geo.height))
+                }
+            }
+            .onEnded { _ in dragMode = 0; didPushUndo = false; startClip = nil }
     }
 }
 

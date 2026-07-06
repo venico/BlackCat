@@ -539,6 +539,7 @@ struct ExportSheetView: View {
             subtitleTracks: orderedSubs,
             imageTracks: project.imageTracks,
             textTracks: project.textTracks,
+            shapeTracks: project.shapeTracks,
             subtitleBottomMargin: project.subtitleBottomMargin,
             subtitleLineSpacing: project.subtitleLineSpacing,
             previewRenderSize: project.previewRenderSize,
@@ -559,6 +560,7 @@ struct ExportInput {
     let subtitleTracks: [Track<SubtitleClip>]
     let imageTracks:    [Track<ImageClip>]
     let textTracks:     [Track<TextClip>]
+    let shapeTracks:    [Track<ShapeClip>]
     let subtitleBottomMargin: Double
     let subtitleLineSpacing:  Double
     let previewRenderSize: CGSize          // 预览分辨率，用于字幕缩放基准
@@ -1163,9 +1165,12 @@ actor TimelineExporter {
             let visibleTextClips = input.textTracks
                 .filter { $0.isVisible }
                 .flatMap { $0.clips }
+            let visibleShapeClips = input.shapeTracks
+                .filter { $0.isVisible }
+                .flatMap { $0.clips }
 
             // ── 快速路径：无 overlay 时用 AVAssetExportSession（5-10x 加速）──
-            let needsPerFrameProcessing = subRenderInfo.hasSubtitles || !visibleTextClips.isEmpty || !colorRanges.isEmpty
+            let needsPerFrameProcessing = subRenderInfo.hasSubtitles || !visibleTextClips.isEmpty || !visibleShapeClips.isEmpty || !colorRanges.isEmpty
             if !needsPerFrameProcessing {
                 try? FileManager.default.removeItem(at: input.outputURL)
                 try await fastExportSession(
@@ -1187,6 +1192,7 @@ actor TimelineExporter {
                 audioMix: audioMix,
                 subtitleInfo: subRenderInfo,
                 textClips: visibleTextClips,
+                shapeClips: visibleShapeClips,
                 colorRanges: colorRanges,
                 fps: fps,
                 bitrate: settings.bitrate,
@@ -1346,6 +1352,7 @@ actor TimelineExporter {
         audioMix: AVMutableAudioMix,
         subtitleInfo: SubtitleRenderInfo,
         textClips: [TextClip],
+        shapeClips: [ShapeClip],
         colorRanges: [(start: Double, end: Double, adj: ColorAdjust)],
         fps: Int, bitrate: Int,
         outputURL: URL,
@@ -1432,6 +1439,7 @@ actor TimelineExporter {
 
         let hasSubtitles = subtitleInfo.hasSubtitles
         let hasTextOverlays = !textClips.isEmpty
+        let hasShapeOverlays = !shapeClips.isEmpty
         let videoQueue = DispatchQueue(label: "export.video")
         let audioQueue = DispatchQueue(label: "export.audio")
         let targetFps = fps
@@ -1490,7 +1498,7 @@ actor TimelineExporter {
                                         targetTime >= $0.start && targetTime < $0.end
                                     }?.adj
 
-                                    let needsExtra = hasSubtitles || hasTextOverlays || (activeAdj != nil && activeAdj?.isIdentity == false)
+                                    let needsExtra = hasSubtitles || hasTextOverlays || hasShapeOverlays || (activeAdj != nil && activeAdj?.isIdentity == false)
                                     if needsExtra {
                                         var image = CIImage(cvPixelBuffer: pb)
 
@@ -1519,6 +1527,13 @@ actor TimelineExporter {
                                             if let subOverlay = cachedSubOverlay {
                                                 image = subOverlay.composited(over: image)
                                             }
+                                        }
+
+                                        if hasShapeOverlays,
+                                           let shapeOverlay = self.renderShapeOverlay(
+                                               atTime: targetTime, clips: shapeClips,
+                                               scale: subtitleInfo.fontScale, renderSize: renderSize) {
+                                            image = shapeOverlay.composited(over: image)
                                         }
 
                                         if let pool = adaptor.pixelBufferPool {
@@ -1829,6 +1844,119 @@ actor TimelineExporter {
 
         guard let cgImage = ctx.makeImage() else { return nil }
         return CIImage(cgImage: cgImage)
+    }
+
+    // MARK: - 图形 overlay 逐帧绘制（导出用，与预览 ShapeOverlay 一致）
+
+    private nonisolated func renderShapeOverlay(atTime time: Double, clips: [ShapeClip],
+                                                scale: CGFloat, renderSize: CGSize) -> CIImage? {
+        let active = clips.filter { $0.startTime <= time && $0.endTime > time }
+        guard !active.isEmpty else { return nil }
+        let w = Int(renderSize.width), h = Int(renderSize.height)
+        guard w > 0, h > 0 else { return nil }
+        let space = CGColorSpaceCreateDeviceRGB()
+        guard let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0,
+                                  space: space,
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue) else { return nil }
+        ctx.clear(CGRect(x: 0, y: 0, width: w, height: h))
+        // 翻转成左上原点，与 posX/posY(0~1) 一致
+        ctx.translateBy(x: 0, y: CGFloat(h))
+        ctx.scaleBy(x: 1, y: -1)
+
+        func cgc(_ c: Color, _ op: Double) -> CGColor {
+            let ns = NSColor(c).usingColorSpace(.sRGB) ?? .white
+            var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
+            ns.getRed(&r, green: &g, blue: &b, alpha: &a)
+            return CGColor(red: r, green: g, blue: b, alpha: a * CGFloat(op))
+        }
+
+        let s = Double(scale)
+        for clip in active {
+            let cx = clip.posX * Double(w)
+            let cy = clip.posY * Double(h)
+            let sw = max(clip.width * clip.scaleX * s, 1)
+            let sh = max(clip.height * clip.scaleY * s, 1)
+            ctx.saveGState()
+            ctx.setAlpha(CGFloat(clip.opacity))
+            if clip.rotation != 0 {
+                ctx.translateBy(x: cx, y: cy)
+                ctx.rotate(by: CGFloat(clip.rotation * .pi / 180))
+                ctx.translateBy(x: -cx, y: -cy)
+            }
+            if clip.shadowEnabled {
+                ctx.setShadow(offset: CGSize(width: clip.shadowOffsetX * s, height: clip.shadowOffsetY * s),
+                              blur: CGFloat(clip.shadowRadius * s),
+                              color: cgc(clip.shadowColor, clip.shadowOpacity))
+            }
+            let rect = CGRect(x: cx - sw / 2, y: cy - sh / 2, width: sw, height: sh)
+            if !clip.type.isClosed {
+                drawShapeLine(ctx: ctx, clip: clip, rect: rect, scale: s, cgc: cgc)
+            } else {
+                let path: CGPath
+                if clip.cornerRadius > 0, let pts = ShapeGeometry.polygonPoints(for: clip.type, in: rect) {
+                    path = ShapeGeometry.roundedPolygon(pts, radius: CGFloat(clip.cornerRadius * s)).cgPath
+                } else if clip.type == .rectangle && clip.cornerRadius > 0 {
+                    let r = CGFloat(min(clip.cornerRadius * s, Double(min(sw, sh)) / 2))
+                    path = CGPath(roundedRect: rect, cornerWidth: r, cornerHeight: r, transform: nil)
+                } else {
+                    path = ShapeGeometry.path(for: clip.type, in: rect).cgPath
+                }
+                if clip.fillEnabled {
+                    ctx.addPath(path); ctx.setFillColor(cgc(clip.fillColor, clip.fillOpacity)); ctx.fillPath()
+                }
+                if clip.strokeEnabled {
+                    ctx.addPath(path)
+                    ctx.setStrokeColor(cgc(clip.strokeColor, clip.strokeOpacity))
+                    ctx.setLineWidth(CGFloat(clip.strokeWidth * s))
+                    ctx.setLineJoin(.round)
+                    if clip.strokeDashed { ctx.setLineDash(phase: 0, lengths: [clip.strokeWidth * 2.5 * s, clip.strokeWidth * 1.6 * s]) }
+                    ctx.strokePath()
+                    ctx.setLineDash(phase: 0, lengths: [])
+                }
+            }
+            ctx.restoreGState()
+        }
+        guard let cgImage = ctx.makeImage() else { return nil }
+        return CIImage(cgImage: cgImage)
+    }
+
+    private nonisolated func drawShapeLine(ctx: CGContext, clip: ShapeClip, rect: CGRect,
+                                           scale: Double, cgc: (Color, Double) -> CGColor) {
+        let y = rect.midY
+        let sw = max(clip.strokeWidth * scale, 1)
+        let col = cgc(clip.strokeColor, clip.strokeOpacity)
+        let headLen = min(max(rect.width * 0.42, sw * 3), rect.height * 1.6) * 0.5
+        let startInset = clip.capStart == .arrow ? headLen : 0
+        let endInset = clip.capEnd == .arrow ? headLen : 0
+        ctx.setStrokeColor(col); ctx.setLineWidth(sw); ctx.setLineCap(.butt)
+        if clip.strokeDashed { ctx.setLineDash(phase: 0, lengths: [clip.strokeWidth * 2.5 * scale, clip.strokeWidth * 1.6 * scale]) }
+        ctx.move(to: CGPoint(x: rect.minX + startInset, y: y))
+        ctx.addLine(to: CGPoint(x: rect.maxX - endInset, y: y))
+        ctx.strokePath()
+        ctx.setLineDash(phase: 0, lengths: [])
+        drawCap(ctx: ctx, cap: clip.capStart, at: CGPoint(x: rect.minX, y: y), dir: -1, headLen: headLen, col: col)
+        drawCap(ctx: ctx, cap: clip.capEnd,   at: CGPoint(x: rect.maxX, y: y), dir: 1,  headLen: headLen, col: col)
+    }
+
+    private nonisolated func drawCap(ctx: CGContext, cap: LineCapStyle, at pt: CGPoint,
+                                     dir: Double, headLen: Double, col: CGColor) {
+        switch cap {
+        case .none: break
+        case .round:
+            ctx.setFillColor(col)
+            ctx.fillEllipse(in: CGRect(x: pt.x - headLen / 2, y: pt.y - headLen / 2, width: headLen, height: headLen))
+        case .square:
+            ctx.setFillColor(col)
+            ctx.fill(CGRect(x: pt.x - headLen / 2, y: pt.y - headLen / 2, width: headLen, height: headLen))
+        case .arrow:
+            let wing = headLen * 0.5
+            ctx.setFillColor(col)
+            ctx.move(to: CGPoint(x: pt.x - dir * headLen, y: pt.y - wing))
+            ctx.addLine(to: pt)
+            ctx.addLine(to: CGPoint(x: pt.x - dir * headLen, y: pt.y + wing))
+            ctx.closePath()
+            ctx.fillPath()
+        }
     }
 
     // MARK: - 逐帧字幕绘制（旧版 CPU 方法，保留兼容）

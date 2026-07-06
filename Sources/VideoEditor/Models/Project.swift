@@ -18,15 +18,17 @@ final class ProjectState: ObservableObject {
     @Published var subtitleTracks: [Track<SubtitleClip>] = []
     @Published var textTracks: [Track<TextClip>] = []
     @Published var textTemplates: [TextTemplate] = []  // 文字样式模板
+    @Published var shapeTracks: [Track<ShapeClip>] = []  // 图形图层
 
     enum OverlayTrackRef: Equatable, Codable {
         case image(UUID)
         case subtitle(UUID)
         case text(UUID)
+        case shape(UUID)
 
         var trackID: UUID {
             switch self {
-            case .image(let id), .subtitle(let id), .text(let id): return id
+            case .image(let id), .subtitle(let id), .text(let id), .shape(let id): return id
             }
         }
     }
@@ -38,20 +40,35 @@ final class ProjectState: ObservableObject {
         for t in imageTracks { currentIDs.insert(t.id) }
         for t in subtitleTracks { currentIDs.insert(t.id) }
         for t in textTracks { currentIDs.insert(t.id) }
+        for t in shapeTracks { currentIDs.insert(t.id) }
         for ref in overlayTrackOrder {
             let rid: UUID
             switch ref {
             case .image(let id): rid = id
             case .subtitle(let id): rid = id
             case .text(let id): rid = id
+            case .shape(let id): rid = id
             }
             if currentIDs.contains(rid) { newOrder.append(ref); currentIDs.remove(rid) }
         }
         for t in imageTracks where currentIDs.contains(t.id) { newOrder.append(.image(t.id)); currentIDs.remove(t.id) }
         for t in subtitleTracks where currentIDs.contains(t.id) { newOrder.append(.subtitle(t.id)); currentIDs.remove(t.id) }
         for t in textTracks where currentIDs.contains(t.id) { newOrder.append(.text(t.id)); currentIDs.remove(t.id) }
+        for t in shapeTracks where currentIDs.contains(t.id) { newOrder.append(.shape(t.id)); currentIDs.remove(t.id) }
         overlayTrackOrder = newOrder
     }
+
+    /// 新轨道插入到指定轨道的正下方（重叠自动新建时用），而不是排到末尾
+    func insertOverlayRefBelow(_ newRef: OverlayTrackRef, below afterTrackID: UUID) {
+        syncOverlayOrder()
+        overlayTrackOrder.removeAll { $0.trackID == newRef.trackID }
+        if let idx = overlayTrackOrder.firstIndex(where: { $0.trackID == afterTrackID }) {
+            overlayTrackOrder.insert(newRef, at: idx + 1)
+        } else {
+            overlayTrackOrder.append(newRef)
+        }
+    }
+
     var orderedSubtitleIndices: [Int] {
         var result: [Int] = []
         for ref in overlayTrackOrder {
@@ -115,6 +132,7 @@ final class ProjectState: ObservableObject {
         for t in imageTracks { for c in t.clips { maxEnd = max(maxEnd, c.endTime) } }
         for t in subtitleTracks { for c in t.clips { maxEnd = max(maxEnd, c.endTime) } }
         for t in textTracks { for c in t.clips { maxEnd = max(maxEnd, c.endTime) } }
+        for t in shapeTracks { for c in t.clips { maxEnd = max(maxEnd, c.endTime) } }
         return maxEnd
     }
 
@@ -179,6 +197,7 @@ final class ProjectState: ObservableObject {
     @Published var showAudioTracks: Bool = true
     @Published var showSubtitleTracks: Bool = true
     @Published var showTextTracks: Bool = true
+    @Published var showShapeTracks: Bool = true
 
     // 删除确认
     @Published var showDeleteConfirm: Bool = false
@@ -192,6 +211,7 @@ final class ProjectState: ObservableObject {
     @Published var selectedImageClipID: UUID?    = nil
     @Published var selectedSubtitleClipID: UUID? = nil
     @Published var selectedTextClipID: UUID?     = nil
+    @Published var selectedShapeClipID: UUID?    = nil
     // Transition selection
     @Published var selectedTransitionClipID: UUID? = nil  // 当前选中的转场（clip ID，其 inTransition 被编辑）
 
@@ -204,6 +224,12 @@ final class ProjectState: ObservableObject {
     var selectedTextClip: TextClip? {
         guard let id = selectedTextClipID else { return nil }
         for t in textTracks { if let c = t.clips.first(where:{ $0.id == id }) { return c } }
+        return nil
+    }
+
+    var selectedShapeClip: ShapeClip? {
+        guard let id = selectedShapeClipID else { return nil }
+        for t in shapeTracks { if let c = t.clips.first(where:{ $0.id == id }) { return c } }
         return nil
     }
 

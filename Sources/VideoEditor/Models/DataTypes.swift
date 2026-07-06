@@ -436,6 +436,172 @@ struct TextClip: Identifiable, Equatable, Codable {
     }
 }
 
+// MARK: - Shape Clip (图形图层)
+
+enum ShapeType: String, Codable, CaseIterable {
+    case rectangle, ellipse, triangle, parallelogram, trapezoid, line, arrow
+
+    var label: String {
+        switch self {
+        case .rectangle:     return "矩形"
+        case .ellipse:       return "圆形"
+        case .triangle:      return "三角形"
+        case .parallelogram: return "平行四边形"
+        case .trapezoid:     return "梯形"
+        case .line:          return "线段"
+        case .arrow:         return "箭头"
+        }
+    }
+
+    /// 是否闭合路径（可填充）。线段/箭头为开放路径，仅描边。
+    var isClosed: Bool {
+        switch self {
+        case .line, .arrow: return false
+        default:            return true
+        }
+    }
+}
+
+/// 线段/箭头两端端点样式
+enum LineCapStyle: String, Codable, CaseIterable {
+    case none, arrow, round, square
+    var label: String {
+        switch self {
+        case .none:   return "无端点"
+        case .arrow:  return "箭头"
+        case .round:  return "圆头"
+        case .square: return "方头"
+        }
+    }
+}
+
+struct ShapeClip: Identifiable, Equatable, Codable {
+    var id = UUID()
+    var type: ShapeType = .rectangle
+    var startTime: Double
+    var endTime: Double
+    var duration: Double { endTime - startTime }
+    // 位置：中心点画面比例 (0~1)，(0.5,0.5)=正中
+    var posX: Double = 0.5
+    var posY: Double = 0.5
+    // 大小：previewRenderSize 坐标系下的基准像素（导出时按比例缩放，与 TextClip.fontSize 一致）
+    var width: Double  = 300
+    var height: Double = 200
+    var scaleX: Double = 1.0
+    var scaleY: Double = 1.0
+    var lockAspect: Bool = true
+    var rotation: Double = 0            // 旋转角度(度)
+    var opacity: Double  = 1
+    // 填充
+    var fillEnabled: Bool = true
+    var fillColor: Color  = .white
+    var fillOpacity: Double = 1
+    // 描边
+    var strokeEnabled: Bool = false
+    var strokeColor: Color  = .white
+    var strokeWidth: Double = 4
+    var strokeOpacity: Double = 1
+    var strokeDashed: Bool = false
+    // 线段/箭头端点样式（起点/终点）
+    var capStart: LineCapStyle = .none
+    var capEnd: LineCapStyle = .none
+    // 圆角（仅矩形有效）
+    var cornerRadius: Double = 0
+    // 阴影
+    var shadowEnabled: Bool = false
+    var shadowColor: Color  = .black
+    var shadowOpacity: Double = 0.5
+    var shadowRadius: Double = 8
+    var shadowOffsetX: Double = 0
+    var shadowOffsetY: Double = 4
+
+    enum CodingKeys: String, CodingKey {
+        case id, type, startTime, endTime, posX, posY
+        case width, height, scaleX, scaleY, lockAspect, rotation, opacity
+        case fillEnabled, fillColorHex, fillOpacity
+        case strokeEnabled, strokeColorHex, strokeWidth, strokeOpacity, strokeDashed
+        case capStart, capEnd
+        case cornerRadius
+        case shadowEnabled, shadowColorHex, shadowOpacity, shadowRadius, shadowOffsetX, shadowOffsetY
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(id, forKey: .id)
+        try c.encode(type, forKey: .type)
+        try c.encode(startTime, forKey: .startTime)
+        try c.encode(endTime, forKey: .endTime)
+        try c.encode(posX, forKey: .posX)
+        try c.encode(posY, forKey: .posY)
+        try c.encode(width, forKey: .width)
+        try c.encode(height, forKey: .height)
+        try c.encode(scaleX, forKey: .scaleX)
+        try c.encode(scaleY, forKey: .scaleY)
+        try c.encode(lockAspect, forKey: .lockAspect)
+        try c.encode(rotation, forKey: .rotation)
+        try c.encode(opacity, forKey: .opacity)
+        try c.encode(fillEnabled, forKey: .fillEnabled)
+        try c.encode(fillColor.toHex(), forKey: .fillColorHex)
+        try c.encode(fillOpacity, forKey: .fillOpacity)
+        try c.encode(strokeEnabled, forKey: .strokeEnabled)
+        try c.encode(strokeColor.toHex(), forKey: .strokeColorHex)
+        try c.encode(strokeWidth, forKey: .strokeWidth)
+        try c.encode(strokeOpacity, forKey: .strokeOpacity)
+        try c.encode(strokeDashed, forKey: .strokeDashed)
+        try c.encode(capStart, forKey: .capStart)
+        try c.encode(capEnd, forKey: .capEnd)
+        try c.encode(cornerRadius, forKey: .cornerRadius)
+        try c.encode(shadowEnabled, forKey: .shadowEnabled)
+        try c.encode(shadowColor.toHex(), forKey: .shadowColorHex)
+        try c.encode(shadowOpacity, forKey: .shadowOpacity)
+        try c.encode(shadowRadius, forKey: .shadowRadius)
+        try c.encode(shadowOffsetX, forKey: .shadowOffsetX)
+        try c.encode(shadowOffsetY, forKey: .shadowOffsetY)
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id        = try c.decode(UUID.self, forKey: .id)
+        type      = (try? c.decode(ShapeType.self, forKey: .type)) ?? .rectangle
+        startTime = try c.decode(Double.self, forKey: .startTime)
+        endTime   = try c.decode(Double.self, forKey: .endTime)
+        posX      = (try? c.decode(Double.self, forKey: .posX)) ?? 0.5
+        posY      = (try? c.decode(Double.self, forKey: .posY)) ?? 0.5
+        width     = (try? c.decode(Double.self, forKey: .width)) ?? 300
+        height    = (try? c.decode(Double.self, forKey: .height)) ?? 200
+        scaleX    = (try? c.decode(Double.self, forKey: .scaleX)) ?? 1
+        scaleY    = (try? c.decode(Double.self, forKey: .scaleY)) ?? 1
+        lockAspect = (try? c.decode(Bool.self, forKey: .lockAspect)) ?? true
+        rotation  = (try? c.decode(Double.self, forKey: .rotation)) ?? 0
+        opacity   = (try? c.decode(Double.self, forKey: .opacity)) ?? 1
+        fillEnabled = (try? c.decode(Bool.self, forKey: .fillEnabled)) ?? true
+        fillColor = Color(hex: (try? c.decode(String.self, forKey: .fillColorHex)) ?? "#F5B942")
+        fillOpacity = (try? c.decode(Double.self, forKey: .fillOpacity)) ?? 1
+        strokeEnabled = (try? c.decode(Bool.self, forKey: .strokeEnabled)) ?? false
+        strokeColor = Color(hex: (try? c.decode(String.self, forKey: .strokeColorHex)) ?? "#FFFFFF")
+        strokeWidth = (try? c.decode(Double.self, forKey: .strokeWidth)) ?? 4
+        strokeOpacity = (try? c.decode(Double.self, forKey: .strokeOpacity)) ?? 1
+        strokeDashed = (try? c.decode(Bool.self, forKey: .strokeDashed)) ?? false
+        capStart = (try? c.decode(LineCapStyle.self, forKey: .capStart)) ?? .none
+        capEnd = (try? c.decode(LineCapStyle.self, forKey: .capEnd)) ?? .none
+        cornerRadius = (try? c.decode(Double.self, forKey: .cornerRadius)) ?? 0
+        shadowEnabled = (try? c.decode(Bool.self, forKey: .shadowEnabled)) ?? false
+        shadowColor = Color(hex: (try? c.decode(String.self, forKey: .shadowColorHex)) ?? "#000000")
+        shadowOpacity = (try? c.decode(Double.self, forKey: .shadowOpacity)) ?? 0.5
+        shadowRadius = (try? c.decode(Double.self, forKey: .shadowRadius)) ?? 8
+        shadowOffsetX = (try? c.decode(Double.self, forKey: .shadowOffsetX)) ?? 0
+        shadowOffsetY = (try? c.decode(Double.self, forKey: .shadowOffsetY)) ?? 4
+    }
+    init(type: ShapeType, startTime: Double, endTime: Double) {
+        self.type = type; self.startTime = startTime; self.endTime = endTime
+        // 线段/箭头：默认只描边不填充（白色）；箭头边界框更高以容纳三角头
+        if !type.isClosed {
+            fillEnabled = false
+            strokeEnabled = true
+            height = (type == .arrow) ? 48 : 8
+            if type == .arrow { capEnd = .arrow }
+        }
+    }
+}
+
 struct Track<Clip: Identifiable & Equatable & Codable>: Identifiable, Codable {
     var id = UUID()
     var clips: [Clip]   = []
@@ -487,6 +653,7 @@ struct ProjectDocument: Codable {
     var subtitleStyles: [SubtitleStyle]
     var textTracks: [Track<TextClip>]?     // 文字/标题图层（向后兼容：旧 .bcj 无此字段）
     var textTemplates: [TextTemplate]?    // 文字样式模板（向后兼容）
+    var shapeTracks: [Track<ShapeClip>]?   // 图形图层（向后兼容：旧 .bcj 无此字段）
     var mediaAssets: [MediaAsset]
     var exportSettings: ExportSettings
     var previewResolution: String
@@ -505,6 +672,7 @@ struct ProjectSnapshot {
     var imageTracks: [Track<ImageClip>]
     var subtitleTracks: [Track<SubtitleClip>]
     var textTracks: [Track<TextClip>]
+    var shapeTracks: [Track<ShapeClip>]
     var overlayTrackOrder: [ProjectState.OverlayTrackRef]
     var subtitleBottomMargin: Double
     var subtitleLineSpacing: Double
@@ -573,4 +741,92 @@ func makeChannelTap(left: Float, right: Float) -> MTAudioProcessingTap? {
                                              kMTAudioProcessingTapCreationFlag_PostEffects, &tap)
     guard status == noErr else { ctx.deallocate(); return nil }
     return tap
+}
+
+// MARK: - Shape Geometry（图形路径，素材库缩略图 / 预览 / 导出共用）
+
+enum ShapeGeometry {
+    /// 在给定矩形内生成图形路径。矩形圆角由调用方另行处理。
+    static func path(for type: ShapeType, in r: CGRect) -> Path {
+        var p = Path()
+        switch type {
+        case .rectangle:
+            p.addRect(r)
+        case .ellipse:
+            p.addEllipse(in: r)
+        case .triangle:
+            p.move(to: CGPoint(x: r.midX, y: r.minY))
+            p.addLine(to: CGPoint(x: r.maxX, y: r.maxY))
+            p.addLine(to: CGPoint(x: r.minX, y: r.maxY))
+            p.closeSubpath()
+        case .parallelogram:
+            let dx = r.width * 0.25
+            p.move(to: CGPoint(x: r.minX + dx, y: r.minY))
+            p.addLine(to: CGPoint(x: r.maxX, y: r.minY))
+            p.addLine(to: CGPoint(x: r.maxX - dx, y: r.maxY))
+            p.addLine(to: CGPoint(x: r.minX, y: r.maxY))
+            p.closeSubpath()
+        case .trapezoid:
+            let dx = r.width * 0.22
+            p.move(to: CGPoint(x: r.minX + dx, y: r.minY))
+            p.addLine(to: CGPoint(x: r.maxX - dx, y: r.minY))
+            p.addLine(to: CGPoint(x: r.maxX, y: r.maxY))
+            p.addLine(to: CGPoint(x: r.minX, y: r.maxY))
+            p.closeSubpath()
+        case .line:
+            p.move(to: CGPoint(x: r.minX, y: r.midY))
+            p.addLine(to: CGPoint(x: r.maxX, y: r.midY))
+        case .arrow:
+            let y = r.midY
+            let headLen = r.width * 0.28
+            let wing = headLen * 0.55
+            p.move(to: CGPoint(x: r.minX, y: y))
+            p.addLine(to: CGPoint(x: r.maxX, y: y))
+            p.move(to: CGPoint(x: r.maxX - headLen, y: y - wing))
+            p.addLine(to: CGPoint(x: r.maxX, y: y))
+            p.addLine(to: CGPoint(x: r.maxX - headLen, y: y + wing))
+        }
+        return p
+    }
+
+    /// 多边形顶点（用于圆角）。仅三角/平行四边形/梯形返回，其余 nil。
+    static func polygonPoints(for type: ShapeType, in r: CGRect) -> [CGPoint]? {
+        switch type {
+        case .triangle:
+            return [CGPoint(x: r.midX, y: r.minY), CGPoint(x: r.maxX, y: r.maxY), CGPoint(x: r.minX, y: r.maxY)]
+        case .parallelogram:
+            let dx = r.width * 0.25
+            return [CGPoint(x: r.minX + dx, y: r.minY), CGPoint(x: r.maxX, y: r.minY),
+                    CGPoint(x: r.maxX - dx, y: r.maxY), CGPoint(x: r.minX, y: r.maxY)]
+        case .trapezoid:
+            let dx = r.width * 0.22
+            return [CGPoint(x: r.minX + dx, y: r.minY), CGPoint(x: r.maxX - dx, y: r.minY),
+                    CGPoint(x: r.maxX, y: r.maxY), CGPoint(x: r.minX, y: r.maxY)]
+        default:
+            return nil
+        }
+    }
+
+    /// 给多边形顶点加圆角（二次贝塞尔近似）。
+    static func roundedPolygon(_ pts: [CGPoint], radius: CGFloat) -> Path {
+        var path = Path()
+        let n = pts.count
+        guard n >= 3 else { return path }
+        for i in 0..<n {
+            let prev = pts[(i - 1 + n) % n]
+            let cur = pts[i]
+            let next = pts[(i + 1) % n]
+            let d1 = CGPoint(x: prev.x - cur.x, y: prev.y - cur.y)
+            let d2 = CGPoint(x: next.x - cur.x, y: next.y - cur.y)
+            let len1 = max(hypot(d1.x, d1.y), 0.001)
+            let len2 = max(hypot(d2.x, d2.y), 0.001)
+            let r = min(radius, len1 / 2, len2 / 2)
+            let p1 = CGPoint(x: cur.x + d1.x / len1 * r, y: cur.y + d1.y / len1 * r)
+            let p2 = CGPoint(x: cur.x + d2.x / len2 * r, y: cur.y + d2.y / len2 * r)
+            if i == 0 { path.move(to: p1) } else { path.addLine(to: p1) }
+            path.addQuadCurve(to: p2, control: cur)
+        }
+        path.closeSubpath()
+        return path
+    }
 }

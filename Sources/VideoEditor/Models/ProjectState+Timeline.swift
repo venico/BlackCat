@@ -47,6 +47,14 @@ extension ProjectState {
         textTracks[to].clips.append(clip)
     }
 
+    func moveShapeClipToTrack(id: UUID, from: Int, to: Int) {
+        guard shapeTracks.indices.contains(from), shapeTracks.indices.contains(to) else { return }
+        guard let idx = shapeTracks[from].clips.firstIndex(where: { $0.id == id }) else { return }
+        pushUndoThrottled()
+        let clip = shapeTracks[from].clips.remove(at: idx)
+        shapeTracks[to].clips.append(clip)
+    }
+
     // MARK: - Overlap resolution
 
     /// 检查片段是否与同轨道其他片段重叠，如果重叠则自动新建轨道并移过去
@@ -107,7 +115,7 @@ extension ProjectState {
                     var newTrack = Track<ImageClip>(label: "图片")
                     newTrack.clips.append(removed)
                     imageTracks.append(newTrack)
-                    syncOverlayOrder()
+                    insertOverlayRefBelow(.image(newTrack.id), below: imageTracks[ti].id)
                 }
             }
             return
@@ -171,7 +179,7 @@ extension ProjectState {
                     newTrack.clips.append(removed)
                     newTrack.subtitleStyle = newSubtitleStyle()
                     subtitleTracks.append(newTrack)
-                    syncOverlayOrder()
+                    insertOverlayRefBelow(.subtitle(newTrack.id), below: subtitleTracks[ti].id)
                 }
             }
             return
@@ -203,10 +211,53 @@ extension ProjectState {
                     var newTrack = Track<TextClip>(label: "文字")
                     newTrack.clips.append(removed)
                     textTracks.append(newTrack)
-                    syncOverlayOrder()
+                    insertOverlayRefBelow(.text(newTrack.id), below: textTracks[ti].id)
                 }
             }
             return
+        }
+    }
+
+    func resolveShapeOverlap(id: UUID) {
+        for ti in shapeTracks.indices {
+            guard let ci = shapeTracks[ti].clips.firstIndex(where: { $0.id == id }) else { continue }
+            let clip = shapeTracks[ti].clips[ci]
+            let hasOverlap = shapeTracks[ti].clips.contains {
+                $0.id != id && $0.startTime < clip.endTime - 0.001 && $0.endTime > clip.startTime + 0.001
+            }
+            if hasOverlap {
+                let removed = shapeTracks[ti].clips.remove(at: ci)
+                var placed = false
+                for dti in shapeTracks.indices {
+                    if dti == ti { continue }
+                    let noOverlap = !shapeTracks[dti].clips.contains {
+                        $0.startTime < removed.endTime - 0.001 && $0.endTime > removed.startTime + 0.001
+                    }
+                    if noOverlap {
+                        shapeTracks[dti].clips.append(removed)
+                        placed = true
+                        break
+                    }
+                }
+                if !placed {
+                    var newTrack = Track<ShapeClip>(label: "图形")
+                    newTrack.clips.append(removed)
+                    shapeTracks.append(newTrack)
+                    insertOverlayRefBelow(.shape(newTrack.id), below: shapeTracks[ti].id)
+                }
+            }
+            return
+        }
+    }
+
+    func updateShapeTime(id: UUID, start: Double? = nil, end: Double? = nil) {
+        pushUndoThrottled()
+        for i in shapeTracks.indices {
+            if let j = shapeTracks[i].clips.firstIndex(where: { $0.id == id }) {
+                if let s = start { shapeTracks[i].clips[j].startTime = s }
+                if let e = end   { shapeTracks[i].clips[j].endTime   = e }
+                return
+            }
         }
     }
 
@@ -238,6 +289,7 @@ extension ProjectState {
             if selectedAudioClipID == id    { selectedAudioClipID = nil }
             if selectedSubtitleClipID == id { selectedSubtitleClipID = nil }
             if selectedTextClipID == id     { selectedTextClipID = nil }
+            if selectedShapeClipID == id    { selectedShapeClipID = nil }
         } else {
             // Move current primary into multi-set if needed
             if let pid = selectedVideoClipID, pid != id { selectedClipIDs.insert(pid) }
@@ -245,23 +297,27 @@ extension ProjectState {
             if let pid = selectedAudioClipID, pid != id { selectedClipIDs.insert(pid) }
             if let pid = selectedSubtitleClipID, pid != id { selectedClipIDs.insert(pid) }
             if let pid = selectedTextClipID, pid != id { selectedClipIDs.insert(pid) }
+            if let pid = selectedShapeClipID, pid != id { selectedClipIDs.insert(pid) }
             selectedClipIDs.insert(id)
             // Set as new primary based on type
             if videoTracks.flatMap(\.clips).contains(where: { $0.id == id }) {
                 selectedVideoClipID = id
-                selectedImageClipID = nil; selectedAudioClipID = nil; selectedSubtitleClipID = nil; selectedTextClipID = nil
+                selectedImageClipID = nil; selectedAudioClipID = nil; selectedSubtitleClipID = nil; selectedTextClipID = nil; selectedShapeClipID = nil
             } else if imageTracks.flatMap(\.clips).contains(where: { $0.id == id }) {
                 selectedImageClipID = id
-                selectedVideoClipID = nil; selectedAudioClipID = nil; selectedSubtitleClipID = nil; selectedTextClipID = nil
+                selectedVideoClipID = nil; selectedAudioClipID = nil; selectedSubtitleClipID = nil; selectedTextClipID = nil; selectedShapeClipID = nil
             } else if audioTracks.flatMap(\.clips).contains(where: { $0.id == id }) {
                 selectedAudioClipID = id
-                selectedVideoClipID = nil; selectedImageClipID = nil; selectedSubtitleClipID = nil; selectedTextClipID = nil
+                selectedVideoClipID = nil; selectedImageClipID = nil; selectedSubtitleClipID = nil; selectedTextClipID = nil; selectedShapeClipID = nil
             } else if subtitleTracks.flatMap(\.clips).contains(where: { $0.id == id }) {
                 selectedSubtitleClipID = id
-                selectedVideoClipID = nil; selectedImageClipID = nil; selectedAudioClipID = nil; selectedTextClipID = nil
+                selectedVideoClipID = nil; selectedImageClipID = nil; selectedAudioClipID = nil; selectedTextClipID = nil; selectedShapeClipID = nil
             } else if textTracks.flatMap(\.clips).contains(where: { $0.id == id }) {
                 selectedTextClipID = id
-                selectedVideoClipID = nil; selectedImageClipID = nil; selectedAudioClipID = nil; selectedSubtitleClipID = nil
+                selectedVideoClipID = nil; selectedImageClipID = nil; selectedAudioClipID = nil; selectedSubtitleClipID = nil; selectedShapeClipID = nil
+            } else if shapeTracks.flatMap(\.clips).contains(where: { $0.id == id }) {
+                selectedShapeClipID = id
+                selectedVideoClipID = nil; selectedImageClipID = nil; selectedAudioClipID = nil; selectedSubtitleClipID = nil; selectedTextClipID = nil
             }
         }
     }
@@ -643,7 +699,7 @@ extension ProjectState {
         // 选中新建的文字，清其他选中
         selectedTextClipID = clip.id
         selectedVideoClipID = nil; selectedAudioClipID = nil
-        selectedImageClipID = nil; selectedSubtitleClipID = nil
+        selectedImageClipID = nil; selectedSubtitleClipID = nil; selectedShapeClipID = nil
         selectedClipIDs.removeAll()
 
         undoStack.append(snap)
@@ -672,6 +728,79 @@ extension ProjectState {
             if let ci = textTracks[ti].clips.firstIndex(where: { $0.id == id }) {
                 textTracks[ti].clips.remove(at: ci)
                 if selectedTextClipID == id { selectedTextClipID = nil }
+                undoStack.append(snap)
+                if undoStack.count > 30 { undoStack.removeFirst() }
+                redoStack.removeAll()
+                undoCount = undoStack.count; redoCount = 0
+                isSaved = false
+                return
+            }
+        }
+    }
+
+    // MARK: - 图形图层
+
+    /// 在播放头处添加图形片段（无轨道则新建），并选中它。参照 addTextAtPlayhead。
+    func addShapeAtPlayhead(type: ShapeType) {
+        let snap = currentSnapshot()
+        let trackIdx: Int
+        if let sid = selectedShapeClipID,
+           let i = shapeTracks.firstIndex(where: { $0.clips.contains { $0.id == sid } }) {
+            trackIdx = i
+        } else if !shapeTracks.isEmpty {
+            trackIdx = shapeTracks.count - 1
+        } else {
+            shapeTracks.append(Track<ShapeClip>(label: "图形"))
+            syncOverlayOrder()
+            trackIdx = shapeTracks.count - 1
+        }
+        let start = currentTime
+        let end   = currentTime + 3.0
+        var clip  = ShapeClip(type: type, startTime: start, endTime: end)
+        // 基准尺寸按预览分辨率给合适比例
+        let rs = previewRenderSize
+        if type.isClosed {
+            let side = Double(rs.height) * 0.18
+            clip.width = side; clip.height = side
+        } else if type == .line {
+            clip.width = Double(rs.width) * 0.1; clip.height = Double(rs.height) * 0.03
+        } else {  // arrow：更高的边界框，三角头才够大
+            clip.width = Double(rs.width) * 0.084; clip.height = Double(rs.height) * 0.028
+        }
+        shapeTracks[trackIdx].clips.append(clip)
+        shapeTracks[trackIdx].clips.sort { $0.startTime < $1.startTime }
+        // 选中新建图形，清其他选中
+        selectedShapeClipID = clip.id
+        selectedVideoClipID = nil; selectedAudioClipID = nil
+        selectedImageClipID = nil; selectedSubtitleClipID = nil; selectedTextClipID = nil
+        selectedClipIDs.removeAll()
+
+        undoStack.append(snap)
+        if undoStack.count > 30 { undoStack.removeFirst() }
+        redoStack.removeAll()
+        undoCount = undoStack.count
+        redoCount = 0
+        isSaved = false
+    }
+
+    /// 更新指定图形片段（Inspector / 预览编辑用）
+    func updateShapeClip(id: UUID, _ mutate: (inout ShapeClip) -> Void) {
+        for ti in shapeTracks.indices {
+            if let ci = shapeTracks[ti].clips.firstIndex(where: { $0.id == id }) {
+                mutate(&shapeTracks[ti].clips[ci])
+                isSaved = false
+                return
+            }
+        }
+    }
+
+    /// 删除指定图形片段
+    func deleteShapeClip(id: UUID) {
+        let snap = currentSnapshot()
+        for ti in shapeTracks.indices {
+            if let ci = shapeTracks[ti].clips.firstIndex(where: { $0.id == id }) {
+                shapeTracks[ti].clips.remove(at: ci)
+                if selectedShapeClipID == id { selectedShapeClipID = nil }
                 undoStack.append(snap)
                 if undoStack.count > 30 { undoStack.removeFirst() }
                 redoStack.removeAll()
