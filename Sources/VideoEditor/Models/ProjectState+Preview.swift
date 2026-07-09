@@ -186,8 +186,10 @@ extension ProjectState {
                 ))
             }
 
-            // 图片轨道（上层）
-            for track in iTracks {
+            // 图片轨道：改由 SwiftUI OverlayStack 渲染（参与 overlayTrackOrder 统一叠放），
+            // 预览合成不再处理图片。改回 true 可恢复旧的 AVFoundation 图片合成。
+            let composeImagesInPreview = false
+            for track in iTracks where composeImagesInPreview {
                 guard track.isVisible else { continue }
                 for clip in track.clips {
                     var url = clip.videoURL

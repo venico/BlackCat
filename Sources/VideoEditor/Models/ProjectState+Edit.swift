@@ -79,6 +79,7 @@ extension ProjectState {
         imageTracks    = s.imageTracks
         subtitleTracks = s.subtitleTracks
         textTracks     = s.textTracks
+        shapeTracks    = s.shapeTracks
         overlayTrackOrder = s.overlayTrackOrder
         subtitleBottomMargin = s.subtitleBottomMargin
         subtitleLineSpacing  = s.subtitleLineSpacing
@@ -264,6 +265,7 @@ extension ProjectState {
         if let id = selectedAudioClipID    { allIDs.insert(id) }
         if let id = selectedSubtitleClipID { allIDs.insert(id) }
         if let id = selectedTextClipID     { allIDs.insert(id) }
+        if let id = selectedShapeClipID    { allIDs.insert(id) }
 
         for id in allIDs {
             for (ti, track) in videoTracks.enumerated() {
@@ -291,6 +293,11 @@ extension ProjectState {
                     items.append(.text(clip, trackIndex: ti)); srcIDs.insert(id)
                 }
             }
+            for (ti, track) in shapeTracks.enumerated() {
+                if let clip = track.clips.first(where: { $0.id == id }) {
+                    items.append(.shape(clip, trackIndex: ti)); srcIDs.insert(id)
+                }
+            }
         }
 
         guard !items.isEmpty else { return }
@@ -313,6 +320,7 @@ extension ProjectState {
             for i in audioTracks.indices    { audioTracks[i].clips.removeAll    { srcIDs.contains($0.id) } }
             for i in subtitleTracks.indices { subtitleTracks[i].clips.removeAll { srcIDs.contains($0.id) } }
             for i in textTracks.indices     { textTracks[i].clips.removeAll     { srcIDs.contains($0.id) } }
+            for i in shapeTracks.indices    { shapeTracks[i].clips.removeAll    { srcIDs.contains($0.id) } }
             clipboardIsCut = false
             clipboardSourceIDs = []
         }
@@ -324,6 +332,7 @@ extension ProjectState {
             case .audio(let c, _): return c.startTime
             case .subtitle(let c, _): return c.startTime
             case .text(let c, _): return c.startTime
+            case .shape(let c, _): return c.startTime
             }
         }
         let earliest = clipboard.map { startOf($0) }.min() ?? 0
@@ -334,6 +343,7 @@ extension ProjectState {
         selectedAudioClipID = nil
         selectedSubtitleClipID = nil
         selectedTextClipID = nil
+        selectedShapeClipID = nil
         for item in clipboard {
             let offset = startOf(item) - earliest
 
@@ -353,7 +363,17 @@ extension ProjectState {
                 newClip.cropLeft = clip.cropLeft; newClip.cropRight = clip.cropRight
                 let idx = videoTracks.indices.contains(trackIdx) ? trackIdx : 0
                 if videoTracks.indices.contains(idx) {
-                    videoTracks[idx].clips.append(newClip)
+                    let hasOverlap = videoTracks[idx].clips.contains {
+                        $0.startTime < newClip.endTime - 0.001 && $0.endTime > newClip.startTime + 0.001
+                    }
+                    if hasOverlap {
+                        // 播放头处当前视频轨道有内容 → 正下方新建视频轨道；否则放当前轨道
+                        var newTrack = Track<VideoClip>(label: "视频")
+                        newTrack.clips.append(newClip)
+                        videoTracks.insert(newTrack, at: idx + 1)
+                    } else {
+                        videoTracks[idx].clips.append(newClip)
+                    }
                     selectedClipIDs.insert(newClip.id)
                 }
 
@@ -368,7 +388,19 @@ extension ProjectState {
                 newClip.cropLeft = clip.cropLeft; newClip.cropRight = clip.cropRight
                 let idx = imageTracks.indices.contains(trackIdx) ? trackIdx : 0
                 if imageTracks.indices.contains(idx) {
-                    imageTracks[idx].clips.append(newClip)
+                    let hasOverlap = imageTracks[idx].clips.contains {
+                        $0.startTime < newClip.endTime - 0.001 && $0.endTime > newClip.startTime + 0.001
+                    }
+                    if hasOverlap {
+                        // 播放头处当前轨道有内容 → 正下方新建图片轨道；否则放当前轨道
+                        let anchorID = imageTracks[idx].id
+                        var newTrack = Track<ImageClip>(label: "图片")
+                        newTrack.clips.append(newClip)
+                        imageTracks.append(newTrack)
+                        insertOverlayRefBelow(.image(newTrack.id), below: anchorID)
+                    } else {
+                        imageTracks[idx].clips.append(newClip)
+                    }
                     selectedClipIDs.insert(newClip.id)
                 }
 
@@ -382,7 +414,17 @@ extension ProjectState {
                 newClip.format = clip.format
                 let idx = audioTracks.indices.contains(trackIdx) ? trackIdx : 0
                 if audioTracks.indices.contains(idx) {
-                    audioTracks[idx].clips.append(newClip)
+                    let hasOverlap = audioTracks[idx].clips.contains {
+                        $0.startTime < newClip.endTime - 0.001 && $0.endTime > newClip.startTime + 0.001
+                    }
+                    if hasOverlap {
+                        // 播放头处当前音频轨道有内容 → 正下方新建音频轨道；否则放当前轨道
+                        var newTrack = Track<AudioClip>(label: "音频")
+                        newTrack.clips.append(newClip)
+                        audioTracks.insert(newTrack, at: idx + 1)
+                    } else {
+                        audioTracks[idx].clips.append(newClip)
+                    }
                     selectedClipIDs.insert(newClip.id)
                 }
 
@@ -428,7 +470,48 @@ extension ProjectState {
                 newClip.animation = clip.animation
                 let idx = textTracks.indices.contains(trackIdx) ? trackIdx : 0
                 if textTracks.indices.contains(idx) {
-                    textTracks[idx].clips.append(newClip)
+                    let hasOverlap = textTracks[idx].clips.contains {
+                        $0.startTime < newClip.endTime - 0.001 && $0.endTime > newClip.startTime + 0.001
+                    }
+                    if hasOverlap {
+                        // 播放头处当前轨道有内容 → 正下方新建文字轨道；否则放当前轨道
+                        let anchorID = textTracks[idx].id
+                        var newTrack = Track<TextClip>(label: "文字")
+                        newTrack.clips.append(newClip)
+                        textTracks.append(newTrack)
+                        insertOverlayRefBelow(.text(newTrack.id), below: anchorID)
+                    } else {
+                        textTracks[idx].clips.append(newClip)
+                    }
+                    selectedClipIDs.insert(newClip.id)
+                }
+
+            case .shape(let clip, let trackIdx):
+                var newClip = clip
+                newClip.id = UUID()
+                newClip.startTime = t + offset
+                newClip.endTime = t + offset + clip.duration
+                var idx = shapeTracks.indices.contains(trackIdx) ? trackIdx : 0
+                if shapeTracks.indices.contains(idx) {
+                    let hasOverlap = shapeTracks[idx].clips.contains {
+                        $0.startTime < newClip.endTime - 0.001 && $0.endTime > newClip.startTime + 0.001
+                    }
+                    if hasOverlap {
+                        var placed = false
+                        for dti in shapeTracks.indices where dti != idx {
+                            let noOverlap = !shapeTracks[dti].clips.contains {
+                                $0.startTime < newClip.endTime - 0.001 && $0.endTime > newClip.startTime + 0.001
+                            }
+                            if noOverlap { idx = dti; placed = true; break }
+                        }
+                        if !placed {
+                            let newTrack = Track<ShapeClip>(label: "图形")
+                            shapeTracks.append(newTrack)
+                            syncOverlayOrder()
+                            idx = shapeTracks.count - 1
+                        }
+                    }
+                    shapeTracks[idx].clips.append(newClip)
                     selectedClipIDs.insert(newClip.id)
                 }
             }

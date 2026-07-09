@@ -4,6 +4,13 @@ import UniformTypeIdentifiers
 
 // MARK: - Timeline root
 
+private struct VScrollOffsetKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = nextValue()
+    }
+}
+
 struct TimelineView: View {
     @EnvironmentObject private var project: ProjectState
     @EnvironmentObject private var clock: PlaybackClock
@@ -55,6 +62,7 @@ struct TimelineView: View {
     @State private var trackLabelDragSrc: Int = 0
     @State private var trackLabelDragOffset: CGFloat = 0
     @State private var trackLabelDropIdx: Int? = nil
+    @State private var vScrollOffset: CGFloat = 0
 
     private enum DragOp {
         case moveVideo(id: UUID, originStart: Double, originDur: Double, srcTrack: Int)
@@ -198,13 +206,57 @@ struct TimelineView: View {
                 labelColumn
                 clipArea
             }
+            .background(GeometryReader { g in
+                Color.clear.preference(key: VScrollOffsetKey.self,
+                                       value: g.frame(in: .named("tlVScroll")).minY)
+            })
+        }
+        .coordinateSpace(name: "tlVScroll")
+        .onPreferenceChange(VScrollOffsetKey.self) { v in
+            let off = max(0, -v)
+            if abs(vScrollOffset - off) > 0.5 { vScrollOffset = off }
         }
         .background(GeometryReader { geo -> Color in
             DispatchQueue.main.async { viewportH = geo.size.height }
             return Color.clear
         })
         .clipped()
-        // 播放头三角和竖线都在 DraggablePlayhead 内部（ScrollView 内），完全同步不分离
+        .overlay(alignment: .topLeading) {
+            // 固定顶条：刻度尺 + 播放头三角。位于竖向滚动内容之外 → 竖滑永远不动。
+            GeometryReader { geo in
+                let clipW = max(geo.size.width - labelW, 0)
+                HStack(spacing: 0) {
+                    // 左角："+" 添加轨道菜单（顶条里唯一可点的部分）
+                    addTrackMenu
+
+                    ZStack(alignment: .topLeading) {
+                        TimelineRuler(pps: project.pixelsPerSecond,
+                                      duration: max(clock.duration, project.contentEndTime),
+                                      scrollOffsetX: scrollOffsetX, vpWidth: clipW)
+                            .frame(width: clipW, height: rulerH)
+                        // 播放头三角 + 补一段竖线到顶条底部，与轨道区竖线无缝相接
+                        Canvas { ctx, _ in
+                            let px = clock.currentTime * project.pixelsPerSecond - scrollOffsetX
+                            var tri = Path()
+                            tri.move(to: CGPoint(x: px, y: 16))
+                            tri.addLine(to: CGPoint(x: px - 5, y: 6))
+                            tri.addLine(to: CGPoint(x: px + 5, y: 6))
+                            tri.closeSubpath()
+                            ctx.fill(tri, with: .color(Color.accent))
+                            let connector = CGRect(x: px - 0.5, y: 16, width: 1, height: rulerH - 16)
+                            ctx.fill(Path(connector), with: .color(Color.accent))
+                        }
+                    }
+                    .frame(width: clipW, height: rulerH)
+                    .background(Color(red: 0.09, green: 0.09, blue: 0.10))
+                    .clipped()
+                    // 刻度尺条不拦截点击：穿透回原有的 seek / 滚动条 / 轨道逻辑
+                    .allowsHitTesting(false)
+                }
+            }
+            .frame(height: rulerH)
+        }
+        // 播放头：三角在固定顶条，竖线在轨道区(DraggablePlayhead)，两者同一横向公式，不会分离
         // 翻译进度已移至右下角全局浮层
         .onAppear { setupMonitors(); lastThumbPPS = project.pixelsPerSecond }
         .onDisappear { teardownMonitors() }
@@ -287,6 +339,20 @@ struct TimelineView: View {
 
         // Command + scroll wheel → zoom timeline (pixelsPerSecond)，以播放头为中心
         scrollMonitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { [self] event in
+            // Shift + 滚轮 → 横向滚动时间轴（竖直滚轮不加修饰=纵向滚轨道，走 ScrollView 默认）
+            if event.modifierFlags.contains(.shift) {
+                let d = event.scrollingDeltaY != 0 ? event.scrollingDeltaY : event.scrollingDeltaX
+                if abs(d) > 0, let sv = project.timelineHScrollView, let doc = sv.documentView {
+                    DispatchQueue.main.async {
+                        let maxX = max(0, doc.frame.width - sv.contentView.bounds.width)
+                        let newX = (sv.contentView.bounds.origin.x - d).clamped(to: 0...maxX)
+                        sv.contentView.scroll(to: NSPoint(x: newX, y: 0))
+                        sv.reflectScrolledClipView(sv.contentView)
+                    }
+                }
+                return nil  // consume
+            }
+            // Command + 滚轮 → 缩放
             guard event.modifierFlags.contains(.command) else { return event }
             let delta = event.scrollingDeltaY != 0 ? event.scrollingDeltaY : event.scrollingDeltaX
             guard abs(delta) > 0 else { return event }
@@ -305,31 +371,37 @@ struct TimelineView: View {
 
     // MARK: Label column
 
+    /// "+" 添加轨道菜单：放在固定顶条左角，不随竖滑动
+    private var addTrackMenu: some View {
+        Menu {
+            Button("添加视频轨道") { project.videoTracks.append(Track(label: "视频")) }
+            Button("添加图片轨道") { project.imageTracks.append(Track(label: "图片")); project.syncOverlayOrder() }
+            Button("添加音频轨道") { project.audioTracks.append(Track(label: "音频")) }
+            Button("添加字幕轨道") {
+                var newTrack = Track<SubtitleClip>(label: "字幕")
+                newTrack.subtitleStyle = SubtitleStyle()
+                project.subtitleTracks.append(newTrack)
+                project.syncOverlayOrder()
+            }
+            Button("添加文字轨道") { project.textTracks.append(Track(label: "文字")); project.syncOverlayOrder() }
+            Button("添加图形轨道") { project.shapeTracks.append(Track(label: "图形")); project.syncOverlayOrder() }
+        } label: {
+            Image(systemName: "plus")
+                .font(.system(size: 13, weight: .light))
+                .foregroundColor(Color.labelSecondary)
+                .frame(width: labelW, height: rulerH)
+                .contentShape(Rectangle())
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .frame(width: labelW, height: rulerH)
+        .background(Color(red: 0.09, green: 0.09, blue: 0.10))
+    }
+
     private var labelColumn: some View {
         VStack(spacing: 0) {
-            // "+" dropdown to add tracks
-            Menu {
-                Button("添加视频轨道") { project.videoTracks.append(Track(label: "视频")) }
-                Button("添加图片轨道") { project.imageTracks.append(Track(label: "图片")); project.syncOverlayOrder() }
-                Button("添加音频轨道") { project.audioTracks.append(Track(label: "音频")) }
-                Button("添加字幕轨道") {
-                    var newTrack = Track<SubtitleClip>(label: "字幕")
-                    newTrack.subtitleStyle = SubtitleStyle()
-                    project.subtitleTracks.append(newTrack)
-                    project.syncOverlayOrder()
-                }
-                Button("添加文字轨道") { project.textTracks.append(Track(label: "文字")); project.syncOverlayOrder() }
-                Button("添加图形轨道") { project.shapeTracks.append(Track(label: "图形")); project.syncOverlayOrder() }
-            } label: {
-                Image(systemName: "plus")
-                    .font(.system(size: 13, weight: .light))
-                    .foregroundColor(Color.labelSecondary)
-                    .frame(width: labelW, height: rulerH)
-                    .contentShape(Rectangle())
-            }
-            .menuStyle(.borderlessButton)
-            .menuIndicator(.hidden)
-            .frame(height: rulerH)
+            // 顶部留出刻度尺高度（"+" 已移到固定顶条），保持标签与轨道竖向对齐
+            Color.clear.frame(height: rulerH)
 
             VStack(spacing: 1) {
             // Overlay tracks (image/subtitle/text) — unified order
@@ -590,7 +662,7 @@ struct TimelineView: View {
         GeometryReader { visibleGeo in
             let visibleW = visibleGeo.size.width
             let _ = updateVisibleWidth(visibleW)
-            let contentW = clock.duration * project.pixelsPerSecond + 300
+            let contentW = max(clock.duration, project.contentEndTime) * project.pixelsPerSecond + 300
             let totalW = max(contentW, max(visibleW, 800))
             let effectiveH = max(totalContentH(), viewportH)
             ZStack(alignment: .bottom) {
@@ -603,11 +675,6 @@ struct TimelineView: View {
                     })
                     .frame(width: 1, height: 1)
                     .opacity(0)
-                    TimelineRuler(pps: project.pixelsPerSecond, duration: clock.duration,
-                                  scrollOffsetX: scrollOffsetX, vpWidth: visibleW)
-                        .frame(height: rulerH)
-                        .allowsHitTesting(false)
-
                     VStack(spacing: 0) {
                         Color.clear.frame(height: rulerH).allowsHitTesting(false)
                         trackRows
@@ -668,6 +735,8 @@ struct TimelineView: View {
                 .contextMenu {
                     let selID = project.selectedVideoClipID ?? project.selectedImageClipID
                               ?? project.selectedAudioClipID ?? project.selectedSubtitleClipID
+                              ?? project.selectedTextClipID ?? project.selectedShapeClipID
+                              ?? project.selectedClipIDs.first
                     if let id = selID {
                         Button { project.selectLeftOf(id) } label: { Label("向左全选", systemImage: "arrow.left.to.line") }
                         Button { project.selectRightOf(id) } label: { Label("向右全选", systemImage: "arrow.right.to.line") }
@@ -680,9 +749,12 @@ struct TimelineView: View {
                         Divider()
                     }
                     Button { project.copySelected() } label: { Label("复制", systemImage: "doc.on.doc") }
+                        .disabled(selID == nil)
                     Button { project.cutSelected() } label: { Label("剪切", systemImage: "scissors") }
+                        .disabled(selID == nil)
                     Button { project.pasteAtPlayhead() } label: { Label("粘贴", systemImage: "doc.on.clipboard") }
-                    if selID != nil || project.selectedTextClipID != nil {
+                        .disabled(project.clipboard.isEmpty)
+                    if selID != nil {
                         Divider()
                         Button(role: .destructive) { project.deleteSelected() } label: { Label("删除", systemImage: "trash") }
                     }
@@ -2110,7 +2182,7 @@ private struct TrackLabel: View {
                     .foregroundColor(Color.labelSecondary.opacity(0.5))
                     .frame(width: 14, height: 14)
                     .contentShape(Rectangle())
-                    .gesture(DragGesture()
+                    .gesture(DragGesture(coordinateSpace: .global)
                         .onChanged { v in isDragging = true; onDragChanged?(v.translation.height) }
                         .onEnded { v in isDragging = false; onDragEnded?(v.translation.height) })
             }
@@ -2199,7 +2271,7 @@ private struct TextTrackLabel: View {
                     .foregroundColor(Color.labelSecondary.opacity(0.5))
                     .frame(width: 14, height: 14)
                     .contentShape(Rectangle())
-                    .gesture(DragGesture()
+                    .gesture(DragGesture(coordinateSpace: .global)
                         .onChanged { v in isDragging = true; onDragChanged?(v.translation.height) }
                         .onEnded { v in isDragging = false; onDragEnded?(v.translation.height) })
             }
@@ -2760,7 +2832,8 @@ private struct TimelineRuler: View {
 
             var t = startTime
             while t <= endTime {
-                let x = t * pps
+                // 内容坐标 → 视口坐标（固定顶条里刻度尺不再被 ScrollView 自动平移，需手动减去横滑量）
+                let x = t * pps - scrollOffsetX
                 let majRem = majorStep > 0.001 ? t.truncatingRemainder(dividingBy: majorStep) : 0
                 let isMajor = majRem < 0.001 || (majorStep - majRem) < 0.001
 
@@ -2799,15 +2872,8 @@ private struct DraggablePlayhead: View {
     var body: some View {
         let x = clock.currentTime * pps
         Canvas { ctx, size in
-            // 三角（y 6~16）
-            var tri = Path()
-            tri.move(to: CGPoint(x: x, y: 16))
-            tri.addLine(to: CGPoint(x: x - 5, y: 6))
-            tri.addLine(to: CGPoint(x: x + 5, y: 6))
-            tri.closeSubpath()
-            ctx.fill(tri, with: .color(Color.accent))
-            // 竖线（y 16 ~ fullHeight）
-            let line = CGRect(x: x - 0.5, y: 16, width: 1, height: fullHeight - 16)
+            // 三角已移到固定顶条；这里只画贯穿轨道的竖线
+            let line = CGRect(x: x - 0.5, y: 0, width: 1, height: fullHeight)
             ctx.fill(Path(line), with: .color(Color.accent))
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)

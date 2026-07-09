@@ -540,6 +540,7 @@ struct ExportSheetView: View {
             imageTracks: project.imageTracks,
             textTracks: project.textTracks,
             shapeTracks: project.shapeTracks,
+            overlayTrackOrder: project.overlayTrackOrder,
             subtitleBottomMargin: project.subtitleBottomMargin,
             subtitleLineSpacing: project.subtitleLineSpacing,
             previewRenderSize: project.previewRenderSize,
@@ -561,6 +562,7 @@ struct ExportInput {
     let imageTracks:    [Track<ImageClip>]
     let textTracks:     [Track<TextClip>]
     let shapeTracks:    [Track<ShapeClip>]
+    let overlayTrackOrder: [ProjectState.OverlayTrackRef]
     let subtitleBottomMargin: Double
     let subtitleLineSpacing:  Double
     let previewRenderSize: CGSize          // 预览分辨率，用于字幕缩放基准
@@ -825,61 +827,9 @@ actor TimelineExporter {
             }
         }
 
-        // ── 图片轨道（上层）──
-        var imageCompTracks: [(track: AVMutableCompositionTrack, clip: ImageClip)] = []
-        if includeVideo {
-            let endTime = globalEndTime
-            for track in input.imageTracks {
-                guard track.isVisible else { continue }
-                for clip in track.clips {
-                    var url = clip.videoURL
-                    // videoURL 不存在时（临时文件被清理），从 imageURL 重新生成
-                    if url == nil || !FileManager.default.fileExists(atPath: url!.path),
-                       let imgURL = clip.imageURL {
-                        url = await ProjectState.createVideoFromImage(imageURL: imgURL, duration: clip.duration)
-                    }
-                    guard let url else { continue }
-                    let asset = AVURLAsset(url: url)
-                    let assetDur = try await asset.load(.duration)
-                    let useDur = CMTimeMinimum(CMTime(seconds: clip.duration, preferredTimescale: 600), assetDur)
-                    guard useDur.seconds > 0.01 else { continue }
-                    if let vAsset = try? await asset.loadTracks(withMediaType: .video).first,
-                       let vt = composition.addMutableTrack(withMediaType: .video,
-                                                            preferredTrackID: kCMPersistentTrackID_Invalid) {
-                        // 先填充 clip 之前的空白区间
-                        if clip.startTime > 0.01 {
-                            var pos = CMTime.zero
-                            let fillEnd = CMTime(seconds: clip.startTime, preferredTimescale: 600)
-                            while pos < fillEnd {
-                                let remaining = fillEnd - pos
-                                let fillDur = CMTimeMinimum(assetDur, remaining)
-                                try? vt.insertTimeRange(CMTimeRange(start: .zero, duration: fillDur), of: vAsset, at: pos)
-                                pos = pos + fillDur
-                            }
-                        }
-                        // 在 clip 的时间位置插入实际内容
-                        let range = CMTimeRange(start: .zero, duration: useDur)
-                        let at = CMTime(seconds: clip.startTime, preferredTimescale: 600)
-                        try? vt.insertTimeRange(range, of: vAsset, at: at)
-                        // clip 之后也填充到 endTime
-                        let afterEnd = clip.startTime + useDur.seconds
-                        if endTime > afterEnd + 0.01 {
-                            var pos = CMTime(seconds: afterEnd, preferredTimescale: 600)
-                            let fillEnd = CMTime(seconds: endTime, preferredTimescale: 600)
-                            while pos < fillEnd {
-                                let remaining = fillEnd - pos
-                                let fillDur = CMTimeMinimum(assetDur, remaining)
-                                try? vt.insertTimeRange(CMTimeRange(start: .zero, duration: fillDur), of: vAsset, at: pos)
-                                pos = pos + fillDur
-                            }
-                        }
-                        imageCompTracks.append((track: vt, clip: clip))
-                    }
-                }
-            }
-        }
+        // 图片不再通过 AVCompositionTrack 合成，改为逐帧 CIImage overlay（与预览 OverlayStack 一致）
 
-        // 如果字幕/图片超出音视频长度，扩展 composition 到 globalEndTime
+        // 如果字幕/图片/文字/图形超出音视频长度，扩展 composition 到 globalEndTime
         // 用循环复制源视频首帧来填充（videoComposition 会遮黑，内容不可见，但需要真实帧才能延长导出时长）
         let globalEndCM = CMTime(seconds: globalEndTime, preferredTimescale: 600)
         if globalEndCM > composition.duration {
@@ -965,22 +915,16 @@ actor TimelineExporter {
                     ? (idx: $0.offset, track: $0.element) : nil
             }
 
-            let hasImageTracks = !imageCompTracks.isEmpty
             let hasVideoClipTransforms = !videoCompTracks.isEmpty
 
-            // Step 1: 图片/视频合成 / 分辨率帧率变更
-            if hasImageTracks || hasVideoClipTransforms {
+            // 视频合成 / 分辨率帧率变更（图片不再参与 AVVideoComposition，改由 CIImage overlay）
+            if hasVideoClipTransforms {
                 let vc = AVMutableVideoComposition()
                 vc.renderSize = renderSize
                 vc.frameDuration = frameDuration
                 vc.sourceTrackIDForFrameTiming = kCMPersistentTrackID_Invalid
 
                 let ts: CMTimeScale = 600
-                let imageClipCMRanges = imageCompTracks.map { entry -> (start: CMTime, end: CMTime) in
-                    let s = CMTime(seconds: entry.clip.startTime, preferredTimescale: ts)
-                    let e = CMTime(seconds: entry.clip.endTime, preferredTimescale: ts)
-                    return (s, e)
-                }
                 let videoClipCMRanges = videoCompTracks.map { entry -> (start: CMTime, end: CMTime) in
                     let s = CMTime(seconds: entry.startTime, preferredTimescale: ts)
                     let e = CMTime(seconds: entry.endTime, preferredTimescale: ts)
@@ -988,7 +932,6 @@ actor TimelineExporter {
                 }
 
                 var cmBoundaries: [CMTime] = [.zero, composition.duration]
-                for r in imageClipCMRanges { cmBoundaries.append(r.start); cmBoundaries.append(r.end) }
                 for r in videoClipCMRanges { cmBoundaries.append(r.start); cmBoundaries.append(r.end) }
                 for ti in transitionInfos {
                     cmBoundaries.append(ti.overlapStart)
@@ -1009,25 +952,6 @@ actor TimelineExporter {
                     instruction.backgroundColor = CGColor(gray: 0, alpha: 1)
 
                     var layerInstructions: [AVMutableVideoCompositionLayerInstruction] = []
-                    for (idx, entry) in imageCompTracks.enumerated() {
-                        let clipStartCM = imageClipCMRanges[idx].start
-                        let clipEndCM   = imageClipCMRanges[idx].end
-                        let clipActive = segStartCM >= clipStartCM && segStartCM < clipEndCM
-                        let li = AVMutableVideoCompositionLayerInstruction(assetTrack: entry.track)
-                        if clipActive {
-                            if let natSize = try? await entry.track.load(.naturalSize), natSize.width > 0, natSize.height > 0 {
-                                let t = ProjectState.imageTransform(clip: entry.clip, natSize: natSize, renderSize: renderSize)
-                                li.setTransform(t, at: .zero)
-                                let c = entry.clip
-                                if c.cropTop > 0.001 || c.cropBottom > 0.001 || c.cropLeft > 0.001 || c.cropRight > 0.001 {
-                                    li.setCropRectangle(ProjectState.imageCropRect(clip: c, natSize: natSize), at: .zero)
-                                }
-                            }
-                        } else {
-                            li.setOpacity(0, at: .zero)
-                        }
-                        layerInstructions.append(li)
-                    }
                     for (idx, entry) in videoCompTracks.enumerated() {
                         let li = AVMutableVideoCompositionLayerInstruction(assetTrack: entry.track)
                         let clipStart = videoClipCMRanges[idx].start
@@ -1064,7 +988,7 @@ actor TimelineExporter {
                     vc.renderSize = renderSize
                     vc.frameDuration = frameDuration
                     vc.sourceTrackIDForFrameTiming = kCMPersistentTrackID_Invalid
-                    let visualEnd = max(vEnd, iEnd)
+                    let visualEnd = vEnd
                     let visualEndCM = CMTime(seconds: visualEnd, preferredTimescale: 600)
 
                     let instr = AVMutableVideoCompositionInstruction()
@@ -1093,7 +1017,7 @@ actor TimelineExporter {
             }
 
             // 如果还没有 videoComposition，创建一个基础的（确保帧率/分辨率可控）
-            let visualEnd = max(vEnd, iEnd)
+            let visualEnd = vEnd
             if videoComposition == nil {
                 let vc = AVMutableVideoComposition()
                 vc.renderSize = renderSize
@@ -1147,14 +1071,9 @@ actor TimelineExporter {
                 renderSize: renderSize
             )
 
-            // ── 色调范围表（视频 clip），导出时逐帧应用 CIFilter ──
+            // ── 色调范围表（仅视频 clip），图片色调在 renderImageOverlay 中处理 ──
             let colorRanges: [(start: Double, end: Double, adj: ColorAdjust)] =
                 input.videoTracks.flatMap { track -> [(Double, Double, ColorAdjust)] in
-                    guard track.isVisible else { return [] }
-                    return track.clips.compactMap { clip in
-                        clip.colorAdjust.isIdentity ? nil : (clip.startTime, clip.endTime, clip.colorAdjust)
-                    }
-                } + input.imageTracks.flatMap { track -> [(Double, Double, ColorAdjust)] in
                     guard track.isVisible else { return [] }
                     return track.clips.compactMap { clip in
                         clip.colorAdjust.isIdentity ? nil : (clip.startTime, clip.endTime, clip.colorAdjust)
@@ -1168,9 +1087,12 @@ actor TimelineExporter {
             let visibleShapeClips = input.shapeTracks
                 .filter { $0.isVisible }
                 .flatMap { $0.clips }
+            let visibleImageClips = input.imageTracks
+                .filter { $0.isVisible }
+                .flatMap { $0.clips }
 
             // ── 快速路径：无 overlay 时用 AVAssetExportSession（5-10x 加速）──
-            let needsPerFrameProcessing = subRenderInfo.hasSubtitles || !visibleTextClips.isEmpty || !visibleShapeClips.isEmpty || !colorRanges.isEmpty
+            let needsPerFrameProcessing = subRenderInfo.hasSubtitles || !visibleTextClips.isEmpty || !visibleShapeClips.isEmpty || !visibleImageClips.isEmpty || !colorRanges.isEmpty
             if !needsPerFrameProcessing {
                 try? FileManager.default.removeItem(at: input.outputURL)
                 try await fastExportSession(
@@ -1184,15 +1106,17 @@ actor TimelineExporter {
                 return input.outputURL
             }
 
-            // ── 用 AVAssetWriter 导出（逐帧处理：字幕/文字/色调）──
+            // ── 用 AVAssetWriter 导出（逐帧处理：按 overlayTrackOrder 合成）──
             try? FileManager.default.removeItem(at: input.outputURL)
             try await writerExport(
                 composition: composition,
                 videoComposition: videoComposition!,
                 audioMix: audioMix,
+                overlayTrackOrder: input.overlayTrackOrder,
                 subtitleInfo: subRenderInfo,
-                textClips: visibleTextClips,
-                shapeClips: visibleShapeClips,
+                imageTracks: input.imageTracks,
+                textTracks: input.textTracks,
+                shapeTracks: input.shapeTracks,
                 colorRanges: colorRanges,
                 fps: fps,
                 bitrate: settings.bitrate,
@@ -1350,9 +1274,11 @@ actor TimelineExporter {
         composition: AVMutableComposition,
         videoComposition: AVMutableVideoComposition,
         audioMix: AVMutableAudioMix,
+        overlayTrackOrder: [ProjectState.OverlayTrackRef],
         subtitleInfo: SubtitleRenderInfo,
-        textClips: [TextClip],
-        shapeClips: [ShapeClip],
+        imageTracks: [Track<ImageClip>],
+        textTracks: [Track<TextClip>],
+        shapeTracks: [Track<ShapeClip>],
         colorRanges: [(start: Double, end: Double, adj: ColorAdjust)],
         fps: Int, bitrate: Int,
         outputURL: URL,
@@ -1438,12 +1364,27 @@ actor TimelineExporter {
         writer.startSession(atSourceTime: .zero)
 
         let hasSubtitles = subtitleInfo.hasSubtitles
-        let hasTextOverlays = !textClips.isEmpty
-        let hasShapeOverlays = !shapeClips.isEmpty
+        let imageClipsByTrack: [UUID: [ImageClip]] = Dictionary(
+            uniqueKeysWithValues: imageTracks.filter { $0.isVisible }.map { ($0.id, $0.clips) })
+        let textClipsByTrack: [UUID: [TextClip]] = Dictionary(
+            uniqueKeysWithValues: textTracks.filter { $0.isVisible }.map { ($0.id, $0.clips) })
+        let shapeClipsByTrack: [UUID: [ShapeClip]] = Dictionary(
+            uniqueKeysWithValues: shapeTracks.filter { $0.isVisible }.map { ($0.id, $0.clips) })
+        let hasOverlays = hasSubtitles || !imageClipsByTrack.isEmpty || !textClipsByTrack.isEmpty || !shapeClipsByTrack.isEmpty
         let videoQueue = DispatchQueue(label: "export.video")
         let audioQueue = DispatchQueue(label: "export.audio")
         let targetFps = fps
         let ciCtx = ExportCIContext.shared
+
+        // 预加载图片 CIImage 缓存
+        var imageCICache: [URL: CIImage] = [:]
+        for track in imageTracks where track.isVisible {
+            for clip in track.clips {
+                if let url = clip.imageURL, imageCICache[url] == nil {
+                    imageCICache[url] = CIImage(contentsOf: url)
+                }
+            }
+        }
 
         // 音视频必须并行消费，否则 AVAssetReader 内部缓冲区满会死锁
         await withTaskGroup(of: Void.self) { group in
@@ -1455,7 +1396,6 @@ actor TimelineExporter {
                     var currentReaderTime: Double = 0
                     var nextSB: CMSampleBuffer? = videoOutput.copyNextSampleBuffer()
 
-                    // 字幕缓存：同一字幕段内复用 overlay CIImage
                     var cachedSubOverlay: CIImage? = nil
                     var cachedSubKey: String = ""
 
@@ -1498,7 +1438,7 @@ actor TimelineExporter {
                                         targetTime >= $0.start && targetTime < $0.end
                                     }?.adj
 
-                                    let needsExtra = hasSubtitles || hasTextOverlays || hasShapeOverlays || (activeAdj != nil && activeAdj?.isIdentity == false)
+                                    let needsExtra = hasOverlays || (activeAdj != nil && activeAdj?.isIdentity == false)
                                     if needsExtra {
                                         var image = CIImage(cvPixelBuffer: pb)
 
@@ -1506,34 +1446,49 @@ actor TimelineExporter {
                                             image = ColorAdjust.apply(image, adj)
                                         }
 
-                                        if hasTextOverlays,
-                                           let textOverlay = self.renderTextOverlay(
-                                               atTime: targetTime, clips: textClips,
-                                               fontScale: subtitleInfo.fontScale, renderSize: renderSize) {
-                                            image = textOverlay.composited(over: image)
-                                        }
-
-                                        if hasSubtitles {
-                                            var subKey = ""
-                                            for (track, _) in subtitleInfo.tracks {
-                                                if let clip = track.clips.first(where: { $0.startTime <= targetTime && $0.endTime > targetTime }) {
-                                                    subKey += "\(clip.id)|\(clip.text)|"
+                                        // 按 overlayTrackOrder 从底到顶合成（reversed: 最后元素=最底层，最先合成）
+                                        var subtitleRendered = false
+                                        for ref in overlayTrackOrder.reversed() {
+                                            switch ref {
+                                            case .image(let trackID):
+                                                if let clips = imageClipsByTrack[trackID],
+                                                   let clip = clips.first(where: { $0.startTime <= targetTime && $0.endTime > targetTime }),
+                                                   let overlay = self.renderImageOverlay(
+                                                       clip: clip, renderSize: renderSize, ciCache: imageCICache) {
+                                                    image = overlay.composited(over: image)
+                                                }
+                                            case .subtitle(_):
+                                                if !subtitleRendered && hasSubtitles {
+                                                    var subKey = ""
+                                                    for (track, _) in subtitleInfo.tracks {
+                                                        if let clip = track.clips.first(where: { $0.startTime <= targetTime && $0.endTime > targetTime }) {
+                                                            subKey += "\(clip.id)|\(clip.text)|"
+                                                        }
+                                                    }
+                                                    if subKey != cachedSubKey {
+                                                        cachedSubOverlay = self.renderSubtitleOverlay(atTime: targetTime, info: subtitleInfo)
+                                                        cachedSubKey = subKey
+                                                    }
+                                                    if let subOverlay = cachedSubOverlay {
+                                                        image = subOverlay.composited(over: image)
+                                                    }
+                                                    subtitleRendered = true
+                                                }
+                                            case .text(let trackID):
+                                                if let clips = textClipsByTrack[trackID],
+                                                   let overlay = self.renderTextOverlay(
+                                                       atTime: targetTime, clips: clips,
+                                                       fontScale: subtitleInfo.fontScale, renderSize: renderSize) {
+                                                    image = overlay.composited(over: image)
+                                                }
+                                            case .shape(let trackID):
+                                                if let clips = shapeClipsByTrack[trackID],
+                                                   let overlay = self.renderShapeOverlay(
+                                                       atTime: targetTime, clips: clips,
+                                                       scale: subtitleInfo.fontScale, renderSize: renderSize) {
+                                                    image = overlay.composited(over: image)
                                                 }
                                             }
-                                            if subKey != cachedSubKey {
-                                                cachedSubOverlay = self.renderSubtitleOverlay(atTime: targetTime, info: subtitleInfo)
-                                                cachedSubKey = subKey
-                                            }
-                                            if let subOverlay = cachedSubOverlay {
-                                                image = subOverlay.composited(over: image)
-                                            }
-                                        }
-
-                                        if hasShapeOverlays,
-                                           let shapeOverlay = self.renderShapeOverlay(
-                                               atTime: targetTime, clips: shapeClips,
-                                               scale: subtitleInfo.fontScale, renderSize: renderSize) {
-                                            image = shapeOverlay.composited(over: image)
                                         }
 
                                         if let pool = adaptor.pixelBufferPool {
@@ -1592,6 +1547,72 @@ actor TimelineExporter {
     // MARK: - GPU overlay 渲染（CIImage 管线）
 
     /// 渲染字幕为透明背景 CIImage overlay（用于 CISourceOverCompositing GPU 合成）
+    // MARK: - 图片 overlay 渲染（CIImage 管线，与预览 ImageLayerView 一致）
+
+    private nonisolated func renderImageOverlay(
+        clip: ImageClip, renderSize: CGSize, ciCache: [URL: CIImage]
+    ) -> CIImage? {
+        guard let url = clip.imageURL,
+              var ciImg = ciCache[url] else { return nil }
+        let natW = ciImg.extent.width
+        let natH = ciImg.extent.height
+        guard natW > 0, natH > 0 else { return nil }
+        let rw = renderSize.width
+        let rh = renderSize.height
+
+        // 裁剪（归一化比例，先对原始图片裁剪）
+        let cropL = CGFloat(clip.cropLeft)
+        let cropR = CGFloat(clip.cropRight)
+        let cropT = CGFloat(clip.cropTop)
+        let cropB = CGFloat(clip.cropBottom)
+        if cropL > 0.001 || cropR > 0.001 || cropT > 0.001 || cropB > 0.001 {
+            let cx = natW * cropL
+            let cy = natH * cropB   // CIImage y-up: cropBottom 从底部裁
+            let cw = natW * (1 - cropL - cropR)
+            let ch = natH * (1 - cropT - cropB)
+            guard cw > 0, ch > 0 else { return nil }
+            ciImg = ciImg.cropped(to: CGRect(x: cx, y: cy, width: cw, height: ch))
+        }
+
+        let croppedW = ciImg.extent.width
+        let croppedH = ciImg.extent.height
+
+        // 缩放：baseScale 使图片 fit 画布，再乘用户 scaleX/scaleY
+        let baseScale = min(rw / natW, rh / natH)
+        let sx = baseScale * CGFloat(clip.scaleX)
+        let sy = baseScale * CGFloat(clip.scaleY)
+
+        // 位移：offsetX/offsetY 是归一化值（-1...1），0 = 居中
+        let centerX = rw / 2 + CGFloat(clip.offsetX) * rw
+        let centerY = rh / 2 + CGFloat(clip.offsetY) * rh
+
+        // CIImage 变换：先移到原点 → 缩放 → 移到目标中心
+        // CIImage 是 y-up 坐标系
+        let originX = ciImg.extent.origin.x
+        let originY = ciImg.extent.origin.y
+        var t = CGAffineTransform(translationX: -originX, y: -originY)   // 归零
+        t = t.concatenating(CGAffineTransform(scaleX: sx, y: sy))
+        let scaledW = croppedW * sx
+        let scaledH = croppedH * sy
+        // CIImage y-up: centerY 需要翻转（renderSize 的 y 轴是 y-down）
+        let destX = centerX - scaledW / 2
+        let destY = (rh - centerY) - scaledH / 2
+        t = t.concatenating(CGAffineTransform(translationX: destX, y: destY))
+
+        ciImg = ciImg.transformed(by: t)
+
+        // 色调调节
+        let adj = clip.colorAdjust
+        if !adj.isIdentity {
+            ciImg = ColorAdjust.apply(ciImg, adj)
+        }
+
+        // 裁剪到画布范围
+        ciImg = ciImg.cropped(to: CGRect(origin: .zero, size: renderSize))
+
+        return ciImg
+    }
+
     private nonisolated func renderSubtitleOverlay(
         atTime time: Double, info: SubtitleRenderInfo
     ) -> CIImage? {

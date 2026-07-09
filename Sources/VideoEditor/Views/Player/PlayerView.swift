@@ -27,9 +27,7 @@ struct PlayerView: View {
                     || (clock.lastVideoEndTime > 0 && clock.currentTime >= clock.lastVideoEndTime) {
                     Color.black
                 }
-                SubtitleOverlay()
-                TextOverlay()
-                ShapeOverlay()
+                OverlayStack()
                 VideoTransformOverlay()
                 ImageTransformOverlay()
                 ShapeTransformOverlay()
@@ -100,6 +98,296 @@ private struct AVPlayerNSView: NSViewRepresentable {
         return v
     }
     func updateNSView(_ v: AVPlayerView, context: Context) { v.player = player }
+}
+
+// MARK: - Overlay Stack（按 overlayTrackOrder 统一渲染字幕/文字/图形）
+
+private struct OverlayStack: View {
+    @EnvironmentObject private var project: ProjectState
+    @EnvironmentObject private var clock: PlaybackClock
+    @State private var editingTextID: UUID? = nil
+    @State private var editText: String = ""
+    @State private var shapeDragStart: [UUID: CGPoint] = [:]
+    @State private var subtitleHeights: [UUID: CGFloat] = [:]   // 每条字幕实测高度，用于精确堆叠
+
+    var body: some View {
+        let count = project.overlayTrackOrder.count
+
+        ZStack {
+            Color.clear.contentShape(Rectangle())
+                .onTapGesture {
+                    if editingTextID != nil { commitTextEdit() }
+                    if project.selectedShapeClipID != nil {
+                        project.selectedShapeClipID = nil
+                        project.selectedClipIDs.removeAll()
+                    }
+                }
+                .zIndex(-1)
+
+            ForEach(Array(project.overlayTrackOrder.enumerated()), id: \.element.trackID) { i, ref in
+                let z = Double(count - i)
+                switch ref {
+                case .image(let id):
+                    imageTrackView(trackID: id).zIndex(z)
+                case .subtitle(let id):
+                    subtitleTrackView(trackID: id).zIndex(z)
+                case .text(let id):
+                    textTrackView(trackID: id).zIndex(z)
+                case .shape(let id):
+                    shapeTrackView(trackID: id).zIndex(z)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func imageTrackView(trackID: UUID) -> some View {
+        GeometryReader { geo in
+            if let track = project.imageTracks.first(where: { $0.id == trackID }),
+               track.isVisible,
+               let clip = track.clips.first(where: { $0.startTime <= clock.currentTime && $0.endTime > clock.currentTime }) {
+                ImageLayerView(clip: clip, viewSize: geo.size, videoSize: project.previewRenderSize)
+                    .contentShape(Rectangle())
+                    .onTapGesture { selectImageExclusive(clip.id) }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func textTrackView(trackID: UUID) -> some View {
+        GeometryReader { geo in
+            let scale = geo.size.width / max(project.previewRenderSize.width, 1)
+            if let track = project.textTracks.first(where: { $0.id == trackID }),
+               track.isVisible,
+               let clip = track.clips.first(where: { $0.startTime <= clock.currentTime && $0.endTime > clock.currentTime }) {
+                if editingTextID == clip.id {
+                    TextEditField(text: $editText, clip: clip, scale: scale, onCommit: { commitTextEdit() })
+                        .fixedSize()
+                        .overlay(RoundedRectangle(cornerRadius: 4 * scale).strokeBorder(Color.accent, lineWidth: 1.5))
+                        .position(x: geo.size.width * clip.posX, y: geo.size.height * clip.posY)
+                } else {
+                    TextLabel(clip: clip, scale: scale, selected: project.selectedTextClipID == clip.id)
+                        .position(x: geo.size.width * clip.posX, y: geo.size.height * clip.posY)
+                        .gesture(DragGesture().onChanged { v in
+                            project.selectedTextClipID = clip.id
+                            project.updateTextClip(id: clip.id) {
+                                $0.posX = min(1, max(0, v.location.x / geo.size.width))
+                                $0.posY = min(1, max(0, v.location.y / geo.size.height))
+                            }
+                        })
+                        .onTapGesture(count: 2) {
+                            editText = clip.text
+                            editingTextID = clip.id
+                            project.selectedTextClipID = clip.id
+                        }
+                        .onTapGesture { project.selectedTextClipID = clip.id }
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func shapeTrackView(trackID: UUID) -> some View {
+        GeometryReader { geo in
+            let scale = geo.size.width / max(project.previewRenderSize.width, 1)
+            if let track = project.shapeTracks.first(where: { $0.id == trackID }),
+               track.isVisible,
+               let clip = track.clips.first(where: { $0.startTime <= clock.currentTime && $0.endTime > clock.currentTime }) {
+                ShapeClipView(clip: clip, scale: scale,
+                              selected: project.selectedClipIDs.contains(clip.id) && project.selectedShapeClipID != clip.id)
+                    .position(x: geo.size.width * clip.posX, y: geo.size.height * clip.posY)
+                    .gesture(
+                        DragGesture(minimumDistance: 1)
+                            .onChanged { v in
+                                if shapeDragStart.isEmpty {
+                                    let multi = project.selectedClipIDs.contains(clip.id) && project.selectedClipIDs.count > 1
+                                    if multi {
+                                        for id in project.selectedClipIDs {
+                                            if let c = shapeByID(id) { shapeDragStart[id] = CGPoint(x: c.posX, y: c.posY) }
+                                        }
+                                    } else {
+                                        if project.selectedShapeClipID != clip.id { selectShapeExclusive(clip.id) }
+                                        if let c = shapeByID(clip.id) { shapeDragStart[clip.id] = CGPoint(x: c.posX, y: c.posY) }
+                                    }
+                                }
+                                let dx = v.translation.width / geo.size.width
+                                let dy = v.translation.height / geo.size.height
+                                for (id, s) in shapeDragStart {
+                                    project.updateShapeClip(id: id) {
+                                        $0.posX = min(1, max(0, Double(s.x) + Double(dx)))
+                                        $0.posY = min(1, max(0, Double(s.y) + Double(dy)))
+                                    }
+                                }
+                            }
+                            .onEnded { _ in shapeDragStart = [:] }
+                    )
+                    .onTapGesture {
+                        if NSEvent.modifierFlags.contains(.shift) {
+                            project.shiftToggleClip(clip.id)
+                        } else {
+                            selectShapeExclusive(clip.id)
+                        }
+                    }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func subtitleTrackView(trackID: UUID) -> some View {
+        GeometryReader { geo in
+            let scale = geo.size.width / max(project.previewRenderSize.width, 1)
+            if let track = project.subtitleTracks.first(where: { $0.id == trackID }),
+               track.isVisible,
+               let clip = track.clips.first(where: { $0.startTime <= clock.currentTime && $0.endTime > clock.currentTime }) {
+                let style = track.subtitleStyle ?? SubtitleStyle()
+                let text = style.mergeLineBreaks ? SubtitleOverlay.mergeBreaks(clip.text) : clip.text
+                let bottomPad = subtitleBottomPad(trackID: trackID, geoH: geo.size.height, scale: scale, style: style)
+                SubtitleLabel(text: text, style: style, scale: scale)
+                    .frame(maxWidth: geo.size.width * style.widthPercent / 100)
+                    .multilineTextAlignment(subtitleAlign(style.alignment))
+                    .background(GeometryReader { g in
+                        Color.clear
+                            .onAppear { setSubHeight(trackID, g.size.height) }
+                            .onChange(of: g.size.height) { _ in setSubHeight(trackID, g.size.height) }
+                    })
+                    .padding(.bottom, bottomPad)
+                    .frame(width: geo.size.width, height: geo.size.height, alignment: .bottom)
+            }
+        }
+        .allowsHitTesting(false)
+    }
+
+    private func setSubHeight(_ id: UUID, _ h: CGFloat) {
+        guard h > 0, abs((subtitleHeights[id] ?? -1) - h) > 0.5 else { return }
+        DispatchQueue.main.async { subtitleHeights[id] = h }
+    }
+
+    /// 当前有字幕显示的可见字幕轨道（按 overlayTrackOrder 顺序，第一个=最上）
+    private func activeSubtitleTrackIDs() -> [UUID] {
+        let t = clock.currentTime
+        var active: [UUID] = []
+        for i in project.orderedSubtitleIndices {
+            let track = project.subtitleTracks[i]
+            guard track.isVisible else { continue }
+            if track.clips.contains(where: { $0.startTime <= t && $0.endTime > t }) {
+                active.append(track.id)
+            }
+        }
+        return active
+    }
+
+    /// 用实测高度精确累加堆叠偏移：本轨道底边距 = margin + 其下方各条(高度+间距)之和
+    private func subtitleBottomPad(trackID: UUID, geoH: CGFloat, scale: CGFloat, style: SubtitleStyle) -> CGFloat {
+        let margin = geoH * project.subtitleBottomMargin / 100.0
+        let spacing = CGFloat(project.subtitleLineSpacing) * scale
+        let active = activeSubtitleTrackIDs()
+        guard let level = active.firstIndex(of: trackID), active.count > 1 else { return margin }
+        let fallback = style.fontSize * scale * 1.3 + 6 * scale
+        var pad = margin
+        for k in (level + 1)..<active.count {
+            pad += (subtitleHeights[active[k]] ?? fallback) + spacing
+        }
+        return pad
+    }
+
+    private func subtitleAlign(_ a: String) -> TextAlignment {
+        switch a { case "left": return .leading; case "right": return .trailing; default: return .center }
+    }
+
+    private func commitTextEdit() {
+        guard let id = editingTextID else { return }
+        project.updateTextClip(id: id) { $0.text = editText }
+        editingTextID = nil
+    }
+
+    private func selectShapeExclusive(_ id: UUID) {
+        project.selectedShapeClipID = id
+        project.selectedVideoClipID = nil; project.selectedImageClipID = nil
+        project.selectedAudioClipID = nil; project.selectedSubtitleClipID = nil
+        project.selectedTextClipID = nil
+    }
+
+    private func selectImageExclusive(_ id: UUID) {
+        project.selectedImageClipID = id
+        project.selectedVideoClipID = nil; project.selectedShapeClipID = nil
+        project.selectedAudioClipID = nil; project.selectedSubtitleClipID = nil
+        project.selectedTextClipID = nil
+    }
+
+    private func shapeByID(_ id: UUID) -> ShapeClip? {
+        project.shapeTracks.flatMap { $0.clips }.first { $0.id == id }
+    }
+}
+
+// MARK: - Image Layer（SwiftUI 渲染图片图层，参与 overlayTrackOrder 统一叠放）
+
+/// 图片缓存：避免每帧 NSImage(contentsOf:) 重复解码
+fileprivate final class PreviewImageCache {
+    static let shared = PreviewImageCache()
+    private var cache: [URL: NSImage] = [:]
+    func image(for url: URL) -> NSImage? {
+        if let i = cache[url] { return i }
+        guard let i = NSImage(contentsOf: url) else { return nil }
+        cache[url] = i
+        return i
+    }
+}
+
+private struct ImageLayerView: View {
+    let clip: ImageClip
+    let viewSize: CGSize      // GeometryReader 给的整个预览区域尺寸
+    let videoSize: CGSize     // previewRenderSize
+
+    var body: some View {
+        let imgW = CGFloat(clip.imageWidth)
+        let imgH = CGFloat(clip.imageHeight)
+        if imgW > 0, imgH > 0, let url = clip.imageURL,
+           let nsImg = PreviewImageCache.shared.image(for: url) {
+            // 与 ImageTransformOverlay.computeImageRect 完全一致的几何
+            let s = min(viewSize.width / videoSize.width, viewSize.height / videoSize.height)
+            let renderW = videoSize.width * s
+            let renderH = videoSize.height * s
+            let originX = (viewSize.width - renderW) / 2
+            let originY = (viewSize.height - renderH) / 2
+            let vs = renderW / videoSize.width   // 视频坐标 → 屏幕坐标
+
+            let baseScale = min(videoSize.width / imgW, videoSize.height / imgH)
+            let finalSX = baseScale * CGFloat(clip.scaleX)
+            let finalSY = baseScale * CGFloat(clip.scaleY)
+            let fullW = imgW * finalSX
+            let fullH = imgH * finalSY
+            let cx = videoSize.width / 2 + CGFloat(clip.offsetX) * videoSize.width
+            let cy = videoSize.height / 2 + CGFloat(clip.offsetY) * videoSize.height
+            let fullLeft = cx - fullW / 2
+            let fullTop  = cy - fullH / 2
+
+            let cropX = fullLeft + imgW * CGFloat(clip.cropLeft) * finalSX
+            let cropY = fullTop  + imgH * CGFloat(clip.cropTop)  * finalSY
+            let cropW = imgW * (1 - CGFloat(clip.cropLeft + clip.cropRight)) * finalSX
+            let cropH = imgH * (1 - CGFloat(clip.cropTop  + clip.cropBottom)) * finalSY
+
+            if cropW > 0, cropH > 0 {
+                let adj = clip.colorAdjust
+                ZStack(alignment: .topLeading) {
+                    Image(nsImage: nsImg)
+                        .resizable()
+                        .interpolation(.high)
+                        .frame(width: fullW * vs, height: fullH * vs)
+                        // 完整图左上角相对裁剪框左上角的偏移
+                        .offset(x: -imgW * CGFloat(clip.cropLeft) * finalSX * vs,
+                                y: -imgH * CGFloat(clip.cropTop)  * finalSY * vs)
+                        .brightness(adj.brightness)
+                        .contrast(1 + adj.contrast)
+                        .saturation(1 + adj.saturation)
+                        .hueRotation(.degrees(adj.hue))
+                }
+                .frame(width: cropW * vs, height: cropH * vs, alignment: .topLeading)
+                .clipped()
+                .position(x: originX + (cropX + cropW / 2) * vs,
+                          y: originY + (cropY + cropH / 2) * vs)
+            }
+        }
+    }
 }
 
 // MARK: - Subtitle Overlay

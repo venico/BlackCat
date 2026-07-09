@@ -61,9 +61,12 @@ struct ContentView: View {
                     Color.clear
                         .frame(width: 8)
                         .contentShape(Rectangle())
-                        .offset(x: 4)
-                        .onHover { h in if h { NSCursor.resizeLeftRight.set() } else { NSCursor.arrow.set() } }
-                        .gesture(DragGesture(minimumDistance: 1)
+                        .offset(x: 8)
+                        .zIndex(100)
+                        .onContinuousHover { phase in
+                            if case .active = phase { NSCursor.resizeLeftRight.set() } else { NSCursor.arrow.set() }
+                        }
+                        .gesture(DragGesture(minimumDistance: 1, coordinateSpace: .global)
                             .onChanged { v in
                                 if v.translation == .zero { dragOriginSidebar = sidebarWidth }
                                 sidebarWidth = (dragOriginSidebar + v.translation.width)
@@ -97,9 +100,12 @@ struct ContentView: View {
                                     Color.clear
                                         .frame(width: 8)
                                         .contentShape(Rectangle())
-                                        .offset(x: -4)
-                                        .onHover { h in if h { NSCursor.resizeLeftRight.set() } else { NSCursor.arrow.set() } }
-                                        .gesture(DragGesture(minimumDistance: 1)
+                                        .offset(x: -8)
+                                        .zIndex(100)
+                                        .onContinuousHover { phase in
+                            if case .active = phase { NSCursor.resizeLeftRight.set() } else { NSCursor.arrow.set() }
+                        }
+                                        .gesture(DragGesture(minimumDistance: 1, coordinateSpace: .global)
                                             .onChanged { v in
                                                 if v.translation == .zero { dragOriginInspector = inspectorWidth }
                                                 inspectorWidth = (dragOriginInspector - v.translation.width)
@@ -117,8 +123,9 @@ struct ContentView: View {
                         Color.clear
                             .frame(height: 8)
                             .contentShape(Rectangle())
-                            .onHover { h in if h { NSCursor.resizeUpDown.set() } else { NSCursor.arrow.set() } }
-                            .gesture(DragGesture(minimumDistance: 1)
+                            .zIndex(100)
+                            .onContinuousHover { phase in if case .active = phase { NSCursor.resizeUpDown.set() } else { NSCursor.arrow.set() } }
+                            .gesture(DragGesture(minimumDistance: 1, coordinateSpace: .global)
                                 .onChanged { v in
                                     if !isDraggingH { dragOriginTop = topHeight }
                                     isDraggingH = true

@@ -43,6 +43,8 @@ extension ProjectState {
         guard textTracks.indices.contains(from), textTracks.indices.contains(to) else { return }
         guard let idx = textTracks[from].clips.firstIndex(where: { $0.id == id }) else { return }
         pushUndoThrottled()
+        NSLog("BC_DBG txtMove IN to=%d %@", to, textTracks.map { $0.clips.map { $0.startTime } } as NSArray)
+        defer { NSLog("BC_DBG txtMove OUT %@", textTracks.map { $0.clips.map { $0.startTime } } as NSArray) }
         let clip = textTracks[from].clips.remove(at: idx)
         textTracks[to].clips.append(clip)
     }
@@ -98,25 +100,13 @@ extension ProjectState {
                 $0.id != id && $0.startTime < clip.endTime - 0.001 && $0.endTime > clip.startTime + 0.001
             }
             if hasOverlap {
+                // 重叠：在目标轨道正下方新建轨道安置，保持图层顺序，不塞回原轨道
+                let anchorID = imageTracks[ti].id
                 let removed = imageTracks[ti].clips.remove(at: ci)
-                var placed = false
-                for dti in imageTracks.indices {
-                    if dti == ti { continue }
-                    let noOverlap = !imageTracks[dti].clips.contains {
-                        $0.startTime < removed.endTime - 0.001 && $0.endTime > removed.startTime + 0.001
-                    }
-                    if noOverlap {
-                        imageTracks[dti].clips.append(removed)
-                        placed = true
-                        break
-                    }
-                }
-                if !placed {
-                    var newTrack = Track<ImageClip>(label: "图片")
-                    newTrack.clips.append(removed)
-                    imageTracks.append(newTrack)
-                    insertOverlayRefBelow(.image(newTrack.id), below: imageTracks[ti].id)
-                }
+                var newTrack = Track<ImageClip>(label: "图片")
+                newTrack.clips.append(removed)
+                imageTracks.append(newTrack)
+                insertOverlayRefBelow(.image(newTrack.id), below: anchorID)
             }
             return
         }
@@ -161,32 +151,22 @@ extension ProjectState {
                 $0.id != id && $0.startTime < clip.endTime - 0.001 && $0.endTime > clip.startTime + 0.001
             }
             if hasOverlap {
+                // 重叠：在目标轨道正下方新建轨道安置，保持图层顺序，不塞回原轨道
+                let anchorID = subtitleTracks[ti].id
                 let removed = subtitleTracks[ti].clips.remove(at: ci)
-                var placed = false
-                for dti in subtitleTracks.indices {
-                    if dti == ti { continue }
-                    let noOverlap = !subtitleTracks[dti].clips.contains {
-                        $0.startTime < removed.endTime - 0.001 && $0.endTime > removed.startTime + 0.001
-                    }
-                    if noOverlap {
-                        subtitleTracks[dti].clips.append(removed)
-                        placed = true
-                        break
-                    }
-                }
-                if !placed {
-                    var newTrack = Track<SubtitleClip>(label: "字幕")
-                    newTrack.clips.append(removed)
-                    newTrack.subtitleStyle = newSubtitleStyle()
-                    subtitleTracks.append(newTrack)
-                    insertOverlayRefBelow(.subtitle(newTrack.id), below: subtitleTracks[ti].id)
-                }
+                var newTrack = Track<SubtitleClip>(label: "字幕")
+                newTrack.clips.append(removed)
+                newTrack.subtitleStyle = newSubtitleStyle()
+                subtitleTracks.append(newTrack)
+                insertOverlayRefBelow(.subtitle(newTrack.id), below: anchorID)
             }
             return
         }
     }
 
     func resolveTextOverlap(id: UUID) {
+        NSLog("BC_DBG txtResolve IN %@", textTracks.map { $0.clips.map { $0.startTime } } as NSArray)
+        defer { NSLog("BC_DBG txtResolve OUT %@", textTracks.map { $0.clips.map { $0.startTime } } as NSArray) }
         for ti in textTracks.indices {
             guard let ci = textTracks[ti].clips.firstIndex(where: { $0.id == id }) else { continue }
             let clip = textTracks[ti].clips[ci]
@@ -194,25 +174,13 @@ extension ProjectState {
                 $0.id != id && $0.startTime < clip.endTime - 0.001 && $0.endTime > clip.startTime + 0.001
             }
             if hasOverlap {
+                // 重叠：在目标轨道正下方新建轨道安置，保持图层顺序，不塞回原轨道
+                let anchorID = textTracks[ti].id
                 let removed = textTracks[ti].clips.remove(at: ci)
-                var placed = false
-                for dti in textTracks.indices {
-                    if dti == ti { continue }
-                    let noOverlap = !textTracks[dti].clips.contains {
-                        $0.startTime < removed.endTime - 0.001 && $0.endTime > removed.startTime + 0.001
-                    }
-                    if noOverlap {
-                        textTracks[dti].clips.append(removed)
-                        placed = true
-                        break
-                    }
-                }
-                if !placed {
-                    var newTrack = Track<TextClip>(label: "文字")
-                    newTrack.clips.append(removed)
-                    textTracks.append(newTrack)
-                    insertOverlayRefBelow(.text(newTrack.id), below: textTracks[ti].id)
-                }
+                var newTrack = Track<TextClip>(label: "文字")
+                newTrack.clips.append(removed)
+                textTracks.append(newTrack)
+                insertOverlayRefBelow(.text(newTrack.id), below: anchorID)
             }
             return
         }
@@ -226,25 +194,13 @@ extension ProjectState {
                 $0.id != id && $0.startTime < clip.endTime - 0.001 && $0.endTime > clip.startTime + 0.001
             }
             if hasOverlap {
+                // 重叠：在目标轨道正下方新建轨道安置，保持图层顺序，不塞回原轨道
+                let anchorID = shapeTracks[ti].id
                 let removed = shapeTracks[ti].clips.remove(at: ci)
-                var placed = false
-                for dti in shapeTracks.indices {
-                    if dti == ti { continue }
-                    let noOverlap = !shapeTracks[dti].clips.contains {
-                        $0.startTime < removed.endTime - 0.001 && $0.endTime > removed.startTime + 0.001
-                    }
-                    if noOverlap {
-                        shapeTracks[dti].clips.append(removed)
-                        placed = true
-                        break
-                    }
-                }
-                if !placed {
-                    var newTrack = Track<ShapeClip>(label: "图形")
-                    newTrack.clips.append(removed)
-                    shapeTracks.append(newTrack)
-                    insertOverlayRefBelow(.shape(newTrack.id), below: shapeTracks[ti].id)
-                }
+                var newTrack = Track<ShapeClip>(label: "图形")
+                newTrack.clips.append(removed)
+                shapeTracks.append(newTrack)
+                insertOverlayRefBelow(.shape(newTrack.id), below: anchorID)
             }
             return
         }
@@ -354,6 +310,16 @@ extension ProjectState {
                 selectedClipIDs.formUnion(track.clips.filter { $0.startTime <= clip.startTime }.map(\.id)); return
             }
         }
+        for track in textTracks {
+            if let clip = track.clips.first(where: { $0.id == id }) {
+                selectedClipIDs.formUnion(track.clips.filter { $0.startTime <= clip.startTime }.map(\.id)); return
+            }
+        }
+        for track in shapeTracks {
+            if let clip = track.clips.first(where: { $0.id == id }) {
+                selectedClipIDs.formUnion(track.clips.filter { $0.startTime <= clip.startTime }.map(\.id)); return
+            }
+        }
     }
 
     /// 向右全选：选中同轨道中 startTime >= 当前片段的所有片段
@@ -375,6 +341,16 @@ extension ProjectState {
             }
         }
         for track in subtitleTracks {
+            if let clip = track.clips.first(where: { $0.id == id }) {
+                selectedClipIDs.formUnion(track.clips.filter { $0.startTime >= clip.startTime }.map(\.id)); return
+            }
+        }
+        for track in textTracks {
+            if let clip = track.clips.first(where: { $0.id == id }) {
+                selectedClipIDs.formUnion(track.clips.filter { $0.startTime >= clip.startTime }.map(\.id)); return
+            }
+        }
+        for track in shapeTracks {
             if let clip = track.clips.first(where: { $0.id == id }) {
                 selectedClipIDs.formUnion(track.clips.filter { $0.startTime >= clip.startTime }.map(\.id)); return
             }
@@ -755,7 +731,7 @@ extension ProjectState {
             trackIdx = shapeTracks.count - 1
         }
         let start = currentTime
-        let end   = currentTime + 3.0
+        let end   = currentTime + 2.0
         var clip  = ShapeClip(type: type, startTime: start, endTime: end)
         // 基准尺寸按预览分辨率给合适比例
         let rs = previewRenderSize

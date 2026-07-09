@@ -138,9 +138,11 @@ final class ProjectState: ObservableObject {
 
     /// 缩放下限：确保缩到最小时能完整显示所有内容并有富余
     var minPixelsPerSecond: Double {
-        let end = contentEndTime
-        guard end > 0 else { return 0.4 }
-        // 让内容只占可见区域的 85%，留出 15% 富余
+        let content = contentEndTime
+        guard content > 0 else { return 0.4 }
+        // 让"内容 或 至少 15 秒范围"占可见区域 85%：
+        // 只有图片/文字/图形这类短内容时，也能缩回秒显示（不再被短内容卡在帧显示）
+        let end = max(content, 15)
         return (timelineVisibleWidth * 0.85) / end
     }
 
@@ -296,6 +298,7 @@ final class ProjectState: ObservableObject {
         case image(ImageClip, trackIndex: Int)
         case subtitle(SubtitleClip, trackIndex: Int)
         case text(TextClip, trackIndex: Int)
+        case shape(ShapeClip, trackIndex: Int)
     }
     var clipboard: [ClipboardItem] = []
     @Published var clipboardIsCut: Bool = false
