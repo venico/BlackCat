@@ -11,7 +11,7 @@ struct SettingsView: View {
         case notDownloaded, downloaded, downloading(Double), failed(String)
     }
 
-    private let tabs = ["保存位置", "语音识别", "字幕翻译"]
+    private let tabs = ["保存位置", "语音识别", "字幕翻译", "视频生成"]
 
     var body: some View {
         VStack(spacing: 0) {
@@ -64,6 +64,7 @@ struct SettingsView: View {
                     case 0: saveTab
                     case 1: whisperTab
                     case 2: translateTab
+                    case 3: aiVideoTab
                     default: EmptyView()
                     }
                 }
@@ -182,6 +183,63 @@ struct SettingsView: View {
                     )
                 }
             }
+        }
+    }
+
+    // MARK: - 视频生成
+
+    private var aiVideoTab: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            SSection(title: "生成模型") {
+                IPicker(selection: Binding(
+                    get: { settings.aiProvider },
+                    set: { settings.aiProvider = $0 }
+                ), options: AIVideoService.Provider.allCases.map { ($0.rawValue, $0.displayName) })
+            }
+
+            if let provider = AIVideoService.Provider(rawValue: settings.aiProvider) {
+                if provider == .seedance || provider == .seedance15 {
+                    apiKeyField(
+                        label: "API Key",
+                        placeholder: "输入火山方舟 API Key",
+                        text: Binding(get: { settings.seedanceApiKey }, set: { settings.seedanceApiKey = $0 })
+                    )
+                    if provider == .seedance {
+                        endpointField(
+                            label: "接入点 ID",
+                            placeholder: "ep-xxxxx...",
+                            text: Binding(get: { settings.seedanceEndpoint }, set: { settings.seedanceEndpoint = $0 })
+                        )
+                    } else {
+                        endpointField(
+                            label: "接入点 ID",
+                            placeholder: "ep-xxxxx...",
+                            text: Binding(get: { settings.seedance15Endpoint }, set: { settings.seedance15Endpoint = $0 })
+                        )
+                    }
+                    Text("在火山方舟「接入点管理」中为每个模型创建接入点，填入对应 ID")
+                        .font(.system(size: 10))
+                        .foregroundColor(Color.labelSecondary.opacity(0.6))
+                } else {
+                    apiKeyField(
+                        label: provider.accessKeyLabel,
+                        placeholder: "输入 \(provider.accessKeyLabel)",
+                        text: Binding(get: { settings.aiAccessKey }, set: { settings.aiAccessKey = $0 })
+                    )
+
+                    if provider.needsSecretKey {
+                        apiKeyField(
+                            label: provider.secretKeyLabel,
+                            placeholder: "输入 \(provider.secretKeyLabel)",
+                            text: Binding(get: { settings.aiSecretKey }, set: { settings.aiSecretKey = $0 })
+                        )
+                    }
+                }
+            }
+
+            Text("Key 仅保存在本地，不会上传到任何服务器")
+                .font(.system(size: 10))
+                .foregroundColor(Color.labelSecondary.opacity(0.6))
         }
     }
 
@@ -386,6 +444,22 @@ struct SettingsView: View {
             return Binding(get: { settings.volcanoSecretAccessKey }, set: { settings.volcanoSecretAccessKey = $0 })
         default:
             return .constant("")
+        }
+    }
+
+    private func endpointField(label: String, placeholder: String, text: Binding<String>) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(label)
+                .font(.system(size: 11, weight: .medium))
+                .foregroundColor(Color.labelSecondary)
+            TextField(placeholder, text: text)
+                .textFieldStyle(.plain)
+                .font(.system(size: 12))
+                .foregroundColor(Color.labelPrimary)
+                .padding(.horizontal, 10)
+                .frame(height: 32)
+                .background(Color.white.opacity(0.06))
+                .cornerRadius(7)
         }
     }
 

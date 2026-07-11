@@ -2247,8 +2247,8 @@ struct CustomSlider: View {
     let range: ClosedRange<Double>
     var onDragging: ((Bool) -> Void)? = nil
 
-    private let trackH: CGFloat = 4
-    private let thumbR: CGFloat = 6
+    private let trackH: CGFloat = 2
+    private let thumbR: CGFloat = 3
 
     var body: some View {
         GeometryReader { geo in

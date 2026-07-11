@@ -479,8 +479,8 @@ extension ProjectState {
     }
 
     /// Add asset to timeline at a specific time position (used for drag-drop from media library)
-    func addToTimelineAt(_ asset: MediaAsset, time: Double) {
-        pushUndo()
+    func addToTimelineAt(_ asset: MediaAsset, time: Double, skipUndo: Bool = false) {
+        if !skipUndo { pushUndo() }
         let insertTime = max(0, time)
         switch asset.type {
         case .video:

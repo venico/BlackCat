@@ -17,12 +17,10 @@ struct PlayerView: View {
     }
 
     var body: some View {
-        // Playback bar OVERLAID on the video, only visible while hovering.
-        ZStack(alignment: .bottom) {
+        VStack(spacing: 0) {
             ZStack {
                 Color.previewBg
                 AVPlayerNSView(player: ctrl.player)
-                // Black out the preview when no content or playhead is past all video content.
                 if !hasAnyVisibleClips
                     || (clock.lastVideoEndTime > 0 && clock.currentTime >= clock.lastVideoEndTime) {
                     Color.black
@@ -36,13 +34,11 @@ struct PlayerView: View {
             .overlay(alignment: .top) {
                 if hoveringPlayer {
                     ZStack {
-                        // 标题居中
                         Text(project.projectName + (project.isSaved ? "（已保存）" : ""))
                             .font(.system(size: 11, weight: .medium))
                             .foregroundColor(.white)
                             .shadow(color: .black.opacity(0.8), radius: 3, x: 0, y: 1)
                             .shadow(color: .black.opacity(0.5), radius: 6, x: 0, y: 2)
-                        // 分辨率选择器靠右
                         HStack {
                             Spacer()
                             PreviewResolutionPicker()
@@ -53,19 +49,13 @@ struct PlayerView: View {
                     .transition(.opacity)
                 }
             }
+            .onHover { inside in
+                withAnimation(.easeInOut(duration: 0.18)) {
+                    hoveringPlayer = inside
+                }
+            }
 
-            if hoveringPlayer {
-                PlaybackBar(ctrl: ctrl)
-                    .frame(height: 36)
-                    .padding(.horizontal, 24)
-                    .padding(.bottom, 16)
-                    .transition(.opacity)
-            }
-        }
-        .onHover { inside in
-            withAnimation(.easeInOut(duration: 0.18)) {
-                hoveringPlayer = inside
-            }
+            PreviewToolbar(ctrl: ctrl)
         }
         .onChange(of: project.playerItem) {
             let seekTo = clock.pendingSeekTime ?? clock.currentTime
@@ -687,6 +677,167 @@ private struct PreviewResolutionPicker: View {
             return String(res[res.startIndex..<spaceIdx])
         }
         return res
+    }
+}
+
+// MARK: - Preview Toolbar
+
+private struct PreviewToolbar: View {
+    @EnvironmentObject private var project: ProjectState
+    @EnvironmentObject private var clock: PlaybackClock
+    @ObservedObject var ctrl: PlayerController
+
+    private var fps: Double { Double(project.exportSettings.fps) }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            CustomSlider(value: $clock.currentTime, range: 0...max(clock.duration, 0.01)) { dragging in
+                if !dragging { ctrl.seek(to: clock.currentTime) }
+            }
+            .padding(.horizontal, 8)
+            .padding(.top, 4)
+
+            HStack(spacing: 0) {
+                Text(timecode(clock.currentTime))
+                    .font(.system(size: 10).monospacedDigit())
+                    .foregroundColor(Color(hex: "#E8A54B"))
+                Text(" / ")
+                    .font(.system(size: 10))
+                    .foregroundColor(Color.labelSecondary.opacity(0.5))
+                Text(timecode(clock.duration))
+                    .font(.system(size: 10).monospacedDigit())
+                    .foregroundColor(Color.labelSecondary)
+
+                Spacer()
+
+                HStack(spacing: 12) {
+                    toolBtn("backward.end.fill") { seekToStart() }
+                    toolBtn("backward.frame.fill") { stepFrame(-1) }
+                    toolBtn(ctrl.isPlaying ? "pause.fill" : "play.fill") { ctrl.toggle() }
+                    toolBtn("forward.frame.fill") { stepFrame(1) }
+                    toolBtn("forward.end.fill") { seekToEnd() }
+                }
+
+                Spacer()
+
+                Button { captureFrame() } label: {
+                    Image(systemName: "camera.fill")
+                        .font(.system(size: 11))
+                        .foregroundColor(Color.labelSecondary)
+                        .frame(width: 24, height: 24)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help("捕捉当前帧到素材库")
+            }
+            .padding(.horizontal, 10)
+            .padding(.bottom, 4)
+        }
+        .background(Color.black.opacity(0.85))
+    }
+
+    private func toolBtn(_ icon: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: icon)
+                .font(.system(size: 11, weight: .medium))
+                .foregroundColor(Color.labelPrimary)
+                .frame(width: 26, height: 22)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func timecode(_ t: Double) -> String {
+        let total = max(t, 0)
+        let h = Int(total) / 3600
+        let m = Int(total) / 60 % 60
+        let s = Int(total) % 60
+        let f = Int((total - Double(Int(total))) * fps)
+        return String(format: "%02d:%02d:%02d:%02d", h, m, s, f)
+    }
+
+    private func seekToStart() {
+        clock.currentTime = 0
+        clock.seekRequest += 1
+    }
+
+    private func seekToEnd() {
+        clock.currentTime = max(clock.duration - 1.0 / fps, 0)
+        clock.seekRequest += 1
+    }
+
+    private func stepFrame(_ direction: Int) {
+        if ctrl.isPlaying { ctrl.pause() }
+        let step = 1.0 / fps * Double(direction)
+        clock.currentTime = max(0, min(clock.currentTime + step, clock.duration))
+        clock.seekRequest += 1
+    }
+
+    private func captureFrame() {
+        guard let item = project.playerItem else { return }
+        let asset = item.asset
+        let gen = AVAssetImageGenerator(asset: asset)
+        gen.appliesPreferredTrackTransform = true
+        gen.requestedTimeToleranceBefore = .zero
+        gen.requestedTimeToleranceAfter = .zero
+        let time = CMTime(seconds: clock.currentTime, preferredTimescale: 600)
+
+        guard let cgImg = try? gen.copyCGImage(at: time, actualTime: nil) else {
+            project.showSuccessToast(icon: "xmark.circle", iconColor: .red, title: "截图失败", subtitle: "无法捕捉当前帧")
+            return
+        }
+
+        let nsImg = NSImage(cgImage: cgImg, size: NSSize(width: cgImg.width, height: cgImg.height))
+        let bmp = NSBitmapImageRep(cgImage: cgImg)
+        guard let pngData = bmp.representation(using: .png, properties: [:]) else { return }
+
+        let saveDir = AppSettings.shared.effectiveProjectDir.appendingPathComponent("截图")
+        try? FileManager.default.createDirectory(at: saveDir, withIntermediateDirectories: true)
+        let filename = "frame_\(Int(clock.currentTime * fps)).png"
+        let fileURL = saveDir.appendingPathComponent(filename)
+        try? pngData.write(to: fileURL)
+
+        project.importFile(fileURL)
+        guard let asset = project.mediaAssets.first(where: { $0.url == fileURL }) else { return }
+
+        project.pushUndo()
+        let playhead = clock.currentTime
+        let hasImageAtPlayhead = project.imageTracks.contains { track in
+            track.clips.contains { $0.startTime <= playhead && $0.endTime > playhead }
+        }
+        let trackIdx: Int
+        if hasImageAtPlayhead {
+            project.imageTracks.append(Track(label: "图片"))
+            project.syncOverlayOrder()
+            trackIdx = project.imageTracks.count - 1
+        } else if let emptyIdx = project.imageTracks.firstIndex(where: { $0.clips.isEmpty }) {
+            trackIdx = emptyIdx
+        } else {
+            var foundTrack: Int?
+            for (i, track) in project.imageTracks.enumerated() {
+                let overlap = track.clips.contains { $0.startTime < playhead + 5 && $0.endTime > playhead }
+                if !overlap { foundTrack = i; break }
+            }
+            if let idx = foundTrack {
+                trackIdx = idx
+            } else {
+                project.imageTracks.append(Track(label: "图片"))
+                project.syncOverlayOrder()
+                trackIdx = project.imageTracks.count - 1
+            }
+        }
+        let dur = 5.0
+        var imgW = 0, imgH = 0
+        if let cg = nsImg.cgImage(forProposedRect: nil, context: nil, hints: nil) {
+            imgW = cg.width; imgH = cg.height
+        }
+        project.imageTracks[trackIdx].clips.append(
+            ImageClip(assetID: asset.id, name: asset.name, imageURL: fileURL,
+                      videoURL: nil, startTime: playhead, endTime: playhead + dur,
+                      imageWidth: imgW, imageHeight: imgH))
+        project.duration = max(project.duration, playhead + dur)
+        project.rebuildTimelinePreview()
+        project.showSuccessToast(icon: "camera.fill", iconColor: .blue, title: "截图", subtitle: "已插入图片轨道")
     }
 }
 

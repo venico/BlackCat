@@ -8,6 +8,7 @@ struct MediaLibraryView: View {
     private var isTransitionTab: Bool { project.mediaLibraryTab == "transition" }
     private var isTextTab: Bool { project.mediaLibraryTab == "text" }
     private var isShapeTab: Bool { project.mediaLibraryTab == "shape" }
+    private var isAITab: Bool { project.mediaLibraryTab == "ai" }
 
     private var selectedAssetType: AssetType {
         switch project.mediaLibraryTab {
@@ -48,6 +49,12 @@ struct MediaLibraryView: View {
     var body: some View {
         HStack(spacing: 0) {
             verticalTabBar
+            if isAITab {
+                GeometryReader { geo in
+                    AIChatPanel()
+                        .frame(width: geo.size.width, height: geo.size.height)
+                }
+            } else {
             VStack(spacing: 0) {
             // Section header
             HStack {
@@ -69,7 +76,7 @@ struct MediaLibraryView: View {
             .padding(.bottom, 8)
 
             // Search + Sort bar
-            if !isTransitionTab && !isTextTab && !isShapeTab {
+            if !isTransitionTab && !isTextTab && !isShapeTab && !isAITab {
                 HStack(spacing: 4) {
                     HStack(spacing: 4) {
                         Image(systemName: "magnifyingglass")
@@ -173,17 +180,8 @@ struct MediaLibraryView: View {
             }
 
             Spacer()
-
-            // 转码进度已移至右下角全局浮层
-
-            // Bottom actions
-            VStack(spacing: 8) {
-                ImportButton()
-                ExportButton()
             }
-            .padding(.horizontal, 8)
-            .padding(.bottom, 8)
-            }
+            } // else (non-AI tabs)
         }
     }
 
@@ -198,12 +196,14 @@ struct MediaLibraryView: View {
             tabBtnT("text")
             tabBtnShape("shape")
             Spacer()
+            tabBtnAI()
+            importExportMenuBtn
         }
         .padding(.top, 10)
+        .padding(.bottom, 14)
         .padding(.horizontal, 6)
-        .frame(width: 44)
+        .frame(minWidth: 44, maxWidth: 44, alignment: .center)
         .frame(maxHeight: .infinity)
-        .background(Color.black.opacity(0.15))
     }
 
     private func tabName(_ tab: String) -> String {
@@ -215,6 +215,7 @@ struct MediaLibraryView: View {
         case "transition": return "转场"
         case "text": return "文字"
         case "shape": return "图形"
+        case "ai": return "AI"
         default: return ""
         }
     }
@@ -247,6 +248,22 @@ struct MediaLibraryView: View {
         }
         .buttonStyle(.plain)
         .help(tabName(tab))
+    }
+
+    @ViewBuilder
+    private func tabBtnAI() -> some View {
+        let isActive = project.mediaLibraryTab == "ai"
+        Button { project.mediaLibraryTab = "ai" } label: {
+            Image(nsImage: AITabIcon.render(size: 16))
+                .renderingMode(.template)
+                .foregroundColor(isActive ? .white : Color.labelSecondary)
+                .frame(width: 30, height: 30)
+                .background(isActive ? Color.white.opacity(0.15) : Color.clear)
+                .clipShape(RoundedRectangle(cornerRadius: 7))
+                .contentShape(RoundedRectangle(cornerRadius: 7))
+        }
+        .buttonStyle(.plain)
+        .help("AI")
     }
 
     @ViewBuilder
@@ -300,6 +317,163 @@ struct MediaLibraryView: View {
                 .foregroundColor(Color.labelSecondary.opacity(0.45))
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    // 导入/导出合并菜单按钮
+    private var importExportMenuBtn: some View {
+        Menu {
+            Button {
+                guard project.projectFileURL != nil else { return }
+                let panel = NSOpenPanel()
+                panel.allowsMultipleSelection = true
+                panel.canChooseFiles = true
+                panel.canChooseDirectories = true
+                panel.allowedContentTypes = []
+                panel.begin { r in
+                    guard r == .OK else { return }
+                    panel.urls.forEach { project.importFile($0) }
+                }
+            } label: {
+                Label("导入素材", systemImage: "square.and.arrow.down")
+            }
+            .disabled(project.projectFileURL == nil)
+
+            Button {
+                project.showExportSheet = true
+            } label: {
+                Label("导出 MP4", systemImage: "square.and.arrow.up")
+            }
+            .disabled(project.projectFileURL == nil)
+        } label: {
+            Image(nsImage: ImportExportIcon.render(size: 15))
+                .frame(width: 30, height: 30)
+                .contentShape(RoundedRectangle(cornerRadius: 7))
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .frame(width: 30, height: 30)
+        .help("导入 / 导出")
+    }
+}
+
+// MARK: - Import/Export Icon
+
+private enum AITabIcon {
+    static func render(size: CGFloat) -> NSImage {
+        let s = size
+        let img = NSImage(size: NSSize(width: s, height: s))
+        img.lockFocus()
+        NSColor.black.setStroke()
+        NSColor.black.setFill()
+
+        let lw: CGFloat = 1.2
+        let p: CGFloat = 0.5
+        let r: CGFloat = 2.5
+        let cutX = s * 0.6
+        let cutY = s * 0.6
+
+        let box = NSBezierPath()
+        box.lineWidth = lw; box.lineCapStyle = .round; box.lineJoinStyle = .round
+        box.move(to: NSPoint(x: s - p, y: s - cutY))
+        box.line(to: NSPoint(x: s - p, y: s - p - r))
+        box.appendArc(withCenter: NSPoint(x: s - p - r, y: s - p - r), radius: r, startAngle: 0, endAngle: 90)
+        box.line(to: NSPoint(x: p + r, y: s - p))
+        box.appendArc(withCenter: NSPoint(x: p + r, y: s - p - r), radius: r, startAngle: 90, endAngle: 180)
+        box.line(to: NSPoint(x: p, y: p + r))
+        box.appendArc(withCenter: NSPoint(x: p + r, y: p + r), radius: r, startAngle: 180, endAngle: 270)
+        box.line(to: NSPoint(x: cutX, y: p))
+        box.stroke()
+
+        let tri = NSBezierPath()
+        let cx = s * 0.42
+        let cy = s * 0.5
+        let ts: CGFloat = s * 0.28
+        let tr: CGFloat = 1.0
+        let tA = NSPoint(x: cx - ts * 0.5, y: cy + ts)
+        let tB = NSPoint(x: cx - ts * 0.5, y: cy - ts)
+        let tC = NSPoint(x: cx + ts * 0.9, y: cy)
+        tri.move(to: NSPoint(x: (tA.x + tB.x) / 2, y: (tA.y + tB.y) / 2))
+        tri.appendArc(from: tB, to: tC, radius: tr)
+        tri.appendArc(from: tC, to: tA, radius: tr)
+        tri.appendArc(from: tA, to: tB, radius: tr)
+        tri.close()
+        tri.fill()
+
+        let sx = s * 0.82
+        let sy = s * 0.18
+        let sr: CGFloat = s * 0.18
+        let si: CGFloat = sr * 0.35
+        let star = NSBezierPath()
+        star.move(to: NSPoint(x: sx, y: sy + sr))
+        star.line(to: NSPoint(x: sx - si, y: sy + si))
+        star.line(to: NSPoint(x: sx - sr, y: sy))
+        star.line(to: NSPoint(x: sx - si, y: sy - si))
+        star.line(to: NSPoint(x: sx, y: sy - sr))
+        star.line(to: NSPoint(x: sx + si, y: sy - si))
+        star.line(to: NSPoint(x: sx + sr, y: sy))
+        star.line(to: NSPoint(x: sx + si, y: sy + si))
+        star.close()
+        star.fill()
+
+        img.unlockFocus()
+        img.isTemplate = true
+        return img
+    }
+}
+
+private enum ImportExportIcon {
+    static func render(size: CGFloat) -> NSImage {
+        let s = size
+        let w = s * 1.15
+        let img = NSImage(size: NSSize(width: w, height: s))
+        img.lockFocus()
+
+        NSColor.secondaryLabelColor.setStroke()
+        let lw: CGFloat = 1.3
+        let p: CGFloat = 0.5
+        let r: CGFloat = 2.5
+        let boxR = s - p
+        let gapHi = s * 0.66
+        let gapLo = s * 0.16
+
+        let box = NSBezierPath()
+        box.lineWidth = lw; box.lineCapStyle = .round; box.lineJoinStyle = .round
+        box.move(to: NSPoint(x: boxR, y: gapHi))
+        box.line(to: NSPoint(x: boxR, y: s - p - r))
+        box.appendArc(withCenter: NSPoint(x: boxR - r, y: s - p - r), radius: r, startAngle: 0, endAngle: 90)
+        box.line(to: NSPoint(x: p + r, y: s - p))
+        box.appendArc(withCenter: NSPoint(x: p + r, y: s - p - r), radius: r, startAngle: 90, endAngle: 180)
+        box.line(to: NSPoint(x: p, y: p + r))
+        box.appendArc(withCenter: NSPoint(x: p + r, y: p + r), radius: r, startAngle: 180, endAngle: 270)
+        box.line(to: NSPoint(x: boxR - r, y: p))
+        box.appendArc(withCenter: NSPoint(x: boxR - r, y: p + r), radius: r, startAngle: 270, endAngle: 360)
+        box.line(to: NSPoint(x: boxR, y: gapLo))
+        box.stroke()
+
+        let ay1 = s * 0.48
+        let ay2 = s * 0.34
+        let ax = s * 0.66
+        let bx = w - p
+        let hl: CGFloat = 1.7
+
+        let a1 = NSBezierPath()
+        a1.lineWidth = lw; a1.lineCapStyle = .round; a1.lineJoinStyle = .round
+        a1.move(to: NSPoint(x: ax, y: ay1))
+        a1.line(to: NSPoint(x: bx, y: ay1))
+        a1.move(to: NSPoint(x: bx - hl, y: ay1 + hl))
+        a1.line(to: NSPoint(x: bx, y: ay1))
+        a1.stroke()
+
+        let a2 = NSBezierPath()
+        a2.lineWidth = lw; a2.lineCapStyle = .round; a2.lineJoinStyle = .round
+        a2.move(to: NSPoint(x: bx, y: ay2))
+        a2.line(to: NSPoint(x: ax, y: ay2))
+        a2.move(to: NSPoint(x: ax + hl, y: ay2 - hl))
+        a2.line(to: NSPoint(x: ax, y: ay2))
+        a2.stroke()
+
+        img.unlockFocus()
+        return img
     }
 }
 

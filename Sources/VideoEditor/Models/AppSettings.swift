@@ -19,6 +19,14 @@ final class AppSettings: ObservableObject {
         static let youdaoAppSecret = "settings.translate.youdao.appSecret"
         static let volcanoAccessKeyId = "settings.translate.volcano.accessKeyId"
         static let volcanoSecretAccessKey = "settings.translate.volcano.secretAccessKey"
+        static let aiAccessKey = "settings.ai.accessKey"
+        static let aiSecretKey = "settings.ai.secretKey"
+        static let aiProvider = "settings.ai.provider"
+        static let aiDuration = "settings.ai.duration"
+        static let aiRatio = "settings.ai.ratio"
+        static let seedanceApiKey = "settings.ai.seedance.apiKey"
+        static let seedanceEndpoint = "settings.ai.seedance.endpoint"
+        static let seedance15Endpoint = "settings.ai.seedance15.endpoint"
     }
 
     // MARK: - 文件保存位置
@@ -148,6 +156,33 @@ final class AppSettings: ObservableObject {
         didSet { ud.set(volcanoSecretAccessKey, forKey: K.volcanoSecretAccessKey) }
     }
 
+    // MARK: - AI 视频生成
+
+    @Published var aiAccessKey: String {
+        didSet { ud.set(aiAccessKey, forKey: K.aiAccessKey) }
+    }
+    @Published var aiSecretKey: String {
+        didSet { ud.set(aiSecretKey, forKey: K.aiSecretKey) }
+    }
+    @Published var aiProvider: String {
+        didSet { ud.set(aiProvider, forKey: K.aiProvider) }
+    }
+    @Published var aiDuration: String {
+        didSet { ud.set(aiDuration, forKey: K.aiDuration) }
+    }
+    @Published var aiRatio: String {
+        didSet { ud.set(aiRatio, forKey: K.aiRatio) }
+    }
+    @Published var seedanceApiKey: String {
+        didSet { ud.set(seedanceApiKey, forKey: K.seedanceApiKey) }
+    }
+    @Published var seedanceEndpoint: String {
+        didSet { ud.set(seedanceEndpoint, forKey: K.seedanceEndpoint) }
+    }
+    @Published var seedance15Endpoint: String {
+        didSet { ud.set(seedance15Endpoint, forKey: K.seedance15Endpoint) }
+    }
+
     // MARK: - Init
 
     private init() {
@@ -182,5 +217,14 @@ final class AppSettings: ObservableObject {
         youdaoAppSecret = ud.string(forKey: K.youdaoAppSecret) ?? ""
         volcanoAccessKeyId = ud.string(forKey: K.volcanoAccessKeyId) ?? ""
         volcanoSecretAccessKey = ud.string(forKey: K.volcanoSecretAccessKey) ?? ""
+
+        aiAccessKey = ud.string(forKey: K.aiAccessKey) ?? ""
+        aiSecretKey = ud.string(forKey: K.aiSecretKey) ?? ""
+        aiProvider = ud.string(forKey: K.aiProvider) ?? "kling"
+        aiDuration = ud.string(forKey: K.aiDuration) ?? "5"
+        aiRatio = ud.string(forKey: K.aiRatio) ?? "16:9"
+        seedanceApiKey = ud.string(forKey: K.seedanceApiKey) ?? ""
+        seedanceEndpoint = ud.string(forKey: K.seedanceEndpoint) ?? ""
+        seedance15Endpoint = ud.string(forKey: K.seedance15Endpoint) ?? ""
     }
 }

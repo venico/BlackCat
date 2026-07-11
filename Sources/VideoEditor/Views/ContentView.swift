@@ -52,6 +52,9 @@ struct ContentView: View {
                     RoundedRectangle(cornerRadius: 12)
                         .stroke(Color.white.opacity(0.20), lineWidth: 0.5)
                 )
+                .simultaneousGesture(TapGesture().onEnded {
+                    NSApp.keyWindow?.makeFirstResponder(nil)
+                })
                 .padding(.top, 8)
                 .padding(.leading, 8)
                 .padding(.bottom, 8)
@@ -89,6 +92,9 @@ struct ContentView: View {
                                 .clipShape(RoundedRectangle(cornerRadius: 12))
                                 .overlay(RoundedRectangle(cornerRadius: 12)
                                     .stroke(Color.white.opacity(0.20), lineWidth: 0.5))
+                                .simultaneousGesture(TapGesture().onEnded {
+                                    NSApp.keyWindow?.makeFirstResponder(nil)
+                                })
                             InspectorView()
                                 .frame(width: inspectorWidth)
                                 .background(Color.panelBg)
@@ -149,6 +155,9 @@ struct ContentView: View {
                         .clipShape(RoundedRectangle(cornerRadius: 12))
                         .overlay(RoundedRectangle(cornerRadius: 12)
                             .stroke(Color.white.opacity(0.20), lineWidth: 0.5))
+                        .simultaneousGesture(TapGesture().onEnded {
+                            NSApp.keyWindow?.makeFirstResponder(nil)
+                        })
                         .padding(.bottom, 8)
                         .padding(.horizontal, 8)
                     }

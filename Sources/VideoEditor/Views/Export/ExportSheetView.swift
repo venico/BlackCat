@@ -627,7 +627,8 @@ actor TimelineExporter {
         let aEnd = input.audioTracks.flatMap(\.clips).map(\.endTime).max() ?? 0
         let sEnd = input.subtitleTracks.flatMap(\.clips).map(\.endTime).max() ?? 0
         let tEnd = input.textTracks.flatMap(\.clips).map(\.endTime).max() ?? 0
-        let globalEndTime = max(vEnd, max(iEnd, max(aEnd, max(sEnd, tEnd))))
+        let shEnd = input.shapeTracks.flatMap(\.clips).map(\.endTime).max() ?? 0
+        let globalEndTime = max(vEnd, max(iEnd, max(aEnd, max(sEnd, max(tEnd, shEnd)))))
 
         let composition = AVMutableComposition()
         var audioMixParams: [(trackID: CMPersistentTrackID, volume: Float, left: Float, right: Float, startTime: Double, duration: Double, fadeIn: Double, fadeOut: Double)] = []
@@ -1546,7 +1547,6 @@ actor TimelineExporter {
 
     // MARK: - GPU overlay 渲染（CIImage 管线）
 
-    /// 渲染字幕为透明背景 CIImage overlay（用于 CISourceOverCompositing GPU 合成）
     // MARK: - 图片 overlay 渲染（CIImage 管线，与预览 ImageLayerView 一致）
 
     private nonisolated func renderImageOverlay(
