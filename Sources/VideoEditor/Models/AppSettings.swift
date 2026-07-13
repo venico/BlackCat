@@ -27,6 +27,8 @@ final class AppSettings: ObservableObject {
         static let seedanceApiKey = "settings.ai.seedance.apiKey"
         static let seedanceEndpoint = "settings.ai.seedance.endpoint"
         static let seedance15Endpoint = "settings.ai.seedance15.endpoint"
+        static let llmProvider = "settings.llm.provider"
+        static let llmAPIKey = "settings.llm.apiKey"
     }
 
     // MARK: - 文件保存位置
@@ -156,6 +158,59 @@ final class AppSettings: ObservableObject {
         didSet { ud.set(volcanoSecretAccessKey, forKey: K.volcanoSecretAccessKey) }
     }
 
+    // MARK: - 大模型分析
+
+    enum LLMProvider: String, CaseIterable {
+        case openai = "OpenAI"
+        case claude = "Claude"
+        case deepseek = "DeepSeek"
+        case glm = "GLM"
+
+        var displayName: String {
+            switch self {
+            case .openai: return "OpenAI"
+            case .claude: return "Claude"
+            case .deepseek: return "DeepSeek"
+            case .glm: return "智谱 GLM"
+            }
+        }
+
+        var defaultModel: String {
+            switch self {
+            case .openai: return "gpt-4o-mini"
+            case .claude: return "claude-sonnet-4-20250514"
+            case .deepseek: return "deepseek-chat"
+            case .glm: return "glm-4-flash"
+            }
+        }
+
+        var baseURL: String {
+            switch self {
+            case .openai: return "https://api.openai.com/v1/chat/completions"
+            case .claude: return "https://api.anthropic.com/v1/messages"
+            case .deepseek: return "https://api.deepseek.com/chat/completions"
+            case .glm: return "https://open.bigmodel.cn/api/paas/v4/chat/completions"
+            }
+        }
+
+        var keyPlaceholder: String {
+            switch self {
+            case .openai: return "sk-..."
+            case .claude: return "sk-ant-..."
+            case .deepseek: return "sk-..."
+            case .glm: return "输入 API Key"
+            }
+        }
+    }
+
+    @Published var llmProvider: LLMProvider {
+        didSet { ud.set(llmProvider.rawValue, forKey: K.llmProvider) }
+    }
+
+    @Published var llmAPIKey: String {
+        didSet { ud.set(llmAPIKey, forKey: K.llmAPIKey) }
+    }
+
     // MARK: - AI 视频生成
 
     @Published var aiAccessKey: String {
@@ -226,5 +281,13 @@ final class AppSettings: ObservableObject {
         seedanceApiKey = ud.string(forKey: K.seedanceApiKey) ?? ""
         seedanceEndpoint = ud.string(forKey: K.seedanceEndpoint) ?? ""
         seedance15Endpoint = ud.string(forKey: K.seedance15Endpoint) ?? ""
+
+        if let raw = ud.string(forKey: K.llmProvider),
+           let prov = LLMProvider(rawValue: raw) {
+            llmProvider = prov
+        } else {
+            llmProvider = .deepseek
+        }
+        llmAPIKey = ud.string(forKey: K.llmAPIKey) ?? ""
     }
 }

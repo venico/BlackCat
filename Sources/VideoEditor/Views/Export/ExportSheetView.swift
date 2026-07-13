@@ -1122,6 +1122,7 @@ actor TimelineExporter {
                 fps: fps,
                 bitrate: settings.bitrate,
                 outputURL: input.outputURL,
+                globalEndTime: globalEndTime,
                 progress: progress
             )
             progress(1.0)
@@ -1283,27 +1284,39 @@ actor TimelineExporter {
         colorRanges: [(start: Double, end: Double, adj: ColorAdjust)],
         fps: Int, bitrate: Int,
         outputURL: URL,
+        globalEndTime: Double,
         progress: @escaping (Double) -> Void
     ) async throws {
         let renderSize = videoComposition.renderSize
-        let totalDuration = composition.duration.seconds
+        let totalDuration = max(composition.duration.seconds, globalEndTime)
 
-        // ── Reader ──
-        let reader = try AVAssetReader(asset: composition)
+        // 检测是否有真实视频数据（非 empty time range）
+        let hasRealVideoData = composition.tracks(withMediaType: .video).contains { t in
+            t.segments.contains { !$0.isEmpty }
+        }
 
-        let videoOutput = AVAssetReaderVideoCompositionOutput(
-            videoTracks: composition.tracks(withMediaType: .video),
-            videoSettings: [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA])
-        videoOutput.videoComposition = videoComposition
-        reader.add(videoOutput)
-
+        // ── Reader（仅当有真实视频时创建）──
+        var reader: AVAssetReader? = nil
+        var videoOutput: AVAssetReaderVideoCompositionOutput? = nil
         var audioOutput: AVAssetReaderAudioMixOutput? = nil
-        let audioTracks = composition.tracks(withMediaType: .audio)
-        if !audioTracks.isEmpty {
-            let ao = AVAssetReaderAudioMixOutput(audioTracks: audioTracks, audioSettings: nil)
-            ao.audioMix = audioMix
-            reader.add(ao)
-            audioOutput = ao
+
+        if hasRealVideoData {
+            let r = try AVAssetReader(asset: composition)
+            let vo = AVAssetReaderVideoCompositionOutput(
+                videoTracks: composition.tracks(withMediaType: .video),
+                videoSettings: [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA])
+            vo.videoComposition = videoComposition
+            r.add(vo)
+            videoOutput = vo
+
+            let audioTracks = composition.tracks(withMediaType: .audio)
+            if !audioTracks.isEmpty {
+                let ao = AVAssetReaderAudioMixOutput(audioTracks: audioTracks, audioSettings: nil)
+                ao.audioMix = audioMix
+                r.add(ao)
+                audioOutput = ao
+            }
+            reader = r
         }
 
         // ── Writer ──
@@ -1317,11 +1330,10 @@ actor TimelineExporter {
                 AVVideoAverageBitRateKey: bitrate * 1000,
                 AVVideoExpectedSourceFrameRateKey: fps,
                 AVVideoMaxKeyFrameIntervalKey: fps * 2,
-                AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel,  // High Profile 压缩率更高
-                AVVideoH264EntropyModeKey: AVVideoH264EntropyModeCABAC,        // CABAC 比 CAVLC 压缩率高 ~15%
-                AVVideoAllowFrameReorderingKey: true                            // 允许 B 帧，进一步提高压缩率
+                AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel,
+                AVVideoH264EntropyModeKey: AVVideoH264EntropyModeCABAC,
+                AVVideoAllowFrameReorderingKey: true
             ] as [String: Any],
-            // 优先使用硬件编码器（VideoToolbox），失败时自动回退软件编码
             AVVideoEncoderSpecificationKey: [
                 "EnableHardwareAcceleratedVideoEncoder": true,
                 "RequireHardwareAcceleratedVideoEncoder": false
@@ -1334,7 +1346,7 @@ actor TimelineExporter {
             kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
             kCVPixelBufferWidthKey as String: Int(renderSize.width),
             kCVPixelBufferHeightKey as String: Int(renderSize.height),
-            kCVPixelBufferIOSurfacePropertiesKey as String: [:] as [String: Any]  // GPU 直接访问，避免 CPU 拷贝
+            kCVPixelBufferIOSurfacePropertiesKey as String: [:] as [String: Any]
         ]
         let adaptor = AVAssetWriterInputPixelBufferAdaptor(
             assetWriterInput: videoInput, sourcePixelBufferAttributes: pbAttrs)
@@ -1354,9 +1366,11 @@ actor TimelineExporter {
         }
 
         // ── 开始读写 ──
-        guard reader.startReading() else {
-            throw reader.error ?? NSError(domain: "Export", code: 10,
-                userInfo: [NSLocalizedDescriptionKey: "无法启动读取: \(reader.error?.localizedDescription ?? "unknown")"])
+        if let reader = reader {
+            guard reader.startReading() else {
+                throw reader.error ?? NSError(domain: "Export", code: 10,
+                    userInfo: [NSLocalizedDescriptionKey: "无法启动读取: \(reader.error?.localizedDescription ?? "unknown")"])
+            }
         }
         guard writer.startWriting() else {
             throw writer.error ?? NSError(domain: "Export", code: 11,
@@ -1395,7 +1409,7 @@ actor TimelineExporter {
                     var frameIndex: Int64 = 0
                     var currentPB: CVPixelBuffer? = nil
                     var currentReaderTime: Double = 0
-                    var nextSB: CMSampleBuffer? = videoOutput.copyNextSampleBuffer()
+                    var nextSB: CMSampleBuffer? = videoOutput?.copyNextSampleBuffer()
 
                     var cachedSubOverlay: CIImage? = nil
                     var cachedSubKey: String = ""
@@ -1421,27 +1435,46 @@ actor TimelineExporter {
                                     if pts <= targetTime {
                                         currentPB = CMSampleBufferGetImageBuffer(sb)
                                         currentReaderTime = pts
-                                        nextSB = videoOutput.copyNextSampleBuffer()
+                                        nextSB = videoOutput?.copyNextSampleBuffer()
                                     } else {
                                         break
                                     }
                                 }
 
-                                if currentPB == nil && nextSB == nil {
+                                if currentPB == nil && nextSB == nil && !hasOverlays {
                                     videoInput.markAsFinished()
                                     cont.resume()
                                     return
                                 }
 
                                 let outputPTS = CMTime(value: frameIndex, timescale: Int32(targetFps))
+                                let effectivePB: CVPixelBuffer
                                 if let pb = currentPB {
+                                    effectivePB = pb
+                                } else if let pool = adaptor.pixelBufferPool {
+                                    var blackBuf: CVPixelBuffer?
+                                    CVPixelBufferPoolCreatePixelBuffer(nil, pool, &blackBuf)
+                                    if let bb = blackBuf {
+                                        CVPixelBufferLockBaseAddress(bb, [])
+                                        let addr = CVPixelBufferGetBaseAddress(bb)
+                                        let size = CVPixelBufferGetDataSize(bb)
+                                        memset(addr, 0, size)
+                                        CVPixelBufferUnlockBaseAddress(bb, [])
+                                        effectivePB = bb
+                                    } else {
+                                        videoInput.markAsFinished(); cont.resume(); return
+                                    }
+                                } else {
+                                    videoInput.markAsFinished(); cont.resume(); return
+                                }
+                                if true {
                                     let activeAdj = colorRanges.first {
                                         targetTime >= $0.start && targetTime < $0.end
                                     }?.adj
 
                                     let needsExtra = hasOverlays || (activeAdj != nil && activeAdj?.isIdentity == false)
                                     if needsExtra {
-                                        var image = CIImage(cvPixelBuffer: pb)
+                                        var image = CIImage(cvPixelBuffer: effectivePB)
 
                                         if let adj = activeAdj, !adj.isIdentity {
                                             image = ColorAdjust.apply(image, adj)
@@ -1501,7 +1534,7 @@ actor TimelineExporter {
                                             }
                                         }
                                     } else {
-                                        adaptor.append(pb, withPresentationTime: outputPTS)
+                                        adaptor.append(effectivePB, withPresentationTime: outputPTS)
                                     }
                                 }
                                 frameIndex += 1
@@ -1910,7 +1943,23 @@ actor TimelineExporter {
                               color: cgc(clip.shadowColor, clip.shadowOpacity))
             }
             let rect = CGRect(x: cx - sw / 2, y: cy - sh / 2, width: sw, height: sh)
-            if !clip.type.isClosed {
+            if clip.type == .pen {
+                if let pts = clip.penPoints, pts.count >= 2 {
+                    let penPath = ShapeGeometry.penPath(points: pts, closed: clip.penClosed, in: rect).cgPath
+                    if clip.fillEnabled && clip.effectiveIsClosed {
+                        ctx.addPath(penPath); ctx.setFillColor(cgc(clip.fillColor, clip.fillOpacity)); ctx.fillPath()
+                    }
+                    if clip.strokeEnabled {
+                        ctx.addPath(penPath)
+                        ctx.setStrokeColor(cgc(clip.strokeColor, clip.strokeOpacity))
+                        ctx.setLineWidth(CGFloat(clip.strokeWidth * s))
+                        ctx.setLineCap(.round); ctx.setLineJoin(.round)
+                        if clip.strokeDashed { ctx.setLineDash(phase: 0, lengths: [clip.strokeWidth * 2.5 * s, clip.strokeWidth * 1.6 * s]) }
+                        ctx.strokePath()
+                        ctx.setLineDash(phase: 0, lengths: [])
+                    }
+                }
+            } else if !clip.type.isClosed {
                 drawShapeLine(ctx: ctx, clip: clip, rect: rect, scale: s, cgc: cgc)
             } else {
                 let path: CGPath

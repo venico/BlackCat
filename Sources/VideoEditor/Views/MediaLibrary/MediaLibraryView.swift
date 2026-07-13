@@ -936,6 +936,119 @@ private struct TranscribeFailBubble: View {
     }
 }
 
+// MARK: - SceneDetect Bubble (右下角浮层)
+
+struct SceneDetectBubble: View {
+    let progress: Double
+
+    var body: some View {
+        HStack(spacing: 10) {
+            ZStack {
+                Circle().fill(Color.accent.opacity(0.2)).frame(width: 28, height: 28)
+                Image(systemName: "rectangle.split.3x1")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundColor(Color.accent)
+            }
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text("智能分割")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundColor(Color.labelPrimary)
+                    .lineLimit(1)
+
+                GeometryReader { geo in
+                    HStack(spacing: 6) {
+                        ProgressView(value: progress)
+                            .progressViewStyle(.linear)
+                            .tint(Color.accent)
+                        Text("\(Int(progress * 100))%")
+                            .font(.system(size: 10).monospacedDigit())
+                            .foregroundColor(Color.labelSecondary)
+                            .fixedSize()
+                    }
+                    .frame(width: geo.size.width)
+                }
+                .frame(height: 14)
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .frame(maxWidth: 260)
+        .background(
+            RoundedRectangle(cornerRadius: 10)
+                .fill(Color(red: 0.16, green: 0.16, blue: 0.17))
+                .shadow(color: .black.opacity(0.5), radius: 8, y: 4)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 10)
+                .stroke(Color.white.opacity(0.12), lineWidth: 0.5)
+        )
+    }
+}
+
+// MARK: - LLM Analyze Bubble (右下角浮层)
+
+struct LLMAnalyzeBubble: View {
+    let progress: Double
+    let onCancel: () -> Void
+    @State private var xHovering = false
+
+    var body: some View {
+        HStack(spacing: 10) {
+            ZStack {
+                Circle().fill(Color.purple.opacity(0.2)).frame(width: 28, height: 28)
+                Image(systemName: "brain")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundColor(.purple)
+            }
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text("大模型分析")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundColor(Color.labelPrimary)
+                    .lineLimit(1)
+
+                GeometryReader { geo in
+                    HStack(spacing: 6) {
+                        ProgressView(value: progress)
+                            .progressViewStyle(.linear)
+                            .tint(.purple)
+                        Text("\(Int(progress * 100))%")
+                            .font(.system(size: 10).monospacedDigit())
+                            .foregroundColor(Color.labelSecondary)
+                            .fixedSize()
+                    }
+                    .frame(width: geo.size.width)
+                }
+                .frame(height: 14)
+            }
+
+            Button(action: onCancel) {
+                Image(systemName: "xmark")
+                    .font(.system(size: 9, weight: .bold))
+                    .foregroundColor(xHovering ? Color.labelPrimary : Color.labelSecondary)
+                    .frame(width: 18, height: 18)
+                    .background(Color.white.opacity(xHovering ? 0.15 : 0.08))
+                    .clipShape(Circle())
+            }
+            .buttonStyle(.plain)
+            .onHover { xHovering = $0 }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .frame(maxWidth: 260)
+        .background(
+            RoundedRectangle(cornerRadius: 10)
+                .fill(Color(red: 0.16, green: 0.16, blue: 0.17))
+                .shadow(color: .black.opacity(0.5), radius: 8, y: 4)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 10)
+                .stroke(Color.white.opacity(0.12), lineWidth: 0.5)
+        )
+    }
+}
+
 // MARK: - Transcode Overlay (右下角浮层)
 
 struct TranscodeOverlay: View {
@@ -1439,7 +1552,23 @@ private struct ShapeCard: View {
                     let r = CGRect(x: geo.size.width * 0.2, y: geo.size.height * 0.28,
                                    width: geo.size.width * 0.6, height: geo.size.height * 0.44)
                     let col = Color.labelSecondary.opacity(0.85)
-                    if type == .arrow {
+                    if type == .pen {
+                        // 钢笔图标：一条贝塞尔曲线
+                        let pr = CGRect(x: r.midX - r.width * 0.3, y: r.midY - r.height * 0.3,
+                                        width: r.width * 0.6, height: r.height * 0.6)
+                        ZStack {
+                            Path { p in
+                                p.move(to: CGPoint(x: pr.minX, y: pr.maxY))
+                                p.addCurve(to: CGPoint(x: pr.maxX, y: pr.minY),
+                                           control1: CGPoint(x: pr.minX + pr.width * 0.3, y: pr.minY - pr.height * 0.2),
+                                           control2: CGPoint(x: pr.maxX - pr.width * 0.3, y: pr.maxY + pr.height * 0.2))
+                            }.stroke(col, lineWidth: 2)
+                            Circle().fill(col).frame(width: 5, height: 5)
+                                .position(x: pr.minX, y: pr.maxY)
+                            Circle().fill(col).frame(width: 5, height: 5)
+                                .position(x: pr.maxX, y: pr.minY)
+                        }
+                    } else if type == .arrow {
                         let ar = CGRect(x: r.midX - r.width * 0.25, y: r.midY - r.height * 0.25,
                                         width: r.width * 0.5, height: r.height * 0.5)
                         let y = ar.midY

@@ -578,4 +578,274 @@ extension ProjectState {
             scheduleAutoSave()
         }
     }
+
+    // MARK: - 场景检测分割
+
+    func sceneDetectSelectedClip() {
+        guard !isDetectingScenes else { return }
+        guard SceneDetector.isInstalled else {
+            showSuccessToast(icon: "exclamationmark.triangle.fill", iconColor: .yellow,
+                             title: "智能分割", subtitle: "请先在设置→视频分析中下载组件", autoCountdown: false)
+            return
+        }
+        guard let clipID = selectedVideoClipID else { return }
+        var clip: VideoClip?
+        var trackIdx = 0
+        var clipIdx = 0
+        for ti in videoTracks.indices {
+            if let ci = videoTracks[ti].clips.firstIndex(where: { $0.id == clipID }) {
+                clip = videoTracks[ti].clips[ci]
+                trackIdx = ti; clipIdx = ci
+                break
+            }
+        }
+        guard let c = clip, let url = c.url else { return }
+
+        isDetectingScenes = true
+        sceneDetectProgress = 0
+
+        sceneDetectTask = Task {
+            do {
+                let cuts = try await SceneDetector.detect(videoURL: url) { pct in
+                    DispatchQueue.main.async { self.sceneDetectProgress = pct }
+                }
+                await MainActor.run { applySceneCuts(trackIdx: trackIdx, clipIdx: clipIdx, clip: c, cuts: cuts) }
+            } catch {
+                await MainActor.run {
+                    isDetectingScenes = false
+                    sceneDetectProgress = 0
+                    showSuccessToast(icon: "xmark.circle.fill", iconColor: .red,
+                                     title: "智能分割", subtitle: error.localizedDescription, autoCountdown: false)
+                }
+            }
+        }
+    }
+
+    private func applySceneCuts(trackIdx: Int, clipIdx: Int, clip: VideoClip, cuts: [Double]) {
+        isDetectingScenes = false
+        sceneDetectProgress = 0
+        guard trackIdx < videoTracks.count,
+              clipIdx < videoTracks[trackIdx].clips.count,
+              videoTracks[trackIdx].clips[clipIdx].id == clip.id else {
+            showSuccessToast(icon: "exclamationmark.triangle.fill", iconColor: .yellow,
+                             title: "智能分割", subtitle: "片段已变更，请重新操作", autoCountdown: false)
+            return
+        }
+
+        let relevant = cuts.filter { $0 > clip.trimStart + 0.05 && $0 < clip.trimStart + (clip.endTime - clip.startTime) * clip.speed - 0.05 }
+        guard !relevant.isEmpty else {
+            showSuccessToast(icon: "checkmark.circle.fill", iconColor: .green,
+                             title: "智能分割", subtitle: "未检测到场景切换", autoCountdown: true)
+            return
+        }
+
+        let snap = currentSnapshot()
+        var splits: [VideoClip] = []
+        var prevTrimStart = clip.trimStart
+        var prevTimelineStart = clip.startTime
+
+        for cutSec in relevant {
+            let offsetInClip = cutSec - clip.trimStart
+            let timelinePos = clip.startTime + offsetInClip / clip.speed
+
+            var seg = VideoClip(assetID: clip.assetID, name: clip.name, url: clip.url,
+                                startTime: prevTimelineStart, endTime: timelinePos,
+                                trimStart: prevTrimStart,
+                                overrideResolution: clip.overrideResolution,
+                                overrideFPS: clip.overrideFPS,
+                                overrideBitrate: clip.overrideBitrate)
+            seg.volume = clip.volume; seg.speed = clip.speed
+            seg.videoWidth = clip.videoWidth; seg.videoHeight = clip.videoHeight
+            seg.scaleX = clip.scaleX; seg.scaleY = clip.scaleY
+            seg.lockAspect = clip.lockAspect
+            seg.offsetX = clip.offsetX; seg.offsetY = clip.offsetY
+            seg.cropTop = clip.cropTop; seg.cropBottom = clip.cropBottom
+            seg.cropLeft = clip.cropLeft; seg.cropRight = clip.cropRight
+            splits.append(seg)
+
+            prevTrimStart = cutSec
+            prevTimelineStart = timelinePos
+        }
+
+        var lastSeg = VideoClip(assetID: clip.assetID, name: clip.name, url: clip.url,
+                                startTime: prevTimelineStart, endTime: clip.endTime,
+                                trimStart: prevTrimStart,
+                                overrideResolution: clip.overrideResolution,
+                                overrideFPS: clip.overrideFPS,
+                                overrideBitrate: clip.overrideBitrate)
+        lastSeg.volume = clip.volume; lastSeg.speed = clip.speed
+        lastSeg.videoWidth = clip.videoWidth; lastSeg.videoHeight = clip.videoHeight
+        lastSeg.scaleX = clip.scaleX; lastSeg.scaleY = clip.scaleY
+        lastSeg.lockAspect = clip.lockAspect
+        lastSeg.offsetX = clip.offsetX; lastSeg.offsetY = clip.offsetY
+        lastSeg.cropTop = clip.cropTop; lastSeg.cropBottom = clip.cropBottom
+        lastSeg.cropLeft = clip.cropLeft; lastSeg.cropRight = clip.cropRight
+        splits.append(lastSeg)
+
+        videoTracks[trackIdx].clips.remove(at: clipIdx)
+        videoTracks[trackIdx].clips.insert(contentsOf: splits, at: clipIdx)
+
+        undoStack.append(snap)
+        if undoStack.count > 30 { undoStack.removeFirst() }
+        redoStack.removeAll()
+        undoCount = undoStack.count
+        redoCount = 0
+        rebuildTimelinePreview()
+        scheduleAutoSave()
+
+        showSuccessToast(icon: "checkmark.circle.fill", iconColor: .green,
+                         title: "智能分割", subtitle: "已分割为 \(splits.count) 个片段", autoCountdown: true)
+    }
+
+    // MARK: - 大模型分析（一站式：语音识别 → LLM → 新轨道）
+
+    func llmAnalyzeSelectedClip() {
+        guard !isLLMAnalyzing else { return }
+        let settings = AppSettings.shared
+        guard !settings.llmAPIKey.isEmpty else {
+            showSuccessToast(icon: "exclamationmark.triangle.fill", iconColor: .yellow,
+                             title: "大模型分析", subtitle: "请先在设置→视频分析中配置 API Key", autoCountdown: false)
+            return
+        }
+        guard WhisperTranscriber.modelReady else {
+            showWhisperModelPicker = true
+            return
+        }
+        guard WhisperTranscriber.whisperReady else {
+            showSuccessToast(icon: "exclamationmark.triangle.fill", iconColor: .yellow,
+                             title: "大模型分析", subtitle: "语音识别引擎未就绪（whisper-cli 缺失）", autoCountdown: false)
+            return
+        }
+        guard let clipID = selectedVideoClipID else { return }
+
+        var clip: VideoClip?
+        var trackIdx = 0
+        for ti in videoTracks.indices {
+            if let ci = videoTracks[ti].clips.firstIndex(where: { $0.id == clipID }) {
+                clip = videoTracks[ti].clips[ci]
+                trackIdx = ti
+                break
+            }
+        }
+        guard let c = clip, let mediaURL = c.url else { return }
+
+        isLLMAnalyzing = true
+        llmAnalyzeProgress = 0
+
+        let capSpeed = max(0.01, c.speed)
+        let capOffset = c.startTime
+        let srcDur = c.duration * capSpeed
+
+        llmAnalyzeTask = Task {
+            do {
+                // ── 步骤 1：语音识别 (0~60%) ──
+                try Task.checkCancellation()
+                let segs = try await WhisperTranscriber.transcribe(
+                    mediaURL: mediaURL, trimStart: c.trimStart,
+                    duration: srcDur, language: "auto", prompt: nil
+                ) { pct in
+                    DispatchQueue.main.async { self.llmAnalyzeProgress = pct * 0.6 }
+                }
+
+                guard !segs.isEmpty else {
+                    throw NSError(domain: "LLM", code: 10,
+                                  userInfo: [NSLocalizedDescriptionKey: "语音识别未产生字幕"])
+                }
+
+                let subData = segs.map { s -> (start: Double, end: Double, text: String) in
+                    let st = capOffset + s.start / capSpeed
+                    let en = capOffset + s.end   / capSpeed
+                    return (start: st, end: en, text: s.text)
+                }
+
+                // ── 步骤 2：大模型分析 (60~95%) ──
+                try Task.checkCancellation()
+                await MainActor.run { self.llmAnalyzeProgress = 0.6 }
+
+                let highlights = try await LLMAnalyzer.analyze(
+                    subtitles: subData,
+                    provider: settings.llmProvider,
+                    apiKey: settings.llmAPIKey
+                ) { pct in
+                    DispatchQueue.main.async { self.llmAnalyzeProgress = 0.6 + pct * 0.35 }
+                }
+
+                // ── 步骤 3：生成新轨道 (95~100%) ──
+                try Task.checkCancellation()
+                await MainActor.run {
+                    self.llmAnalyzeProgress = 0.95
+                    self.applyLLMHighlightsNewTrack(sourceClip: c, sourceTrackIdx: trackIdx, highlights: highlights)
+                }
+            } catch is CancellationError {
+                await MainActor.run {
+                    isLLMAnalyzing = false
+                    llmAnalyzeProgress = 0
+                }
+            } catch {
+                await MainActor.run {
+                    let wasCancelled = !isLLMAnalyzing
+                    isLLMAnalyzing = false
+                    llmAnalyzeProgress = 0
+                    if !wasCancelled {
+                        showSuccessToast(icon: "xmark.circle.fill", iconColor: .red,
+                                         title: "大模型分析", subtitle: error.localizedDescription, autoCountdown: false)
+                    }
+                }
+            }
+        }
+    }
+
+    private func applyLLMHighlightsNewTrack(sourceClip: VideoClip, sourceTrackIdx: Int,
+                                             highlights: [LLMAnalyzer.Highlight]) {
+        isLLMAnalyzing = false
+        llmAnalyzeProgress = 0
+
+        let sorted = highlights.sorted { $0.start < $1.start }
+            .filter { $0.start >= sourceClip.startTime && $0.end <= sourceClip.endTime && $0.end > $0.start }
+
+        guard !sorted.isEmpty else {
+            showSuccessToast(icon: "checkmark.circle.fill", iconColor: .green,
+                             title: "大模型分析", subtitle: "未找到精彩片段", autoCountdown: true)
+            return
+        }
+
+        let snap = currentSnapshot()
+        var keeps: [VideoClip] = []
+        var cursor = 0.0
+
+        for hl in sorted {
+            let trimOffset = (hl.start - sourceClip.startTime) * sourceClip.speed
+            let dur = hl.end - hl.start
+            var seg = VideoClip(assetID: sourceClip.assetID, name: sourceClip.name, url: sourceClip.url,
+                                startTime: cursor, endTime: cursor + dur,
+                                trimStart: sourceClip.trimStart + trimOffset,
+                                overrideResolution: sourceClip.overrideResolution,
+                                overrideFPS: sourceClip.overrideFPS,
+                                overrideBitrate: sourceClip.overrideBitrate)
+            seg.volume = sourceClip.volume; seg.speed = sourceClip.speed
+            seg.videoWidth = sourceClip.videoWidth; seg.videoHeight = sourceClip.videoHeight
+            seg.scaleX = sourceClip.scaleX; seg.scaleY = sourceClip.scaleY
+            seg.lockAspect = sourceClip.lockAspect
+            seg.offsetX = sourceClip.offsetX; seg.offsetY = sourceClip.offsetY
+            seg.cropTop = sourceClip.cropTop; seg.cropBottom = sourceClip.cropBottom
+            seg.cropLeft = sourceClip.cropLeft; seg.cropRight = sourceClip.cropRight
+            keeps.append(seg)
+            cursor += dur
+        }
+
+        var newTrack = Track<VideoClip>(label: "精彩片段")
+        newTrack.clips = keeps
+        videoTracks.append(newTrack)
+
+        undoStack.append(snap)
+        if undoStack.count > 30 { undoStack.removeFirst() }
+        redoStack.removeAll()
+        undoCount = undoStack.count
+        redoCount = 0
+        rebuildTimelinePreview()
+        scheduleAutoSave()
+
+        showSuccessToast(icon: "checkmark.circle.fill", iconColor: .green,
+                         title: "大模型分析", subtitle: "已生成精彩片段轨道（\(keeps.count) 段）", autoCountdown: true)
+    }
 }

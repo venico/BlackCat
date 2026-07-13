@@ -214,6 +214,9 @@ final class ProjectState: ObservableObject {
     @Published var selectedSubtitleClipID: UUID? = nil
     @Published var selectedTextClipID: UUID?     = nil
     @Published var selectedShapeClipID: UUID?    = nil
+    @Published var penDrawingMode: Bool = false
+    @Published var penEditingClipID: UUID? = nil
+    var penRawPoints: [(x: Double, y: Double, cInDX: Double, cInDY: Double, cOutDX: Double, cOutDY: Double, smooth: Bool)] = []
     // Transition selection
     @Published var selectedTransitionClipID: UUID? = nil  // 当前选中的转场（clip ID，其 inTransition 被编辑）
 
@@ -278,6 +281,23 @@ final class ProjectState: ObservableObject {
         transcribeState = .idle
         showSuccessToast(icon: "stop.fill", iconColor: .yellow, title: "语音识别", subtitle: "已停止", autoCountdown: false)
     }
+    // MARK: - 场景检测 / 大模型分析
+    @Published var isDetectingScenes: Bool = false
+    @Published var sceneDetectProgress: Double = 0
+    var sceneDetectTask: Task<Void, Never>? = nil
+    @Published var isLLMAnalyzing: Bool = false
+    @Published var llmAnalyzeProgress: Double = 0
+    var llmAnalyzeTask: Task<Void, Never>? = nil
+
+    func cancelLLMAnalyze() {
+        llmAnalyzeTask?.cancel()
+        llmAnalyzeTask = nil
+        WhisperTranscriber.killCurrentProcess()
+        isLLMAnalyzing = false
+        llmAnalyzeProgress = 0
+        showSuccessToast(icon: "stop.fill", iconColor: .yellow, title: "大模型分析", subtitle: "已停止", autoCountdown: false)
+    }
+
     @Published var mediaLibraryTab: String = "video"      // 素材库当前标签（提升到 ProjectState，转场图标点击可切换）
     enum MediaSortOrder: String, CaseIterable {
         case name = "名称"
@@ -453,6 +473,11 @@ final class ProjectState: ObservableObject {
         translationDone = 0
         translationProgress = 0
         translatingTrackIDs.removeAll()
+        let pending = placeholderClipIDs
+        placeholderClipIDs.removeAll()
+        for ti in subtitleTracks.indices {
+            subtitleTracks[ti].clips.removeAll { pending.contains($0.id) }
+        }
         showSuccessToast(icon: "stop.fill", iconColor: .yellow, title: "翻译", subtitle: "已停止", autoCountdown: false)
     }
     /// 占位字幕 ID 集合（翻译中显示呼吸效果）

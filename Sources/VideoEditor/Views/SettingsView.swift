@@ -11,7 +11,8 @@ struct SettingsView: View {
         case notDownloaded, downloaded, downloading(Double), failed(String)
     }
 
-    private let tabs = ["保存位置", "语音识别", "字幕翻译", "视频生成"]
+    @State private var sceneDetectState: ModelState = .notDownloaded
+    private let tabs = ["保存位置", "语音识别", "字幕翻译", "视频分析", "视频生成"]
 
     var body: some View {
         VStack(spacing: 0) {
@@ -64,7 +65,8 @@ struct SettingsView: View {
                     case 0: saveTab
                     case 1: whisperTab
                     case 2: translateTab
-                    case 3: aiVideoTab
+                    case 3: sceneDetectTab
+                    case 4: aiVideoTab
                     default: EmptyView()
                     }
                 }
@@ -74,7 +76,7 @@ struct SettingsView: View {
         }
         .frame(width: 540, height: 520)
         .background(Color(red: 0.13, green: 0.13, blue: 0.14))
-        .onAppear { refreshModelStates() }
+        .onAppear { refreshModelStates(); refreshSceneDetectState() }
     }
 
     // MARK: - 保存位置
@@ -182,6 +184,131 @@ struct SettingsView: View {
                         text: translateSecretBinding
                     )
                 }
+            }
+        }
+    }
+
+    // MARK: - 视频分析
+
+    private var sceneDetectTab: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            pathRow(label: "组件存储位置", path: SceneDetector.supportDir, placeholder: "", defaultDir: SceneDetector.supportDir) { _ in }
+
+            Text("场景检测组件")
+                .font(.system(size: 11, weight: .medium))
+                .foregroundColor(Color.labelSecondary)
+
+            HStack(spacing: 10) {
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("PySceneDetect")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundColor(Color.labelPrimary)
+                    Text("基于内容分析的智能场景切割（含 Python 运行时），\(SceneDetector.componentSize)")
+                        .font(.system(size: 10))
+                        .foregroundColor(Color.labelSecondary)
+                }
+
+                Spacer()
+
+                switch sceneDetectState {
+                case .downloaded:
+                    Text("已安装")
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundColor(.green.opacity(0.8))
+                        .padding(.horizontal, 8).frame(height: 24)
+                        .background(Color.green.opacity(0.1))
+                        .cornerRadius(4)
+                case .notDownloaded:
+                    Button { downloadSceneDetect() } label: {
+                        Text("下载")
+                            .font(.system(size: 10, weight: .medium))
+                            .foregroundColor(Color.accent)
+                            .padding(.horizontal, 10).frame(height: 24)
+                            .background(Color.accent.opacity(0.15))
+                            .cornerRadius(4)
+                    }
+                    .buttonStyle(.plain)
+                case .downloading(let pct):
+                    HStack(spacing: 6) {
+                        ProgressView(value: pct)
+                            .frame(width: 50)
+                            .tint(Color.accent)
+                        Text("\(Int(pct * 100))%")
+                            .font(.system(size: 10).monospacedDigit())
+                            .foregroundColor(Color.labelSecondary)
+                            .frame(width: 28)
+                    }
+                case .failed(let msg):
+                    HStack(spacing: 6) {
+                        Text(msg)
+                            .font(.system(size: 9))
+                            .foregroundColor(.red.opacity(0.8))
+                            .lineLimit(1)
+                            .frame(maxWidth: 80)
+                        Button { downloadSceneDetect() } label: {
+                            Text("重试")
+                                .font(.system(size: 10, weight: .medium))
+                                .foregroundColor(Color.accent)
+                                .padding(.horizontal, 8).frame(height: 24)
+                                .background(Color.accent.opacity(0.15))
+                                .cornerRadius(4)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 8)
+            .background(Color.white.opacity(0.04))
+            .cornerRadius(7)
+
+            Text("安装后可在工具栏使用「智能分割」功能，自动检测视频场景切换点并分割片段。")
+                .font(.system(size: 10))
+                .foregroundColor(Color.labelSecondary)
+
+            Divider().padding(.vertical, 4)
+
+            SSection(title: "大模型分析") {
+                IPicker(selection: Binding(
+                    get: { settings.llmProvider.displayName },
+                    set: { name in
+                        if let p = AppSettings.LLMProvider.allCases.first(where: { $0.displayName == name }) {
+                            settings.llmProvider = p
+                        }
+                    }
+                ), options: AppSettings.LLMProvider.allCases.map { ($0.displayName, $0.displayName) })
+
+                apiKeyField(
+                    label: "API Key",
+                    placeholder: settings.llmProvider.keyPlaceholder,
+                    text: Binding(
+                        get: { settings.llmAPIKey },
+                        set: { settings.llmAPIKey = $0 }
+                    )
+                )
+
+                Text("使用大模型分析视频字幕，自动识别精彩片段并裁剪。分析前确保语音识别功能可用。")
+                    .font(.system(size: 10))
+                    .foregroundColor(Color.labelSecondary)
+            }
+        }
+    }
+
+    private func refreshSceneDetectState() {
+        if case .downloading = sceneDetectState { return }
+        sceneDetectState = SceneDetector.isInstalled ? .downloaded : .notDownloaded
+    }
+
+    private func downloadSceneDetect() {
+        sceneDetectState = .downloading(0)
+        Task {
+            do {
+                try await SceneDetector.download { pct in
+                    DispatchQueue.main.async { sceneDetectState = .downloading(pct) }
+                }
+                await MainActor.run { sceneDetectState = .downloaded }
+            } catch {
+                await MainActor.run { sceneDetectState = .failed(error.localizedDescription) }
             }
         }
     }

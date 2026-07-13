@@ -439,7 +439,7 @@ struct TextClip: Identifiable, Equatable, Codable {
 // MARK: - Shape Clip (图形图层)
 
 enum ShapeType: String, Codable, CaseIterable {
-    case rectangle, ellipse, triangle, parallelogram, trapezoid, line, arrow
+    case rectangle, ellipse, triangle, parallelogram, trapezoid, line, arrow, pen
 
     var label: String {
         switch self {
@@ -450,16 +450,31 @@ enum ShapeType: String, Codable, CaseIterable {
         case .trapezoid:     return "梯形"
         case .line:          return "线段"
         case .arrow:         return "箭头"
+        case .pen:           return "钢笔"
         }
     }
 
-    /// 是否闭合路径（可填充）。线段/箭头为开放路径，仅描边。
+    /// 是否闭合路径（可填充）。线段/箭头为开放路径，仅描边。钢笔由 penClosed 决定。
     var isClosed: Bool {
         switch self {
         case .line, .arrow: return false
+        case .pen:          return true
         default:            return true
         }
     }
+}
+
+// MARK: - 钢笔路径锚点
+
+struct PenPoint: Identifiable, Equatable, Codable {
+    var id = UUID()
+    var x: Double       // 归一化坐标 0~1（相对于 clip 的 width×height 边界框）
+    var y: Double
+    var ctrlInDX: Double = 0    // 入控制柄偏移（归一化，相对于锚点）
+    var ctrlInDY: Double = 0
+    var ctrlOutDX: Double = 0   // 出控制柄偏移
+    var ctrlOutDY: Double = 0
+    var smooth: Bool = true     // 平滑模式：拖动一个控制柄另一个联动
 }
 
 /// 线段/箭头两端端点样式
@@ -514,6 +529,12 @@ struct ShapeClip: Identifiable, Equatable, Codable {
     var shadowRadius: Double = 8
     var shadowOffsetX: Double = 0
     var shadowOffsetY: Double = 4
+    // 钢笔路径（仅 .pen 类型）
+    var penPoints: [PenPoint]? = nil
+    var penClosed: Bool = false
+
+    /// 是否闭合路径（pen 由 penClosed 决定，其余由 ShapeType 决定）
+    var effectiveIsClosed: Bool { type == .pen ? penClosed : type.isClosed }
 
     enum CodingKeys: String, CodingKey {
         case id, type, startTime, endTime, posX, posY
@@ -523,6 +544,7 @@ struct ShapeClip: Identifiable, Equatable, Codable {
         case capStart, capEnd
         case cornerRadius
         case shadowEnabled, shadowColorHex, shadowOpacity, shadowRadius, shadowOffsetX, shadowOffsetY
+        case penPoints, penClosed
     }
     func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
@@ -556,6 +578,8 @@ struct ShapeClip: Identifiable, Equatable, Codable {
         try c.encode(shadowRadius, forKey: .shadowRadius)
         try c.encode(shadowOffsetX, forKey: .shadowOffsetX)
         try c.encode(shadowOffsetY, forKey: .shadowOffsetY)
+        try c.encodeIfPresent(penPoints, forKey: .penPoints)
+        try c.encode(penClosed, forKey: .penClosed)
     }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -589,11 +613,18 @@ struct ShapeClip: Identifiable, Equatable, Codable {
         shadowRadius = (try? c.decode(Double.self, forKey: .shadowRadius)) ?? 8
         shadowOffsetX = (try? c.decode(Double.self, forKey: .shadowOffsetX)) ?? 0
         shadowOffsetY = (try? c.decode(Double.self, forKey: .shadowOffsetY)) ?? 4
+        penPoints = try? c.decode([PenPoint].self, forKey: .penPoints)
+        penClosed = (try? c.decode(Bool.self, forKey: .penClosed)) ?? false
     }
     init(type: ShapeType, startTime: Double, endTime: Double) {
         self.type = type; self.startTime = startTime; self.endTime = endTime
-        // 线段/箭头：默认只描边不填充（白色）；箭头边界框更高以容纳三角头
-        if !type.isClosed {
+        if type == .pen {
+            fillEnabled = false
+            strokeEnabled = true
+            strokeColor = .white
+            strokeWidth = 3
+            width = 100; height = 100
+        } else if !type.isClosed {
             fillEnabled = false
             strokeEnabled = true
             height = (type == .arrow) ? 48 : 8
@@ -785,7 +816,41 @@ enum ShapeGeometry {
             p.move(to: CGPoint(x: r.maxX - headLen, y: y - wing))
             p.addLine(to: CGPoint(x: r.maxX, y: y))
             p.addLine(to: CGPoint(x: r.maxX - headLen, y: y + wing))
+        case .pen:
+            break // pen 使用 penPath() 单独生成
         }
+        return p
+    }
+
+    /// 从归一化 PenPoint 数组生成贝塞尔路径
+    static func penPath(points: [PenPoint], closed: Bool, in r: CGRect) -> Path {
+        guard points.count >= 2 else {
+            var p = Path()
+            if let pt = points.first {
+                let pos = CGPoint(x: r.minX + pt.x * r.width, y: r.minY + pt.y * r.height)
+                p.addEllipse(in: CGRect(x: pos.x - 3, y: pos.y - 3, width: 6, height: 6))
+            }
+            return p
+        }
+        var p = Path()
+        func mapPt(_ pt: PenPoint) -> CGPoint {
+            CGPoint(x: r.minX + pt.x * r.width, y: r.minY + pt.y * r.height)
+        }
+        func addSegment(from a: PenPoint, to b: PenPoint) {
+            let ap = mapPt(a), bp = mapPt(b)
+            let hasCtrl = abs(a.ctrlOutDX) > 1e-6 || abs(a.ctrlOutDY) > 1e-6
+                       || abs(b.ctrlInDX) > 1e-6 || abs(b.ctrlInDY) > 1e-6
+            if hasCtrl {
+                let cp1 = CGPoint(x: ap.x + a.ctrlOutDX * r.width, y: ap.y + a.ctrlOutDY * r.height)
+                let cp2 = CGPoint(x: bp.x + b.ctrlInDX * r.width, y: bp.y + b.ctrlInDY * r.height)
+                p.addCurve(to: bp, control1: cp1, control2: cp2)
+            } else {
+                p.addLine(to: bp)
+            }
+        }
+        p.move(to: mapPt(points[0]))
+        for i in 1..<points.count { addSegment(from: points[i - 1], to: points[i]) }
+        if closed { addSegment(from: points.last!, to: points.first!); p.closeSubpath() }
         return p
     }
 

@@ -318,9 +318,12 @@ extension ProjectState {
                 }
             } catch {
                 await MainActor.run {
+                    let wasCancelled = self.transcribeTask == nil
                     self.transcribeState = .idle
                     self.transcribeTask = nil
-                    self.showSuccessToast(icon: "exclamationmark.triangle", iconColor: .red, title: "语音识别", subtitle: error.localizedDescription, autoCountdown: false)
+                    if !wasCancelled {
+                        self.showSuccessToast(icon: "exclamationmark.triangle", iconColor: .red, title: "语音识别", subtitle: error.localizedDescription, autoCountdown: false)
+                    }
                 }
             }
         }

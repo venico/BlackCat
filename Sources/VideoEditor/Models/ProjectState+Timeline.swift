@@ -719,28 +719,50 @@ extension ProjectState {
     /// 在播放头处添加图形片段（无轨道则新建），并选中它。参照 addTextAtPlayhead。
     func addShapeAtPlayhead(type: ShapeType) {
         let snap = currentSnapshot()
+        let start = currentTime
+        let end   = currentTime + 2.0
         let trackIdx: Int
-        if let sid = selectedShapeClipID,
-           let i = shapeTracks.firstIndex(where: { $0.clips.contains { $0.id == sid } }) {
-            trackIdx = i
-        } else if !shapeTracks.isEmpty {
-            trackIdx = shapeTracks.count - 1
-        } else {
+        if shapeTracks.isEmpty {
             shapeTracks.append(Track<ShapeClip>(label: "图形"))
             syncOverlayOrder()
             trackIdx = shapeTracks.count - 1
+        } else {
+            var candidate: Int
+            if let sid = selectedShapeClipID,
+               let i = shapeTracks.firstIndex(where: { $0.clips.contains { $0.id == sid } }) {
+                candidate = i
+            } else {
+                candidate = shapeTracks.count - 1
+            }
+            let overlaps = shapeTracks[candidate].clips.contains { c in
+                c.startTime < end && c.endTime > start
+            }
+            if overlaps {
+                if let freeIdx = shapeTracks.indices.first(where: { idx in
+                    !shapeTracks[idx].clips.contains { c in c.startTime < end && c.endTime > start }
+                }) {
+                    candidate = freeIdx
+                } else {
+                    shapeTracks.append(Track<ShapeClip>(label: "图形"))
+                    syncOverlayOrder()
+                    candidate = shapeTracks.count - 1
+                }
+            }
+            trackIdx = candidate
         }
-        let start = currentTime
-        let end   = currentTime + 2.0
         var clip  = ShapeClip(type: type, startTime: start, endTime: end)
         // 基准尺寸按预览分辨率给合适比例
         let rs = previewRenderSize
-        if type.isClosed {
+        if type == .pen {
+            clip.width = Double(rs.width) * 0.3; clip.height = Double(rs.height) * 0.3
+            penRawPoints = []
+            penDrawingMode = true
+        } else if type.isClosed {
             let side = Double(rs.height) * 0.18
             clip.width = side; clip.height = side
         } else if type == .line {
             clip.width = Double(rs.width) * 0.1; clip.height = Double(rs.height) * 0.03
-        } else {  // arrow：更高的边界框，三角头才够大
+        } else {
             clip.width = Double(rs.width) * 0.084; clip.height = Double(rs.height) * 0.028
         }
         shapeTracks[trackIdx].clips.append(clip)
@@ -785,6 +807,44 @@ extension ProjectState {
                 return
             }
         }
+    }
+
+    /// 完成钢笔路径绘制（由 PenDrawingOverlay 调用）
+    func finalizePenDrawing(clipID: UUID, rawPoints: [(x: Double, y: Double, cInDX: Double, cInDY: Double, cOutDX: Double, cOutDY: Double, smooth: Bool)], closed: Bool) {
+        guard rawPoints.count >= 2 else {
+            deleteShapeClip(id: clipID)
+            penDrawingMode = false
+            return
+        }
+        let allX = rawPoints.flatMap { p in [p.x, p.x + p.cInDX, p.x + p.cOutDX] }
+        let allY = rawPoints.flatMap { p in [p.y, p.y + p.cInDY, p.y + p.cOutDY] }
+        let minX = allX.min()!, maxX = allX.max()!, minY = allY.min()!, maxY = allY.max()!
+        let pad = 4.0
+        let bx = minX - pad, by = minY - pad
+        let bw = max(maxX - minX + pad * 2, 8), bh = max(maxY - minY + pad * 2, 8)
+
+        let points: [PenPoint] = rawPoints.map { p in
+            PenPoint(x: (p.x - bx) / bw, y: (p.y - by) / bh,
+                     ctrlInDX: p.cInDX / bw, ctrlInDY: p.cInDY / bh,
+                     ctrlOutDX: p.cOutDX / bw, ctrlOutDY: p.cOutDY / bh,
+                     smooth: p.smooth)
+        }
+
+        updateShapeClip(id: clipID) { c in
+            c.width = bw; c.height = bh
+            c.posX = (bx + bw / 2) / max(Double(previewRenderSize.width), 1)
+            c.posY = (by + bh / 2) / max(Double(previewRenderSize.height), 1)
+            c.penPoints = points
+            c.penClosed = closed
+            if closed { c.fillEnabled = true; c.fillColor = .white; c.fillOpacity = 0.3 }
+        }
+        penDrawingMode = false
+    }
+
+    /// 取消钢笔绘制
+    func cancelPenDrawing(clipID: UUID) {
+        deleteShapeClip(id: clipID)
+        penDrawingMode = false
     }
 
     // MARK: - 文字样式模板

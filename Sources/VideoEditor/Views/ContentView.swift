@@ -18,7 +18,9 @@ struct ContentView: View {
     @State private var inspectorWidth: CGFloat = 280
     // Drag origin tracking (prevents cumulative translation bug)
     @State private var dragOriginSidebar: CGFloat = 220
+    @State private var isDraggingSidebar = false
     @State private var dragOriginInspector: CGFloat = 280
+    @State private var isDraggingInspector = false
     @State private var dragOriginTop: CGFloat = 420
     @State private var settingsVisible = false
 
@@ -71,11 +73,14 @@ struct ContentView: View {
                         }
                         .gesture(DragGesture(minimumDistance: 1, coordinateSpace: .global)
                             .onChanged { v in
-                                if v.translation == .zero { dragOriginSidebar = sidebarWidth }
-                                sidebarWidth = (dragOriginSidebar + v.translation.width)
-                                    .clamped(to: 160...400)
+                                if !isDraggingSidebar { dragOriginSidebar = sidebarWidth }
+                                isDraggingSidebar = true
+                                sidebarWidth = min(max(dragOriginSidebar + v.translation.width, 160), 400)
                             }
-                            .onEnded { _ in NSCursor.arrow.set() }
+                            .onEnded { _ in
+                                isDraggingSidebar = false
+                                NSCursor.arrow.set()
+                            }
                         )
                 }
             }
@@ -113,11 +118,14 @@ struct ContentView: View {
                         }
                                         .gesture(DragGesture(minimumDistance: 1, coordinateSpace: .global)
                                             .onChanged { v in
-                                                if v.translation == .zero { dragOriginInspector = inspectorWidth }
-                                                inspectorWidth = (dragOriginInspector - v.translation.width)
-                                                    .clamped(to: 200...450)
+                                                if !isDraggingInspector { dragOriginInspector = inspectorWidth }
+                                                isDraggingInspector = true
+                                                inspectorWidth = min(max(dragOriginInspector - v.translation.width, 200), 450)
                                             }
-                                            .onEnded { _ in NSCursor.arrow.set() }
+                                            .onEnded { _ in
+                                                isDraggingInspector = false
+                                                NSCursor.arrow.set()
+                                            }
                                         )
                                 }
                         }
@@ -187,6 +195,19 @@ struct ContentView: View {
                 if project.isTranscribing || { if case .failed = project.transcribeState { return true } else { return false } }() {
                     TranscribeOverlay()
                         .environmentObject(project)
+                }
+                if project.isDetectingScenes {
+                    SceneDetectBubble(progress: project.sceneDetectProgress)
+                        .transition(.asymmetric(
+                            insertion: .move(edge: .trailing).combined(with: .opacity),
+                            removal: .opacity))
+                }
+                if project.isLLMAnalyzing {
+                    LLMAnalyzeBubble(progress: project.llmAnalyzeProgress,
+                                     onCancel: { project.cancelLLMAnalyze() })
+                        .transition(.asymmetric(
+                            insertion: .move(edge: .trailing).combined(with: .opacity),
+                            removal: .opacity))
                 }
                 if project.translationTotal > 0 {
                     TranslationBubble()

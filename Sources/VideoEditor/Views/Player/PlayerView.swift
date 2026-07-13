@@ -29,6 +29,8 @@ struct PlayerView: View {
                 VideoTransformOverlay()
                 ImageTransformOverlay()
                 ShapeTransformOverlay()
+                PenDrawingOverlay()
+                PenEditOverlay()
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .overlay(alignment: .top) {
@@ -211,6 +213,9 @@ private struct OverlayStack: View {
                             }
                             .onEnded { _ in shapeDragStart = [:] }
                     )
+                    .onTapGesture(count: 2) {
+                        if clip.type == .pen { project.penEditingClipID = clip.id }
+                    }
                     .onTapGesture {
                         if NSEvent.modifierFlags.contains(.shift) {
                             project.shiftToggleClip(clip.id)
@@ -1505,7 +1510,9 @@ struct ShapeClipView: View {
 
     @ViewBuilder
     private func shapeBody(w: CGFloat, h: CGFloat) -> some View {
-        if !clip.type.isClosed {
+        if clip.type == .pen {
+            penBody(w: w, h: h)
+        } else if !clip.type.isClosed {
             lineBody(w: w, h: h)
         } else if clip.type == .rectangle && clip.cornerRadius > 0 {
             let rr = RoundedRectangle(cornerRadius: min(clip.cornerRadius * scale, min(w, h) / 2))
@@ -1527,6 +1534,25 @@ struct ShapeClipView: View {
                     path.fill(clip.fillColor.opacity(clip.fillOpacity))
                 }
                 if clip.strokeEnabled || !clip.type.isClosed {
+                    path.stroke(clip.strokeColor.opacity(clip.strokeOpacity),
+                                style: StrokeStyle(lineWidth: max(clip.strokeWidth * scale, 1),
+                                                   lineCap: .round, lineJoin: .round,
+                                                   dash: clip.strokeDashed ? [clip.strokeWidth * 2.5 * scale, clip.strokeWidth * 1.6 * scale] : []))
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func penBody(w: CGFloat, h: CGFloat) -> some View {
+        if let pts = clip.penPoints, pts.count >= 2 {
+            let rect = CGRect(x: 0, y: 0, width: w, height: h)
+            let path = ShapeGeometry.penPath(points: pts, closed: clip.penClosed, in: rect)
+            ZStack {
+                if clip.fillEnabled && clip.effectiveIsClosed {
+                    path.fill(clip.fillColor.opacity(clip.fillOpacity))
+                }
+                if clip.strokeEnabled {
                     path.stroke(clip.strokeColor.opacity(clip.strokeOpacity),
                                 style: StrokeStyle(lineWidth: max(clip.strokeWidth * scale, 1),
                                                    lineCap: .round, lineJoin: .round,
@@ -1666,13 +1692,15 @@ private struct ShapeTransformOverlay: View {
     @State private var startClip: ShapeClip? = nil
     @State private var startRotation = 0.0
     @State private var startAngle = 0.0
+    @State private var penKeyMon: Any? = nil
 
     private let accent = Color.accent
 
     var body: some View {
         GeometryReader { geo in
             if let clip = project.selectedShapeClip,
-               clip.startTime <= clock.currentTime, clip.endTime > clock.currentTime {
+               clip.startTime <= clock.currentTime, clip.endTime > clock.currentTime,
+               !project.penDrawingMode, project.penEditingClipID != clip.id {
                 let scale = geo.size.width / max(project.previewRenderSize.width, 1)
                 let center = CGPoint(x: geo.size.width * clip.posX, y: geo.size.height * clip.posY)
                 let w = max(clip.width * clip.scaleX * scale, 8)
@@ -1688,7 +1716,7 @@ private struct ShapeTransformOverlay: View {
                         .allowsHitTesting(false)
 
                     if !isMulti {
-                    if clip.type.isClosed {
+                    if clip.effectiveIsClosed || clip.type == .pen {
                         // 四边单向缩放条（橙色，和图片一致）
                         ForEach(0..<4, id: \.self) { e in
                             let horiz = e < 2
@@ -1719,8 +1747,26 @@ private struct ShapeTransformOverlay: View {
                         .gesture(rotateGesture(clip: clip, center: center))
                     }
                 }
+                .onAppear { installPenEnterMonitor() }
+                .onDisappear { removePenEnterMonitor() }
             }
         }
+    }
+
+    private func installPenEnterMonitor() {
+        removePenEnterMonitor()
+        penKeyMon = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            guard event.keyCode == 36,  // Enter
+                  project.penEditingClipID == nil,
+                  !project.penDrawingMode,
+                  let clip = project.selectedShapeClip,
+                  clip.type == .pen else { return event }
+            project.penEditingClipID = clip.id
+            return nil
+        }
+    }
+    private func removePenEnterMonitor() {
+        if let m = penKeyMon { NSEvent.removeMonitor(m); penKeyMon = nil }
     }
 
     // MARK: 手柄视图
@@ -1867,6 +1913,352 @@ private struct ShapeTransformOverlay: View {
                 }
             }
             .onEnded { _ in dragMode = 0; didPushUndo = false; startClip = nil }
+    }
+}
+
+// MARK: - Pen Drawing Overlay（钢笔绘制模式）
+
+private struct PenDrawingOverlay: View {
+    @EnvironmentObject private var project: ProjectState
+    @State private var draggingHandle = false
+    @State private var dragStartPos: CGPoint? = nil
+    @State private var dragCurrentPos: CGPoint? = nil
+    @State private var hoverPos: CGPoint? = nil
+    @State private var keyMonitor: Any? = nil
+
+    var body: some View {
+        GeometryReader { geo in
+            if project.penDrawingMode, let clipID = project.selectedShapeClipID {
+                let vs = geo.size
+                ZStack {
+                    Color.black.opacity(0.01).contentShape(Rectangle())
+                        .gesture(penGesture(vs: vs, clipID: clipID))
+                        .onContinuousHover { phase in
+                            switch phase {
+                            case .active(let pt):
+                                hoverPos = pt
+                                Self.penCursor.set()
+                            case .ended:
+                                hoverPos = nil
+                                NSCursor.arrow.set()
+                            @unknown default: break
+                            }
+                        }
+                    drawingPath(vs: vs)
+                    anchorDots(vs: vs, clipID: clipID)
+                }
+                .onAppear { installKeyMonitor(clipID: clipID) }
+                .onDisappear { NSCursor.arrow.set(); removeKeyMonitor() }
+            }
+        }
+    }
+
+    private func penGesture(vs: CGSize, clipID: UUID) -> some Gesture {
+        DragGesture(minimumDistance: 0)
+            .onChanged { v in
+                let dist = hypot(v.translation.width, v.translation.height)
+                if dist > 3 {
+                    draggingHandle = true
+                    dragStartPos = v.startLocation
+                    dragCurrentPos = v.location
+                }
+            }
+            .onEnded { v in
+                let scaleX = max(project.previewRenderSize.width, 1) / vs.width
+                let scaleY = max(project.previewRenderSize.height, 1) / vs.height
+                let cx = Double(v.startLocation.x) * scaleX
+                let cy = Double(v.startLocation.y) * scaleY
+                let dist = hypot(v.translation.width, v.translation.height)
+
+                if !project.penRawPoints.isEmpty {
+                    let first = project.penRawPoints[0]
+                    let dx = cx - first.x, dy = cy - first.y
+                    if hypot(dx, dy) < 12 * max(scaleX, scaleY) {
+                        project.finalizePenDrawing(clipID: clipID, rawPoints: project.penRawPoints, closed: true)
+                        project.penRawPoints = []; draggingHandle = false; dragStartPos = nil; dragCurrentPos = nil
+                        return
+                    }
+                }
+
+                if dist > 3 {
+                    let hdx = Double(v.translation.width) * scaleX
+                    let hdy = Double(v.translation.height) * scaleY
+                    project.penRawPoints.append((x: cx, y: cy, cInDX: -hdx, cInDY: -hdy, cOutDX: hdx, cOutDY: hdy, smooth: true))
+                } else {
+                    project.penRawPoints.append((x: cx, y: cy, cInDX: 0, cInDY: 0, cOutDX: 0, cOutDY: 0, smooth: true))
+                }
+                project.objectWillChange.send()
+                draggingHandle = false; dragStartPos = nil; dragCurrentPos = nil
+            }
+    }
+
+    @ViewBuilder
+    private func drawingPath(vs: CGSize) -> some View {
+        let canvasW = max(Double(project.previewRenderSize.width), 1)
+        let canvasH = max(Double(project.previewRenderSize.height), 1)
+        let sx = vs.width / canvasW, sy = vs.height / canvasH
+        Canvas { ctx, size in
+            let col = Color.white
+            // 已提交的路径段
+            if !project.penRawPoints.isEmpty {
+                var path = Path()
+                for (i, pt) in project.penRawPoints.enumerated() {
+                    let p = CGPoint(x: pt.x * sx, y: pt.y * sy)
+                    if i == 0 { path.move(to: p) }
+                    else {
+                        let prev = project.penRawPoints[i - 1]
+                        let pp = CGPoint(x: prev.x * sx, y: prev.y * sy)
+                        let hasC = abs(prev.cOutDX) > 0.5 || abs(prev.cOutDY) > 0.5 || abs(pt.cInDX) > 0.5 || abs(pt.cInDY) > 0.5
+                        if hasC {
+                            path.addCurve(to: p,
+                                          control1: CGPoint(x: pp.x + prev.cOutDX * sx, y: pp.y + prev.cOutDY * sy),
+                                          control2: CGPoint(x: p.x + pt.cInDX * sx, y: p.y + pt.cInDY * sy))
+                        } else { path.addLine(to: p) }
+                    }
+                }
+
+                // 拖拽中：预览新点的曲线段
+                if draggingHandle, let sp = dragStartPos, let cp = dragCurrentPos, let last = project.penRawPoints.last {
+                    let lp = CGPoint(x: last.x * sx, y: last.y * sy)
+                    let mirror = CGPoint(x: 2 * sp.x - cp.x, y: 2 * sp.y - cp.y)
+                    let cp1 = CGPoint(x: lp.x + last.cOutDX * sx, y: lp.y + last.cOutDY * sy)
+                    let hasLastOut = abs(last.cOutDX) > 0.5 || abs(last.cOutDY) > 0.5
+                    if hasLastOut {
+                        path.addCurve(to: sp, control1: cp1, control2: mirror)
+                    } else {
+                        path.addCurve(to: sp, control1: lp, control2: mirror)
+                    }
+                } else if let hp = hoverPos {
+                    // 悬浮预览线
+                    let last = project.penRawPoints.last!
+                    let lp = CGPoint(x: last.x * sx, y: last.y * sy)
+                    let hasOut = abs(last.cOutDX) > 0.5 || abs(last.cOutDY) > 0.5
+                    if hasOut {
+                        path.addCurve(to: hp,
+                                      control1: CGPoint(x: lp.x + last.cOutDX * sx, y: lp.y + last.cOutDY * sy),
+                                      control2: hp)
+                    } else { path.addLine(to: hp) }
+                }
+                ctx.stroke(path, with: .color(col), lineWidth: 2)
+            }
+
+            // 已提交点的控制柄
+            for pt in project.penRawPoints {
+                let pp = CGPoint(x: pt.x * sx, y: pt.y * sy)
+                if abs(pt.cOutDX) > 0.5 || abs(pt.cOutDY) > 0.5 {
+                    let h1 = CGPoint(x: pp.x + pt.cOutDX * sx, y: pp.y + pt.cOutDY * sy)
+                    let h2 = CGPoint(x: pp.x + pt.cInDX * sx, y: pp.y + pt.cInDY * sy)
+                    var lp = Path(); lp.move(to: h2); lp.addLine(to: pp); lp.addLine(to: h1)
+                    ctx.stroke(lp, with: .color(Color.orange.opacity(0.6)), lineWidth: 1)
+                    ctx.fill(Path(ellipseIn: CGRect(x: h1.x - 3.5, y: h1.y - 3.5, width: 7, height: 7)), with: .color(.orange))
+                    ctx.fill(Path(ellipseIn: CGRect(x: h2.x - 3.5, y: h2.y - 3.5, width: 7, height: 7)), with: .color(.orange))
+                }
+            }
+
+            // 拖拽中：实时显示新点的控制柄
+            if draggingHandle, let sp = dragStartPos, let cp = dragCurrentPos {
+                let mirror = CGPoint(x: 2 * sp.x - cp.x, y: 2 * sp.y - cp.y)
+                var hl = Path(); hl.move(to: mirror); hl.addLine(to: sp); hl.addLine(to: cp)
+                ctx.stroke(hl, with: .color(Color.orange.opacity(0.7)), lineWidth: 1)
+                ctx.fill(Path(ellipseIn: CGRect(x: cp.x - 3.5, y: cp.y - 3.5, width: 7, height: 7)), with: .color(.orange))
+                ctx.fill(Path(ellipseIn: CGRect(x: mirror.x - 3.5, y: mirror.y - 3.5, width: 7, height: 7)), with: .color(.orange))
+                ctx.fill(Path(ellipseIn: CGRect(x: sp.x - 4.5, y: sp.y - 4.5, width: 9, height: 9)), with: .color(.white))
+                ctx.stroke(Path(ellipseIn: CGRect(x: sp.x - 4.5, y: sp.y - 4.5, width: 9, height: 9)),
+                           with: .color(Color.accentColor), lineWidth: 1.5)
+            }
+
+            // 闭合提示
+            if project.penRawPoints.count >= 2 {
+                let fp = CGPoint(x: project.penRawPoints[0].x * sx, y: project.penRawPoints[0].y * sy)
+                let checkPos = draggingHandle ? dragStartPos : hoverPos
+                if let cp = checkPos, hypot(cp.x - fp.x, cp.y - fp.y) < 12 {
+                    ctx.stroke(Path(ellipseIn: CGRect(x: fp.x - 8, y: fp.y - 8, width: 16, height: 16)),
+                               with: .color(.green), lineWidth: 2)
+                }
+            }
+        }
+        .allowsHitTesting(false)
+    }
+
+    @ViewBuilder
+    private func anchorDots(vs: CGSize, clipID: UUID) -> some View {
+        let sx = vs.width / max(Double(project.previewRenderSize.width), 1)
+        let sy = vs.height / max(Double(project.previewRenderSize.height), 1)
+        ForEach(Array(project.penRawPoints.enumerated()), id: \.offset) { i, pt in
+            Circle().fill(Color.white).frame(width: 8, height: 8)
+                .overlay(Circle().stroke(Color.accent, lineWidth: 1.5))
+                .position(x: pt.x * sx, y: pt.y * sy)
+                .allowsHitTesting(false)
+        }
+    }
+
+    private static let penSVGPath = "M517.888 193.664c29.44-11.776 62.72-6.208 86.656 13.952l5.376 4.928 201.6 201.6c22.4 22.4 30.4 55.168 21.248 85.12l-2.368 6.848-100.928 252.288c-11.52 28.8-37.696 49.024-68.48 52.928l-216.704 27.072c-5.568 0.64-11.456 1.472-17.536 2.368l-18.88 3.072-9.92 1.792-30.848 6.016-21.12 4.48-31.808 7.104-40.768 9.728-66.176 16.896-27.52 7.488a43.072 43.072 0 0 1-54.016-48.448l1.472-6.208 12.608-47.424 11.264-44.672 9.728-40.768 7.104-31.808 4.48-21.12 6.016-30.848 3.392-19.52 2.752-18.24 28.16-225.28c3.584-28.416 21.12-52.928 46.464-65.536l6.464-2.944 252.288-100.928z m31.68 79.168L297.28 373.76l-24.896 199.296-2.048 16.896c-3.328 27.2-9.344 60.096-16.384 93.568l-7.36 33.536 140.288-140.288a85.312 85.312 0 1 1 60.352 60.352l-140.288 140.288 16.704-3.712 33.472-7.04c22.144-4.48 43.52-8.32 62.848-11.136l230.272-28.8 100.864-252.288-201.536-201.6z m100.8-140.544a42.688 42.688 0 0 1 56.32-3.52l4.032 3.52 180.992 180.992a42.688 42.688 0 0 1-56.32 63.936l-4.032-3.584-180.992-180.992a42.688 42.688 0 0 1 0-60.352z"
+
+    private static let penCursor: NSCursor = {
+        let svg = """
+        <svg viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg" width="16" height="16">
+        <g transform="rotate(90 512 512)">
+        <path fill="rgba(0,0,0,0.5)" stroke="rgba(0,0,0,0.5)" stroke-width="60" stroke-linejoin="round" d="\(penSVGPath)"/>
+        <path fill="white" d="\(penSVGPath)"/>
+        </g>
+        </svg>
+        """
+        guard let data = svg.data(using: .utf8),
+              let img = NSImage(data: data) else { return .crosshair }
+        img.isTemplate = false
+        return NSCursor(image: img, hotSpot: NSPoint(x: 0, y: 0))
+    }()
+
+    private func installKeyMonitor(clipID: UUID) {
+        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            if event.keyCode == 53 || event.keyCode == 36 {
+                if project.penRawPoints.count >= 2 {
+                    project.finalizePenDrawing(clipID: clipID, rawPoints: project.penRawPoints, closed: false)
+                } else { project.cancelPenDrawing(clipID: clipID) }
+                project.penRawPoints = []
+                return nil
+            }
+            return event
+        }
+    }
+
+    private func removeKeyMonitor() {
+        if let m = keyMonitor { NSEvent.removeMonitor(m); keyMonitor = nil }
+    }
+}
+
+// MARK: - Pen Edit Overlay（钢笔路径编辑模式）
+
+private struct PenEditOverlay: View {
+    @EnvironmentObject private var project: ProjectState
+    @State private var didPushUndo = false
+
+    var body: some View {
+        GeometryReader { geo in
+            if let editID = project.penEditingClipID,
+               let clip = project.shapeTracks.flatMap({ $0.clips }).first(where: { $0.id == editID }),
+               let pts = clip.penPoints, pts.count >= 2 {
+                let vs = geo.size
+                let scale = vs.width / max(project.previewRenderSize.width, 1)
+                let cx = vs.width * clip.posX
+                let cy = vs.height * clip.posY
+                let fw = clip.width * clip.scaleX * scale
+                let fh = clip.height * clip.scaleY * scale
+
+                ZStack {
+                    Color.black.opacity(0.01).contentShape(Rectangle())
+                        .onTapGesture { project.penEditingClipID = nil }
+
+                    ForEach(Array(pts.enumerated()), id: \.element.id) { i, pt in
+                        let px = cx - fw / 2 + pt.x * fw
+                        let py = cy - fh / 2 + pt.y * fh
+                        let hOutX = px + pt.ctrlOutDX * fw
+                        let hOutY = py + pt.ctrlOutDY * fh
+                        let hInX = px + pt.ctrlInDX * fw
+                        let hInY = py + pt.ctrlInDY * fh
+                        let hasHandle = abs(pt.ctrlOutDX) > 1e-6 || abs(pt.ctrlOutDY) > 1e-6
+                                     || abs(pt.ctrlInDX) > 1e-6 || abs(pt.ctrlInDY) > 1e-6
+
+                        if hasHandle {
+                            Path { p in p.move(to: CGPoint(x: hInX, y: hInY)); p.addLine(to: CGPoint(x: px, y: py)); p.addLine(to: CGPoint(x: hOutX, y: hOutY)) }
+                                .stroke(Color.orange.opacity(0.5), lineWidth: 1).allowsHitTesting(false)
+
+                            handleCircle(color: .orange)
+                                .position(x: hOutX, y: hOutY)
+                                .gesture(handleDrag(clipID: editID, pointIndex: i, isOut: true, fw: fw, fh: fh, pt: pt))
+
+                            handleCircle(color: .orange)
+                                .position(x: hInX, y: hInY)
+                                .gesture(handleDrag(clipID: editID, pointIndex: i, isOut: false, fw: fw, fh: fh, pt: pt))
+                        }
+
+                        anchorSquare()
+                            .position(x: px, y: py)
+                            .gesture(anchorDrag(clipID: editID, pointIndex: i, fw: fw, fh: fh, pt: pt))
+                    }
+                }
+                .onAppear { installEscMonitor() }
+                .onDisappear { removeEscMonitor() }
+            }
+        }
+    }
+
+    private func anchorSquare() -> some View {
+        Rectangle().fill(Color.white).frame(width: 9, height: 9)
+            .overlay(Rectangle().stroke(Color.accent, lineWidth: 1.5))
+            .shadow(color: .black.opacity(0.3), radius: 2, y: 1)
+            .frame(width: 24, height: 24).contentShape(Rectangle())
+    }
+
+    private func handleCircle(color: Color) -> some View {
+        Circle().fill(Color.white).frame(width: 7, height: 7)
+            .overlay(Circle().stroke(color, lineWidth: 1.5))
+            .frame(width: 22, height: 22).contentShape(Circle())
+    }
+
+    private func pushUndoOnce() {
+        if !didPushUndo { project.pushUndo(); didPushUndo = true }
+    }
+
+    private func anchorDrag(clipID: UUID, pointIndex i: Int, fw: CGFloat, fh: CGFloat, pt: PenPoint) -> some Gesture {
+        DragGesture(minimumDistance: 1)
+            .onChanged { v in
+                pushUndoOnce()
+                let dx = v.translation.width / fw
+                let dy = v.translation.height / fh
+                project.updateShapeClip(id: clipID) { c in
+                    guard var pts = c.penPoints, i < pts.count else { return }
+                    pts[i].x = pt.x + dx; pts[i].y = pt.y + dy
+                    c.penPoints = pts
+                }
+            }
+            .onEnded { _ in didPushUndo = false }
+    }
+
+    private func handleDrag(clipID: UUID, pointIndex i: Int, isOut: Bool, fw: CGFloat, fh: CGFloat, pt: PenPoint) -> some Gesture {
+        DragGesture(minimumDistance: 1)
+            .onChanged { v in
+                pushUndoOnce()
+                let dx = v.translation.width / fw
+                let dy = v.translation.height / fh
+                project.updateShapeClip(id: clipID) { c in
+                    guard var pts = c.penPoints, i < pts.count else { return }
+                    if isOut {
+                        pts[i].ctrlOutDX = pt.ctrlOutDX + dx
+                        pts[i].ctrlOutDY = pt.ctrlOutDY + dy
+                        if pts[i].smooth { pts[i].ctrlInDX = -(pts[i].ctrlOutDX); pts[i].ctrlInDY = -(pts[i].ctrlOutDY) }
+                    } else {
+                        pts[i].ctrlInDX = pt.ctrlInDX + dx
+                        pts[i].ctrlInDY = pt.ctrlInDY + dy
+                        if pts[i].smooth { pts[i].ctrlOutDX = -(pts[i].ctrlInDX); pts[i].ctrlOutDY = -(pts[i].ctrlInDY) }
+                    }
+                    c.penPoints = pts
+                }
+            }
+            .onEnded { _ in didPushUndo = false }
+    }
+
+    @State private var escMonitor: Any? = nil
+
+    private func installEscMonitor() {
+        escMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            if event.keyCode == 53 || event.keyCode == 36 { // Escape or Enter → exit edit
+                project.penEditingClipID = nil; return nil
+            }
+            if event.keyCode == 51, let editID = project.penEditingClipID { // Delete key
+                project.pushUndo()
+                project.updateShapeClip(id: editID) { c in
+                    guard var pts = c.penPoints, pts.count > 2 else { return }
+                    // 删暂不实现（需要选中某个点的状态），后续可扩展
+                }
+                return nil
+            }
+            return event
+        }
+    }
+
+    private func removeEscMonitor() {
+        if let m = escMonitor { NSEvent.removeMonitor(m); escMonitor = nil }
     }
 }
 

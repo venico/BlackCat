@@ -47,8 +47,9 @@ struct TimelineView: View {
     @State private var activeSnapTime: Double? = nil  // 吸附指示线位置
 
     // Global event monitors
-    @State private var keyMonitor:    Any? = nil
-    @State private var scrollMonitor: Any? = nil
+    @State private var keyMonitor:     Any? = nil
+    @State private var scrollMonitor:  Any? = nil
+    @State private var lastMagnifyValue: CGFloat = 1.0
     @State private var scrollBarHovered = false
     @State private var scrollFraction: Double = 0
     @State private var scrollViewportFraction: Double = 1
@@ -221,6 +222,17 @@ struct TimelineView: View {
             return Color.clear
         })
         .clipped()
+        .simultaneousGesture(
+            MagnificationGesture()
+                .onChanged { value in
+                    let delta = value / lastMagnifyValue
+                    project.zoomTo(project.pixelsPerSecond * Double(delta))
+                    lastMagnifyValue = value
+                }
+                .onEnded { _ in
+                    lastMagnifyValue = 1.0
+                }
+        )
         .overlay(alignment: .topLeading) {
             // 固定顶条：刻度尺 + 播放头三角。位于竖向滚动内容之外 → 竖滑永远不动。
             GeometryReader { geo in
@@ -283,8 +295,8 @@ struct TimelineView: View {
                 return event
             }
 
-            // Esc → 取消选择
-            if event.keyCode == 53 {
+            // Esc → 取消选择（钢笔绘制/编辑时跳过，让 PenDrawingOverlay 处理）
+            if event.keyCode == 53, !project.penDrawingMode, project.penEditingClipID == nil {
                 project.selectedVideoClipID      = nil
                 project.selectedImageClipID      = nil
                 project.selectedAudioClipID      = nil
@@ -362,11 +374,12 @@ struct TimelineView: View {
             }
             return nil  // consume — prevents scroll view from also scrolling
         }
+
     }
 
     private func teardownMonitors() {
-        if let m = keyMonitor    { NSEvent.removeMonitor(m); keyMonitor    = nil }
-        if let m = scrollMonitor { NSEvent.removeMonitor(m); scrollMonitor = nil }
+        if let m = keyMonitor     { NSEvent.removeMonitor(m); keyMonitor     = nil }
+        if let m = scrollMonitor  { NSEvent.removeMonitor(m); scrollMonitor  = nil }
     }
 
     // MARK: Label column
@@ -2658,11 +2671,16 @@ private struct SubtitleClipView: View {
             }
         }
         .frame(width: w, height: clipH)
-        .opacity(isDragging ? 0 : isPlaceholder ? (breathing ? 0.7 : 0.3) :
+        .opacity(isDragging ? 0 : (isPlaceholder && breathing) ? 0.4 :
                  (project.clipboardIsCut && project.clipboardSourceIDs.contains(clip.id) ? 0.35 : 1.0))
-        .animation(isPlaceholder ? .easeInOut(duration: 0.8).repeatForever(autoreverses: true) : .default, value: breathing)
-        .onAppear { if isPlaceholder { breathing = true } }
-        .onChange(of: isPlaceholder) { ph in breathing = ph }
+        .onAppear { if isPlaceholder { withAnimation(.easeInOut(duration: 0.8).repeatForever(autoreverses: true)) { breathing = true } } }
+        .onChange(of: isPlaceholder) { ph in
+            if ph {
+                withAnimation(.easeInOut(duration: 0.8).repeatForever(autoreverses: true)) { breathing = true }
+            } else {
+                withAnimation(.default) { breathing = false }
+            }
+        }
         .offset(x: clip.startTime*pps + 1)
         .allowsHitTesting(false)
     }
@@ -2926,6 +2944,11 @@ struct TimelineToolbar: View {
 
                 // 翻译 & 样式工具
                 TranslateToolGroup()
+
+                Divider().frame(height:16).padding(.horizontal,4)
+
+                AnalyzeMenuBtn()
+                    .environmentObject(project)
             }.padding(.leading,8)
 
             Spacer()
@@ -3170,6 +3193,7 @@ private struct TranslateToolGroup: View {
                     guard !Task.isCancelled else { return }
                     done += 1
                     await MainActor.run {
+                        guard project.translationTask != nil else { return }
                         guard let ti = project.subtitleTracks.firstIndex(where: { $0.id == destTrackID }) else { return }
                         let phID = placeholders[i].id
                         if let ci = project.subtitleTracks[ti].clips.firstIndex(where: { $0.id == phID }) {
@@ -3235,6 +3259,7 @@ private struct TranslateToolGroup: View {
                     guard !Task.isCancelled else { return }
                     done += 1
                     await MainActor.run {
+                        guard project.translationTask != nil else { return }
                         guard let ti = project.subtitleTracks.firstIndex(where: { $0.id == destTrackID }) else { return }
                         let phID = placeholders[i].id
                         if let ci = project.subtitleTracks[ti].clips.firstIndex(where: { $0.id == phID }) {
@@ -3264,6 +3289,68 @@ private struct TranslateToolGroup: View {
         }
     }
 
+}
+
+private struct AnalyzeMenuBtn: View {
+    @EnvironmentObject private var project: ProjectState
+    @State private var hov = false
+
+    private var busy: Bool { project.isDetectingScenes || project.isLLMAnalyzing }
+    private var enabled: Bool { !busy && project.selectedVideoClipID != nil }
+
+    var body: some View {
+        Button {
+            showMenu()
+        } label: {
+            HStack(spacing: 2) {
+                Image(systemName: "rectangle.split.3x1")
+                    .font(.system(size: 12, weight: .light))
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 7, weight: .semibold))
+            }
+            .foregroundColor(enabled ? (hov ? Color.labelPrimary : Color.labelSecondary)
+                                     : Color.labelSecondary.opacity(0.35))
+            .frame(height: 28)
+            .padding(.horizontal, 4)
+            .background((enabled && hov) ? Color.white.opacity(0.08) : Color.clear)
+            .cornerRadius(5)
+        }
+        .buttonStyle(.plain)
+        .disabled(!enabled)
+        .onHover { hov = $0 }
+        .help(busy ? "正在分析…" : "视频分析")
+    }
+
+    private func showMenu() {
+        let menu = NSMenu()
+        let auto = NSMenuItem(title: "自动分析（场景检测）", action: #selector(AnalyzeMenuHandler.autoDetect(_:)), keyEquivalent: "")
+        auto.target = AnalyzeMenuHandler.shared
+        auto.isEnabled = SceneDetector.isInstalled
+        menu.addItem(auto)
+
+        let llm = NSMenuItem(title: "大模型分析（精彩片段）", action: #selector(AnalyzeMenuHandler.llmAnalyze(_:)), keyEquivalent: "")
+        llm.target = AnalyzeMenuHandler.shared
+        llm.isEnabled = !AppSettings.shared.llmAPIKey.isEmpty
+        menu.addItem(llm)
+
+        AnalyzeMenuHandler.shared.project = project
+        if let event = NSApp.currentEvent {
+            NSMenu.popUpContextMenu(menu, with: event, for: NSApp.keyWindow?.contentView ?? NSView())
+        }
+    }
+}
+
+private final class AnalyzeMenuHandler: NSObject {
+    static let shared = AnalyzeMenuHandler()
+    weak var project: ProjectState?
+
+    @objc func autoDetect(_ sender: NSMenuItem) {
+        project?.sceneDetectSelectedClip()
+    }
+
+    @objc func llmAnalyze(_ sender: NSMenuItem) {
+        project?.llmAnalyzeSelectedClip()
+    }
 }
 
 private struct TBtn: View {

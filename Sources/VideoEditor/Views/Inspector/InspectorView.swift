@@ -995,7 +995,7 @@ private struct ShapeInspector: View {
                 }
             }
 
-            if clip.type.isClosed {
+            if clip.effectiveIsClosed {
                 ISection(title: "填充") {
                     toggleRow("启用填充", $fillEnabled, dimKP: \.fillEnabled) { write { $0.fillEnabled = fillEnabled } }
                     if fillEnabled {
@@ -1022,7 +1022,7 @@ private struct ShapeInspector: View {
                         .dimNonUniform(dim(\.strokeWidth))
                     ISlider(label: "不透明度", value: Binding(get: { strokeOpacity * 100 }, set: { strokeOpacity = $0 / 100 }), range: 0...100, unit: "%")
                         .onChange(of: strokeOpacity) { _ in write { $0.strokeOpacity = strokeOpacity } }
-                    if !clip.type.isClosed {
+                    if !clip.type.isClosed && clip.type != .pen {
                         HStack(spacing: 12) {
                             Text("起点").font(.system(size: 11)).foregroundColor(Color.labelSecondary).frame(width: 68, alignment: .leading)
                             IPicker(selection: Binding(get: { capStartV.label }, set: { setCap($0, start: true) }), options: LineCapStyle.allCases.map { ($0.label, $0.label) })
@@ -1053,6 +1053,29 @@ private struct ShapeInspector: View {
                         .onChange(of: shadowDistance) { _ in applyShadowVector() }
                     ISlider(label: "角度", value: $shadowAngle, range: 0...360, unit: "°")
                         .onChange(of: shadowAngle) { _ in applyShadowVector() }
+                }
+            }
+
+            if clip.type == .pen {
+                ISection(title: "路径") {
+                    HStack {
+                        Text("闭合路径").font(.system(size: 11)).foregroundColor(Color.labelSecondary)
+                        Spacer()
+                        Toggle("", isOn: Binding(
+                            get: { clip.penClosed },
+                            set: { v in write { $0.penClosed = v; if v && !$0.fillEnabled { $0.fillEnabled = true; $0.fillOpacity = 0.3 } } }
+                        )).labelsHidden().toggleStyle(.switch).scaleEffect(0.8)
+                    }
+                    Button {
+                        project.penEditingClipID = clip.id
+                    } label: {
+                        HStack { Spacer(); Image(systemName: "pencil.and.outline"); Text("编辑路径"); Spacer() }
+                            .font(.system(size: 12, weight: .medium))
+                            .foregroundColor(.accent)
+                            .frame(height: 32)
+                            .background(Color.accent.opacity(0.12))
+                            .clipShape(RoundedRectangle(cornerRadius: 8))
+                    }.buttonStyle(.plain)
                 }
             }
 
