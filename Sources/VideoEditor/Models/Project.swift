@@ -19,18 +19,48 @@ final class ProjectState: ObservableObject {
     @Published var textTracks: [Track<TextClip>] = []
     @Published var textTemplates: [TextTemplate] = []  // 文字样式模板
     @Published var shapeTracks: [Track<ShapeClip>] = []  // 图形图层
+    @Published var compoundTracks: [Track<CompoundClip>] = []
+
+    // 复合片段编辑栈
+    struct CompositionLevel {
+        var name: String
+        var snapshot: ProjectSnapshot
+        var compoundTrackIndex: Int
+        var compoundClipIndex: Int
+        var activeStart: Double = 0
+        var activeDuration: Double = .infinity
+        var savedUndoStack: [ProjectSnapshot] = []
+        var savedRedoStack: [ProjectSnapshot] = []
+        var savedUndoCount: Int = 0
+        var savedRedoCount: Int = 0
+    }
+    @Published var compositionStack: [CompositionLevel] = []
+    var isInsideCompound: Bool { !compositionStack.isEmpty }
 
     enum OverlayTrackRef: Equatable, Codable {
         case image(UUID)
         case subtitle(UUID)
         case text(UUID)
         case shape(UUID)
+        case compound(UUID)
 
         var trackID: UUID {
             switch self {
-            case .image(let id), .subtitle(let id), .text(let id), .shape(let id): return id
+            case .image(let id), .subtitle(let id), .text(let id), .shape(let id), .compound(let id): return id
             }
         }
+    }
+
+    enum CompoundTrackKind { case overlay, video, audio }
+
+    func compoundTrackKind(_ track: Track<CompoundClip>) -> CompoundTrackKind {
+        for clip in track.clips {
+            if !clip.videoTracks.flatMap(\.clips).isEmpty { return .video }
+        }
+        for clip in track.clips {
+            if !clip.audioTracks.flatMap(\.clips).isEmpty { return .audio }
+        }
+        return .overlay
     }
     @Published var overlayTrackOrder: [OverlayTrackRef] = []
 
@@ -41,6 +71,7 @@ final class ProjectState: ObservableObject {
         for t in subtitleTracks { currentIDs.insert(t.id) }
         for t in textTracks { currentIDs.insert(t.id) }
         for t in shapeTracks { currentIDs.insert(t.id) }
+        for t in compoundTracks where compoundTrackKind(t) == .overlay { currentIDs.insert(t.id) }
         for ref in overlayTrackOrder {
             let rid: UUID
             switch ref {
@@ -48,6 +79,7 @@ final class ProjectState: ObservableObject {
             case .subtitle(let id): rid = id
             case .text(let id): rid = id
             case .shape(let id): rid = id
+            case .compound(let id): rid = id
             }
             if currentIDs.contains(rid) { newOrder.append(ref); currentIDs.remove(rid) }
         }
@@ -55,6 +87,7 @@ final class ProjectState: ObservableObject {
         for t in subtitleTracks where currentIDs.contains(t.id) { newOrder.append(.subtitle(t.id)); currentIDs.remove(t.id) }
         for t in textTracks where currentIDs.contains(t.id) { newOrder.append(.text(t.id)); currentIDs.remove(t.id) }
         for t in shapeTracks where currentIDs.contains(t.id) { newOrder.append(.shape(t.id)); currentIDs.remove(t.id) }
+        for t in compoundTracks where currentIDs.contains(t.id) { newOrder.append(.compound(t.id)); currentIDs.remove(t.id) }
         overlayTrackOrder = newOrder
     }
 
@@ -214,6 +247,7 @@ final class ProjectState: ObservableObject {
     @Published var selectedSubtitleClipID: UUID? = nil
     @Published var selectedTextClipID: UUID?     = nil
     @Published var selectedShapeClipID: UUID?    = nil
+    @Published var selectedCompoundClipID: UUID? = nil
     @Published var penDrawingMode: Bool = false
     @Published var penEditingClipID: UUID? = nil
     var penRawPoints: [(x: Double, y: Double, cInDX: Double, cInDY: Double, cOutDX: Double, cOutDY: Double, smooth: Bool)] = []

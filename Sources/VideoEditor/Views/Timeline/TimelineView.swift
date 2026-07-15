@@ -24,6 +24,7 @@ struct TimelineView: View {
     @State private var subtitleTrackHeights: [Int: CGFloat] = [:]
     @State private var textTrackHeights: [Int: CGFloat] = [:]
     @State private var shapeTrackHeights: [Int: CGFloat] = [:]
+    @State private var compoundTrackHeights: [Int: CGFloat] = [:]
     private let defaultTrackH: CGFloat = 52
     private let defaultSubTrackH: CGFloat = 28
     private func imgH(_ i: Int) -> CGFloat { imageTrackHeights[i] ?? defaultTrackH }
@@ -32,6 +33,7 @@ struct TimelineView: View {
     private func subH(_ i: Int) -> CGFloat { subtitleTrackHeights[i] ?? defaultSubTrackH }
     private func txtH(_ i: Int) -> CGFloat { textTrackHeights[i] ?? defaultSubTrackH }
     private func shpH(_ i: Int) -> CGFloat { shapeTrackHeights[i] ?? defaultSubTrackH }
+    private func cmpH(_ i: Int) -> CGFloat { compoundTrackHeights[i] ?? defaultTrackH }
     // 拖动起始值
     @State private var dragOriginTrackH: CGFloat = 0
     @State private var isLibraryDragOver = false
@@ -56,6 +58,8 @@ struct TimelineView: View {
     @State private var scrollOffsetX: CGFloat = 0
     @State private var thumbRefreshWork: DispatchWorkItem? = nil
     @State private var lastThumbPPS: Double = 0
+    @State private var lastCompoundClickID: UUID? = nil
+    @State private var lastCompoundClickTime: Date = .distantPast
 
     // 轨道标签拖拽排序
     private enum TrackDragType: Equatable { case video, audio, overlay }
@@ -72,6 +76,7 @@ struct TimelineView: View {
         case moveSubtitle(id: UUID, originStart: Double, originDur: Double, srcTrack: Int)
         case moveText(id: UUID, originStart: Double, originDur: Double, srcTrack: Int)
         case moveShape(id: UUID, originStart: Double, originDur: Double, srcTrack: Int)
+        case moveCompound(id: UUID, originStart: Double, originDur: Double, srcTrack: Int)
         case moveMulti(items: [DragItem])
         case trimVideoLeft(id: UUID, originStart: Double, originEnd: Double, originTrimStart: Double, assetDur: Double)
         case trimVideoRight(id: UUID, originStart: Double, originEnd: Double, originTrimStart: Double, assetDur: Double)
@@ -85,6 +90,8 @@ struct TimelineView: View {
         case trimTextRight(id: UUID, originStart: Double, originEnd: Double)
         case trimShapeLeft(id: UUID, originStart: Double, originEnd: Double)
         case trimShapeRight(id: UUID, originStart: Double, originEnd: Double)
+        case trimCompoundLeft(id: UUID, originStart: Double, originEnd: Double, originInternalStart: Double)
+        case trimCompoundRight(id: UUID, originStart: Double, originEnd: Double)
         case movingPlayhead
         case resizeTrack(TrackKind)
         case box
@@ -107,28 +114,29 @@ struct TimelineView: View {
         case subtitle(id: UUID, start: Double, dur: Double)
         case text(id: UUID, start: Double, dur: Double)
         case shape(id: UUID, start: Double, dur: Double)
+        case compound(id: UUID, start: Double, dur: Double, trackIndex: Int, clipIndex: Int)
 
         var id: UUID {
             switch self {
-            case .video(let id, _, _), .image(let id, _, _), .audio(let id, _, _), .subtitle(let id, _, _), .text(let id, _, _), .shape(let id, _, _):
+            case .video(let id, _, _), .image(let id, _, _), .audio(let id, _, _), .subtitle(let id, _, _), .text(let id, _, _), .shape(let id, _, _), .compound(let id, _, _, _, _):
                 return id
             }
         }
         var start: Double {
             switch self {
-            case .video(_, let s, _), .image(_, let s, _), .audio(_, let s, _), .subtitle(_, let s, _), .text(_, let s, _), .shape(_, let s, _):
+            case .video(_, let s, _), .image(_, let s, _), .audio(_, let s, _), .subtitle(_, let s, _), .text(_, let s, _), .shape(_, let s, _), .compound(_, let s, _, _, _):
                 return s
             }
         }
         var duration: Double {
             switch self {
-            case .video(_, _, let d), .image(_, _, let d), .audio(_, _, let d), .subtitle(_, _, let d), .text(_, _, let d), .shape(_, _, let d):
+            case .video(_, _, let d), .image(_, _, let d), .audio(_, _, let d), .subtitle(_, _, let d), .text(_, _, let d), .shape(_, _, let d), .compound(_, _, let d, _, _):
                 return d
             }
         }
     }
 
-    private enum TrackKind: Equatable { case image(Int), video(Int), audio(Int), subtitle(Int), text(Int), shape(Int) }
+    private enum TrackKind: Equatable { case image(Int), video(Int), audio(Int), subtitle(Int), text(Int), shape(Int), compound(Int) }
     private enum ClipTrimEdge { case left, right }
 
     // Custom trim cursors: trapezoid + triangle indicating direction
@@ -301,6 +309,7 @@ struct TimelineView: View {
                 project.selectedImageClipID      = nil
                 project.selectedAudioClipID      = nil
                 project.selectedSubtitleClipID   = nil
+                project.selectedCompoundClipID   = nil
                 project.selectedTransitionClipID = nil
                 project.selectedClipIDs.removeAll()
                 return nil
@@ -441,6 +450,11 @@ struct TimelineView: View {
                         .opacity(isTrackDragging(.video, i) ? 0.55 : 1.0)
                 }
             }
+            // 视频类复合片段轨道标签
+            ForEach(videoCompoundIndices, id:\.self) { ti in
+                compoundTrackLabel(ti)
+                    .frame(height: cmpH(ti))
+            }
             if project.showAudioTracks {
                 ForEach(project.audioTracks.indices, id:\.self) { i in
                     TrackLabel(icon:"music.note", title: project.audioTracks[i].label,
@@ -457,6 +471,11 @@ struct TimelineView: View {
                         .opacity(isTrackDragging(.audio, i) ? 0.55 : 1.0)
                 }
             }
+            // 音频类复合片段轨道标签
+            ForEach(audioCompoundIndices, id:\.self) { ti in
+                compoundTrackLabel(ti)
+                    .frame(height: cmpH(ti))
+            }
             } // end inner VStack
             .overlay(trackDropIndicatorLine())
             .background(Color(red:0.09,green:0.09,blue:0.10))
@@ -465,8 +484,19 @@ struct TimelineView: View {
         .frame(maxHeight: .infinity, alignment: .top)
     }
 
+    @ViewBuilder
+    private func compoundTrackLabel(_ ti: Int) -> some View {
+        TrackLabel(icon: "rectangle.on.rectangle", title: project.compoundTracks[ti].label.isEmpty ? "复合" : project.compoundTracks[ti].label,
+                   count: project.compoundTracks[ti].clips.count, hasMute: true,
+                   isMuted: project.compoundTracks[ti].isMuted, isVis: project.compoundTracks[ti].isVisible,
+                   onMute: { project.pushUndo(); project.compoundTracks[ti].isMuted.toggle(); project.rebuildTimelinePreview() },
+                   onVis:  { project.pushUndo(); project.compoundTracks[ti].isVisible.toggle(); project.rebuildTimelinePreview() },
+                   onDel:  { project.pushUndo(); project.compoundTracks.remove(at: ti); project.syncOverlayOrder(); project.rebuildTimelinePreview() },
+                   onDragChanged: { _ in }, onDragEnded: { _ in })
+    }
+
     private struct ResolvedOverlay {
-        enum Kind { case image, subtitle, text, shape }
+        enum Kind { case image, subtitle, text, shape, compound }
         let kind: Kind
         let index: Int
         let trackID: UUID
@@ -487,6 +517,10 @@ struct TimelineView: View {
             case .shape(let id):
                 guard let i = project.shapeTracks.firstIndex(where: { $0.id == id }) else { return nil }
                 return ResolvedOverlay(kind: .shape, index: i, trackID: id)
+            case .compound(let id):
+                guard let i = project.compoundTracks.firstIndex(where: { $0.id == id }),
+                      project.compoundTrackKind(project.compoundTracks[i]) == .overlay else { return nil }
+                return ResolvedOverlay(kind: .compound, index: i, trackID: id)
             }
         }
     }
@@ -498,6 +532,7 @@ struct TimelineView: View {
             case .subtitle: return project.showSubtitleTracks
             case .text: return project.showTextTracks
             case .shape: return project.showShapeTracks
+            case .compound: return true
             }
         }
     }
@@ -508,7 +543,15 @@ struct TimelineView: View {
         case .subtitle: return subH(entry.index)
         case .text: return txtH(entry.index)
         case .shape: return shpH(entry.index)
+        case .compound: return cmpH(entry.index)
         }
+    }
+
+    private var videoCompoundIndices: [Int] {
+        project.compoundTracks.indices.filter { project.compoundTrackKind(project.compoundTracks[$0]) == .video }
+    }
+    private var audioCompoundIndices: [Int] {
+        project.compoundTracks.indices.filter { project.compoundTrackKind(project.compoundTracks[$0]) == .audio }
     }
 
     private func trackLabelDropTarget(type: TrackDragType, source: Int, offset: CGFloat) -> Int {
@@ -617,6 +660,15 @@ struct TimelineView: View {
                        onDel:  { project.pushUndo(); project.shapeTracks.remove(at:i); project.syncOverlayOrder() },
                        onDragChanged: { handleDragChanged(type: .overlay, index: ovIdx, offsetY: $0) },
                        onDragEnded:   { handleDragEnded(type: .overlay, index: ovIdx, offsetY: $0) })
+        case .compound:
+            TrackLabel(icon:"rectangle.on.rectangle", title: project.compoundTracks[i].label.isEmpty ? "复合" : project.compoundTracks[i].label,
+                       count: project.compoundTracks[i].clips.count, hasMute: true,
+                       isMuted: project.compoundTracks[i].isMuted, isVis: project.compoundTracks[i].isVisible,
+                       onMute: { project.pushUndo(); project.compoundTracks[i].isMuted.toggle(); project.rebuildTimelinePreview() },
+                       onVis:  { project.pushUndo(); project.compoundTracks[i].isVisible.toggle(); project.rebuildTimelinePreview() },
+                       onDel:  { project.pushUndo(); project.compoundTracks.remove(at:i); project.syncOverlayOrder(); project.rebuildTimelinePreview() },
+                       onDragChanged: { handleDragChanged(type: .overlay, index: ovIdx, offsetY: $0) },
+                       onDragEnded:   { handleDragEnded(type: .overlay, index: ovIdx, offsetY: $0) })
         }
     }
 
@@ -640,6 +692,8 @@ struct TimelineView: View {
             if project.showVideoTracks {
                 baseY += project.videoTracks.indices.reduce(CGFloat(0)) { $0 + vidH($1) } + CGFloat(project.videoTracks.count)
             }
+            let vcIndices = videoCompoundIndices
+            if !vcIndices.isEmpty { baseY += vcIndices.reduce(CGFloat(0)) { $0 + cmpH($1) } + CGFloat(vcIndices.count) }
         }
         let insertBefore = dropIdx < trackLabelDragSrc
         let lineIdx = insertBefore ? dropIdx : dropIdx + 1
@@ -749,6 +803,7 @@ struct TimelineView: View {
                     let selID = project.selectedVideoClipID ?? project.selectedImageClipID
                               ?? project.selectedAudioClipID ?? project.selectedSubtitleClipID
                               ?? project.selectedTextClipID ?? project.selectedShapeClipID
+                              ?? project.selectedCompoundClipID
                               ?? project.selectedClipIDs.first
                     if let id = selID {
                         Button { project.selectLeftOf(id) } label: { Label("向左全选", systemImage: "arrow.left.to.line") }
@@ -768,6 +823,11 @@ struct TimelineView: View {
                     Button { project.pasteAtPlayhead() } label: { Label("粘贴", systemImage: "doc.on.clipboard") }
                         .disabled(project.clipboard.isEmpty)
                     if selID != nil {
+                        Divider()
+                        Button { project.createCompoundFromSelected() } label: { Label("创建复合片段", systemImage: "rectangle.on.rectangle") }
+                        if let cid = project.selectedCompoundClipID {
+                            Button { project.dissolveCompound(cid) } label: { Label("解除复合片段", systemImage: "rectangle.on.rectangle.slash") }
+                        }
                         Divider()
                         Button(role: .destructive) { project.deleteSelected() } label: { Label("删除", systemImage: "trash") }
                     }
@@ -857,7 +917,7 @@ struct TimelineView: View {
                 guard let op = dragOp else { return }
                 // Track ghost position for move ops (offset so clip stays under grab point)
                 switch op {
-                case .moveVideo, .moveImage, .moveAudio, .moveSubtitle, .moveText, .moveShape:
+                case .moveVideo, .moveImage, .moveAudio, .moveSubtitle, .moveText, .moveShape, .moveCompound:
                     dragGhostPos = CGPoint(x: v.location.x - dragGhostOffset.width,
                                            y: v.location.y - dragGhostOffset.height)
                 default: break
@@ -881,16 +941,37 @@ struct TimelineView: View {
                     let isShift = NSEvent.modifierFlags.contains(.shift)
                     let hitTransition = hitTestTransitionIcon(at: v.startLocation) != nil
                     if !hitTransition, let (hit, _) = findClipTarget(at: v.startLocation) {
-                        if isShift {
+                        if case .compound(let id, _, _, let ti, let ci) = hit {
+                            if lastCompoundClickID == id && Date().timeIntervalSince(lastCompoundClickTime) < 0.35 {
+                                project.enterCompound(trackIndex: ti, clipIndex: ci)
+                                lastCompoundClickID = nil
+                            } else {
+                                lastCompoundClickID = id
+                                lastCompoundClickTime = Date()
+                                // 单击选中
+                                project.selectedCompoundClipID = id
+                                project.selectedVideoClipID = nil
+                                project.selectedImageClipID = nil
+                                project.selectedAudioClipID = nil
+                                project.selectedSubtitleClipID = nil
+                                project.selectedTextClipID = nil
+                                project.selectedShapeClipID = nil
+                                project.selectedClipIDs.removeAll()
+                                project.selectedTransitionClipID = nil
+                            }
+                        } else if isShift {
                             switch hit {
                             case .video(let id, _, _), .image(let id, _, _),
                                  .audio(let id, _, _), .subtitle(let id, _, _), .text(let id, _, _), .shape(let id, _, _):
+                                project.shiftToggleClip(id)
+                            case .compound(let id, _, _, _, _):
                                 project.shiftToggleClip(id)
                             }
                         } else {
                             project.selectedClipIDs.removeAll()
                             project.selectedTransitionClipID = nil
                             project.selectedShapeClipID = nil
+                            project.selectedCompoundClipID = nil
                             switch hit {
                             case .video(let id, _, _):
                                 project.selectedVideoClipID = id
@@ -929,6 +1010,14 @@ struct TimelineView: View {
                                 project.selectedAudioClipID = nil
                                 project.selectedSubtitleClipID = nil
                                 project.selectedTextClipID = nil
+                            case .compound(let id, _, _, _, _):
+                                project.selectedCompoundClipID = id
+                                project.selectedVideoClipID = nil
+                                project.selectedImageClipID = nil
+                                project.selectedAudioClipID = nil
+                                project.selectedSubtitleClipID = nil
+                                project.selectedTextClipID = nil
+                                project.selectedShapeClipID = nil
                             }
                         }
                     } else if !hitTransition {
@@ -940,6 +1029,7 @@ struct TimelineView: View {
                         project.selectedSubtitleClipID   = nil
                         project.selectedTextClipID       = nil
                         project.selectedShapeClipID      = nil
+                        project.selectedCompoundClipID   = nil
                         project.selectedTransitionClipID = nil
                         let t = max(0, Double(v.startLocation.x) / project.pixelsPerSecond)
                         project.requestSeek(to: t)
@@ -978,6 +1068,10 @@ struct TimelineView: View {
                     case .moveShape(let id, _, _, let srcTrack):
                         if let dst = destTrack.shapeIndex, dst != srcTrack {
                             project.moveShapeClipToTrack(id: id, from: srcTrack, to: dst)
+                        }
+                    case .moveCompound(let id, _, _, let srcTrack):
+                        if let dst = destTrack.compoundIndex, dst != srcTrack {
+                            project.moveCompoundClipToTrack(id: id, from: srcTrack, to: dst)
                         }
                     case .moveMulti(let items):
                         for it in items {
@@ -1026,6 +1120,8 @@ struct TimelineView: View {
                         project.resolveTextOverlap(id: id)
                     case .moveShape(let id, _, _, _), .trimShapeLeft(let id, _, _), .trimShapeRight(let id, _, _):
                         project.resolveShapeOverlap(id: id)
+                    case .moveCompound(let id, _, _, _), .trimCompoundLeft(let id, _, _, _), .trimCompoundRight(let id, _, _):
+                        project.resolveCompoundOverlap(id: id)
                     case .moveMulti(let items):
                         for it in items {
                             switch it.kind {
@@ -1052,10 +1148,12 @@ struct TimelineView: View {
                 case .trimImageLeft, .trimImageRight,
                      .trimAudioLeft, .trimAudioRight,
                      .trimSubtitleLeft, .trimSubtitleRight,
-                     .trimTextLeft, .trimTextRight:
+                     .trimTextLeft, .trimTextRight,
+                     .trimShapeLeft, .trimShapeRight,
+                     .trimCompoundLeft, .trimCompoundRight:
                     NSCursor.arrow.set()
                     project.rebuildTimelinePreview()
-                case .moveVideo, .moveImage, .moveAudio, .moveSubtitle, .moveText, .moveMulti:
+                case .moveVideo, .moveImage, .moveAudio, .moveSubtitle, .moveText, .moveShape, .moveCompound, .moveMulti:
                     project.rebuildTimelinePreview()
                 case .resizeTrack:
                     NSCursor.arrow.set()
@@ -1262,6 +1360,22 @@ struct TimelineView: View {
                 project.selectedAudioClipID = nil; project.selectedSubtitleClipID = nil; project.selectedTextClipID = nil
                 dragOp = .trimShapeRight(id: id, originStart: s, originEnd: s + d)
                 Self.trimRightCursor.set()
+            case (.compound(let id, let s, let d, let ti, _), nil):
+                project.selectedCompoundClipID = id
+                project.selectedVideoClipID = nil; project.selectedImageClipID = nil
+                project.selectedAudioClipID = nil; project.selectedSubtitleClipID = nil
+                project.selectedTextClipID = nil; project.selectedShapeClipID = nil
+                draggingClipID = id
+                dragOp = .moveCompound(id: id, originStart: s, originDur: d, srcTrack: ti)
+            case (.compound(let id, let s, let d, let ti, _), .left):
+                project.selectedCompoundClipID = id
+                let iStart = project.compoundTracks[ti].clips.first(where: { $0.id == id })?.internalStart ?? 0
+                dragOp = .trimCompoundLeft(id: id, originStart: s, originEnd: s + d, originInternalStart: iStart)
+                Self.trimLeftCursor.set()
+            case (.compound(let id, let s, let d, _, _), .right):
+                project.selectedCompoundClipID = id
+                dragOp = .trimCompoundRight(id: id, originStart: s, originEnd: s + d)
+                Self.trimRightCursor.set()
             }
         } else {
             dragOp = .box
@@ -1418,6 +1532,11 @@ struct TimelineView: View {
             let (ns, sp) = snapStart(raw, duration: d, excluding: [id])
             activeSnapTime = sp
             project.updateShapeTime(id: id, start: ns, end: ns + d)
+        case .moveCompound(let id, let s, let d, _):
+            let raw = max(0, s + dt)
+            let (ns, sp) = snapStart(raw, duration: d, excluding: [id])
+            activeSnapTime = sp
+            project.updateCompoundClip(id: id) { $0.startTime = ns; $0.endTime = ns + d }
         case .moveMulti(let items):
             let minOrig = items.map(\.originStart).min() ?? 0
             let clampedDt = max(dt, -minOrig)
@@ -1527,6 +1646,18 @@ struct TimelineView: View {
             ne = snapped; activeSnapTime = sp
             project.updateShapeTime(id: id, end: ne)
             if ne > clock.duration { clock.duration = ne }
+        case .trimCompoundLeft(let id, let originStart, let originEnd, let originInternalStart):
+            var ns = max(0, min(originStart + dt, originEnd - 0.1))
+            let (snapped, sp) = snapEdge(ns, excluding: [id])
+            ns = snapped; activeSnapTime = sp
+            let newInternal = max(0, originInternalStart + (ns - originStart))
+            project.updateCompoundClip(id: id) { $0.startTime = ns; $0.internalStart = newInternal }
+        case .trimCompoundRight(let id, let originStart, let originEnd):
+            var ne = max(originStart + 0.1, originEnd + dt)
+            let (snapped, sp) = snapEdge(ne, excluding: [id])
+            ne = snapped; activeSnapTime = sp
+            project.updateCompoundClip(id: id) { $0.endTime = ne }
+            if ne > clock.duration { clock.duration = ne }
         case .movingPlayhead:
             activeSnapTime = nil
             let t = max(0, Double(current.x) / pps)
@@ -1541,6 +1672,7 @@ struct TimelineView: View {
                 case .subtitle(let i): dragOriginTrackH = subH(i)
                 case .text(let i):     dragOriginTrackH = txtH(i)
                 case .shape(let i):    dragOriginTrackH = shpH(i)
+                case .compound(let i): dragOriginTrackH = cmpH(i)
                 }
             }
             let newH = (dragOriginTrackH + totalTranslation.height).clamped(to: 28...120)
@@ -1551,6 +1683,7 @@ struct TimelineView: View {
             case .subtitle(let i): subtitleTrackHeights[i] = newH
             case .text(let i):     textTrackHeights[i] = newH
             case .shape(let i):    shapeTrackHeights[i] = newH
+            case .compound(let i): compoundTrackHeights[i] = newH
             }
         case .box:
             activeSnapTime = nil
@@ -1664,6 +1797,15 @@ struct TimelineView: View {
                     if let m = bestMatch(project.shapeTracks[entry.index].clips, x: pt.x,
                         { c, _, _ in .shape(id: c.id, start: c.startTime, dur: c.duration) },
                         { $0.startTime }, { $0.endTime }) { return m }
+                case .compound:
+                    let ti = entry.index
+                    for (ci, c) in project.compoundTracks[ti].clips.enumerated() {
+                        let xMin = CGFloat(c.startTime * pps) + 1
+                        let xMax = CGFloat(c.endTime * pps) + 1
+                        if pt.x >= xMin - threshold && pt.x <= xMax + threshold {
+                            return (.compound(id: c.id, start: c.startTime, dur: c.duration, trackIndex: ti, clipIndex: ci), nil)
+                        }
+                    }
                 }
                 return nil
             }
@@ -1682,6 +1824,21 @@ struct TimelineView: View {
                 rowTop += h
             }
         }
+        for ti in videoCompoundIndices {
+            if !first { rowTop += 1 }; first = false
+            let h = cmpH(ti)
+            if pt.y >= rowTop && pt.y < rowTop + h {
+                for (ci, c) in project.compoundTracks[ti].clips.enumerated() {
+                    let xMin = CGFloat(c.startTime * pps) + 1
+                    let xMax = CGFloat(c.endTime * pps) + 1
+                    if pt.x >= xMin - threshold && pt.x <= xMax + threshold {
+                        return (.compound(id: c.id, start: c.startTime, dur: c.duration, trackIndex: ti, clipIndex: ci), nil)
+                    }
+                }
+                return nil
+            }
+            rowTop += h
+        }
         if project.showAudioTracks {
             for ti in project.audioTracks.indices {
                 if !first { rowTop += 1 }; first = false
@@ -1694,6 +1851,21 @@ struct TimelineView: View {
                 }
                 rowTop += h
             }
+        }
+        for ti in audioCompoundIndices {
+            if !first { rowTop += 1 }; first = false
+            let h = cmpH(ti)
+            if pt.y >= rowTop && pt.y < rowTop + h {
+                for (ci, c) in project.compoundTracks[ti].clips.enumerated() {
+                    let xMin = CGFloat(c.startTime * pps) + 1
+                    let xMax = CGFloat(c.endTime * pps) + 1
+                    if pt.x >= xMin - threshold && pt.x <= xMax + threshold {
+                        return (.compound(id: c.id, start: c.startTime, dur: c.duration, trackIndex: ti, clipIndex: ci), nil)
+                    }
+                }
+                return nil
+            }
+            rowTop += h
         }
         return nil
     }
@@ -1729,6 +1901,11 @@ struct TimelineView: View {
                     let xEnd = max(c.startTime*pps, c.endTime*pps)
                     if rectIntersects(rect, xRange: (c.startTime*pps)...xEnd, yRange: yRange) { ids.insert(c.id) }
                 }
+            case .compound:
+                for c in project.compoundTracks[entry.index].clips {
+                    let xEnd = max(c.startTime*pps, c.endTime*pps)
+                    if rectIntersects(rect, xRange: (c.startTime*pps)...xEnd, yRange: yRange) { ids.insert(c.id) }
+                }
             }
             rowTop += h
         }
@@ -1745,6 +1922,16 @@ struct TimelineView: View {
                 rowTop += h
             }
         }
+        for ti in videoCompoundIndices {
+            if !first { rowTop += 1 }; first = false
+            let h = cmpH(ti)
+            let yRange = rowTop ... (rowTop + h)
+            for c in project.compoundTracks[ti].clips {
+                let xEnd = max(c.startTime*pps, c.endTime*pps)
+                if rectIntersects(rect, xRange: (c.startTime*pps)...xEnd, yRange: yRange) { ids.insert(c.id) }
+            }
+            rowTop += h
+        }
         if project.showAudioTracks {
             for ti in project.audioTracks.indices {
                 if !first { rowTop += 1 }; first = false
@@ -1757,6 +1944,16 @@ struct TimelineView: View {
                 }
                 rowTop += h
             }
+        }
+        for ti in audioCompoundIndices {
+            if !first { rowTop += 1 }; first = false
+            let h = cmpH(ti)
+            let yRange = rowTop ... (rowTop + h)
+            for c in project.compoundTracks[ti].clips {
+                let xEnd = max(c.startTime*pps, c.endTime*pps)
+                if rectIntersects(rect, xRange: (c.startTime*pps)...xEnd, yRange: yRange) { ids.insert(c.id) }
+            }
+            rowTop += h
         }
 
         project.selectedClipIDs = ids
@@ -1785,6 +1982,7 @@ struct TimelineView: View {
             case .subtitle: if abs(y - top) <= threshold { return .subtitle(entry.index) }
             case .text: if abs(y - top) <= threshold { return .text(entry.index) }
             case .shape: if abs(y - top) <= threshold { return .shape(entry.index) }
+            case .compound: if abs(y - top) <= threshold { return .compound(entry.index) }
             }
         }
         if project.showVideoTracks {
@@ -1794,12 +1992,22 @@ struct TimelineView: View {
                 if abs(y - top) <= threshold { return .video(i) }
             }
         }
+        for ti in videoCompoundIndices {
+            if !first { top += 1 }; first = false
+            top += cmpH(ti)
+            if abs(y - top) <= threshold { return .compound(ti) }
+        }
         if project.showAudioTracks {
             for i in project.audioTracks.indices {
                 if !first { top += 1 }; first = false
                 top += audH(i)
                 if abs(y - top) <= threshold { return .audio(i) }
             }
+        }
+        for ti in audioCompoundIndices {
+            if !first { top += 1 }; first = false
+            top += cmpH(ti)
+            if abs(y - top) <= threshold { return .compound(ti) }
         }
         return nil
     }
@@ -1808,8 +2016,12 @@ struct TimelineView: View {
         var h = rulerH
         var trackCount = 0
         for entry in visibleOverlays { h += overlayH(entry); trackCount += 1 }
-        if project.showVideoTracks    { for i in project.videoTracks.indices    { h += vidH(i) }; trackCount += project.videoTracks.count }
-        if project.showAudioTracks    { for i in project.audioTracks.indices    { h += audH(i) }; trackCount += project.audioTracks.count }
+        if project.showVideoTracks { for i in project.videoTracks.indices { h += vidH(i) }; trackCount += project.videoTracks.count }
+        let vcIdx = videoCompoundIndices
+        if !vcIdx.isEmpty { for ti in vcIdx { h += cmpH(ti) }; trackCount += vcIdx.count }
+        if project.showAudioTracks { for i in project.audioTracks.indices { h += audH(i) }; trackCount += project.audioTracks.count }
+        let acIdx = audioCompoundIndices
+        if !acIdx.isEmpty { for ti in acIdx { h += cmpH(ti) }; trackCount += acIdx.count }
         if trackCount > 1 { h += CGFloat(trackCount - 1) }
         return h
     }
@@ -1855,6 +2067,18 @@ struct TimelineView: View {
                 .opacity(isTrackDragging(.video, i) ? 0.55 : 1.0)
             }
         }
+        // 视频类复合片段轨道
+        ForEach(videoCompoundIndices, id:\.self) { ti in
+            trackRow(height: cmpH(ti), hidden: !project.compoundTracks[ti].isVisible,
+                     muted: project.compoundTracks[ti].isMuted, tint: Color(hex: "#FF9F43")) {
+                ForEach(project.compoundTracks[ti].clips.filter { isClipVisible(startTime: $0.startTime, endTime: $0.endTime) }) { clip in
+                    CompoundClipView(clip: clip, pps: project.pixelsPerSecond, h: cmpH(ti),
+                                     scrollOffsetX: scrollOffsetX,
+                                     sel: clip.id == project.selectedCompoundClipID,
+                                     isDragging: draggingClipID == clip.id)
+                }
+            }
+        }
         if project.showAudioTracks {
             ForEach(project.audioTracks.indices, id:\.self) { i in
                 trackRow(height: audH(i), hidden: !project.audioTracks[i].isVisible, muted: project.audioTracks[i].isMuted, tint: Color(hex: "#5DB85D")) {
@@ -1870,8 +2094,79 @@ struct TimelineView: View {
                 .opacity(isTrackDragging(.audio, i) ? 0.55 : 1.0)
             }
         }
+        // 音频类复合片段轨道
+        ForEach(audioCompoundIndices, id:\.self) { ti in
+            trackRow(height: cmpH(ti), hidden: !project.compoundTracks[ti].isVisible,
+                     muted: project.compoundTracks[ti].isMuted, tint: Color(hex: "#FF9F43")) {
+                ForEach(project.compoundTracks[ti].clips.filter { isClipVisible(startTime: $0.startTime, endTime: $0.endTime) }) { clip in
+                    CompoundClipView(clip: clip, pps: project.pixelsPerSecond, h: cmpH(ti),
+                                     scrollOffsetX: scrollOffsetX,
+                                     sel: clip.id == project.selectedCompoundClipID,
+                                     isDragging: draggingClipID == clip.id)
+                }
+            }
+        }
         }
         .overlay(trackDropIndicatorLine())
+        .overlay(compoundGrayOverlay())
+    }
+
+    @ViewBuilder
+    private func compoundGrayOverlay() -> some View {
+        if let level = project.compositionStack.last {
+            let pps = project.pixelsPerSecond
+            let activeStart = level.activeStart
+            let activeEnd = activeStart + level.activeDuration
+            let allEnd = compoundSubContentEnd()
+            GeometryReader { geo in
+                // 左侧灰色区域（0 ~ activeStart）
+                if activeStart > 0 {
+                    Rectangle()
+                        .fill(Color.black.opacity(0.5))
+                        .frame(width: CGFloat(activeStart * pps))
+                        .frame(maxHeight: .infinity)
+                        .position(x: CGFloat(activeStart * pps) / 2, y: geo.size.height / 2)
+                        .allowsHitTesting(false)
+                }
+                // 右侧灰色区域（activeEnd ~ allEnd）
+                if activeEnd < allEnd {
+                    let rightX = CGFloat(activeEnd * pps)
+                    let rightW = max(0, CGFloat(allEnd * pps) - rightX)
+                    Rectangle()
+                        .fill(Color.black.opacity(0.5))
+                        .frame(width: rightW)
+                        .frame(maxHeight: .infinity)
+                        .position(x: rightX + rightW / 2, y: geo.size.height / 2)
+                        .allowsHitTesting(false)
+                }
+                // 左边界线
+                if activeStart > 0 {
+                    Rectangle().fill(Color.yellow.opacity(0.6))
+                        .frame(width: 1).frame(maxHeight: .infinity)
+                        .position(x: CGFloat(activeStart * pps), y: geo.size.height / 2)
+                        .allowsHitTesting(false)
+                }
+                // 右边界线
+                if activeEnd < allEnd {
+                    Rectangle().fill(Color.yellow.opacity(0.6))
+                        .frame(width: 1).frame(maxHeight: .infinity)
+                        .position(x: CGFloat(activeEnd * pps), y: geo.size.height / 2)
+                        .allowsHitTesting(false)
+                }
+            }
+        }
+    }
+
+    private func compoundSubContentEnd() -> Double {
+        var maxEnd = 0.0
+        for t in project.videoTracks { for c in t.clips { maxEnd = max(maxEnd, c.endTime) } }
+        for t in project.audioTracks { for c in t.clips { maxEnd = max(maxEnd, c.endTime) } }
+        for t in project.imageTracks { for c in t.clips { maxEnd = max(maxEnd, c.endTime) } }
+        for t in project.subtitleTracks { for c in t.clips { maxEnd = max(maxEnd, c.endTime) } }
+        for t in project.textTracks { for c in t.clips { maxEnd = max(maxEnd, c.endTime) } }
+        for t in project.shapeTracks { for c in t.clips { maxEnd = max(maxEnd, c.endTime) } }
+        for t in project.compoundTracks { for c in t.clips { maxEnd = max(maxEnd, c.endTime) } }
+        return maxEnd
     }
 
     @ViewBuilder
@@ -1914,6 +2209,16 @@ struct TimelineView: View {
                                           scrollOffsetX: scrollOffsetX)
                 }
             }
+        case .compound:
+            trackRow(height: cmpH(i), hidden: !project.compoundTracks[i].isVisible,
+                     muted: project.compoundTracks[i].isMuted, tint: Color(hex: "#FF9F43")) {
+                ForEach(project.compoundTracks[i].clips.filter { isClipVisible(startTime: $0.startTime, endTime: $0.endTime) }) { clip in
+                    CompoundClipView(clip: clip, pps: project.pixelsPerSecond, h: cmpH(i),
+                                     scrollOffsetX: scrollOffsetX,
+                                     sel: clip.id == project.selectedCompoundClipID,
+                                     isDragging: draggingClipID == clip.id)
+                }
+            }
         }
     }
 
@@ -1951,6 +2256,10 @@ struct TimelineView: View {
             guard let clip = project.shapeTracks.flatMap(\.clips).first(where: { $0.id == id }) else { return nil }
             let ti = project.shapeTracks.firstIndex { $0.clips.contains { $0.id == id } } ?? 0
             return GhostInfo(name: clip.type.label, duration: clip.duration, color: Color(hex: "#5B8FF9"), height: shpH(ti) - 4, isSubtitle: true)
+        case .moveCompound(let id, _, _, _):
+            guard let clip = project.compoundTracks.flatMap(\.clips).first(where: { $0.id == id }) else { return nil }
+            let ti = project.compoundTracks.firstIndex { $0.clips.contains { $0.id == id } } ?? 0
+            return GhostInfo(name: clip.name, duration: clip.duration, color: Color(hex: "#FF9F43"), height: cmpH(ti) - 4, isSubtitle: false)
         default: return nil
         }
     }
@@ -1967,6 +2276,7 @@ struct TimelineView: View {
         var subtitleIndex: Int?
         var textIndex: Int?
         var shapeIndex: Int?
+        var compoundIndex: Int?
     }
 
     private func trackRowForClip(_ hit: ClipHit) -> Int {
@@ -1995,7 +2305,20 @@ struct TimelineView: View {
             return oCount + ti
         case .audio(let id, _, _):
             let ti = project.audioTracks.firstIndex { $0.clips.contains { $0.id == id } } ?? 0
-            return oCount + vCount + ti
+            return oCount + vCount + videoCompoundIndices.count + ti
+        case .compound(_, _, _, let ti, _):
+            let kind = project.compoundTrackKind(project.compoundTracks[ti])
+            switch kind {
+            case .overlay:
+                let trackID = project.compoundTracks[ti].id
+                return overlays.firstIndex { $0.trackID == trackID } ?? 0
+            case .video:
+                let vcIdx = videoCompoundIndices.firstIndex(of: ti) ?? 0
+                return oCount + vCount + vcIdx
+            case .audio:
+                let acIdx = audioCompoundIndices.firstIndex(of: ti) ?? 0
+                return oCount + vCount + videoCompoundIndices.count + project.audioTracks.count + acIdx
+            }
         }
     }
 
@@ -2003,13 +2326,23 @@ struct TimelineView: View {
         let overlays = resolvedOverlays
         let oCount = overlays.count
         let vCount = project.showVideoTracks ? project.videoTracks.count : 0
+        let vcIdx = videoCompoundIndices
+        let vcCount = vcIdx.count
+        let aCount = project.showAudioTracks ? project.audioTracks.count : 0
+        let acIdx = audioCompoundIndices
         var top = rulerH
 
         func heightForRow(_ r: Int) -> CGFloat {
             if r < oCount { return overlayH(overlays[r]) }
             let afterOverlay = r - oCount
             if afterOverlay < vCount { return vidH(afterOverlay) }
-            return audH(afterOverlay - vCount)
+            let afterVideo = afterOverlay - vCount
+            if afterVideo < vcCount { return cmpH(vcIdx[afterVideo]) }
+            let afterVC = afterVideo - vcCount
+            if afterVC < aCount { return audH(afterVC) }
+            let afterAudio = afterVC - aCount
+            if afterAudio < acIdx.count { return cmpH(acIdx[afterAudio]) }
+            return defaultTrackH
         }
 
         for r in 0..<row {
@@ -2032,6 +2365,7 @@ struct TimelineView: View {
                 case .subtitle: return TrackTarget(subtitleIndex: entry.index)
                 case .text: return TrackTarget(textIndex: entry.index)
                 case .shape: return TrackTarget(shapeIndex: entry.index)
+                case .compound: return TrackTarget(compoundIndex: entry.index)
                 }
             }
             top += h
@@ -2044,6 +2378,12 @@ struct TimelineView: View {
                 top += h
             }
         }
+        for ti in videoCompoundIndices {
+            if !first { top += 1 }; first = false
+            let h = cmpH(ti)
+            if y < top + h { return TrackTarget(compoundIndex: ti) }
+            top += h
+        }
         if project.showAudioTracks {
             for i in project.audioTracks.indices {
                 if !first { top += 1 }; first = false
@@ -2051,6 +2391,12 @@ struct TimelineView: View {
                 if y < top + h { return TrackTarget(audioIndex: i) }
                 top += h
             }
+        }
+        for ti in audioCompoundIndices {
+            if !first { top += 1 }; first = false
+            let h = cmpH(ti)
+            if y < top + h { return TrackTarget(compoundIndex: ti) }
+            top += h
         }
         return TrackTarget()
     }
@@ -2382,8 +2728,7 @@ private struct VideoClipView: View {
             // Name label — sticky to viewport left edge
             Text(clip.name).font(.system(size:9, weight:.medium))
                 .foregroundColor(.white)
-                .shadow(color: .black.opacity(0.8), radius: 2, x: 0, y: 1)
-                .shadow(color: .black.opacity(0.5), radius: 4, x: 0, y: 1)
+                .shadow(color: .black.opacity(0.4), radius: 2, x: 0, y: 1)
                 .lineLimit(1)
                 .padding(.leading, stickyTitleX)
                 .padding(.top, 4)
@@ -2492,8 +2837,7 @@ private struct ImageClipView: View {
                 .stroke(sel ? Color.white : Color.clear, lineWidth: sel ? 2 : 0)
             Text(clip.name).font(.system(size:9, weight:.medium))
                 .foregroundColor(.white)
-                .shadow(color: .black.opacity(0.8), radius: 2, x: 0, y: 1)
-                .shadow(color: .black.opacity(0.5), radius: 4, x: 0, y: 1)
+                .shadow(color: .black.opacity(0.4), radius: 2, x: 0, y: 1)
                 .lineLimit(1)
                 .padding(.leading, stickyTitleX)
                 .padding(.top, 4)
@@ -2661,7 +3005,7 @@ private struct SubtitleClipView: View {
             RoundedRectangle(cornerRadius:6)
                 .fill(Color(hex:"#7B6FC4").opacity(isPlaceholder ? 0.35 : 0.85))
                 .overlay(RoundedRectangle(cornerRadius:6)
-                    .stroke(sel ? Color.white : Color(hex:"#9B8FD4").opacity(0.4), lineWidth: sel ? 2 : 1))
+                    .stroke(sel ? Color.white : Color(hex:"#9B8FD4").opacity(0.4), lineWidth: 1))
             if !isPlaceholder && w > 16 {
                 Text(clip.text.components(separatedBy:"\n").first ?? clip.text)
                     .font(.system(size:8, weight:.medium))
@@ -2710,7 +3054,7 @@ private struct TextClipView: View {
             RoundedRectangle(cornerRadius:6)
                 .fill(Color(hex:"#D4668E").opacity(0.85))
                 .overlay(RoundedRectangle(cornerRadius:6)
-                    .stroke(sel ? Color.white : Color(hex:"#E088A8").opacity(0.4), lineWidth: sel ? 2 : 1))
+                    .stroke(sel ? Color.white : Color(hex:"#E088A8").opacity(0.4), lineWidth: 1))
             if w > 16 {
                 HStack(spacing: 3) {
                     Text("T")
@@ -2756,7 +3100,7 @@ private struct ShapeTimelineClipView: View {
             RoundedRectangle(cornerRadius:6)
                 .fill(Color(hex:"#5B8FF9").opacity(0.85))
                 .overlay(RoundedRectangle(cornerRadius:6)
-                    .stroke(sel ? Color.white : Color(hex:"#8AB4FF").opacity(0.4), lineWidth: sel ? 2 : 1))
+                    .stroke(sel ? Color.white : Color(hex:"#8AB4FF").opacity(0.4), lineWidth: 1))
             if w > 16 {
                 HStack(spacing: 3) {
                     Image(systemName: "square.on.circle")
@@ -2775,6 +3119,140 @@ private struct ShapeTimelineClipView: View {
                  (project.clipboardIsCut && project.clipboardSourceIDs.contains(clip.id) ? 0.35 : 1.0))
         .offset(x: clip.startTime*pps + 1)
         .allowsHitTesting(false)
+    }
+}
+
+private struct CompoundClipView: View {
+    let clip: CompoundClip
+    let pps: Double
+    let h: CGFloat
+    var scrollOffsetX: CGFloat = 0
+    var sel: Bool = false
+    var isDragging: Bool = false
+    @EnvironmentObject var project: ProjectState
+
+    private enum ContentKind { case video(UUID), image(UUID), audio(UUID), subtitle(String), text(String), shape, empty }
+
+    private var primaryContent: ContentKind {
+        if let vc = clip.videoTracks.flatMap(\.clips).first { return .video(vc.assetID) }
+        if let ic = clip.imageTracks.flatMap(\.clips).first { return .image(ic.assetID) }
+        if let tc = clip.textTracks.flatMap(\.clips).first { return .text(tc.text) }
+        if let sc = clip.shapeTracks.flatMap(\.clips).first { return .shape }
+        if let sub = clip.subtitleTracks.flatMap(\.clips).first { return .subtitle(sub.text) }
+        if let ac = clip.audioTracks.flatMap(\.clips).first { return .audio(ac.assetID) }
+        return .empty
+    }
+
+    private var stickyTitleX: CGFloat {
+        let w = max(clip.duration * pps, 5)
+        let clipStart = CGFloat(clip.startTime * pps) + 1
+        let clipLeftInViewport = clipStart - scrollOffsetX
+        if clipLeftInViewport < 5 { return min(-clipLeftInViewport + 5, w - 60) }
+        return 5
+    }
+
+    var body: some View {
+        let w = max(clip.duration * pps, 5)
+        let clipH = h - 4
+        ZStack(alignment: .leading) {
+            contentBackground(w: w, clipH: clipH)
+            RoundedRectangle(cornerRadius: 6)
+                .stroke(sel ? Color.white : Color(hex: "#FFBE76").opacity(0.4), lineWidth: sel ? 2 : 1)
+            HStack(spacing: 3) {
+                Image(systemName: "rectangle.on.rectangle")
+                    .font(.system(size: 8))
+                    .foregroundColor(.white)
+                Text(clip.name)
+                    .font(.system(size: 9, weight: .medium))
+                    .foregroundColor(.white)
+                    .lineLimit(1)
+            }
+            .shadow(color: .black.opacity(0.4), radius: 2, x: 0, y: 1)
+            .padding(.leading, stickyTitleX)
+            .padding(.top, 4)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        }
+        .frame(width: w, height: clipH)
+        .clipShape(RoundedRectangle(cornerRadius: 6))
+        .opacity(isDragging ? 0 : 1.0)
+        .offset(x: clip.startTime * pps + 1)
+        .allowsHitTesting(false)
+    }
+
+    @ViewBuilder
+    private func contentBackground(w: CGFloat, clipH: CGFloat) -> some View {
+        switch primaryContent {
+        case .video(let assetID):
+            if let frames = project.assetThumbnails[assetID], !frames.isEmpty {
+                videoThumbnailStrip(frames: frames, clipWidth: w, clipH: clipH)
+                    .overlay(Color(hex: "#FF9F43").opacity(0.15))
+            } else {
+                RoundedRectangle(cornerRadius: 6).fill(Color(hex: "#FF9F43").opacity(0.82))
+            }
+        case .image(let assetID):
+            if let thumb = project.mediaThumbnails[assetID] {
+                Image(nsImage: thumb).resizable().aspectRatio(contentMode: .fill)
+                    .frame(width: w, height: clipH).clipped()
+                    .overlay(Color(hex: "#FF9F43").opacity(0.15))
+            } else {
+                RoundedRectangle(cornerRadius: 6).fill(Color(hex: "#FF9F43").opacity(0.82))
+            }
+        case .audio(let assetID):
+            ZStack {
+                RoundedRectangle(cornerRadius: 6).fill(Color(hex: "#FF9F43").opacity(0.78))
+                if let wave = project.waveformCache[assetID] {
+                    AudioWaveformCanvas(waveData: wave, trimStart: 0, clipDuration: clip.duration, fullHeight: true)
+                        .clipShape(RoundedRectangle(cornerRadius: 6))
+                        .opacity(0.5)
+                }
+            }
+        case .text(let txt):
+            ZStack {
+                RoundedRectangle(cornerRadius: 6).fill(Color(hex: "#FF9F43").opacity(0.82))
+                Text(txt).font(.system(size: 10)).foregroundColor(.white.opacity(0.5))
+                    .lineLimit(2).padding(.horizontal, 6).padding(.top, 16)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            }
+        case .subtitle(let txt):
+            ZStack {
+                RoundedRectangle(cornerRadius: 6).fill(Color(hex: "#FF9F43").opacity(0.82))
+                Text(txt).font(.system(size: 10)).foregroundColor(.white.opacity(0.5))
+                    .lineLimit(2).padding(.horizontal, 6).padding(.top, 16)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            }
+        case .shape:
+            ZStack {
+                RoundedRectangle(cornerRadius: 6).fill(Color(hex: "#FF9F43").opacity(0.82))
+                Image(systemName: "square.on.circle")
+                    .font(.system(size: 16)).foregroundColor(.white.opacity(0.3))
+            }
+        case .empty:
+            RoundedRectangle(cornerRadius: 6).fill(Color(hex: "#FF9F43").opacity(0.82))
+        }
+    }
+
+    @ViewBuilder
+    private func videoThumbnailStrip(frames: [ThumbnailFrame], clipWidth: CGFloat, clipH: CGFloat) -> some View {
+        let ratio: CGFloat = frames.first.map { CGFloat($0.image.size.width) / max(CGFloat($0.image.size.height), 1) } ?? 1.0
+        let thumbW = max(clipH * ratio, 1)
+        let count = max(1, Int(ceil(clipWidth / thumbW)))
+        let clipStartX = clip.startTime * pps
+        let visLeft = scrollOffsetX - clipStartX - thumbW
+        let visRight = scrollOffsetX + max(project.timelineVisibleWidth, 400) - clipStartX + thumbW
+        let startIdx = max(0, Int(floor(visLeft / thumbW)))
+        let endIdx = max(startIdx, min(count, Int(ceil(visRight / thumbW))))
+        HStack(spacing: 0) {
+            if startIdx > 0 { Color.clear.frame(width: thumbW * CGFloat(startIdx), height: clipH) }
+            ForEach(startIdx..<endIdx, id: \.self) { i in
+                let t = clip.duration * Double(i) / Double(count)
+                let frame = frames.min(by: { abs($0.time - t) < abs($1.time - t) }) ?? frames[0]
+                Image(nsImage: frame.image).resizable().aspectRatio(contentMode: .fill)
+                    .frame(width: i == count - 1 ? clipWidth - thumbW * CGFloat(count - 1) : thumbW, height: clipH)
+                    .clipped()
+            }
+            if endIdx < count { Color.clear.frame(width: thumbW * CGFloat(count - endIdx), height: clipH) }
+        }
+        .frame(width: clipWidth, height: clipH)
     }
 }
 
@@ -2918,6 +3396,51 @@ private struct LogSlider: View {
     }
 }
 
+// MARK: - Compound Breadcrumb
+
+struct CompoundBreadcrumb: View {
+    @EnvironmentObject private var project: ProjectState
+
+    var body: some View {
+        if project.isInsideCompound {
+            HStack(spacing: 4) {
+                Button {
+                    while project.isInsideCompound { project.exitCompound() }
+                } label: {
+                    Text("主时间线")
+                        .font(.system(size: 11))
+                        .foregroundColor(Color.accent)
+                }
+                .buttonStyle(.plain)
+                ForEach(Array(project.compositionStack.enumerated()), id: \.offset) { idx, level in
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 8))
+                        .foregroundColor(Color.labelSecondary)
+                    if idx == project.compositionStack.count - 1 {
+                        Text(level.name)
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundColor(.white)
+                    } else {
+                        Button {
+                            let pops = project.compositionStack.count - idx - 1
+                            for _ in 0..<pops { project.exitCompound() }
+                        } label: {
+                            Text(level.name)
+                                .font(.system(size: 11))
+                                .foregroundColor(Color.accent)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                Spacer()
+            }
+            .padding(.horizontal, 12)
+            .frame(height: 24)
+            .background(Color(red: 0.15, green: 0.15, blue: 0.16))
+        }
+    }
+}
+
 // MARK: - Toolbar
 
 struct TimelineToolbar: View {
@@ -2925,8 +3448,10 @@ struct TimelineToolbar: View {
     private var hasSelection: Bool {
         project.selectedVideoClipID != nil || project.selectedImageClipID != nil ||
         project.selectedAudioClipID != nil || project.selectedSubtitleClipID != nil ||
-        project.selectedTextClipID != nil || !project.selectedClipIDs.isEmpty
+        project.selectedTextClipID != nil || project.selectedShapeClipID != nil ||
+        project.selectedCompoundClipID != nil || !project.selectedClipIDs.isEmpty
     }
+    private var canSplit: Bool { hasSelection }
     var body: some View {
         HStack(spacing:0) {
             // 左侧：编辑工具
@@ -2934,7 +3459,9 @@ struct TimelineToolbar: View {
                 TBtn(icon:"arrow.uturn.backward", help:"撤销", enabled: project.undoCount > 0) { project.undo() }
                 TBtn(icon:"arrow.uturn.forward",  help:"重做", enabled: project.redoCount > 0) { project.redo() }
                 Divider().frame(height:16).padding(.horizontal,4)
-                TBtn(icon:"scissors",         help:"在播放头分割片段", enabled: hasSelection && project.selectedImageClipID == nil && project.selectedTextClipID == nil) { project.splitAtPlayhead() }
+                SplitBtn(style: .center, help: "在播放头分割片段", enabled: canSplit) { project.splitAtPlayhead() }
+                SplitBtn(style: .keepLeft, help: "保留左侧", enabled: canSplit) { project.splitKeepLeft() }
+                SplitBtn(style: .keepRight, help: "保留右侧", enabled: canSplit) { project.splitKeepRight() }
                 TBtn(icon:"trash",            help:"删除选中片段", enabled: hasSelection)   { project.deleteSelected() }
                 TBtn(icon:"text.alignleft",   help:"将选中片段对齐到播放头", enabled: hasSelection) { project.alignSelectedToPlayhead() }
                 TBtn(icon:"character.bubble", help:"在当前字幕轨道插入字幕")  { project.insertSubtitleAtPlayhead() }
@@ -3323,12 +3850,12 @@ private struct AnalyzeMenuBtn: View {
 
     private func showMenu() {
         let menu = NSMenu()
-        let auto = NSMenuItem(title: "自动分析（场景检测）", action: #selector(AnalyzeMenuHandler.autoDetect(_:)), keyEquivalent: "")
+        let auto = NSMenuItem(title: "智能分割", action: #selector(AnalyzeMenuHandler.autoDetect(_:)), keyEquivalent: "")
         auto.target = AnalyzeMenuHandler.shared
         auto.isEnabled = SceneDetector.isInstalled
         menu.addItem(auto)
 
-        let llm = NSMenuItem(title: "大模型分析（精彩片段）", action: #selector(AnalyzeMenuHandler.llmAnalyze(_:)), keyEquivalent: "")
+        let llm = NSMenuItem(title: "AI 剪辑", action: #selector(AnalyzeMenuHandler.llmAnalyze(_:)), keyEquivalent: "")
         llm.target = AnalyzeMenuHandler.shared
         llm.isEnabled = !AppSettings.shared.llmAPIKey.isEmpty
         menu.addItem(llm)
@@ -3350,6 +3877,65 @@ private final class AnalyzeMenuHandler: NSObject {
 
     @objc func llmAnalyze(_ sender: NSMenuItem) {
         project?.llmAnalyzeSelectedClip()
+    }
+}
+
+private struct SplitBtn: View {
+    enum Style { case center, keepLeft, keepRight }
+    let style: Style
+    var help: String? = nil
+    var enabled: Bool = true
+    let action: () -> Void
+    @State private var hov = false
+
+    var body: some View {
+        Button(action: action) {
+            Canvas { ctx, size in
+                let cx = size.width / 2, cy = size.height / 2
+                let color = enabled ? (hov ? Color.labelPrimary : Color.labelSecondary)
+                                     : Color.labelSecondary.opacity(0.35)
+                let solid = GraphicsContext.Shading.color(color)
+                let dim = GraphicsContext.Shading.color(color.opacity(0.3))
+                let lw: CGFloat = 1.2
+                let h: CGFloat = 10
+                let tick: CGFloat = 3
+                let gap: CGFloat = 5
+
+                let leftSolid: Bool
+                let rightSolid: Bool
+                switch style {
+                case .center:    leftSolid = true;  rightSolid = true
+                case .keepLeft:  leftSolid = true;  rightSolid = false
+                case .keepRight: leftSolid = false; rightSolid = true
+                }
+
+                // 中间虚线（切割线）
+                for dy in stride(from: cy - h/2, to: cy + h/2, by: 3) {
+                    ctx.fill(Path(CGRect(x: cx - lw/2, y: dy, width: lw, height: 1.5)), with: solid)
+                }
+
+                // 左 ] 括号：竖线 + 上下横线向右
+                let lx = cx - gap
+                let ls = leftSolid ? solid : dim
+                ctx.fill(Path(CGRect(x: lx - lw/2, y: cy - h/2, width: lw, height: h)), with: ls)
+                ctx.fill(Path(CGRect(x: lx, y: cy - h/2, width: tick, height: lw)), with: ls)
+                ctx.fill(Path(CGRect(x: lx, y: cy + h/2 - lw, width: tick, height: lw)), with: ls)
+
+                // 右 [ 括号：竖线 + 上下横线向左
+                let rx = cx + gap
+                let rs = rightSolid ? solid : dim
+                ctx.fill(Path(CGRect(x: rx - lw/2, y: cy - h/2, width: lw, height: h)), with: rs)
+                ctx.fill(Path(CGRect(x: rx - tick, y: cy - h/2, width: tick, height: lw)), with: rs)
+                ctx.fill(Path(CGRect(x: rx - tick, y: cy + h/2 - lw, width: tick, height: lw)), with: rs)
+            }
+            .frame(width: 28, height: 28)
+            .background((enabled && hov) ? Color.white.opacity(0.08) : Color.clear)
+            .cornerRadius(5)
+        }
+        .buttonStyle(.plain)
+        .disabled(!enabled)
+        .onHover { hov = $0 }
+        .help(help ?? "")
     }
 }
 

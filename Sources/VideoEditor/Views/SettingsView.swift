@@ -194,7 +194,7 @@ struct SettingsView: View {
         VStack(alignment: .leading, spacing: 12) {
             pathRow(label: "组件存储位置", path: SceneDetector.supportDir, placeholder: "", defaultDir: SceneDetector.supportDir) { _ in }
 
-            Text("场景检测组件")
+            Text("智能分割")
                 .font(.system(size: 11, weight: .medium))
                 .foregroundColor(Color.labelSecondary)
 
@@ -268,7 +268,7 @@ struct SettingsView: View {
 
             Divider().padding(.vertical, 4)
 
-            SSection(title: "大模型分析") {
+            SSection(title: "AI 剪辑") {
                 IPicker(selection: Binding(
                     get: { settings.llmProvider.displayName },
                     set: { name in

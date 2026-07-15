@@ -540,6 +540,7 @@ struct ExportSheetView: View {
             imageTracks: project.imageTracks,
             textTracks: project.textTracks,
             shapeTracks: project.shapeTracks,
+            compoundTracks: project.compoundTracks,
             overlayTrackOrder: project.overlayTrackOrder,
             subtitleBottomMargin: project.subtitleBottomMargin,
             subtitleLineSpacing: project.subtitleLineSpacing,
@@ -562,6 +563,7 @@ struct ExportInput {
     let imageTracks:    [Track<ImageClip>]
     let textTracks:     [Track<TextClip>]
     let shapeTracks:    [Track<ShapeClip>]
+    let compoundTracks: [Track<CompoundClip>]
     let overlayTrackOrder: [ProjectState.OverlayTrackRef]
     let subtitleBottomMargin: Double
     let subtitleLineSpacing:  Double
@@ -1118,6 +1120,7 @@ actor TimelineExporter {
                 imageTracks: input.imageTracks,
                 textTracks: input.textTracks,
                 shapeTracks: input.shapeTracks,
+                compoundTracks: input.compoundTracks,
                 colorRanges: colorRanges,
                 fps: fps,
                 bitrate: settings.bitrate,
@@ -1281,6 +1284,7 @@ actor TimelineExporter {
         imageTracks: [Track<ImageClip>],
         textTracks: [Track<TextClip>],
         shapeTracks: [Track<ShapeClip>],
+        compoundTracks: [Track<CompoundClip>],
         colorRanges: [(start: Double, end: Double, adj: ColorAdjust)],
         fps: Int, bitrate: Int,
         outputURL: URL,
@@ -1385,7 +1389,8 @@ actor TimelineExporter {
             uniqueKeysWithValues: textTracks.filter { $0.isVisible }.map { ($0.id, $0.clips) })
         let shapeClipsByTrack: [UUID: [ShapeClip]] = Dictionary(
             uniqueKeysWithValues: shapeTracks.filter { $0.isVisible }.map { ($0.id, $0.clips) })
-        let hasOverlays = hasSubtitles || !imageClipsByTrack.isEmpty || !textClipsByTrack.isEmpty || !shapeClipsByTrack.isEmpty
+        let compoundClips = compoundTracks.filter { $0.isVisible }.flatMap(\.clips)
+        let hasOverlays = hasSubtitles || !imageClipsByTrack.isEmpty || !textClipsByTrack.isEmpty || !shapeClipsByTrack.isEmpty || !compoundClips.isEmpty
         let videoQueue = DispatchQueue(label: "export.video")
         let audioQueue = DispatchQueue(label: "export.audio")
         let targetFps = fps
@@ -1521,6 +1526,39 @@ actor TimelineExporter {
                                                        atTime: targetTime, clips: clips,
                                                        scale: subtitleInfo.fontScale, renderSize: renderSize) {
                                                     image = overlay.composited(over: image)
+                                                }
+                                            case .compound(let trackID):
+                                                if let track = compoundTracks.first(where: { $0.id == trackID && $0.isVisible }),
+                                                   let compound = track.clips.first(where: { $0.startTime <= targetTime && $0.endTime > targetTime }) {
+                                                    let it = targetTime - compound.startTime + compound.internalStart
+                                                    for imgTrack in compound.imageTracks {
+                                                        if let clip = imgTrack.clips.first(where: { $0.startTime <= it && $0.endTime > it }),
+                                                           let overlay = self.renderImageOverlay(clip: clip, renderSize: renderSize, ciCache: imageCICache) {
+                                                            image = overlay.composited(over: image)
+                                                        }
+                                                    }
+                                                    let cSubTracks = compound.subtitleTracks.map { t in
+                                                        (track: t, style: t.subtitleStyle ?? SubtitleStyle())
+                                                    }
+                                                    if !cSubTracks.isEmpty {
+                                                        let cSubInfo = SubtitleRenderInfo(
+                                                            tracks: cSubTracks, fontScale: subtitleInfo.fontScale,
+                                                            bottomMargin: subtitleInfo.bottomMargin,
+                                                            lineSpacing: subtitleInfo.lineSpacing, renderSize: renderSize)
+                                                        if let overlay = self.renderSubtitleOverlay(atTime: it, info: cSubInfo) {
+                                                            image = overlay.composited(over: image)
+                                                        }
+                                                    }
+                                                    let cTextClips = compound.textTracks.flatMap(\.clips)
+                                                    if let overlay = self.renderTextOverlay(atTime: it, clips: cTextClips,
+                                                                                            fontScale: subtitleInfo.fontScale, renderSize: renderSize) {
+                                                        image = overlay.composited(over: image)
+                                                    }
+                                                    let cShapeClips = compound.shapeTracks.flatMap(\.clips)
+                                                    if let overlay = self.renderShapeOverlay(atTime: it, clips: cShapeClips,
+                                                                                             scale: subtitleInfo.fontScale, renderSize: renderSize) {
+                                                        image = overlay.composited(over: image)
+                                                    }
                                                 }
                                             }
                                         }

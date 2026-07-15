@@ -26,10 +26,15 @@ struct TrafficLightsView: View {
             }
             TrafficLightBtn(
                 color: isActive ? Color(hex: "#28C840") : Color(hex: "#BEBEBF"),
-                symbol: "plus",
+                symbol: isHovered ? (NSEvent.modifierFlags.contains(.option) ? "plus" : "arrow.up.left.and.arrow.down.right") : "",
                 hovered: isHovered
             ) {
-                NSApplication.shared.keyWindow?.zoom(nil)
+                guard let win = NSApplication.shared.keyWindow else { return }
+                if NSEvent.modifierFlags.contains(.option) {
+                    win.zoom(nil)
+                } else {
+                    win.toggleFullScreen(nil)
+                }
             }
         }
         .onHover { isHovered = $0 }

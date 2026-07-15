@@ -66,6 +66,7 @@ extension ProjectState {
                         subtitleTracks: subtitleTracks,
                         textTracks: textTracks,
                         shapeTracks: shapeTracks,
+                        compoundTracks: compoundTracks,
                         overlayTrackOrder: overlayTrackOrder,
                         subtitleBottomMargin: subtitleBottomMargin,
                         subtitleLineSpacing: subtitleLineSpacing,
@@ -80,6 +81,7 @@ extension ProjectState {
         subtitleTracks = s.subtitleTracks
         textTracks     = s.textTracks
         shapeTracks    = s.shapeTracks
+        compoundTracks = s.compoundTracks
         overlayTrackOrder = s.overlayTrackOrder
         subtitleBottomMargin = s.subtitleBottomMargin
         subtitleLineSpacing  = s.subtitleLineSpacing
@@ -163,6 +165,63 @@ extension ProjectState {
                     break outer
                 }
             }
+        } else if let id = selectedImageClipID {
+            outer: for ti in imageTracks.indices {
+                if let ci = imageTracks[ti].clips.firstIndex(where: { $0.id == id }) {
+                    let c = imageTracks[ti].clips[ci]
+                    if c.startTime + 0.01 < t && c.endTime - 0.01 > t {
+                        imageTracks[ti].clips[ci].endTime = t
+                        var newClip = c; newClip.id = UUID()
+                        newClip.startTime = t; newClip.endTime = c.endTime
+                        imageTracks[ti].clips.insert(newClip, at: ci + 1)
+                        changed = true
+                    }
+                    break outer
+                }
+            }
+        } else if let id = selectedTextClipID {
+            outer: for ti in textTracks.indices {
+                if let ci = textTracks[ti].clips.firstIndex(where: { $0.id == id }) {
+                    let c = textTracks[ti].clips[ci]
+                    if c.startTime + 0.01 < t && c.endTime - 0.01 > t {
+                        textTracks[ti].clips[ci].endTime = t
+                        var newClip = c; newClip.id = UUID()
+                        newClip.startTime = t; newClip.endTime = c.endTime
+                        textTracks[ti].clips.insert(newClip, at: ci + 1)
+                        changed = true
+                    }
+                    break outer
+                }
+            }
+        } else if let id = selectedShapeClipID {
+            outer: for ti in shapeTracks.indices {
+                if let ci = shapeTracks[ti].clips.firstIndex(where: { $0.id == id }) {
+                    let c = shapeTracks[ti].clips[ci]
+                    if c.startTime + 0.01 < t && c.endTime - 0.01 > t {
+                        shapeTracks[ti].clips[ci].endTime = t
+                        var newClip = c; newClip.id = UUID()
+                        newClip.startTime = t; newClip.endTime = c.endTime
+                        shapeTracks[ti].clips.insert(newClip, at: ci + 1)
+                        changed = true
+                    }
+                    break outer
+                }
+            }
+        } else if let id = selectedCompoundClipID {
+            outer: for ti in compoundTracks.indices {
+                if let ci = compoundTracks[ti].clips.firstIndex(where: { $0.id == id }) {
+                    let c = compoundTracks[ti].clips[ci]
+                    if c.startTime + 0.01 < t && c.endTime - 0.01 > t {
+                        compoundTracks[ti].clips[ci].endTime = t
+                        var newClip = c; newClip.id = UUID()
+                        newClip.startTime = t; newClip.endTime = c.endTime
+                        newClip.internalStart = c.internalStart + (t - c.startTime)
+                        compoundTracks[ti].clips.insert(newClip, at: ci + 1)
+                        changed = true
+                    }
+                    break outer
+                }
+            }
         }
 
         if changed {
@@ -174,6 +233,590 @@ extension ProjectState {
             rebuildTimelinePreview()
             scheduleAutoSave()
         }
+    }
+
+    /// 向左分割：保留播放头左边，删除右边
+    func splitKeepLeft() {
+        let t = currentTime
+        let snap = currentSnapshot()
+        var changed = false
+
+        if let id = selectedVideoClipID {
+            for ti in videoTracks.indices {
+                if let ci = videoTracks[ti].clips.firstIndex(where: { $0.id == id }) {
+                    let c = videoTracks[ti].clips[ci]
+                    if c.startTime + 0.01 < t && c.endTime - 0.01 > t {
+                        videoTracks[ti].clips[ci].endTime = t
+                        changed = true
+                    }
+                    break
+                }
+            }
+        } else if let id = selectedAudioClipID {
+            for ti in audioTracks.indices {
+                if let ci = audioTracks[ti].clips.firstIndex(where: { $0.id == id }) {
+                    let c = audioTracks[ti].clips[ci]
+                    if c.startTime + 0.01 < t && c.endTime - 0.01 > t {
+                        audioTracks[ti].clips[ci].endTime = t
+                        changed = true
+                    }
+                    break
+                }
+            }
+        } else if let id = selectedSubtitleClipID {
+            for ti in subtitleTracks.indices {
+                if let ci = subtitleTracks[ti].clips.firstIndex(where: { $0.id == id }) {
+                    let c = subtitleTracks[ti].clips[ci]
+                    if c.startTime + 0.01 < t && c.endTime - 0.01 > t {
+                        subtitleTracks[ti].clips[ci].endTime = t
+                        changed = true
+                    }
+                    break
+                }
+            }
+        } else if let id = selectedImageClipID {
+            for ti in imageTracks.indices {
+                if let ci = imageTracks[ti].clips.firstIndex(where: { $0.id == id }) {
+                    if imageTracks[ti].clips[ci].startTime + 0.01 < t && imageTracks[ti].clips[ci].endTime - 0.01 > t {
+                        imageTracks[ti].clips[ci].endTime = t; changed = true
+                    }; break
+                }
+            }
+        } else if let id = selectedTextClipID {
+            for ti in textTracks.indices {
+                if let ci = textTracks[ti].clips.firstIndex(where: { $0.id == id }) {
+                    if textTracks[ti].clips[ci].startTime + 0.01 < t && textTracks[ti].clips[ci].endTime - 0.01 > t {
+                        textTracks[ti].clips[ci].endTime = t; changed = true
+                    }; break
+                }
+            }
+        } else if let id = selectedShapeClipID {
+            for ti in shapeTracks.indices {
+                if let ci = shapeTracks[ti].clips.firstIndex(where: { $0.id == id }) {
+                    if shapeTracks[ti].clips[ci].startTime + 0.01 < t && shapeTracks[ti].clips[ci].endTime - 0.01 > t {
+                        shapeTracks[ti].clips[ci].endTime = t; changed = true
+                    }; break
+                }
+            }
+        } else if let id = selectedCompoundClipID {
+            for ti in compoundTracks.indices {
+                if let ci = compoundTracks[ti].clips.firstIndex(where: { $0.id == id }) {
+                    if compoundTracks[ti].clips[ci].startTime + 0.01 < t && compoundTracks[ti].clips[ci].endTime - 0.01 > t {
+                        compoundTracks[ti].clips[ci].endTime = t; changed = true
+                    }; break
+                }
+            }
+        }
+
+        if changed {
+            undoStack.append(snap)
+            if undoStack.count > 30 { undoStack.removeFirst() }
+            redoStack.removeAll()
+            undoCount = undoStack.count; redoCount = 0
+            rebuildTimelinePreview(); scheduleAutoSave()
+        }
+    }
+
+    /// 向右分割：保留播放头右边，删除左边
+    func splitKeepRight() {
+        let t = currentTime
+        let snap = currentSnapshot()
+        var changed = false
+
+        if let id = selectedVideoClipID {
+            for ti in videoTracks.indices {
+                if let ci = videoTracks[ti].clips.firstIndex(where: { $0.id == id }) {
+                    let c = videoTracks[ti].clips[ci]
+                    if c.startTime + 0.01 < t && c.endTime - 0.01 > t {
+                        videoTracks[ti].clips[ci].trimStart = c.trimStart + (t - c.startTime) * c.speed
+                        videoTracks[ti].clips[ci].startTime = t
+                        changed = true
+                    }
+                    break
+                }
+            }
+        } else if let id = selectedAudioClipID {
+            for ti in audioTracks.indices {
+                if let ci = audioTracks[ti].clips.firstIndex(where: { $0.id == id }) {
+                    let c = audioTracks[ti].clips[ci]
+                    if c.startTime + 0.01 < t && c.endTime - 0.01 > t {
+                        audioTracks[ti].clips[ci].trimStart = c.trimStart + (t - c.startTime) * c.speed
+                        audioTracks[ti].clips[ci].startTime = t
+                        changed = true
+                    }
+                    break
+                }
+            }
+        } else if let id = selectedSubtitleClipID {
+            for ti in subtitleTracks.indices {
+                if let ci = subtitleTracks[ti].clips.firstIndex(where: { $0.id == id }) {
+                    let c = subtitleTracks[ti].clips[ci]
+                    if c.startTime + 0.01 < t && c.endTime - 0.01 > t {
+                        subtitleTracks[ti].clips[ci].startTime = t
+                        changed = true
+                    }
+                    break
+                }
+            }
+        } else if let id = selectedImageClipID {
+            for ti in imageTracks.indices {
+                if let ci = imageTracks[ti].clips.firstIndex(where: { $0.id == id }) {
+                    if imageTracks[ti].clips[ci].startTime + 0.01 < t && imageTracks[ti].clips[ci].endTime - 0.01 > t {
+                        imageTracks[ti].clips[ci].startTime = t; changed = true
+                    }; break
+                }
+            }
+        } else if let id = selectedTextClipID {
+            for ti in textTracks.indices {
+                if let ci = textTracks[ti].clips.firstIndex(where: { $0.id == id }) {
+                    if textTracks[ti].clips[ci].startTime + 0.01 < t && textTracks[ti].clips[ci].endTime - 0.01 > t {
+                        textTracks[ti].clips[ci].startTime = t; changed = true
+                    }; break
+                }
+            }
+        } else if let id = selectedShapeClipID {
+            for ti in shapeTracks.indices {
+                if let ci = shapeTracks[ti].clips.firstIndex(where: { $0.id == id }) {
+                    if shapeTracks[ti].clips[ci].startTime + 0.01 < t && shapeTracks[ti].clips[ci].endTime - 0.01 > t {
+                        shapeTracks[ti].clips[ci].startTime = t; changed = true
+                    }; break
+                }
+            }
+        } else if let id = selectedCompoundClipID {
+            for ti in compoundTracks.indices {
+                if let ci = compoundTracks[ti].clips.firstIndex(where: { $0.id == id }) {
+                    let c = compoundTracks[ti].clips[ci]
+                    if c.startTime + 0.01 < t && c.endTime - 0.01 > t {
+                        compoundTracks[ti].clips[ci].internalStart = c.internalStart + (t - c.startTime)
+                        compoundTracks[ti].clips[ci].startTime = t
+                        changed = true
+                    }; break
+                }
+            }
+        }
+
+        if changed {
+            undoStack.append(snap)
+            if undoStack.count > 30 { undoStack.removeFirst() }
+            redoStack.removeAll()
+            undoCount = undoStack.count; redoCount = 0
+            rebuildTimelinePreview(); scheduleAutoSave()
+        }
+    }
+
+    // MARK: - Compound Clip (复合片段)
+
+    func createCompoundFromSelected() {
+        let snap = currentSnapshot()
+
+        // 收集所有选中片段的 ID
+        var ids = selectedClipIDs
+        if let id = selectedVideoClipID { ids.insert(id) }
+        if let id = selectedAudioClipID { ids.insert(id) }
+        if let id = selectedSubtitleClipID { ids.insert(id) }
+        if let id = selectedImageClipID { ids.insert(id) }
+        if let id = selectedTextClipID { ids.insert(id) }
+        if let id = selectedShapeClipID { ids.insert(id) }
+        if let id = selectedCompoundClipID { ids.insert(id) }
+        guard !ids.isEmpty else { return }
+
+        // 找出所有匹配的片段，计算时间范围
+        var minTime = Double.infinity
+        var maxTime = 0.0
+
+        var collectedVideo: [Track<VideoClip>] = []
+        var collectedAudio: [Track<AudioClip>] = []
+        var collectedImage: [Track<ImageClip>] = []
+        var collectedSubtitle: [Track<SubtitleClip>] = []
+        var collectedText: [Track<TextClip>] = []
+        var collectedShape: [Track<ShapeClip>] = []
+
+        for ti in videoTracks.indices {
+            let matched = videoTracks[ti].clips.filter { ids.contains($0.id) }
+            if !matched.isEmpty {
+                for c in matched { minTime = min(minTime, c.startTime); maxTime = max(maxTime, c.endTime) }
+                collectedVideo.append(Track(clips: matched, label: videoTracks[ti].label))
+            }
+        }
+        for ti in audioTracks.indices {
+            let matched = audioTracks[ti].clips.filter { ids.contains($0.id) }
+            if !matched.isEmpty {
+                for c in matched { minTime = min(minTime, c.startTime); maxTime = max(maxTime, c.endTime) }
+                collectedAudio.append(Track(clips: matched, label: audioTracks[ti].label))
+            }
+        }
+        var origToNew: [UUID: OverlayTrackRef] = [:]
+        for ti in imageTracks.indices {
+            let matched = imageTracks[ti].clips.filter { ids.contains($0.id) }
+            if !matched.isEmpty {
+                for c in matched { minTime = min(minTime, c.startTime); maxTime = max(maxTime, c.endTime) }
+                let newTrack = Track<ImageClip>(clips: matched, label: imageTracks[ti].label)
+                origToNew[imageTracks[ti].id] = .image(newTrack.id)
+                collectedImage.append(newTrack)
+            }
+        }
+        for ti in subtitleTracks.indices {
+            let matched = subtitleTracks[ti].clips.filter { ids.contains($0.id) }
+            if !matched.isEmpty {
+                for c in matched { minTime = min(minTime, c.startTime); maxTime = max(maxTime, c.endTime) }
+                var newTrack = Track<SubtitleClip>(clips: matched, label: subtitleTracks[ti].label)
+                newTrack.subtitleStyle = subtitleTracks[ti].subtitleStyle
+                origToNew[subtitleTracks[ti].id] = .subtitle(newTrack.id)
+                collectedSubtitle.append(newTrack)
+            }
+        }
+        for ti in textTracks.indices {
+            let matched = textTracks[ti].clips.filter { ids.contains($0.id) }
+            if !matched.isEmpty {
+                for c in matched { minTime = min(minTime, c.startTime); maxTime = max(maxTime, c.endTime) }
+                let newTrack = Track<TextClip>(clips: matched, label: textTracks[ti].label)
+                origToNew[textTracks[ti].id] = .text(newTrack.id)
+                collectedText.append(newTrack)
+            }
+        }
+        for ti in shapeTracks.indices {
+            let matched = shapeTracks[ti].clips.filter { ids.contains($0.id) }
+            if !matched.isEmpty {
+                for c in matched { minTime = min(minTime, c.startTime); maxTime = max(maxTime, c.endTime) }
+                let newTrack = Track<ShapeClip>(clips: matched, label: shapeTracks[ti].label)
+                origToNew[shapeTracks[ti].id] = .shape(newTrack.id)
+                collectedShape.append(newTrack)
+            }
+        }
+
+        guard minTime < maxTime else { return }
+
+        // 根据父 overlayTrackOrder 的顺序构建复合片段的 overlayTrackOrder
+        var compoundOverlayOrder: [OverlayTrackRef] = []
+        for ref in overlayTrackOrder {
+            if let newRef = origToNew[ref.trackID] {
+                compoundOverlayOrder.append(newRef)
+            }
+        }
+
+        // 偏移子片段时间到从 0 开始
+        let offset = minTime
+        for ti in collectedVideo.indices {
+            for ci in collectedVideo[ti].clips.indices {
+                collectedVideo[ti].clips[ci].startTime -= offset
+                collectedVideo[ti].clips[ci].endTime -= offset
+            }
+        }
+        for ti in collectedAudio.indices {
+            for ci in collectedAudio[ti].clips.indices {
+                collectedAudio[ti].clips[ci].startTime -= offset
+                collectedAudio[ti].clips[ci].endTime -= offset
+            }
+        }
+        for ti in collectedImage.indices {
+            for ci in collectedImage[ti].clips.indices {
+                collectedImage[ti].clips[ci].startTime -= offset
+                collectedImage[ti].clips[ci].endTime -= offset
+            }
+        }
+        for ti in collectedSubtitle.indices {
+            for ci in collectedSubtitle[ti].clips.indices {
+                collectedSubtitle[ti].clips[ci].startTime -= offset
+                collectedSubtitle[ti].clips[ci].endTime -= offset
+            }
+        }
+        for ti in collectedText.indices {
+            for ci in collectedText[ti].clips.indices {
+                collectedText[ti].clips[ci].startTime -= offset
+                collectedText[ti].clips[ci].endTime -= offset
+            }
+        }
+        for ti in collectedShape.indices {
+            for ci in collectedShape[ti].clips.indices {
+                collectedShape[ti].clips[ci].startTime -= offset
+                collectedShape[ti].clips[ci].endTime -= offset
+            }
+        }
+
+        // 从父时间线移除选中片段
+        for ti in videoTracks.indices {
+            videoTracks[ti].clips.removeAll { ids.contains($0.id) }
+        }
+        for ti in audioTracks.indices {
+            audioTracks[ti].clips.removeAll { ids.contains($0.id) }
+        }
+        for ti in imageTracks.indices {
+            imageTracks[ti].clips.removeAll { ids.contains($0.id) }
+        }
+        for ti in subtitleTracks.indices {
+            subtitleTracks[ti].clips.removeAll { ids.contains($0.id) }
+        }
+        for ti in textTracks.indices {
+            textTracks[ti].clips.removeAll { ids.contains($0.id) }
+        }
+        for ti in shapeTracks.indices {
+            shapeTracks[ti].clips.removeAll { ids.contains($0.id) }
+        }
+
+        // 清理变空的轨道
+        let emptyImageIDs = imageTracks.filter { $0.clips.isEmpty }.map(\.id)
+        let emptySubIDs = subtitleTracks.filter { $0.clips.isEmpty }.map(\.id)
+        let emptyTextIDs = textTracks.filter { $0.clips.isEmpty }.map(\.id)
+        let emptyShapeIDs = shapeTracks.filter { $0.clips.isEmpty }.map(\.id)
+        videoTracks.removeAll { $0.clips.isEmpty }
+        audioTracks.removeAll { $0.clips.isEmpty }
+        imageTracks.removeAll { $0.clips.isEmpty }
+        subtitleTracks.removeAll { $0.clips.isEmpty }
+        textTracks.removeAll { $0.clips.isEmpty }
+        shapeTracks.removeAll { $0.clips.isEmpty }
+        let removedOverlayIDs = Set(emptyImageIDs + emptySubIDs + emptyTextIDs + emptyShapeIDs)
+        if !removedOverlayIDs.isEmpty {
+            overlayTrackOrder.removeAll { removedOverlayIDs.contains($0.trackID) }
+        }
+
+        // 收集复合片段（嵌套支持）
+        var collectedCompound: [Track<CompoundClip>] = []
+        for ti in compoundTracks.indices {
+            let matched = compoundTracks[ti].clips.filter { ids.contains($0.id) }
+            if !matched.isEmpty {
+                for c in matched { minTime = min(minTime, c.startTime); maxTime = max(maxTime, c.endTime) }
+                collectedCompound.append(Track(clips: matched, label: compoundTracks[ti].label))
+            }
+        }
+        for ti in compoundTracks.indices {
+            compoundTracks[ti].clips.removeAll { ids.contains($0.id) }
+        }
+        for ti in collectedCompound.indices {
+            for ci in collectedCompound[ti].clips.indices {
+                collectedCompound[ti].clips[ci].startTime -= offset
+                collectedCompound[ti].clips[ci].endTime -= offset
+            }
+        }
+
+        let totalCount = compoundTracks.flatMap(\.clips).count + 1
+        var compound = CompoundClip(
+            name: "复合片段 \(totalCount)",
+            startTime: minTime, endTime: maxTime,
+            videoTracks: collectedVideo, audioTracks: collectedAudio,
+            imageTracks: collectedImage, subtitleTracks: collectedSubtitle,
+            textTracks: collectedText, shapeTracks: collectedShape,
+            compoundTracks: collectedCompound
+        )
+        compound.overlayTrackOrder = compoundOverlayOrder
+
+        // 找一个不重叠的轨道放入，否则新建
+        var placed = false
+        for ti in compoundTracks.indices {
+            let overlaps = compoundTracks[ti].clips.contains { c in
+                c.startTime < compound.endTime && c.endTime > compound.startTime
+            }
+            if !overlaps {
+                compoundTracks[ti].clips.append(compound)
+                placed = true
+                break
+            }
+        }
+        if !placed {
+            compoundTracks.append(Track(clips: [compound], label: "复合"))
+        }
+
+        // 清除选中
+        selectedVideoClipID = nil; selectedAudioClipID = nil
+        selectedSubtitleClipID = nil; selectedImageClipID = nil
+        selectedTextClipID = nil; selectedShapeClipID = nil
+        selectedCompoundClipID = nil
+        selectedClipIDs.removeAll()
+
+        syncOverlayOrder()
+        undoStack.append(snap)
+        if undoStack.count > 30 { undoStack.removeFirst() }
+        redoStack.removeAll()
+        undoCount = undoStack.count; redoCount = 0
+        rebuildTimelinePreview(); scheduleAutoSave()
+    }
+
+    func enterCompound(trackIndex: Int, clipIndex: Int) {
+        guard trackIndex < compoundTracks.count,
+              clipIndex < compoundTracks[trackIndex].clips.count else { return }
+        let compound = compoundTracks[trackIndex].clips[clipIndex]
+
+        var level = CompositionLevel(
+            name: compound.name,
+            snapshot: currentSnapshot(),
+            compoundTrackIndex: trackIndex,
+            compoundClipIndex: clipIndex,
+            activeStart: compound.internalStart,
+            activeDuration: compound.duration
+        )
+        level.savedUndoStack = undoStack
+        level.savedRedoStack = redoStack
+        level.savedUndoCount = undoCount
+        level.savedRedoCount = redoCount
+        compositionStack.append(level)
+
+        videoTracks = compound.videoTracks
+        audioTracks = compound.audioTracks
+        imageTracks = compound.imageTracks
+        subtitleTracks = compound.subtitleTracks
+        textTracks = compound.textTracks
+        shapeTracks = compound.shapeTracks
+        compoundTracks = compound.compoundTracks
+        if compound.overlayTrackOrder.isEmpty {
+            overlayTrackOrder = []
+            syncOverlayOrder()
+        } else {
+            overlayTrackOrder = compound.overlayTrackOrder
+            syncOverlayOrder()
+        }
+
+        selectedVideoClipID = nil; selectedAudioClipID = nil
+        selectedSubtitleClipID = nil; selectedImageClipID = nil
+        selectedTextClipID = nil; selectedShapeClipID = nil
+        selectedClipIDs.removeAll()
+        undoStack.removeAll(); redoStack.removeAll()
+        undoCount = 0; redoCount = 0
+
+        currentTime = 0
+        rebuildTimelinePreview()
+    }
+
+    func exitCompound() {
+        guard let level = compositionStack.popLast() else { return }
+
+        // 把当前编辑内容保存回复合片段
+        var snap = level.snapshot
+        if level.compoundTrackIndex < snap.compoundTracks.count,
+           level.compoundClipIndex < snap.compoundTracks[level.compoundTrackIndex].clips.count {
+            snap.compoundTracks[level.compoundTrackIndex].clips[level.compoundClipIndex].videoTracks = videoTracks
+            snap.compoundTracks[level.compoundTrackIndex].clips[level.compoundClipIndex].audioTracks = audioTracks
+            snap.compoundTracks[level.compoundTrackIndex].clips[level.compoundClipIndex].imageTracks = imageTracks
+            snap.compoundTracks[level.compoundTrackIndex].clips[level.compoundClipIndex].subtitleTracks = subtitleTracks
+            snap.compoundTracks[level.compoundTrackIndex].clips[level.compoundClipIndex].textTracks = textTracks
+            snap.compoundTracks[level.compoundTrackIndex].clips[level.compoundClipIndex].shapeTracks = shapeTracks
+            snap.compoundTracks[level.compoundTrackIndex].clips[level.compoundClipIndex].compoundTracks = compoundTracks
+            snap.compoundTracks[level.compoundTrackIndex].clips[level.compoundClipIndex].overlayTrackOrder = overlayTrackOrder
+        }
+
+        applySnapshot(snap)
+
+        selectedVideoClipID = nil; selectedAudioClipID = nil
+        selectedSubtitleClipID = nil; selectedImageClipID = nil
+        selectedTextClipID = nil; selectedShapeClipID = nil
+        selectedClipIDs.removeAll()
+        undoStack = level.savedUndoStack
+        redoStack = level.savedRedoStack
+        undoCount = level.savedUndoCount
+        redoCount = level.savedRedoCount
+    }
+
+    private func firstNonOverlappingTrack(newRanges: [(Double, Double)], existingPerTrack: [[(Double, Double)]]) -> Int? {
+        for ti in existingPerTrack.indices {
+            let hasOverlap = newRanges.contains { nr in
+                existingPerTrack[ti].contains { er in nr.0 < er.1 - 0.001 && nr.1 > er.0 + 0.001 }
+            }
+            if !hasOverlap { return ti }
+        }
+        return nil
+    }
+
+    func dissolveCompound(_ compoundID: UUID) {
+        let snap = currentSnapshot()
+        guard let ti = compoundTracks.firstIndex(where: { $0.clips.contains { $0.id == compoundID } }),
+              let ci = compoundTracks[ti].clips.firstIndex(where: { $0.id == compoundID }) else { return }
+        let compound = compoundTracks[ti].clips[ci]
+        let offset = compound.startTime
+
+        for subTrack in compound.videoTracks {
+            var clips = subTrack.clips
+            for i in clips.indices { clips[i].startTime += offset; clips[i].endTime += offset }
+            let nr = clips.map { ($0.startTime, $0.endTime) }
+            if let di = firstNonOverlappingTrack(newRanges: nr, existingPerTrack: videoTracks.map { $0.clips.map { ($0.startTime, $0.endTime) } }) {
+                videoTracks[di].clips.append(contentsOf: clips)
+            } else {
+                videoTracks.append(Track(clips: clips, label: subTrack.label))
+            }
+        }
+        for subTrack in compound.audioTracks {
+            var clips = subTrack.clips
+            for i in clips.indices { clips[i].startTime += offset; clips[i].endTime += offset }
+            let nr = clips.map { ($0.startTime, $0.endTime) }
+            if let di = firstNonOverlappingTrack(newRanges: nr, existingPerTrack: audioTracks.map { $0.clips.map { ($0.startTime, $0.endTime) } }) {
+                audioTracks[di].clips.append(contentsOf: clips)
+            } else {
+                audioTracks.append(Track(clips: clips, label: subTrack.label))
+            }
+        }
+        var subIDtoNewRef: [UUID: OverlayTrackRef] = [:]
+        for subTrack in compound.imageTracks {
+            var clips = subTrack.clips
+            for i in clips.indices { clips[i].startTime += offset; clips[i].endTime += offset }
+            let newTrack = Track<ImageClip>(clips: clips, label: subTrack.label)
+            imageTracks.append(newTrack)
+            subIDtoNewRef[subTrack.id] = .image(newTrack.id)
+        }
+        for subTrack in compound.subtitleTracks {
+            var clips = subTrack.clips
+            for i in clips.indices { clips[i].startTime += offset; clips[i].endTime += offset }
+            var newTrack = Track<SubtitleClip>(clips: clips, label: subTrack.label)
+            newTrack.subtitleStyle = subTrack.subtitleStyle ?? newSubtitleStyle()
+            subtitleTracks.append(newTrack)
+            subIDtoNewRef[subTrack.id] = .subtitle(newTrack.id)
+        }
+        for subTrack in compound.textTracks {
+            var clips = subTrack.clips
+            for i in clips.indices { clips[i].startTime += offset; clips[i].endTime += offset }
+            let newTrack = Track<TextClip>(clips: clips, label: subTrack.label)
+            textTracks.append(newTrack)
+            subIDtoNewRef[subTrack.id] = .text(newTrack.id)
+        }
+        for subTrack in compound.shapeTracks {
+            var clips = subTrack.clips
+            for i in clips.indices { clips[i].startTime += offset; clips[i].endTime += offset }
+            let newTrack = Track<ShapeClip>(clips: clips, label: subTrack.label)
+            shapeTracks.append(newTrack)
+            subIDtoNewRef[subTrack.id] = .shape(newTrack.id)
+        }
+        for subTrack in compound.compoundTracks {
+            var clips = subTrack.clips
+            for i in clips.indices { clips[i].startTime += offset; clips[i].endTime += offset }
+            compoundTracks.append(Track(clips: clips, label: subTrack.label))
+        }
+
+        // 按复合片段内部 overlayTrackOrder 的顺序插入新建的 overlay 轨道
+        var newOverlayRefs: [OverlayTrackRef] = []
+        for ref in compound.overlayTrackOrder {
+            if let newRef = subIDtoNewRef[ref.trackID] {
+                newOverlayRefs.append(newRef)
+            }
+        }
+        for ref in subIDtoNewRef.values where !newOverlayRefs.contains(where: { $0.trackID == ref.trackID }) {
+            newOverlayRefs.append(ref)
+        }
+
+        let compoundTrackID = compoundTracks[ti].id
+        let compoundOrderIndex = overlayTrackOrder.firstIndex(where: { $0.trackID == compoundTrackID })
+
+        compoundTracks[ti].clips.remove(at: ci)
+        let trackEmpty = compoundTracks[ti].clips.isEmpty
+        if trackEmpty { compoundTracks.remove(at: ti) }
+
+        var insertAt: Int
+        if let idx = compoundOrderIndex {
+            if trackEmpty {
+                overlayTrackOrder.remove(at: idx)
+                insertAt = idx
+            } else {
+                insertAt = idx + 1
+            }
+        } else {
+            insertAt = overlayTrackOrder.count
+        }
+        insertAt = min(insertAt, overlayTrackOrder.count)
+        overlayTrackOrder.insert(contentsOf: newOverlayRefs, at: insertAt)
+
+        selectedCompoundClipID = nil
+        syncOverlayOrder()
+
+        undoStack.append(snap)
+        if undoStack.count > 30 { undoStack.removeFirst() }
+        redoStack.removeAll()
+        undoCount = undoStack.count; redoCount = 0
+        rebuildTimelinePreview(); scheduleAutoSave()
     }
 
     // MARK: - Delete
@@ -192,6 +835,7 @@ extension ProjectState {
         if let id = selectedSubtitleClipID { ids.insert(id) }
         if let id = selectedTextClipID     { ids.insert(id) }
         if let id = selectedShapeClipID    { ids.insert(id) }
+        if let id = selectedCompoundClipID { ids.insert(id) }
         guard !ids.isEmpty else { return }
 
         for i in videoTracks.indices {
@@ -224,6 +868,11 @@ extension ProjectState {
             shapeTracks[i].clips.removeAll { ids.contains($0.id) }
             if shapeTracks[i].clips.count != before { changed = true }
         }
+        for i in compoundTracks.indices {
+            let before = compoundTracks[i].clips.count
+            compoundTracks[i].clips.removeAll { ids.contains($0.id) }
+            if compoundTracks[i].clips.count != before { changed = true }
+        }
 
         selectedVideoClipID    = nil
         selectedImageClipID    = nil
@@ -231,6 +880,7 @@ extension ProjectState {
         selectedSubtitleClipID = nil
         selectedTextClipID     = nil
         selectedShapeClipID    = nil
+        selectedCompoundClipID = nil
         selectedClipIDs.removeAll()
 
         if changed {

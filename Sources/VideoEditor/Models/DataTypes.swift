@@ -633,7 +633,7 @@ struct ShapeClip: Identifiable, Equatable, Codable {
     }
 }
 
-struct Track<Clip: Identifiable & Equatable & Codable>: Identifiable, Codable {
+struct Track<Clip: Identifiable & Equatable & Codable>: Identifiable, Equatable, Codable {
     var id = UUID()
     var clips: [Clip]   = []
     var label: String   = ""
@@ -695,6 +695,26 @@ struct ProjectDocument: Codable {
 
 extension ExportSettings: Codable {}
 
+// MARK: - Compound Clip (复合片段)
+
+struct CompoundClip: Identifiable, Equatable, Codable {
+    var id = UUID()
+    var name: String = "复合片段"
+    var startTime: Double
+    var endTime: Double
+    var duration: Double { endTime - startTime }
+    var internalStart: Double = 0
+
+    var videoTracks: [Track<VideoClip>] = []
+    var audioTracks: [Track<AudioClip>] = []
+    var imageTracks: [Track<ImageClip>] = []
+    var subtitleTracks: [Track<SubtitleClip>] = []
+    var textTracks: [Track<TextClip>] = []
+    var shapeTracks: [Track<ShapeClip>] = []
+    var compoundTracks: [Track<CompoundClip>] = []
+    var overlayTrackOrder: [ProjectState.OverlayTrackRef] = []
+}
+
 // MARK: - Snapshot (for undo/redo)
 
 struct ProjectSnapshot {
@@ -704,6 +724,7 @@ struct ProjectSnapshot {
     var subtitleTracks: [Track<SubtitleClip>]
     var textTracks: [Track<TextClip>]
     var shapeTracks: [Track<ShapeClip>]
+    var compoundTracks: [Track<CompoundClip>]
     var overlayTrackOrder: [ProjectState.OverlayTrackRef]
     var subtitleBottomMargin: Double
     var subtitleLineSpacing: Double

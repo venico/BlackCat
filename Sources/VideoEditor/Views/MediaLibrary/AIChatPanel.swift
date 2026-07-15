@@ -39,8 +39,8 @@ struct AIChatPanel: View {
         }
         .padding(.leading, 10)
         .padding(.trailing, 8)
-        .padding(.top, 8)
-        .padding(.bottom, 6)
+        .padding(.top, 13)
+        .padding(.bottom, 8)
     }
 
     // MARK: - 历史会话

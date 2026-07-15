@@ -194,7 +194,6 @@ extension ProjectState {
                 $0.id != id && $0.startTime < clip.endTime - 0.001 && $0.endTime > clip.startTime + 0.001
             }
             if hasOverlap {
-                // 重叠：在目标轨道正下方新建轨道安置，保持图层顺序，不塞回原轨道
                 let anchorID = shapeTracks[ti].id
                 let removed = shapeTracks[ti].clips.remove(at: ci)
                 var newTrack = Track<ShapeClip>(label: "图形")
@@ -203,6 +202,45 @@ extension ProjectState {
                 insertOverlayRefBelow(.shape(newTrack.id), below: anchorID)
             }
             return
+        }
+    }
+
+    func moveCompoundClipToTrack(id: UUID, from: Int, to: Int) {
+        guard compoundTracks.indices.contains(from), compoundTracks.indices.contains(to) else { return }
+        guard let idx = compoundTracks[from].clips.firstIndex(where: { $0.id == id }) else { return }
+        pushUndoThrottled()
+        let clip = compoundTracks[from].clips.remove(at: idx)
+        compoundTracks[to].clips.append(clip)
+    }
+
+    func resolveCompoundOverlap(id: UUID) {
+        for ti in compoundTracks.indices {
+            guard let ci = compoundTracks[ti].clips.firstIndex(where: { $0.id == id }) else { continue }
+            let clip = compoundTracks[ti].clips[ci]
+            let hasOverlap = compoundTracks[ti].clips.contains {
+                $0.id != id && $0.startTime < clip.endTime - 0.001 && $0.endTime > clip.startTime + 0.001
+            }
+            if hasOverlap {
+                let kind = compoundTrackKind(compoundTracks[ti])
+                let anchorID = compoundTracks[ti].id
+                let removed = compoundTracks[ti].clips.remove(at: ci)
+                var newTrack = Track<CompoundClip>(label: "复合")
+                newTrack.clips.append(removed)
+                compoundTracks.append(newTrack)
+                if kind == .overlay {
+                    insertOverlayRefBelow(.compound(newTrack.id), below: anchorID)
+                }
+            }
+            return
+        }
+    }
+
+    func updateCompoundClip(id: UUID, _ modify: (inout CompoundClip) -> Void) {
+        pushUndoThrottled()
+        for i in compoundTracks.indices {
+            if let j = compoundTracks[i].clips.firstIndex(where: { $0.id == id }) {
+                modify(&compoundTracks[i].clips[j]); return
+            }
         }
     }
 
@@ -430,7 +468,7 @@ extension ProjectState {
                 var newTrack = Track<SubtitleClip>(clips: clips, label: "字幕")
                 newTrack.subtitleStyle = newSubtitleStyle()
                 subtitleTracks.append(newTrack)
-                syncOverlayOrder()
+                overlayTrackOrder.insert(.subtitle(newTrack.id), at: 0)
             }
             if let mx = clips.map(\.endTime).max() { duration = max(duration, mx) }
             if let i = mediaAssets.firstIndex(where:{ $0.id == asset.id }) {
@@ -441,8 +479,9 @@ extension ProjectState {
             if let emptyIdx = imageTracks.firstIndex(where: { $0.clips.isEmpty }) {
                 trackIdx = emptyIdx
             } else {
-                imageTracks.append(Track(label: "图片"))
-                syncOverlayOrder()
+                let newTrack = Track<ImageClip>(label: "图片")
+                imageTracks.append(newTrack)
+                overlayTrackOrder.insert(.image(newTrack.id), at: 0)
                 trackIdx = imageTracks.count - 1
             }
             let dur = 5.0
@@ -534,8 +573,9 @@ extension ProjectState {
             if let emptyIdx = imageTracks.firstIndex(where: { $0.clips.isEmpty }) {
                 trackIdx = emptyIdx
             } else {
-                imageTracks.append(Track(label: "图片"))
-                syncOverlayOrder()
+                let newTrack = Track<ImageClip>(label: "图片")
+                imageTracks.append(newTrack)
+                overlayTrackOrder.insert(.image(newTrack.id), at: 0)
                 trackIdx = imageTracks.count - 1
             }
             let dur = 5.0
@@ -624,21 +664,34 @@ extension ProjectState {
     func insertSubtitleAtPlayhead() {
         let snap = currentSnapshot()
 
+        let start = currentTime
+        let end   = min(currentTime + 2.0, max(duration, currentTime + 2.0))
+
         let trackIdx: Int
-        if let sid = selectedSubtitleClipID {
-            // 选中了字幕片段 → 在其所在轨道新建
-            trackIdx = subtitleTracks.firstIndex { $0.clips.contains { $0.id == sid } } ?? 0
+        if let sid = selectedSubtitleClipID,
+           let i = subtitleTracks.firstIndex(where: { $0.clips.contains { $0.id == sid } }) {
+            let hasOverlap = subtitleTracks[i].clips.contains { $0.startTime < end && $0.endTime > start }
+            if hasOverlap {
+                var newTrack = Track<SubtitleClip>(label: "字幕")
+                newTrack.subtitleStyle = subtitleTracks[i].subtitleStyle ?? newSubtitleStyle()
+                subtitleTracks.append(newTrack)
+                overlayTrackOrder.insert(.subtitle(newTrack.id), at: 0)
+                trackIdx = subtitleTracks.count - 1
+            } else {
+                trackIdx = i
+            }
+        } else if let i = subtitleTracks.firstIndex(where: { t in
+            !t.clips.contains { $0.startTime < end && $0.endTime > start }
+        }) {
+            trackIdx = i
         } else {
-            // 没选中任何字幕 → 新建轨道（放在最后）
             var newTrack = Track<SubtitleClip>(label: "字幕")
             newTrack.subtitleStyle = newSubtitleStyle()
             subtitleTracks.append(newTrack)
-            syncOverlayOrder()
+            overlayTrackOrder.insert(.subtitle(newTrack.id), at: 0)
             trackIdx = subtitleTracks.count - 1
         }
 
-        let start = currentTime
-        let end   = min(currentTime + 2.0, max(duration, currentTime + 2.0))
         let clip  = SubtitleClip(text: "新字幕", startTime: start, endTime: end)
         subtitleTracks[trackIdx].clips.append(clip)
         subtitleTracks[trackIdx].clips.sort { $0.startTime < $1.startTime }
@@ -656,19 +709,32 @@ extension ProjectState {
     /// 在播放头插入文字图层（选中文字则在其轨道，否则用最后一条文字轨道，无则新建）
     func addTextAtPlayhead() {
         let snap = currentSnapshot()
+        let start = currentTime
+        let end   = currentTime + 3.0
+
         let trackIdx: Int
         if let tid = selectedTextClipID,
            let i = textTracks.firstIndex(where: { $0.clips.contains { $0.id == tid } }) {
+            let hasOverlap = textTracks[i].clips.contains { $0.startTime < end && $0.endTime > start }
+            if hasOverlap {
+                let newTrack = Track<TextClip>(label: "文字")
+                textTracks.append(newTrack)
+                overlayTrackOrder.insert(.text(newTrack.id), at: 0)
+                trackIdx = textTracks.count - 1
+            } else {
+                trackIdx = i
+            }
+        } else if let i = textTracks.firstIndex(where: { t in
+            !t.clips.contains { $0.startTime < end && $0.endTime > start }
+        }) {
             trackIdx = i
-        } else if !textTracks.isEmpty {
-            trackIdx = textTracks.count - 1
         } else {
-            textTracks.append(Track<TextClip>(label: "文字"))
-            syncOverlayOrder()
+            let newTrack = Track<TextClip>(label: "文字")
+            textTracks.append(newTrack)
+            overlayTrackOrder.insert(.text(newTrack.id), at: 0)
             trackIdx = textTracks.count - 1
         }
-        let start = currentTime
-        let end   = currentTime + 3.0
+
         let clip  = TextClip(text: "标题文字", startTime: start, endTime: end)
         textTracks[trackIdx].clips.append(clip)
         textTracks[trackIdx].clips.sort { $0.startTime < $1.startTime }
@@ -723,8 +789,9 @@ extension ProjectState {
         let end   = currentTime + 2.0
         let trackIdx: Int
         if shapeTracks.isEmpty {
-            shapeTracks.append(Track<ShapeClip>(label: "图形"))
-            syncOverlayOrder()
+            let newTrack = Track<ShapeClip>(label: "图形")
+            shapeTracks.append(newTrack)
+            overlayTrackOrder.insert(.shape(newTrack.id), at: 0)
             trackIdx = shapeTracks.count - 1
         } else {
             var candidate: Int
@@ -743,8 +810,9 @@ extension ProjectState {
                 }) {
                     candidate = freeIdx
                 } else {
-                    shapeTracks.append(Track<ShapeClip>(label: "图形"))
-                    syncOverlayOrder()
+                    let newTrack = Track<ShapeClip>(label: "图形")
+                    shapeTracks.append(newTrack)
+                    overlayTrackOrder.insert(.shape(newTrack.id), at: 0)
                     candidate = shapeTracks.count - 1
                 }
             }

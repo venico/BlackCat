@@ -104,21 +104,15 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate 
         editMenu.addItem(withTitle: "全选", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
         mainMenu.addItem(editItem)
 
-        // ── 显示 ──
-        let viewMenu = NSMenu(title: "显示")
-        viewMenu.delegate = self  // 每次打开前清理
-        let viewItem = NSMenuItem(); viewItem.submenu = viewMenu
-        let fullScreen = NSMenuItem(title: "进入全屏幕", action: #selector(doToggleFullScreen), keyEquivalent: "f")
-        fullScreen.keyEquivalentModifierMask = [.command, .control]
-        viewMenu.addItem(fullScreen)
-        mainMenu.addItem(viewItem)
-
         // ── 窗口 ──
         let windowMenu = NSMenu(title: "窗口")
         windowMenu.delegate = self
         let windowItem = NSMenuItem(); windowItem.submenu = windowMenu
         windowMenu.addItem(withTitle: "最小化", action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m")
         windowMenu.addItem(withTitle: "缩放", action: #selector(NSWindow.performZoom(_:)), keyEquivalent: "")
+        let fullScreen = NSMenuItem(title: "进入全屏幕", action: #selector(doToggleFullScreen), keyEquivalent: "f")
+        fullScreen.keyEquivalentModifierMask = [.command, .control]
+        windowMenu.addItem(fullScreen)
         windowMenu.addItem(.separator())
         windowMenu.addItem(withTitle: "前置全部窗口", action: #selector(NSApplication.arrangeInFront(_:)), keyEquivalent: "")
         mainMenu.addItem(windowItem)
@@ -130,6 +124,10 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate 
 
     public func menuNeedsUpdate(_ menu: NSMenu) {
         cleanupMenu(menu)
+        let isFS = NSApp.keyWindow?.styleMask.contains(.fullScreen) == true
+        for item in menu.items where item.action == #selector(doToggleFullScreen) {
+            item.title = isFS ? "退出全屏幕" : "进入全屏幕"
+        }
     }
 
     public func menuWillOpen(_ menu: NSMenu) {
@@ -277,7 +275,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate 
     @objc private func showAbout() {
         NSApp.orderFrontStandardAboutPanel(options: [
             .applicationName: "黑猫剪辑",
-            .applicationVersion: "3.8.5",
+            .applicationVersion: "3.9.0",
             .version: "",
             .credits: NSAttributedString(string: "")
         ])

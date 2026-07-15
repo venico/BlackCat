@@ -157,6 +157,8 @@ struct ContentView: View {
                             TimelineView()
                                 .frame(maxHeight: .infinity)
                                 .clipped()
+                            CompoundBreadcrumb()
+                                .fixedSize(horizontal: false, vertical: true)
                         }
                         .frame(maxHeight: .infinity)
                         .background(Color.timelineBg)

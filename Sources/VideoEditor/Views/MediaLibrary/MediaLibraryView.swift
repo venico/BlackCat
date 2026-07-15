@@ -50,10 +50,7 @@ struct MediaLibraryView: View {
         HStack(spacing: 0) {
             verticalTabBar
             if isAITab {
-                GeometryReader { geo in
-                    AIChatPanel()
-                        .frame(width: geo.size.width, height: geo.size.height)
-                }
+                AIChatPanel()
             } else {
             VStack(spacing: 0) {
             // Section header

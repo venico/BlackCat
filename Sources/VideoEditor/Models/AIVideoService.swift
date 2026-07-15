@@ -493,13 +493,21 @@ final class AIVideoService: ObservableObject {
         request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
 
+        var reqContent: [[String: Any]] = [
+            ["type": "text", "text": prompt]
+        ]
+        let durationSec: Int
+        switch duration {
+        case "10": durationSec = 10
+        default: durationSec = 5
+        }
         let body: [String: Any] = [
             "model": model,
-            "content": [
-                [
-                    "type": "text",
-                    "text": prompt
-                ]
+            "content": reqContent,
+            "parameters": [
+                "aspect_ratio": aspectRatio,
+                "duration": durationSec,
+                "quality": "high"
             ]
         ]
         request.httpBody = try JSONSerialization.data(withJSONObject: body)

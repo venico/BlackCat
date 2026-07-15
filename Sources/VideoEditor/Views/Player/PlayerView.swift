@@ -35,17 +35,11 @@ struct PlayerView: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .overlay(alignment: .top) {
                 if hoveringPlayer {
-                    ZStack {
-                        Text(project.projectName + (project.isSaved ? "（已保存）" : ""))
-                            .font(.system(size: 11, weight: .medium))
-                            .foregroundColor(.white)
-                            .shadow(color: .black.opacity(0.8), radius: 3, x: 0, y: 1)
-                            .shadow(color: .black.opacity(0.5), radius: 6, x: 0, y: 2)
-                        HStack {
-                            Spacer()
-                            PreviewResolutionPicker()
-                        }
-                    }
+                    Text(project.projectName + (project.isSaved ? "（已保存）" : ""))
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundColor(.white)
+                        .shadow(color: .black.opacity(0.8), radius: 3, x: 0, y: 1)
+                        .shadow(color: .black.opacity(0.5), radius: 6, x: 0, y: 2)
                     .padding(.horizontal, 8)
                     .padding(.top, 8)
                     .transition(.opacity)
@@ -127,9 +121,21 @@ private struct OverlayStack: View {
                     textTrackView(trackID: id).zIndex(z)
                 case .shape(let id):
                     shapeTrackView(trackID: id).zIndex(z)
+                case .compound(let id):
+                    compoundOverlayView(trackID: id).zIndex(z)
                 }
             }
+            ForEach(nonOverlayCompoundTrackIDs, id: \.self) { trackID in
+                compoundOverlayView(trackID: trackID).zIndex(-0.5)
+            }
         }
+    }
+
+    private var nonOverlayCompoundTrackIDs: [UUID] {
+        let overlayIDs = Set(project.overlayTrackOrder.compactMap { ref -> UUID? in
+            if case .compound(let id) = ref { return id }; return nil
+        })
+        return project.compoundTracks.map(\.id).filter { !overlayIDs.contains($0) }
     }
 
     @ViewBuilder
@@ -311,6 +317,74 @@ private struct OverlayStack: View {
 
     private func shapeByID(_ id: UUID) -> ShapeClip? {
         project.shapeTracks.flatMap { $0.clips }.first { $0.id == id }
+    }
+
+    @ViewBuilder
+    private func compoundOverlayView(trackID: UUID) -> some View {
+        let t = clock.currentTime
+        let found = compoundClipAt(trackID: trackID, time: t)
+        GeometryReader { geo in
+            if let (compound, it) = found {
+                compoundImages(compound: compound, it: it, geo: geo)
+                compoundShapes(compound: compound, it: it, geo: geo)
+                compoundTexts(compound: compound, it: it, geo: geo)
+                compoundSubtitles(compound: compound, it: it, geo: geo)
+            }
+        }
+        .allowsHitTesting(false)
+    }
+
+    private func compoundClipAt(trackID: UUID, time: Double) -> (CompoundClip, Double)? {
+        guard let track = project.compoundTracks.first(where: { $0.id == trackID }),
+              track.isVisible,
+              let compound = track.clips.first(where: { $0.startTime <= time && $0.endTime > time })
+        else { return nil }
+        let it = time - compound.startTime + compound.internalStart
+        return (compound, it)
+    }
+
+    @ViewBuilder
+    private func compoundImages(compound: CompoundClip, it: Double, geo: GeometryProxy) -> some View {
+        let clips = compound.imageTracks.flatMap(\.clips).filter { $0.startTime <= it && $0.endTime > it }
+        ForEach(clips) { clip in
+            ImageLayerView(clip: clip, viewSize: geo.size, videoSize: project.previewRenderSize)
+        }
+    }
+
+    @ViewBuilder
+    private func compoundShapes(compound: CompoundClip, it: Double, geo: GeometryProxy) -> some View {
+        let scale = geo.size.width / max(project.previewRenderSize.width, 1)
+        let clips = compound.shapeTracks.flatMap(\.clips).filter { $0.startTime <= it && $0.endTime > it }
+        ForEach(clips) { clip in
+            ShapeClipView(clip: clip, scale: scale, selected: false)
+                .position(x: geo.size.width * clip.posX, y: geo.size.height * clip.posY)
+        }
+    }
+
+    @ViewBuilder
+    private func compoundTexts(compound: CompoundClip, it: Double, geo: GeometryProxy) -> some View {
+        let scale = geo.size.width / max(project.previewRenderSize.width, 1)
+        let clips = compound.textTracks.flatMap(\.clips).filter { $0.startTime <= it && $0.endTime > it }
+        ForEach(clips) { clip in
+            TextLabel(clip: clip, scale: scale)
+                .position(x: geo.size.width * clip.posX, y: geo.size.height * clip.posY)
+        }
+    }
+
+    @ViewBuilder
+    private func compoundSubtitles(compound: CompoundClip, it: Double, geo: GeometryProxy) -> some View {
+        let scale = geo.size.width / max(project.previewRenderSize.width, 1)
+        ForEach(compound.subtitleTracks) { subTrack in
+            if let clip = subTrack.clips.first(where: { $0.startTime <= it && $0.endTime > it }) {
+                let style = subTrack.subtitleStyle ?? SubtitleStyle()
+                let text = style.mergeLineBreaks ? SubtitleOverlay.mergeBreaks(clip.text) : clip.text
+                SubtitleLabel(text: text, style: style, scale: scale)
+                    .frame(maxWidth: geo.size.width * style.widthPercent / 100)
+                    .multilineTextAlignment(subtitleAlign(style.alignment))
+                    .padding(.bottom, geo.size.height * project.subtitleBottomMargin / 100.0)
+                    .frame(width: geo.size.width, height: geo.size.height, alignment: .bottom)
+            }
+        }
     }
 }
 
@@ -734,6 +808,9 @@ private struct PreviewToolbar: View {
                 }
                 .buttonStyle(.plain)
                 .help("捕捉当前帧到素材库")
+
+                PreviewResolutionPicker()
+                    .padding(.leading, 4)
             }
             .padding(.horizontal, 10)
             .padding(.bottom, 4)
