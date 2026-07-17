@@ -429,6 +429,51 @@ extension ProjectState {
         return nil
     }
 
+    // MARK: - 倒放视频预处理（ffmpeg reverse）
+
+    func generateReversedVideo(inputURL: URL, trimStart: Double, srcDurSec: Double) async -> URL? {
+        let key = "\(inputURL.path)|\(trimStart)|\(srcDurSec)"
+        if let cached = reversedVideoCache[key], FileManager.default.fileExists(atPath: cached.path) {
+            return cached
+        }
+        guard let ffmpeg = Self.findFFmpeg() else { return nil }
+        DispatchQueue.main.async { [weak self] in self?.isReversingVideo = true }
+        let tmpURL = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("bc_rev_\(UUID().uuidString).mp4")
+        let ss = max(0, trimStart)
+        var args = ["-y"]
+        if ss > 0.001 { args += ["-ss", String(format: "%.6f", ss)] }
+        args += ["-t", String(format: "%.6f", srcDurSec), "-i", inputURL.path]
+        args += ["-vf", "reverse", "-af", "areverse"]
+        args += ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "18"]
+        args += ["-c:a", "aac", "-ar", "44100", "-ac", "2"]
+        args += [tmpURL.path]
+        var ok = await Task.detached(priority: .userInitiated) {
+            Self.runFFmpegSync(ffmpeg: ffmpeg, arguments: args)
+        }.value
+        if !ok {
+            let argsNoAudio = ["-y"] +
+                (ss > 0.001 ? ["-ss", String(format: "%.6f", ss)] : []) +
+                ["-t", String(format: "%.6f", srcDurSec), "-i", inputURL.path,
+                 "-vf", "reverse", "-an",
+                 "-c:v", "libx264", "-preset", "ultrafast", "-crf", "18",
+                 tmpURL.path]
+            ok = await Task.detached(priority: .userInitiated) {
+                Self.runFFmpegSync(ffmpeg: ffmpeg, arguments: argsNoAudio)
+            }.value
+        }
+        DispatchQueue.main.async { [weak self] in self?.isReversingVideo = false }
+        if ok {
+            reversedVideoCache[key] = tmpURL
+            return tmpURL
+        }
+        DispatchQueue.main.async { [weak self] in
+            self?.showSuccessToast(icon: "xmark.circle.fill", iconColor: .red,
+                                   title: "倒放", subtitle: "生成失败", autoCountdown: false)
+        }
+        return nil
+    }
+
     static func findFFmpeg() -> URL? {
         // 优先从 app bundle 内部查找（已内置）
         if let bundlePath = Bundle.main.executableURL?.deletingLastPathComponent() {

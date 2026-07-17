@@ -198,6 +198,12 @@ struct ContentView: View {
                     TranscribeOverlay()
                         .environmentObject(project)
                 }
+                if project.isReversingVideo {
+                    ReverseVideoBubble()
+                        .transition(.asymmetric(
+                            insertion: .move(edge: .trailing).combined(with: .opacity),
+                            removal: .opacity))
+                }
                 if project.isDetectingScenes {
                     SceneDetectBubble(progress: project.sceneDetectProgress)
                         .transition(.asymmetric(

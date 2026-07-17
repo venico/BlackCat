@@ -614,6 +614,46 @@ actor TimelineExporter {
         return nil
     }
 
+    // ── ffmpeg 倒放视频预处理 ──
+    private var reversedVideoCache: [String: URL] = [:]
+
+    private func generateReversedVideo(inputURL: URL, trimStart: Double, srcDurSec: Double) async -> URL? {
+        let key = "\(inputURL.path)|\(trimStart)|\(srcDurSec)"
+        if let cached = reversedVideoCache[key], FileManager.default.fileExists(atPath: cached.path) {
+            return cached
+        }
+        guard let ffmpeg = ProjectState.findFFmpeg() else { return nil }
+        let tmpURL = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("bc_rev_\(UUID().uuidString).mp4")
+        let ss = max(0, trimStart)
+        var args = ["-y"]
+        if ss > 0.001 { args += ["-ss", String(format: "%.6f", ss)] }
+        args += ["-t", String(format: "%.6f", srcDurSec), "-i", inputURL.path]
+        args += ["-vf", "reverse", "-af", "areverse"]
+        args += ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "18"]
+        args += ["-c:a", "aac", "-ar", "44100", "-ac", "2"]
+        args += [tmpURL.path]
+        var ok = await Task.detached(priority: .userInitiated) {
+            ProjectState.runFFmpegSync(ffmpeg: ffmpeg, arguments: args)
+        }.value
+        if !ok {
+            let argsNoAudio = ["-y"] +
+                (ss > 0.001 ? ["-ss", String(format: "%.6f", ss)] : []) +
+                ["-t", String(format: "%.6f", srcDurSec), "-i", inputURL.path,
+                 "-vf", "reverse", "-an",
+                 "-c:v", "libx264", "-preset", "ultrafast", "-crf", "18",
+                 tmpURL.path]
+            ok = await Task.detached(priority: .userInitiated) {
+                ProjectState.runFFmpegSync(ffmpeg: ffmpeg, arguments: argsNoAudio)
+            }.value
+        }
+        if ok {
+            reversedVideoCache[key] = tmpURL
+            return tmpURL
+        }
+        return nil
+    }
+
     func export(_ input: ExportInput,
                 progress: @escaping (Double) -> Void) async throws -> URL {
         let settings = input.settings
@@ -697,14 +737,32 @@ actor TimelineExporter {
                 let actualRange   = CMTimeRange(start: actualTrimSt, duration: actualSrcDur)
                 let at            = CMTime(seconds: clip.startTime - bAdvance, preferredTimescale: 600)
                 let targetDurSec  = useDur.seconds + bAdvance + aExtend
+                // 倒放：预生成反转视频
+                var exEffAsset: AVURLAsset = asset
+                var exEffTrimSt = actualTrimSt
+                var exEffSrcDur = actualSrcDur
+                var exEffAudioURL = url
+                var exEffAudioTrim: Double = clip.trimStart
+                if clip.reversed {
+                    let revStart = max(0, actualTrimSt.seconds)
+                    if let revURL = await self.generateReversedVideo(
+                        inputURL: url, trimStart: revStart, srcDurSec: actualSrcDur.seconds) {
+                        exEffAsset = AVURLAsset(url: revURL)
+                        exEffTrimSt = .zero
+                        exEffSrcDur = (try? await exEffAsset.load(.duration)) ?? actualSrcDur
+                        exEffAudioURL = revURL
+                        exEffAudioTrim = 0
+                    }
+                }
                 if includeVideo && track.isVisible,
-                   let vAsset = try? await asset.loadTracks(withMediaType: .video).first {
+                   let vAsset = try? await exEffAsset.loadTracks(withMediaType: .video).first {
                     let vt = composition.addMutableTrack(withMediaType: .video,
                                                          preferredTrackID: kCMPersistentTrackID_Invalid)
-                    try vt?.insertTimeRange(actualRange, of: vAsset, at: at)
+                    try vt?.insertTimeRange(CMTimeRange(start: exEffTrimSt, duration: exEffSrcDur),
+                                            of: vAsset, at: at)
                     if let vt {
                         if abs(speed - 1.0) > 0.001 {
-                            let compRange = CMTimeRange(start: at, duration: actualSrcDur)
+                            let compRange = CMTimeRange(start: at, duration: exEffSrcDur)
                             vt.scaleTimeRange(compRange, toDuration: CMTime(seconds: targetDurSec, preferredTimescale: 600))
                         }
                         videoCompTracks.append((track: vt, clip: clip,
@@ -720,12 +778,10 @@ actor TimelineExporter {
                 if includeAudio && !track.isMuted {
                     let aAt = CMTime(seconds: clip.startTime, preferredTimescale: 44100)
                     if abs(speed - 1.0) > 0.001 {
-                        // 变速：用 ffmpeg atempo 预处理，避免 scaleTimeRange 音频失真
-                        if let url = clip.url,
-                           let speedURL = await self.generateSpeedAudio(
-                               inputURL: url, trimStart: clip.trimStart,
+                        if let speedURL = await self.generateSpeedAudio(
+                               inputURL: exEffAudioURL, trimStart: exEffAudioTrim,
                                srcDurSec: srcContentDurSec, speed: speed,
-                               audioTrackIndex: clip.audioTrackIndex),
+                               audioTrackIndex: clip.reversed ? 0 : clip.audioTrackIndex),
                            let at2 = composition.addMutableTrack(withMediaType: .audio,
                                                                  preferredTrackID: kCMPersistentTrackID_Invalid) {
                             let sAsset = AVURLAsset(url: speedURL)
@@ -736,8 +792,17 @@ actor TimelineExporter {
                                 audioMixParams.append((at2.trackID, clip.volume, 1.0, 1.0, clip.startTime, ins.seconds, 0, 0))
                             }
                         }
+                    } else if clip.reversed {
+                        let revAudioTracks = (try? await exEffAsset.loadTracks(withMediaType: .audio)) ?? []
+                        if let aTrack = revAudioTracks.first,
+                           let at2 = composition.addMutableTrack(withMediaType: .audio,
+                                                                 preferredTrackID: kCMPersistentTrackID_Invalid) {
+                            let revDur = (try? await exEffAsset.load(.duration)) ?? .zero
+                            let useDurC = CMTimeMinimum(revDur, CMTime(seconds: useDur.seconds, preferredTimescale: 44100))
+                            try? at2.insertTimeRange(CMTimeRange(start: .zero, duration: useDurC), of: aTrack, at: aAt)
+                            audioMixParams.append((at2.trackID, clip.volume, 1.0, 1.0, clip.startTime, useDurC.seconds, 0, 0))
+                        }
                     } else {
-                        // 正常速度：直接插入
                         let allAudioTracks = (try? await asset.loadTracks(withMediaType: .audio)) ?? []
                         let aIdx = min(clip.audioTrackIndex, max(allAudioTracks.count - 1, 0))
                         if let aAsset = allAudioTracks.isEmpty ? nil : allAudioTracks[aIdx],
@@ -1672,6 +1737,18 @@ actor TimelineExporter {
 
         ciImg = ciImg.transformed(by: t)
 
+        // 镜像 / 旋转（以画布中心为锚）
+        if clip.mirrorH || clip.mirrorV || clip.rotation != 0 {
+            let mcx = rw / 2, mcy = rh / 2
+            var mt = CGAffineTransform(translationX: -mcx, y: -mcy)
+            if clip.mirrorH { mt = mt.scaledBy(x: -1, y: 1) }
+            if clip.mirrorV { mt = mt.scaledBy(x: 1, y: -1) }
+            let rad = CGFloat(clip.rotation) * .pi / 180
+            if abs(rad) > 0.001 { mt = mt.rotated(by: rad) }
+            mt = mt.translatedBy(x: mcx, y: mcy)
+            ciImg = ciImg.transformed(by: mt)
+        }
+
         // 色调调节
         let adj = clip.colorAdjust
         if !adj.isIdentity {
@@ -1970,9 +2047,11 @@ actor TimelineExporter {
             let sh = max(clip.height * clip.scaleY * s, 1)
             ctx.saveGState()
             ctx.setAlpha(CGFloat(clip.opacity))
-            if clip.rotation != 0 {
+            if clip.rotation != 0 || clip.mirrorH || clip.mirrorV {
                 ctx.translateBy(x: cx, y: cy)
-                ctx.rotate(by: CGFloat(clip.rotation * .pi / 180))
+                if clip.mirrorH { ctx.scaleBy(x: -1, y: 1) }
+                if clip.mirrorV { ctx.scaleBy(x: 1, y: -1) }
+                if clip.rotation != 0 { ctx.rotate(by: CGFloat(clip.rotation * .pi / 180)) }
                 ctx.translateBy(x: -cx, y: -cy)
             }
             if clip.shadowEnabled {

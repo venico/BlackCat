@@ -106,7 +106,7 @@ extension ProjectState {
                 var newTrack = Track<ImageClip>(label: "图片")
                 newTrack.clips.append(removed)
                 imageTracks.append(newTrack)
-                insertOverlayRefBelow(.image(newTrack.id), below: anchorID)
+                insertOverlayRefAbove(.image(newTrack.id), above: anchorID)
             }
             return
         }
@@ -158,7 +158,7 @@ extension ProjectState {
                 newTrack.clips.append(removed)
                 newTrack.subtitleStyle = newSubtitleStyle()
                 subtitleTracks.append(newTrack)
-                insertOverlayRefBelow(.subtitle(newTrack.id), below: anchorID)
+                insertOverlayRefAbove(.subtitle(newTrack.id), above: anchorID)
             }
             return
         }
@@ -180,7 +180,7 @@ extension ProjectState {
                 var newTrack = Track<TextClip>(label: "文字")
                 newTrack.clips.append(removed)
                 textTracks.append(newTrack)
-                insertOverlayRefBelow(.text(newTrack.id), below: anchorID)
+                insertOverlayRefAbove(.text(newTrack.id), above: anchorID)
             }
             return
         }
@@ -199,7 +199,7 @@ extension ProjectState {
                 var newTrack = Track<ShapeClip>(label: "图形")
                 newTrack.clips.append(removed)
                 shapeTracks.append(newTrack)
-                insertOverlayRefBelow(.shape(newTrack.id), below: anchorID)
+                insertOverlayRefAbove(.shape(newTrack.id), above: anchorID)
             }
             return
         }
@@ -228,7 +228,15 @@ extension ProjectState {
                 newTrack.clips.append(removed)
                 compoundTracks.append(newTrack)
                 if kind == .overlay {
-                    insertOverlayRefBelow(.compound(newTrack.id), below: anchorID)
+                    insertOverlayRefAbove(.compound(newTrack.id), above: anchorID)
+                } else if kind == .video {
+                    if let ai = videoSectionOrder.firstIndex(where: { $0.trackID == anchorID }) {
+                        videoSectionOrder.insert(.compound(newTrack.id), at: ai + 1)
+                    }
+                } else if kind == .audio {
+                    if let ai = audioSectionOrder.firstIndex(where: { $0.trackID == anchorID }) {
+                        audioSectionOrder.insert(.compound(newTrack.id), at: ai + 1)
+                    }
                 }
             }
             return
@@ -271,47 +279,60 @@ extension ProjectState {
         }
     }
 
+    func updateCompoundTime(id: UUID, start: Double? = nil, end: Double? = nil) {
+        pushUndoThrottled()
+        for i in compoundTracks.indices {
+            if let j = compoundTracks[i].clips.firstIndex(where: { $0.id == id }) {
+                if let s = start { compoundTracks[i].clips[j].startTime = s }
+                if let e = end   { compoundTracks[i].clips[j].endTime   = e }
+                return
+            }
+        }
+    }
+
     // MARK: - Multi-select helpers
 
     /// Shift+click: toggle a clip in/out of multi-selection
     func shiftToggleClip(_ id: UUID) {
         if selectedClipIDs.contains(id) {
             selectedClipIDs.remove(id)
-            // Also clear primary if it matches
             if selectedVideoClipID == id    { selectedVideoClipID = nil }
             if selectedImageClipID == id    { selectedImageClipID = nil }
             if selectedAudioClipID == id    { selectedAudioClipID = nil }
             if selectedSubtitleClipID == id { selectedSubtitleClipID = nil }
             if selectedTextClipID == id     { selectedTextClipID = nil }
             if selectedShapeClipID == id    { selectedShapeClipID = nil }
+            if selectedCompoundClipID == id { selectedCompoundClipID = nil }
         } else {
-            // Move current primary into multi-set if needed
             if let pid = selectedVideoClipID, pid != id { selectedClipIDs.insert(pid) }
             if let pid = selectedImageClipID, pid != id { selectedClipIDs.insert(pid) }
             if let pid = selectedAudioClipID, pid != id { selectedClipIDs.insert(pid) }
             if let pid = selectedSubtitleClipID, pid != id { selectedClipIDs.insert(pid) }
             if let pid = selectedTextClipID, pid != id { selectedClipIDs.insert(pid) }
             if let pid = selectedShapeClipID, pid != id { selectedClipIDs.insert(pid) }
+            if let pid = selectedCompoundClipID, pid != id { selectedClipIDs.insert(pid) }
             selectedClipIDs.insert(id)
-            // Set as new primary based on type
-            if videoTracks.flatMap(\.clips).contains(where: { $0.id == id }) {
+            if compoundTracks.flatMap(\.clips).contains(where: { $0.id == id }) {
+                selectedCompoundClipID = id
+                selectedVideoClipID = nil; selectedImageClipID = nil; selectedAudioClipID = nil; selectedSubtitleClipID = nil; selectedTextClipID = nil; selectedShapeClipID = nil
+            } else if videoTracks.flatMap(\.clips).contains(where: { $0.id == id }) {
                 selectedVideoClipID = id
-                selectedImageClipID = nil; selectedAudioClipID = nil; selectedSubtitleClipID = nil; selectedTextClipID = nil; selectedShapeClipID = nil
+                selectedImageClipID = nil; selectedAudioClipID = nil; selectedSubtitleClipID = nil; selectedTextClipID = nil; selectedShapeClipID = nil; selectedCompoundClipID = nil
             } else if imageTracks.flatMap(\.clips).contains(where: { $0.id == id }) {
                 selectedImageClipID = id
-                selectedVideoClipID = nil; selectedAudioClipID = nil; selectedSubtitleClipID = nil; selectedTextClipID = nil; selectedShapeClipID = nil
+                selectedVideoClipID = nil; selectedAudioClipID = nil; selectedSubtitleClipID = nil; selectedTextClipID = nil; selectedShapeClipID = nil; selectedCompoundClipID = nil
             } else if audioTracks.flatMap(\.clips).contains(where: { $0.id == id }) {
                 selectedAudioClipID = id
-                selectedVideoClipID = nil; selectedImageClipID = nil; selectedSubtitleClipID = nil; selectedTextClipID = nil; selectedShapeClipID = nil
+                selectedVideoClipID = nil; selectedImageClipID = nil; selectedSubtitleClipID = nil; selectedTextClipID = nil; selectedShapeClipID = nil; selectedCompoundClipID = nil
             } else if subtitleTracks.flatMap(\.clips).contains(where: { $0.id == id }) {
                 selectedSubtitleClipID = id
-                selectedVideoClipID = nil; selectedImageClipID = nil; selectedAudioClipID = nil; selectedTextClipID = nil; selectedShapeClipID = nil
+                selectedVideoClipID = nil; selectedImageClipID = nil; selectedAudioClipID = nil; selectedTextClipID = nil; selectedShapeClipID = nil; selectedCompoundClipID = nil
             } else if textTracks.flatMap(\.clips).contains(where: { $0.id == id }) {
                 selectedTextClipID = id
-                selectedVideoClipID = nil; selectedImageClipID = nil; selectedAudioClipID = nil; selectedSubtitleClipID = nil; selectedShapeClipID = nil
+                selectedVideoClipID = nil; selectedImageClipID = nil; selectedAudioClipID = nil; selectedSubtitleClipID = nil; selectedShapeClipID = nil; selectedCompoundClipID = nil
             } else if shapeTracks.flatMap(\.clips).contains(where: { $0.id == id }) {
                 selectedShapeClipID = id
-                selectedVideoClipID = nil; selectedImageClipID = nil; selectedAudioClipID = nil; selectedSubtitleClipID = nil; selectedTextClipID = nil
+                selectedVideoClipID = nil; selectedImageClipID = nil; selectedAudioClipID = nil; selectedSubtitleClipID = nil; selectedTextClipID = nil; selectedCompoundClipID = nil
             }
         }
     }
@@ -323,6 +344,7 @@ extension ProjectState {
         if let pid = selectedAudioClipID    { selectedClipIDs.insert(pid) }
         if let pid = selectedSubtitleClipID { selectedClipIDs.insert(pid) }
         if let pid = selectedTextClipID     { selectedClipIDs.insert(pid) }
+        if let pid = selectedCompoundClipID { selectedClipIDs.insert(pid) }
     }
 
     /// 向左全选：选中同轨道中 startTime <= 当前片段的所有片段
@@ -401,7 +423,6 @@ extension ProjectState {
         pushUndo()
         switch asset.type {
         case .video:
-            // 每条视频放到独立的视频轨道，方便多轨编辑
             let trackIdx: Int
             if let emptyIdx = videoTracks.firstIndex(where: { $0.clips.isEmpty }) {
                 trackIdx = emptyIdx
@@ -409,6 +430,14 @@ extension ProjectState {
                 videoTracks.append(Track(label: "视频"))
                 trackIdx = videoTracks.count - 1
             }
+            syncVideoSectionOrder()
+            let placeholderDur = asset.duration > 0 ? asset.duration : 30.0
+            let clip = VideoClip(assetID: asset.id, name: asset.name, url: asset.url,
+                                 startTime: 0, endTime: placeholderDur)
+            videoTracks[trackIdx].clips.append(clip)
+            duration = max(duration, placeholderDur)
+            rebuildTimelinePreview()
+            let clipID = clip.id
             Task {
                 let avAsset = AVURLAsset(url: asset.url)
                 let dur = (try? await avAsset.load(.duration))?.seconds ?? 30
@@ -419,9 +448,14 @@ extension ProjectState {
                 }
                 let finalW = natW, finalH = natH
                 await MainActor.run {
-                    self.videoTracks[trackIdx].clips.append(
-                        VideoClip(assetID: asset.id, name: asset.name, url: asset.url,
-                                  startTime: 0, endTime: dur, videoWidth: finalW, videoHeight: finalH))
+                    for ti in self.videoTracks.indices {
+                        if let ci = self.videoTracks[ti].clips.firstIndex(where: { $0.id == clipID }) {
+                            self.videoTracks[ti].clips[ci].endTime = dur
+                            self.videoTracks[ti].clips[ci].videoWidth = finalW
+                            self.videoTracks[ti].clips[ci].videoHeight = finalH
+                            break
+                        }
+                    }
                     self.duration = max(self.duration, dur)
                     if let i = self.mediaAssets.firstIndex(where:{ $0.id == asset.id }) { self.mediaAssets[i].duration = dur }
                     self.rebuildTimelinePreview()
@@ -435,12 +469,23 @@ extension ProjectState {
                 audioTracks.append(Track(label: "音频"))
                 trackIdx = audioTracks.count - 1
             }
+            syncAudioSectionOrder()
+            let placeholderDur = asset.duration > 0 ? asset.duration : 30.0
+            let clip = AudioClip(assetID: asset.id, name: asset.name, url: asset.url,
+                                 startTime: 0, endTime: placeholderDur)
+            audioTracks[trackIdx].clips.append(clip)
+            duration = max(duration, placeholderDur)
+            rebuildTimelinePreview()
+            let clipID = clip.id
             Task {
                 let dur = (try? await AVURLAsset(url: asset.url).load(.duration))?.seconds ?? 30
                 await MainActor.run {
-                    self.audioTracks[trackIdx].clips.append(
-                        AudioClip(assetID: asset.id, name: asset.name, url: asset.url,
-                                  startTime: 0, endTime: dur))
+                    for ti in self.audioTracks.indices {
+                        if let ci = self.audioTracks[ti].clips.firstIndex(where: { $0.id == clipID }) {
+                            self.audioTracks[ti].clips[ci].endTime = dur
+                            break
+                        }
+                    }
                     self.duration = max(self.duration, dur)
                     if let i = self.mediaAssets.firstIndex(where:{ $0.id == asset.id }) { self.mediaAssets[i].duration = dur }
                     self.rebuildTimelinePreview()
@@ -530,6 +575,14 @@ extension ProjectState {
                 videoTracks.append(Track(label: "视频"))
                 trackIdx = videoTracks.count - 1
             }
+            syncVideoSectionOrder()
+            let placeholderDur = asset.duration > 0 ? asset.duration : 30.0
+            let clip = VideoClip(assetID: asset.id, name: asset.name, url: asset.url,
+                                 startTime: insertTime, endTime: insertTime + placeholderDur)
+            videoTracks[trackIdx].clips.append(clip)
+            duration = max(duration, insertTime + placeholderDur)
+            rebuildTimelinePreview()
+            let clipID = clip.id
             Task {
                 let avAsset = AVURLAsset(url: asset.url)
                 let dur = (try? await avAsset.load(.duration))?.seconds ?? 30
@@ -540,10 +593,14 @@ extension ProjectState {
                 }
                 let finalW = natW, finalH = natH
                 await MainActor.run {
-                    self.videoTracks[trackIdx].clips.append(
-                        VideoClip(assetID: asset.id, name: asset.name, url: asset.url,
-                                  startTime: insertTime, endTime: insertTime + dur,
-                                  videoWidth: finalW, videoHeight: finalH))
+                    for ti in self.videoTracks.indices {
+                        if let ci = self.videoTracks[ti].clips.firstIndex(where: { $0.id == clipID }) {
+                            self.videoTracks[ti].clips[ci].endTime = insertTime + dur
+                            self.videoTracks[ti].clips[ci].videoWidth = finalW
+                            self.videoTracks[ti].clips[ci].videoHeight = finalH
+                            break
+                        }
+                    }
                     self.duration = max(self.duration, insertTime + dur)
                     if let i = self.mediaAssets.firstIndex(where: { $0.id == asset.id }) { self.mediaAssets[i].duration = dur }
                     self.rebuildTimelinePreview()
@@ -557,12 +614,23 @@ extension ProjectState {
                 audioTracks.append(Track(label: "音频"))
                 audioTrackIdx = audioTracks.count - 1
             }
+            syncAudioSectionOrder()
+            let placeholderDur = asset.duration > 0 ? asset.duration : 30.0
+            let aClip = AudioClip(assetID: asset.id, name: asset.name, url: asset.url,
+                                  startTime: insertTime, endTime: insertTime + placeholderDur)
+            audioTracks[audioTrackIdx].clips.append(aClip)
+            duration = max(duration, insertTime + placeholderDur)
+            rebuildTimelinePreview()
+            let aClipID = aClip.id
             Task {
                 let dur = (try? await AVURLAsset(url: asset.url).load(.duration))?.seconds ?? 30
                 await MainActor.run {
-                    self.audioTracks[audioTrackIdx].clips.append(
-                        AudioClip(assetID: asset.id, name: asset.name, url: asset.url,
-                                  startTime: insertTime, endTime: insertTime + dur))
+                    for ti in self.audioTracks.indices {
+                        if let ci = self.audioTracks[ti].clips.firstIndex(where: { $0.id == aClipID }) {
+                            self.audioTracks[ti].clips[ci].endTime = insertTime + dur
+                            break
+                        }
+                    }
                     self.duration = max(self.duration, insertTime + dur)
                     if let i = self.mediaAssets.firstIndex(where: { $0.id == asset.id }) { self.mediaAssets[i].duration = dur }
                     self.rebuildTimelinePreview()
@@ -696,6 +764,9 @@ extension ProjectState {
         subtitleTracks[trackIdx].clips.append(clip)
         subtitleTracks[trackIdx].clips.sort { $0.startTime < $1.startTime }
         selectedSubtitleClipID = clip.id
+        selectedVideoClipID = nil; selectedAudioClipID = nil
+        selectedImageClipID = nil; selectedTextClipID = nil; selectedShapeClipID = nil
+        selectedCompoundClipID = nil; selectedClipIDs.removeAll()
 
         undoStack.append(snap)
         if undoStack.count > 30 { undoStack.removeFirst() }
@@ -742,7 +813,7 @@ extension ProjectState {
         selectedTextClipID = clip.id
         selectedVideoClipID = nil; selectedAudioClipID = nil
         selectedImageClipID = nil; selectedSubtitleClipID = nil; selectedShapeClipID = nil
-        selectedClipIDs.removeAll()
+        selectedCompoundClipID = nil; selectedClipIDs.removeAll()
 
         undoStack.append(snap)
         if undoStack.count > 30 { undoStack.removeFirst() }

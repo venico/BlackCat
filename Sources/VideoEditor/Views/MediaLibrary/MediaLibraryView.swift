@@ -983,6 +983,45 @@ struct SceneDetectBubble: View {
     }
 }
 
+// MARK: - Reverse Video Bubble (右下角浮层)
+
+struct ReverseVideoBubble: View {
+    var body: some View {
+        HStack(spacing: 10) {
+            ZStack {
+                Circle().fill(Color.orange.opacity(0.2)).frame(width: 28, height: 28)
+                Image(systemName: "arrow.counterclockwise")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundColor(.orange)
+            }
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text("正在生成倒放视频...")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundColor(Color.labelPrimary)
+                    .lineLimit(1)
+
+                ProgressView()
+                    .progressViewStyle(.linear)
+                    .tint(.orange)
+                    .frame(height: 14)
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .frame(maxWidth: 260)
+        .background(
+            RoundedRectangle(cornerRadius: 10)
+                .fill(Color(red: 0.16, green: 0.16, blue: 0.17))
+                .shadow(color: .black.opacity(0.5), radius: 8, y: 4)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 10)
+                .stroke(Color.white.opacity(0.12), lineWidth: 0.5)
+        )
+    }
+}
+
 // MARK: - LLM Analyze Bubble (右下角浮层)
 
 struct LLMAnalyzeBubble: View {

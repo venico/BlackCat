@@ -13,7 +13,8 @@ struct PlayerView: View {
     private var hasAnyVisibleClips: Bool {
         let hasVideo = project.videoTracks.contains { $0.isVisible && !$0.clips.isEmpty }
         let hasImage = project.imageTracks.contains { $0.isVisible && !$0.clips.isEmpty }
-        return hasVideo || hasImage
+        let hasCompoundVideo = project.compoundTracks.contains { $0.isVisible && !$0.clips.isEmpty && $0.clips.contains { !$0.videoTracks.flatMap(\.clips).isEmpty } }
+        return hasVideo || hasImage || hasCompoundVideo
     }
 
     var body: some View {
@@ -452,6 +453,8 @@ private struct ImageLayerView: View {
                 }
                 .frame(width: cropW * vs, height: cropH * vs, alignment: .topLeading)
                 .clipped()
+                .scaleEffect(x: clip.mirrorH ? -1 : 1, y: clip.mirrorV ? -1 : 1)
+                .rotationEffect(.degrees(Double(clip.rotation)))
                 .position(x: originX + (cropX + cropW / 2) * vs,
                           y: originY + (cropY + cropH / 2) * vs)
             }
@@ -1581,6 +1584,7 @@ struct ShapeClipView: View {
             .modifier(ShapeShadow(clip: clip, scale: scale))
             .frame(width: max(w, 28), height: max(h, 28))   // 扩大点击热区（线段等细图形好点）
             .contentShape(Rectangle())
+            .scaleEffect(x: clip.mirrorH ? -1 : 1, y: clip.mirrorV ? -1 : 1)
             .rotationEffect(.degrees(clip.rotation))
             .opacity(clip.opacity)
     }

@@ -68,6 +68,8 @@ extension ProjectState {
                         shapeTracks: shapeTracks,
                         compoundTracks: compoundTracks,
                         overlayTrackOrder: overlayTrackOrder,
+                        videoSectionOrder: videoSectionOrder,
+                        audioSectionOrder: audioSectionOrder,
                         subtitleBottomMargin: subtitleBottomMargin,
                         subtitleLineSpacing: subtitleLineSpacing,
                         duration: duration,
@@ -83,6 +85,8 @@ extension ProjectState {
         shapeTracks    = s.shapeTracks
         compoundTracks = s.compoundTracks
         overlayTrackOrder = s.overlayTrackOrder
+        videoSectionOrder = s.videoSectionOrder
+        audioSectionOrder = s.audioSectionOrder
         subtitleBottomMargin = s.subtitleBottomMargin
         subtitleLineSpacing  = s.subtitleLineSpacing
         duration       = s.duration
@@ -486,6 +490,30 @@ extension ProjectState {
 
         guard minTime < maxTime else { return }
 
+        // 确定复合片段类型和锚点（在移除源片段前记录）
+        let willBeVideo = !collectedVideo.isEmpty
+        let willBeAudio = !willBeVideo && !collectedAudio.isEmpty
+        var anchorTrackID: UUID?
+        var anchorOverlayIdx: Int?
+        if willBeVideo {
+            anchorTrackID = videoTracks.first(where: { t in t.clips.contains { ids.contains($0.id) } })?.id
+        } else if willBeAudio {
+            anchorTrackID = audioTracks.first(where: { t in t.clips.contains { ids.contains($0.id) } })?.id
+        } else {
+            for (oi, ref) in overlayTrackOrder.enumerated() {
+                let tid = ref.trackID
+                var affected = false
+                switch ref {
+                case .image: affected = imageTracks.first(where: { $0.id == tid })?.clips.contains { ids.contains($0.id) } ?? false
+                case .subtitle: affected = subtitleTracks.first(where: { $0.id == tid })?.clips.contains { ids.contains($0.id) } ?? false
+                case .text: affected = textTracks.first(where: { $0.id == tid })?.clips.contains { ids.contains($0.id) } ?? false
+                case .shape: affected = shapeTracks.first(where: { $0.id == tid })?.clips.contains { ids.contains($0.id) } ?? false
+                case .compound: break
+                }
+                if affected { anchorOverlayIdx = oi; break }
+            }
+        }
+
         // 根据父 overlayTrackOrder 的顺序构建复合片段的 overlayTrackOrder
         var compoundOverlayOrder: [OverlayTrackRef] = []
         for ref in overlayTrackOrder {
@@ -622,7 +650,25 @@ extension ProjectState {
         selectedCompoundClipID = nil
         selectedClipIDs.removeAll()
 
+        // 将新复合轨道插入到源轨道的位置
+        if let cTrackID = compoundTracks.first(where: { $0.clips.contains(where: { $0.id == compound.id }) })?.id {
+            if willBeVideo, let anchor = anchorTrackID {
+                if let ai = videoSectionOrder.firstIndex(where: { $0.trackID == anchor }) {
+                    videoSectionOrder.insert(.compound(cTrackID), at: ai)
+                }
+            } else if willBeAudio, let anchor = anchorTrackID {
+                if let ai = audioSectionOrder.firstIndex(where: { $0.trackID == anchor }) {
+                    audioSectionOrder.insert(.compound(cTrackID), at: ai)
+                }
+            } else if let oi = anchorOverlayIdx {
+                let insertAt = min(oi, overlayTrackOrder.count)
+                overlayTrackOrder.insert(.compound(cTrackID), at: insertAt)
+            }
+        }
+
         syncOverlayOrder()
+        syncVideoSectionOrder()
+        syncAudioSectionOrder()
         undoStack.append(snap)
         if undoStack.count > 30 { undoStack.removeFirst() }
         redoStack.removeAll()
@@ -721,6 +767,11 @@ extension ProjectState {
         let compound = compoundTracks[ti].clips[ci]
         let offset = compound.startTime
 
+        // 记录复合轨道在 section order 中的位置（释放后新轨道插到这里）
+        let compoundTrackUUID = compoundTracks[ti].id
+        let videoAnchorIdx = videoSectionOrder.firstIndex(where: { $0.trackID == compoundTrackUUID })
+        let audioAnchorIdx = audioSectionOrder.firstIndex(where: { $0.trackID == compoundTrackUUID })
+
         for subTrack in compound.videoTracks {
             var clips = subTrack.clips
             for i in clips.indices { clips[i].startTime += offset; clips[i].endTime += offset }
@@ -810,6 +861,25 @@ extension ProjectState {
         overlayTrackOrder.insert(contentsOf: newOverlayRefs, at: insertAt)
 
         selectedCompoundClipID = nil
+
+        // 将释放出的新视频/音频轨道插入到复合轨道原来的 section order 位置
+        if let anchor = videoAnchorIdx {
+            let existingIDs = Set(videoSectionOrder.map(\.trackID))
+            var newRefs: [VideoSectionRef] = []
+            for t in videoTracks where !existingIDs.contains(t.id) { newRefs.append(.video(t.id)) }
+            if !newRefs.isEmpty {
+                videoSectionOrder.insert(contentsOf: newRefs, at: min(anchor, videoSectionOrder.count))
+            }
+        }
+        if let anchor = audioAnchorIdx {
+            let existingIDs = Set(audioSectionOrder.map(\.trackID))
+            var newRefs: [AudioSectionRef] = []
+            for t in audioTracks where !existingIDs.contains(t.id) { newRefs.append(.audio(t.id)) }
+            if !newRefs.isEmpty {
+                audioSectionOrder.insert(contentsOf: newRefs, at: min(anchor, audioSectionOrder.count))
+            }
+        }
+
         syncOverlayOrder()
 
         undoStack.append(snap)
@@ -916,6 +986,7 @@ extension ProjectState {
         if let id = selectedSubtitleClipID { allIDs.insert(id) }
         if let id = selectedTextClipID     { allIDs.insert(id) }
         if let id = selectedShapeClipID    { allIDs.insert(id) }
+        if let id = selectedCompoundClipID { allIDs.insert(id) }
 
         for id in allIDs {
             for (ti, track) in videoTracks.enumerated() {
@@ -948,6 +1019,11 @@ extension ProjectState {
                     items.append(.shape(clip, trackIndex: ti)); srcIDs.insert(id)
                 }
             }
+            for (ti, track) in compoundTracks.enumerated() {
+                if let clip = track.clips.first(where: { $0.id == id }) {
+                    items.append(.compound(clip, trackIndex: ti)); srcIDs.insert(id)
+                }
+            }
         }
 
         guard !items.isEmpty else { return }
@@ -971,6 +1047,7 @@ extension ProjectState {
             for i in subtitleTracks.indices { subtitleTracks[i].clips.removeAll { srcIDs.contains($0.id) } }
             for i in textTracks.indices     { textTracks[i].clips.removeAll     { srcIDs.contains($0.id) } }
             for i in shapeTracks.indices    { shapeTracks[i].clips.removeAll    { srcIDs.contains($0.id) } }
+            for i in compoundTracks.indices { compoundTracks[i].clips.removeAll { srcIDs.contains($0.id) } }
             clipboardIsCut = false
             clipboardSourceIDs = []
         }
@@ -983,6 +1060,7 @@ extension ProjectState {
             case .subtitle(let c, _): return c.startTime
             case .text(let c, _): return c.startTime
             case .shape(let c, _): return c.startTime
+            case .compound(let c, _): return c.startTime
             }
         }
         let earliest = clipboard.map { startOf($0) }.min() ?? 0
@@ -994,6 +1072,7 @@ extension ProjectState {
         selectedSubtitleClipID = nil
         selectedTextClipID = nil
         selectedShapeClipID = nil
+        selectedCompoundClipID = nil
         for item in clipboard {
             let offset = startOf(item) - earliest
 
@@ -1047,7 +1126,7 @@ extension ProjectState {
                         var newTrack = Track<ImageClip>(label: "图片")
                         newTrack.clips.append(newClip)
                         imageTracks.append(newTrack)
-                        insertOverlayRefBelow(.image(newTrack.id), below: anchorID)
+                        insertOverlayRefAbove(.image(newTrack.id), above: anchorID)
                     } else {
                         imageTracks[idx].clips.append(newClip)
                     }
@@ -1129,7 +1208,7 @@ extension ProjectState {
                         var newTrack = Track<TextClip>(label: "文字")
                         newTrack.clips.append(newClip)
                         textTracks.append(newTrack)
-                        insertOverlayRefBelow(.text(newTrack.id), below: anchorID)
+                        insertOverlayRefAbove(.text(newTrack.id), above: anchorID)
                     } else {
                         textTracks[idx].clips.append(newClip)
                     }
@@ -1164,9 +1243,43 @@ extension ProjectState {
                     shapeTracks[idx].clips.append(newClip)
                     selectedClipIDs.insert(newClip.id)
                 }
+
+            case .compound(let clip, let trackIdx):
+                var newClip = clip
+                newClip.id = UUID()
+                newClip.startTime = t + offset
+                newClip.endTime = t + offset + clip.duration
+                let idx = compoundTracks.indices.contains(trackIdx) ? trackIdx : 0
+                if compoundTracks.indices.contains(idx) {
+                    let hasOverlap = compoundTracks[idx].clips.contains {
+                        $0.startTime < newClip.endTime - 0.001 && $0.endTime > newClip.startTime + 0.001
+                    }
+                    if hasOverlap {
+                        let kind = compoundTrackKind(compoundTracks[idx])
+                        let anchorID = compoundTracks[idx].id
+                        var newTrack = Track<CompoundClip>(label: "复合")
+                        newTrack.clips.append(newClip)
+                        compoundTracks.append(newTrack)
+                        if kind == .overlay {
+                            insertOverlayRefAbove(.compound(newTrack.id), above: anchorID)
+                        } else if kind == .video {
+                            if let ai = videoSectionOrder.firstIndex(where: { $0.trackID == anchorID }) {
+                                videoSectionOrder.insert(.compound(newTrack.id), at: ai + 1)
+                            }
+                        } else if kind == .audio {
+                            if let ai = audioSectionOrder.firstIndex(where: { $0.trackID == anchorID }) {
+                                audioSectionOrder.insert(.compound(newTrack.id), at: ai + 1)
+                            }
+                        }
+                    } else {
+                        compoundTracks[idx].clips.append(newClip)
+                    }
+                    selectedClipIDs.insert(newClip.id)
+                }
             }
         }
 
+        syncOverlayOrder()
         undoStack.append(snap)
         if undoStack.count > 30 { undoStack.removeFirst() }
         redoStack.removeAll()

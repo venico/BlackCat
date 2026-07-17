@@ -20,6 +20,7 @@ final class ProjectState: ObservableObject {
     @Published var textTemplates: [TextTemplate] = []  // 文字样式模板
     @Published var shapeTracks: [Track<ShapeClip>] = []  // 图形图层
     @Published var compoundTracks: [Track<CompoundClip>] = []
+    @Published var selectedMarkerID: UUID? = nil
 
     // 复合片段编辑栈
     struct CompositionLevel {
@@ -64,6 +65,45 @@ final class ProjectState: ObservableObject {
     }
     @Published var overlayTrackOrder: [OverlayTrackRef] = []
 
+    enum VideoSectionRef: Equatable, Hashable {
+        case video(UUID)
+        case compound(UUID)
+        var trackID: UUID { switch self { case .video(let id), .compound(let id): return id } }
+    }
+    enum AudioSectionRef: Equatable, Hashable {
+        case audio(UUID)
+        case compound(UUID)
+        var trackID: UUID { switch self { case .audio(let id), .compound(let id): return id } }
+    }
+    @Published var videoSectionOrder: [VideoSectionRef] = []
+    @Published var audioSectionOrder: [AudioSectionRef] = []
+
+    func syncVideoSectionOrder() {
+        var validIDs = Set<UUID>()
+        for t in videoTracks { validIDs.insert(t.id) }
+        for t in compoundTracks where compoundTrackKind(t) == .video { validIDs.insert(t.id) }
+        var newOrder: [VideoSectionRef] = []
+        for ref in videoSectionOrder where validIDs.contains(ref.trackID) {
+            newOrder.append(ref); validIDs.remove(ref.trackID)
+        }
+        for t in videoTracks where validIDs.contains(t.id) { newOrder.append(.video(t.id)); validIDs.remove(t.id) }
+        for t in compoundTracks where validIDs.contains(t.id) { newOrder.append(.compound(t.id)) }
+        videoSectionOrder = newOrder
+    }
+
+    func syncAudioSectionOrder() {
+        var validIDs = Set<UUID>()
+        for t in audioTracks { validIDs.insert(t.id) }
+        for t in compoundTracks where compoundTrackKind(t) == .audio { validIDs.insert(t.id) }
+        var newOrder: [AudioSectionRef] = []
+        for ref in audioSectionOrder where validIDs.contains(ref.trackID) {
+            newOrder.append(ref); validIDs.remove(ref.trackID)
+        }
+        for t in audioTracks where validIDs.contains(t.id) { newOrder.append(.audio(t.id)); validIDs.remove(t.id) }
+        for t in compoundTracks where validIDs.contains(t.id) { newOrder.append(.compound(t.id)) }
+        audioSectionOrder = newOrder
+    }
+
     func syncOverlayOrder() {
         var currentIDs = Set<UUID>()
         var newOrder: [OverlayTrackRef] = []
@@ -83,22 +123,25 @@ final class ProjectState: ObservableObject {
             }
             if currentIDs.contains(rid) { newOrder.append(ref); currentIDs.remove(rid) }
         }
-        for t in imageTracks where currentIDs.contains(t.id) { newOrder.append(.image(t.id)); currentIDs.remove(t.id) }
-        for t in subtitleTracks where currentIDs.contains(t.id) { newOrder.append(.subtitle(t.id)); currentIDs.remove(t.id) }
-        for t in textTracks where currentIDs.contains(t.id) { newOrder.append(.text(t.id)); currentIDs.remove(t.id) }
-        for t in shapeTracks where currentIDs.contains(t.id) { newOrder.append(.shape(t.id)); currentIDs.remove(t.id) }
-        for t in compoundTracks where currentIDs.contains(t.id) { newOrder.append(.compound(t.id)); currentIDs.remove(t.id) }
-        overlayTrackOrder = newOrder
+        var newRefs: [OverlayTrackRef] = []
+        for t in imageTracks where currentIDs.contains(t.id) { newRefs.append(.image(t.id)); currentIDs.remove(t.id) }
+        for t in subtitleTracks where currentIDs.contains(t.id) { newRefs.append(.subtitle(t.id)); currentIDs.remove(t.id) }
+        for t in textTracks where currentIDs.contains(t.id) { newRefs.append(.text(t.id)); currentIDs.remove(t.id) }
+        for t in shapeTracks where currentIDs.contains(t.id) { newRefs.append(.shape(t.id)); currentIDs.remove(t.id) }
+        for t in compoundTracks where currentIDs.contains(t.id) { newRefs.append(.compound(t.id)); currentIDs.remove(t.id) }
+        overlayTrackOrder = newRefs + newOrder
+        syncVideoSectionOrder()
+        syncAudioSectionOrder()
     }
 
-    /// 新轨道插入到指定轨道的正下方（重叠自动新建时用），而不是排到末尾
-    func insertOverlayRefBelow(_ newRef: OverlayTrackRef, below afterTrackID: UUID) {
+    /// 新轨道插入到指定轨道的正上方（重叠自动新建时用）
+    func insertOverlayRefAbove(_ newRef: OverlayTrackRef, above anchorTrackID: UUID) {
         syncOverlayOrder()
         overlayTrackOrder.removeAll { $0.trackID == newRef.trackID }
-        if let idx = overlayTrackOrder.firstIndex(where: { $0.trackID == afterTrackID }) {
-            overlayTrackOrder.insert(newRef, at: idx + 1)
+        if let idx = overlayTrackOrder.firstIndex(where: { $0.trackID == anchorTrackID }) {
+            overlayTrackOrder.insert(newRef, at: idx)
         } else {
-            overlayTrackOrder.append(newRef)
+            overlayTrackOrder.insert(newRef, at: 0)
         }
     }
 
@@ -153,6 +196,8 @@ final class ProjectState: ObservableObject {
     private var _zoomWorkItem: DispatchWorkItem? = nil
     /// 变速音频临时文件缓存：key = "path|trimStart|srcDurSec|speed|trackIdx"
     var audioSpeedCache: [String: URL] = [:]
+    /// 倒放视频临时文件缓存：key = "path|trimStart|srcDurSec"
+    var reversedVideoCache: [String: URL] = [:]
     @Published var snapEnabled: Bool = true
     @Published var showImageTracks: Bool = true
     var timelineVisibleWidth: Double = 800  // 由 GeometryReader 更新
@@ -233,6 +278,7 @@ final class ProjectState: ObservableObject {
     @Published var showSubtitleTracks: Bool = true
     @Published var showTextTracks: Bool = true
     @Published var showShapeTracks: Bool = true
+    @Published var showCompoundTracks: Bool = true
 
     // 删除确认
     @Published var showDeleteConfirm: Bool = false
@@ -290,6 +336,12 @@ final class ProjectState: ObservableObject {
         return nil
     }
 
+    var selectedCompoundClip: CompoundClip? {
+        guard let id = selectedCompoundClipID else { return nil }
+        for t in compoundTracks { if let c = t.clips.first(where: { $0.id == id }) { return c } }
+        return nil
+    }
+
     // 语音识别状态（Whisper）
     enum TranscribeState: Equatable {
         case idle
@@ -316,6 +368,7 @@ final class ProjectState: ObservableObject {
         showSuccessToast(icon: "stop.fill", iconColor: .yellow, title: "语音识别", subtitle: "已停止", autoCountdown: false)
     }
     // MARK: - 场景检测 / 大模型分析
+    @Published var isReversingVideo: Bool = false
     @Published var isDetectingScenes: Bool = false
     @Published var sceneDetectProgress: Double = 0
     var sceneDetectTask: Task<Void, Never>? = nil
@@ -353,6 +406,7 @@ final class ProjectState: ObservableObject {
         case subtitle(SubtitleClip, trackIndex: Int)
         case text(TextClip, trackIndex: Int)
         case shape(ShapeClip, trackIndex: Int)
+        case compound(CompoundClip, trackIndex: Int)
     }
     var clipboard: [ClipboardItem] = []
     @Published var clipboardIsCut: Bool = false
@@ -537,6 +591,8 @@ final class ProjectState: ObservableObject {
                 self?.saveMediaLibrary(assets)
             }
             .store(in: &cancellables)
+        syncVideoSectionOrder()
+        syncAudioSectionOrder()
     }
 
     deinit {
@@ -550,5 +606,158 @@ final class ProjectState: ObservableObject {
     func requestSeek(to t: Double) {
         currentTime = max(t, 0)
         seekRequest &+= 1
+        selectedMarkerID = nil
+    }
+
+    // MARK: - Marker helpers
+
+    struct MarkerAbsolute: Identifiable {
+        var id: UUID { marker.id }
+        var marker: Marker
+        var absoluteTime: Double
+    }
+
+    var allMarkersAbsolute: [MarkerAbsolute] {
+        var result: [MarkerAbsolute] = []
+        func collect<C: Identifiable & Equatable & Codable>(_ tracks: [Track<C>], startTime: KeyPath<C, Double>, markers: KeyPath<C, [Marker]?>) {
+            for track in tracks {
+                for clip in track.clips {
+                    for m in clip[keyPath: markers] ?? [] {
+                        result.append(.init(marker: m, absoluteTime: clip[keyPath: startTime] + m.time))
+                    }
+                }
+            }
+        }
+        collect(videoTracks, startTime: \.startTime, markers: \.markers)
+        collect(audioTracks, startTime: \.startTime, markers: \.markers)
+        collect(imageTracks, startTime: \.startTime, markers: \.markers)
+        collect(subtitleTracks, startTime: \.startTime, markers: \.markers)
+        collect(textTracks, startTime: \.startTime, markers: \.markers)
+        collect(shapeTracks, startTime: \.startTime, markers: \.markers)
+        collect(compoundTracks, startTime: \.startTime, markers: \.markers)
+        return result
+    }
+
+    func addMarkerToSelectedClip() {
+        let t = currentTime
+        if let id = selectedVideoClipID, let clip = selectedVideoClip {
+            let offset = t - clip.startTime
+            guard offset >= 0 && offset <= clip.duration else { return }
+            pushUndo()
+            let m = Marker(time: offset, title: "标记")
+            updateVideoClip(id: id) { $0.markers = ($0.markers ?? []) + [m] }
+            selectedMarkerID = m.id
+        } else if let id = selectedAudioClipID, let clip = audioTracks.flatMap(\.clips).first(where: { $0.id == id }) {
+            let offset = t - clip.startTime
+            guard offset >= 0 && offset <= clip.duration else { return }
+            pushUndo()
+            let m = Marker(time: offset, title: "标记")
+            for i in audioTracks.indices {
+                if let j = audioTracks[i].clips.firstIndex(where: { $0.id == id }) {
+                    audioTracks[i].clips[j].markers = (audioTracks[i].clips[j].markers ?? []) + [m]; break
+                }
+            }
+            selectedMarkerID = m.id
+        } else if let id = selectedImageClipID, let clip = imageTracks.flatMap(\.clips).first(where: { $0.id == id }) {
+            let offset = t - clip.startTime
+            guard offset >= 0 && offset <= clip.duration else { return }
+            pushUndo()
+            let m = Marker(time: offset, title: "标记")
+            updateImageClip(id: id) { $0.markers = ($0.markers ?? []) + [m] }
+            selectedMarkerID = m.id
+        } else if let id = selectedSubtitleClipID, let clip = subtitleTracks.flatMap(\.clips).first(where: { $0.id == id }) {
+            let offset = t - clip.startTime
+            guard offset >= 0 && offset <= clip.duration else { return }
+            pushUndo()
+            let m = Marker(time: offset, title: "标记")
+            for i in subtitleTracks.indices {
+                if let j = subtitleTracks[i].clips.firstIndex(where: { $0.id == id }) {
+                    subtitleTracks[i].clips[j].markers = (subtitleTracks[i].clips[j].markers ?? []) + [m]; break
+                }
+            }
+            selectedMarkerID = m.id
+        } else if let id = selectedTextClipID, let clip = textTracks.flatMap(\.clips).first(where: { $0.id == id }) {
+            let offset = t - clip.startTime
+            guard offset >= 0 && offset <= clip.duration else { return }
+            pushUndo()
+            let m = Marker(time: offset, title: "标记")
+            for i in textTracks.indices {
+                if let j = textTracks[i].clips.firstIndex(where: { $0.id == id }) {
+                    textTracks[i].clips[j].markers = (textTracks[i].clips[j].markers ?? []) + [m]; break
+                }
+            }
+            selectedMarkerID = m.id
+        } else if let id = selectedShapeClipID, let clip = shapeTracks.flatMap(\.clips).first(where: { $0.id == id }) {
+            let offset = t - clip.startTime
+            guard offset >= 0 && offset <= clip.duration else { return }
+            pushUndo()
+            let m = Marker(time: offset, title: "标记")
+            for i in shapeTracks.indices {
+                if let j = shapeTracks[i].clips.firstIndex(where: { $0.id == id }) {
+                    shapeTracks[i].clips[j].markers = (shapeTracks[i].clips[j].markers ?? []) + [m]; break
+                }
+            }
+            selectedMarkerID = m.id
+        } else if let id = selectedCompoundClipID, let clip = compoundTracks.flatMap(\.clips).first(where: { $0.id == id }) {
+            let offset = t - clip.startTime
+            guard offset >= 0 && offset <= clip.duration else { return }
+            pushUndo()
+            let m = Marker(time: offset, title: "标记")
+            for i in compoundTracks.indices {
+                if let j = compoundTracks[i].clips.firstIndex(where: { $0.id == id }) {
+                    compoundTracks[i].clips[j].markers = (compoundTracks[i].clips[j].markers ?? []) + [m]; break
+                }
+            }
+            selectedMarkerID = m.id
+        }
+    }
+
+    func removeMarker(id: UUID) {
+        pushUndo()
+        func removeFrom<C>(_ tracks: inout [Track<C>], markers: WritableKeyPath<C, [Marker]?>) -> Bool {
+            for i in tracks.indices {
+                for j in tracks[i].clips.indices {
+                    if tracks[i].clips[j][keyPath: markers]?.contains(where: { $0.id == id }) == true {
+                        tracks[i].clips[j][keyPath: markers]?.removeAll { $0.id == id }
+                        return true
+                    }
+                }
+            }
+            return false
+        }
+        if removeFrom(&videoTracks, markers: \.markers) ||
+           removeFrom(&audioTracks, markers: \.markers) ||
+           removeFrom(&imageTracks, markers: \.markers) ||
+           removeFrom(&subtitleTracks, markers: \.markers) ||
+           removeFrom(&textTracks, markers: \.markers) ||
+           removeFrom(&shapeTracks, markers: \.markers) ||
+           removeFrom(&compoundTracks, markers: \.markers) {
+            if selectedMarkerID == id { selectedMarkerID = nil }
+        }
+    }
+
+    func updateMarker(id: UUID, _ modify: (inout Marker) -> Void) {
+        func update<C>(_ tracks: inout [Track<C>], markers: WritableKeyPath<C, [Marker]?>) -> Bool {
+            for i in tracks.indices {
+                for j in tracks[i].clips.indices {
+                    if let k = tracks[i].clips[j][keyPath: markers]?.firstIndex(where: { $0.id == id }) {
+                        modify(&tracks[i].clips[j][keyPath: markers]![k])
+                        return true
+                    }
+                }
+            }
+            return false
+        }
+        _ = update(&videoTracks, markers: \.markers) ||
+            update(&audioTracks, markers: \.markers) ||
+            update(&imageTracks, markers: \.markers) ||
+            update(&subtitleTracks, markers: \.markers) ||
+            update(&textTracks, markers: \.markers) ||
+            update(&shapeTracks, markers: \.markers) ||
+            update(&compoundTracks, markers: \.markers)
+    }
+
+    func findMarker(id: UUID) -> MarkerAbsolute? {
+        allMarkersAbsolute.first { $0.id == id }
     }
 }

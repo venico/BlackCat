@@ -12,7 +12,7 @@ struct SettingsView: View {
     }
 
     @State private var sceneDetectState: ModelState = .notDownloaded
-    private let tabs = ["保存位置", "语音识别", "字幕翻译", "视频分析", "视频生成"]
+    private let tabs = ["保存位置", "语音识别", "字幕翻译", "视频分析", "AI 生成"]
 
     var body: some View {
         VStack(spacing: 0) {
@@ -313,15 +313,15 @@ struct SettingsView: View {
         }
     }
 
-    // MARK: - 视频生成
+    // MARK: - AI 生成
 
     private var aiVideoTab: some View {
         VStack(alignment: .leading, spacing: 12) {
             SSection(title: "生成模型") {
-                IPicker(selection: Binding(
+                AIProviderPicker(selection: Binding(
                     get: { settings.aiProvider },
                     set: { settings.aiProvider = $0 }
-                ), options: AIVideoService.Provider.allCases.map { ($0.rawValue, $0.displayName) })
+                ))
             }
 
             if let provider = AIVideoService.Provider(rawValue: settings.aiProvider) {
@@ -347,21 +347,68 @@ struct SettingsView: View {
                     Text("在火山方舟「接入点管理」中为每个模型创建接入点，填入对应 ID")
                         .font(.system(size: 10))
                         .foregroundColor(Color.labelSecondary.opacity(0.6))
-                } else {
+                } else if provider == .kling {
                     apiKeyField(
-                        label: provider.accessKeyLabel,
-                        placeholder: "输入 \(provider.accessKeyLabel)",
+                        label: "Access Key",
+                        placeholder: "输入 Access Key",
                         text: Binding(get: { settings.aiAccessKey }, set: { settings.aiAccessKey = $0 })
                     )
-
-                    if provider.needsSecretKey {
-                        apiKeyField(
-                            label: provider.secretKeyLabel,
-                            placeholder: "输入 \(provider.secretKeyLabel)",
-                            text: Binding(get: { settings.aiSecretKey }, set: { settings.aiSecretKey = $0 })
+                    apiKeyField(
+                        label: "Secret Key",
+                        placeholder: "输入 Secret Key",
+                        text: Binding(get: { settings.aiSecretKey }, set: { settings.aiSecretKey = $0 })
+                    )
+                } else if provider == .runway {
+                    apiKeyField(
+                        label: "API Key",
+                        placeholder: "输入 Runway API Key",
+                        text: Binding(get: { settings.aiAccessKey }, set: { settings.aiAccessKey = $0 })
+                    )
+                } else {
+                    apiKeyField(
+                        label: "API Key",
+                        placeholder: "输入 \(provider.displayName) API Key",
+                        text: Binding(
+                            get: { settings.providerAPIKey(for: provider.rawValue) },
+                            set: { settings.setProviderAPIKey($0, for: provider.rawValue) }
                         )
+                    )
+                    if provider.category == .text {
+                        Text("文字生成使用标准 Chat Completions 接口")
+                            .font(.system(size: 10))
+                            .foregroundColor(Color.labelSecondary.opacity(0.6))
                     }
                 }
+            }
+
+            SSection(title: "联网搜索") {
+                SearchEnginePicker(selection: Binding(
+                    get: { settings.searchEngine },
+                    set: { settings.searchEngine = $0 }
+                ))
+
+                if settings.searchEngine == .bing {
+                    apiKeyField(
+                        label: "Bing Search Key",
+                        placeholder: "输入 Bing Web Search API Key",
+                        text: Binding(get: { settings.bingSearchKey }, set: { settings.bingSearchKey = $0 })
+                    )
+                } else {
+                    apiKeyField(
+                        label: "Google API Key",
+                        placeholder: "输入 Google Custom Search API Key",
+                        text: Binding(get: { settings.googleSearchKey }, set: { settings.googleSearchKey = $0 })
+                    )
+                    apiKeyField(
+                        label: "搜索引擎 ID (CX)",
+                        placeholder: "输入 Google CX ID",
+                        text: Binding(get: { settings.googleSearchCX }, set: { settings.googleSearchCX = $0 })
+                    )
+                }
+
+                Text("填写后，文字生成模型可开启联网搜索获取实时信息")
+                    .font(.system(size: 10))
+                    .foregroundColor(Color.labelSecondary.opacity(0.6))
             }
 
             Text("Key 仅保存在本地，不会上传到任何服务器")
@@ -619,6 +666,144 @@ private struct SSection<Content: View>: View {
                     .foregroundColor(Color.labelSecondary).tracking(0.4)
             }
             content
+        }
+    }
+}
+
+private struct AIProviderPicker: View {
+    @Binding var selection: String
+    @State private var hov = false
+
+    private var currentLabel: String {
+        AIVideoService.Provider(rawValue: selection)?.displayName ?? selection
+    }
+
+    var body: some View {
+        Button(action: showMenu) {
+            HStack(spacing: 6) {
+                Text(currentLabel)
+                    .font(.system(size: 12))
+                    .foregroundColor(Color.labelPrimary)
+                    .lineLimit(1)
+                Spacer(minLength: 4)
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundColor(Color.labelSecondary)
+            }
+            .padding(.horizontal, 10)
+            .frame(maxWidth: .infinity, minHeight: 32, maxHeight: 32)
+            .background(Color.white.opacity(hov ? 0.10 : 0.06))
+            .cornerRadius(7)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .onHover { hov = $0 }
+    }
+
+    private func showMenu() {
+        let menu = NSMenu()
+        menu.minimumWidth = 220
+        IPickerItemHandler.shared.actions.removeAll()
+        var tag = 0
+        for cat in AIVideoService.ProviderCategory.allCases {
+            let header = NSMenuItem(title: cat.rawValue, action: nil, keyEquivalent: "")
+            header.isEnabled = false
+            let attrs: [NSAttributedString.Key: Any] = [
+                .font: NSFont.systemFont(ofSize: 11, weight: .medium),
+                .foregroundColor: NSColor.secondaryLabelColor
+            ]
+            header.attributedTitle = NSAttributedString(string: cat.rawValue, attributes: attrs)
+            menu.addItem(header)
+
+            for provider in AIVideoService.Provider.providers(for: cat) {
+                let item = NSMenuItem(title: provider.displayName,
+                                      action: #selector(IPickerItemHandler.pick(_:)),
+                                      keyEquivalent: "")
+                item.target = IPickerItemHandler.shared
+                item.tag = tag
+                item.indentationLevel = 1
+                let sel = selection
+                IPickerItemHandler.shared.actions[tag] = { [self] in selection = provider.rawValue }
+                let title = NSMutableAttributedString(string: provider.displayName, attributes: [
+                    .font: NSFont.systemFont(ofSize: 13)
+                ])
+                if provider.rawValue == sel {
+                    title.append(NSAttributedString(string: "  ✓", attributes: [
+                        .font: NSFont.systemFont(ofSize: 12, weight: .semibold),
+                        .foregroundColor: NSColor.white
+                    ]))
+                }
+                item.attributedTitle = title
+                menu.addItem(item)
+                tag += 1
+            }
+            menu.addItem(.separator())
+        }
+        if menu.items.last?.isSeparatorItem == true { menu.removeItem(at: menu.numberOfItems - 1) }
+        let view = NSApp.keyWindow?.contentView ?? NSView()
+        if let event = NSApp.currentEvent {
+            NSMenu.popUpContextMenu(menu, with: event, for: view)
+        } else {
+            menu.popUp(positioning: nil, at: .zero, in: view)
+        }
+    }
+}
+
+private struct SearchEnginePicker: View {
+    @Binding var selection: AppSettings.SearchEngine
+    @State private var hov = false
+
+    var body: some View {
+        Button(action: showMenu) {
+            HStack(spacing: 6) {
+                Text(selection.rawValue)
+                    .font(.system(size: 12))
+                    .foregroundColor(Color.labelPrimary)
+                    .lineLimit(1)
+                Spacer(minLength: 4)
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundColor(Color.labelSecondary)
+            }
+            .padding(.horizontal, 10)
+            .frame(maxWidth: .infinity, minHeight: 32, maxHeight: 32)
+            .background(Color.white.opacity(hov ? 0.10 : 0.06))
+            .cornerRadius(7)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .onHover { hov = $0 }
+    }
+
+    private func showMenu() {
+        let menu = NSMenu()
+        menu.minimumWidth = 180
+        IPickerItemHandler.shared.actions.removeAll()
+        for (tag, eng) in AppSettings.SearchEngine.allCases.enumerated() {
+            let item = NSMenuItem(title: eng.rawValue,
+                                  action: #selector(IPickerItemHandler.pick(_:)),
+                                  keyEquivalent: "")
+            item.target = IPickerItemHandler.shared
+            item.tag = tag
+            IPickerItemHandler.shared.actions[tag] = { [self] in selection = eng }
+            let title = NSMutableAttributedString(string: eng.rawValue, attributes: [
+                .font: NSFont.systemFont(ofSize: 13)
+            ])
+            if eng == selection {
+                title.append(NSAttributedString(string: "  ✓", attributes: [
+                    .font: NSFont.systemFont(ofSize: 12, weight: .semibold),
+                    .foregroundColor: NSColor.white
+                ]))
+            }
+            item.attributedTitle = title
+            menu.addItem(item)
+        }
+
+        guard let view = NSApp.keyWindow?.contentView else { return }
+        if let event = NSApp.currentEvent {
+            NSMenu.popUpContextMenu(menu, with: event, for: view)
+        } else {
+            menu.popUp(positioning: nil, at: .zero, in: view)
         }
     }
 }

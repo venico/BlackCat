@@ -112,6 +112,7 @@ struct SubtitleClip: Identifiable, Equatable, Codable {
     var startTime: Double
     var endTime: Double
     var duration: Double { endTime - startTime }
+    var markers: [Marker]? = nil
 }
 
 // MARK: - Transition
@@ -237,10 +238,15 @@ struct VideoClip: Identifiable, Equatable, Codable {
     // 播放速率：1.0=正常，2.0=2倍速，0.5=半速（0.1~4.0）
     // 语义：时间轴宽度不变，源素材消耗量 = duration * speed
     var speed: Double = 1.0
+    var mirrorH: Bool = false
+    var mirrorV: Bool = false
+    var rotation: Int = 0
+    var reversed: Bool = false
     // 色调调节
     var colorAdjust: ColorAdjust = .identity
     // 转场：从前一个 clip 到本 clip 的转场效果（nil = 无转场）
     var inTransition: Transition? = nil
+    var markers: [Marker]? = nil
 }
 
 struct AudioClip: Identifiable, Equatable, Codable {
@@ -264,6 +270,7 @@ struct AudioClip: Identifiable, Equatable, Codable {
     var fadeOutDuration: Double = 1.0  // seconds
     // 播放速率
     var speed: Double = 1.0
+    var markers: [Marker]? = nil
 }
 
 struct ImageClip: Identifiable, Equatable, Codable {
@@ -287,8 +294,12 @@ struct ImageClip: Identifiable, Equatable, Codable {
     var cropBottom: Double = 0
     var cropLeft: Double   = 0
     var cropRight: Double  = 0
+    var mirrorH: Bool = false
+    var mirrorV: Bool = false
+    var rotation: Int = 0
     // 色调调节
     var colorAdjust: ColorAdjust = .identity
+    var markers: [Marker]? = nil
 }
 
 // MARK: - Text Template (文字样式模板)
@@ -380,12 +391,14 @@ struct TextClip: Identifiable, Equatable, Codable {
     var rotation: Double  = 0          // 旋转角度(度)
     var opacity: Double   = 1
     var animation: TextAnimation = .none
+    var markers: [Marker]? = nil
 
     enum CodingKeys: String, CodingKey {
         case id, text, startTime, endTime, posX, posY
         case fontName, fontSize, bold, italic
         case textColorHex, strokeColorHex, strokeWidth, bgColorHex, bgOpacity
         case alignment, rotation, opacity, animation
+        case markers
     }
     func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
@@ -408,6 +421,7 @@ struct TextClip: Identifiable, Equatable, Codable {
         try c.encode(rotation, forKey: .rotation)
         try c.encode(opacity, forKey: .opacity)
         try c.encode(animation, forKey: .animation)
+        try c.encodeIfPresent(markers, forKey: .markers)
     }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -430,6 +444,7 @@ struct TextClip: Identifiable, Equatable, Codable {
         rotation    = (try? c.decode(Double.self, forKey: .rotation)) ?? 0
         opacity     = (try? c.decode(Double.self, forKey: .opacity)) ?? 1
         animation   = (try? c.decode(TextAnimation.self, forKey: .animation)) ?? .none
+        markers = try? c.decode([Marker].self, forKey: .markers)
     }
     init(text: String = "标题文字", startTime: Double, endTime: Double) {
         self.text = text; self.startTime = startTime; self.endTime = endTime
@@ -506,6 +521,8 @@ struct ShapeClip: Identifiable, Equatable, Codable {
     var scaleY: Double = 1.0
     var lockAspect: Bool = true
     var rotation: Double = 0            // 旋转角度(度)
+    var mirrorH: Bool = false
+    var mirrorV: Bool = false
     var opacity: Double  = 1
     // 填充
     var fillEnabled: Bool = true
@@ -532,6 +549,7 @@ struct ShapeClip: Identifiable, Equatable, Codable {
     // 钢笔路径（仅 .pen 类型）
     var penPoints: [PenPoint]? = nil
     var penClosed: Bool = false
+    var markers: [Marker]? = nil
 
     /// 是否闭合路径（pen 由 penClosed 决定，其余由 ShapeType 决定）
     var effectiveIsClosed: Bool { type == .pen ? penClosed : type.isClosed }
@@ -545,6 +563,7 @@ struct ShapeClip: Identifiable, Equatable, Codable {
         case cornerRadius
         case shadowEnabled, shadowColorHex, shadowOpacity, shadowRadius, shadowOffsetX, shadowOffsetY
         case penPoints, penClosed
+        case markers
     }
     func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
@@ -580,6 +599,7 @@ struct ShapeClip: Identifiable, Equatable, Codable {
         try c.encode(shadowOffsetY, forKey: .shadowOffsetY)
         try c.encodeIfPresent(penPoints, forKey: .penPoints)
         try c.encode(penClosed, forKey: .penClosed)
+        try c.encodeIfPresent(markers, forKey: .markers)
     }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -615,6 +635,7 @@ struct ShapeClip: Identifiable, Equatable, Codable {
         shadowOffsetY = (try? c.decode(Double.self, forKey: .shadowOffsetY)) ?? 4
         penPoints = try? c.decode([PenPoint].self, forKey: .penPoints)
         penClosed = (try? c.decode(Bool.self, forKey: .penClosed)) ?? false
+        markers = try? c.decode([Marker].self, forKey: .markers)
     }
     init(type: ShapeType, startTime: Double, endTime: Double) {
         self.type = type; self.startTime = startTime; self.endTime = endTime
@@ -629,6 +650,28 @@ struct ShapeClip: Identifiable, Equatable, Codable {
             strokeEnabled = true
             height = (type == .arrow) ? 48 : 8
             if type == .arrow { capEnd = .arrow }
+        }
+    }
+}
+
+// MARK: - Marker (片段标记，time 为片段内偏移)
+
+struct Marker: Identifiable, Equatable, Codable {
+    var id = UUID()
+    var time: Double
+    var title: String = ""
+    var color: MarkerColor = .cyan
+
+    enum MarkerColor: String, Codable, CaseIterable {
+        case cyan, pink, orange, green, purple
+        var swiftUIColor: Color {
+            switch self {
+            case .cyan:   return Color(hex: "#4DD8E0")
+            case .pink:   return Color(hex: "#E85D75")
+            case .orange: return Color(hex: "#E8A54B")
+            case .green:  return Color(hex: "#A4C639")
+            case .purple: return Color(hex: "#B07DE8")
+            }
         }
     }
 }
@@ -713,6 +756,7 @@ struct CompoundClip: Identifiable, Equatable, Codable {
     var shapeTracks: [Track<ShapeClip>] = []
     var compoundTracks: [Track<CompoundClip>] = []
     var overlayTrackOrder: [ProjectState.OverlayTrackRef] = []
+    var markers: [Marker]? = nil
 }
 
 // MARK: - Snapshot (for undo/redo)
@@ -726,6 +770,8 @@ struct ProjectSnapshot {
     var shapeTracks: [Track<ShapeClip>]
     var compoundTracks: [Track<CompoundClip>]
     var overlayTrackOrder: [ProjectState.OverlayTrackRef]
+    var videoSectionOrder: [ProjectState.VideoSectionRef] = []
+    var audioSectionOrder: [ProjectState.AudioSectionRef] = []
     var subtitleBottomMargin: Double
     var subtitleLineSpacing: Double
     var duration: Double

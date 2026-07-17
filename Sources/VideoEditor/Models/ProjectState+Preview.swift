@@ -26,24 +26,30 @@ extension ProjectState {
         let aTracks = audioTracks
         let sTracks = subtitleTracks
         let cTracks = compoundTracks
+        let vSectionOrder = videoSectionOrder
         let restoreTime = seekTo ?? currentTime
+        let tTracks = textTracks
+        let shTracks = shapeTracks
         let vEnd = vTracks.flatMap(\.clips).map(\.endTime).max() ?? 0
         let iEnd = iTracks.flatMap(\.clips).map(\.endTime).max() ?? 0
         let aEnd = aTracks.flatMap(\.clips).map(\.endTime).max() ?? 0
         let sEnd = sTracks.flatMap(\.clips).map(\.endTime).max() ?? 0
         let cEnd = cTracks.flatMap(\.clips).map(\.endTime).max() ?? 0
-        let endTime = max(vEnd, max(iEnd, max(aEnd, max(sEnd, cEnd))))
+        let tEnd = tTracks.flatMap(\.clips).map(\.endTime).max() ?? 0
+        let shEnd = shTracks.flatMap(\.clips).map(\.endTime).max() ?? 0
+        let endTime = [vEnd, iEnd, aEnd, sEnd, cEnd, tEnd, shEnd].max() ?? 0
 
         // 指纹检测：跳过无变化的重复 rebuild（seekTo 除外）
         var hasher = Hasher()
-        hasher.combine(vTracks.flatMap(\.clips).map { "\($0.id)\($0.startTime)\($0.endTime)\($0.trimStart)\($0.speed)\($0.volume)\($0.scaleX)\($0.scaleY)\($0.offsetX)\($0.offsetY)\($0.cropTop)\($0.cropBottom)\($0.cropLeft)\($0.cropRight)\($0.audioTrackIndex)\($0.inTransition?.type.rawValue ?? "")\($0.inTransition?.duration ?? 0)\($0.colorAdjust.brightness)\($0.colorAdjust.contrast)\($0.colorAdjust.saturation)\($0.colorAdjust.hue)" }.joined())
-        hasher.combine(iTracks.flatMap(\.clips).map { "\($0.id)\($0.startTime)\($0.endTime)\($0.scaleX)\($0.scaleY)\($0.offsetX)\($0.offsetY)\($0.cropTop)\($0.cropBottom)\($0.cropLeft)\($0.cropRight)\($0.colorAdjust.brightness)\($0.colorAdjust.contrast)\($0.colorAdjust.saturation)\($0.colorAdjust.hue)" }.joined())
+        hasher.combine(vTracks.flatMap(\.clips).map { "\($0.id)\($0.startTime)\($0.endTime)\($0.trimStart)\($0.speed)\($0.volume)\($0.scaleX)\($0.scaleY)\($0.offsetX)\($0.offsetY)\($0.cropTop)\($0.cropBottom)\($0.cropLeft)\($0.cropRight)\($0.audioTrackIndex)\($0.inTransition?.type.rawValue ?? "")\($0.inTransition?.duration ?? 0)\($0.colorAdjust.brightness)\($0.colorAdjust.contrast)\($0.colorAdjust.saturation)\($0.colorAdjust.hue)\($0.mirrorH)\($0.mirrorV)\($0.rotation)\($0.reversed)" }.joined())
+        hasher.combine(iTracks.flatMap(\.clips).map { "\($0.id)\($0.startTime)\($0.endTime)\($0.scaleX)\($0.scaleY)\($0.offsetX)\($0.offsetY)\($0.cropTop)\($0.cropBottom)\($0.cropLeft)\($0.cropRight)\($0.colorAdjust.brightness)\($0.colorAdjust.contrast)\($0.colorAdjust.saturation)\($0.colorAdjust.hue)\($0.mirrorH)\($0.mirrorV)\($0.rotation)" }.joined())
         hasher.combine(aTracks.flatMap(\.clips).map { "\($0.id)\($0.startTime)\($0.endTime)\($0.trimStart)\($0.speed)\($0.volume)\($0.leftChannel)\($0.rightChannel)\($0.fadeInEnabled)\($0.fadeInDuration)\($0.fadeOutEnabled)\($0.fadeOutDuration)" }.joined())
         hasher.combine(vTracks.map { "\($0.isVisible)\($0.isMuted)" }.joined())
         hasher.combine(iTracks.map { "\($0.isVisible)" }.joined())
         hasher.combine(aTracks.map { "\($0.isVisible)\($0.isMuted)" }.joined())
         hasher.combine(cTracks.flatMap(\.clips).map { "\($0.id)\($0.startTime)\($0.endTime)\($0.internalStart)" }.joined())
         hasher.combine(cTracks.map { "\($0.isVisible)\($0.isMuted)" }.joined())
+        hasher.combine(vSectionOrder.map { "\($0.trackID)" }.joined())
         let fp = hasher.finalize()
         if seekTo == nil && fp == lastRebuildFingerprint { return }
         lastRebuildFingerprint = fp
@@ -90,128 +96,168 @@ extension ProjectState {
                 }
             }
 
-            // 视频轨道 — 第二遍：按 transAdjusts 插入（A 延伸 + B 提前）
-            for track in vTracks {
-                let sortedClips = track.clips.sorted(by: { $0.startTime < $1.startTime })
-                for clip in sortedClips {
-                    guard let url = clip.url else { continue }
-                    let asset = self.cachedAVAsset(url: url)
-                    let assetDurSec = clipAssetDurSec[clip.id] ?? 0
-                    let assetDur = CMTime(seconds: assetDurSec, preferredTimescale: 600)
-                    let trimSt  = CMTime(seconds: clip.trimStart, preferredTimescale: 600)
-                    let maxSrcDur = assetDur - trimSt
-                    // 变速：源素材消耗 = duration * speed，timeline 时长上限 = maxSrcDur / speed
-                    let speed = max(0.01, clip.speed)
-                    let maxTimelineDur = CMTime(seconds: maxSrcDur.seconds / speed, preferredTimescale: 600)
-                    let useDur = CMTimeMinimum(CMTime(seconds: clip.duration, preferredTimescale: 600), maxTimelineDur)
-                    guard useDur.seconds > 0.01 else { continue }
-                    let srcContentDurSec = useDur.seconds * speed  // 源素材实际消耗量（秒）
+            // 视频轨道+复合视频 — 按 videoSectionOrder 反序添加（底层先、顶层后覆盖）
+            for ref in vSectionOrder.reversed() {
+                switch ref {
+                case .video(let trackID):
+                    guard let track = vTracks.first(where: { $0.id == trackID }) else { continue }
+                    let sortedClips = track.clips.sorted(by: { $0.startTime < $1.startTime })
+                    for clip in sortedClips {
+                        guard let url = clip.url else { continue }
+                        let asset = self.cachedAVAsset(url: url)
+                        let assetDurSec = clipAssetDurSec[clip.id] ?? 0
+                        let assetDur = CMTime(seconds: assetDurSec, preferredTimescale: 600)
+                        let trimSt  = CMTime(seconds: clip.trimStart, preferredTimescale: 600)
+                        let maxSrcDur = assetDur - trimSt
+                        let speed = max(0.01, clip.speed)
+                        let maxTimelineDur = CMTime(seconds: maxSrcDur.seconds / speed, preferredTimescale: 600)
+                        let useDur = CMTimeMinimum(CMTime(seconds: clip.duration, preferredTimescale: 600), maxTimelineDur)
+                        guard useDur.seconds > 0.01 else { continue }
+                        let srcContentDurSec = useDur.seconds * speed
 
-                    // 查询该 clip 作为 A 需要延伸多少，作为 B 需要提前多少
-                    let aExtend  = transAdjusts.first(where: { $0.clipAID == clip.id && $0.type != .fadeToBlack })?.half ?? 0
-                    let bAdvance = transAdjusts.first(where: { $0.clipBID == clip.id && $0.type != .fadeToBlack })?.half ?? 0
+                        let aExtend  = transAdjusts.first(where: { $0.clipAID == clip.id && $0.type != .fadeToBlack })?.half ?? 0
+                        let bAdvance = transAdjusts.first(where: { $0.clipBID == clip.id && $0.type != .fadeToBlack })?.half ?? 0
 
-                    // 视频 source range：从 (trimStart - bAdvance) 开始，读 (srcContentDur + bAdvance + aExtend) 秒源素材
-                    let actualTrimSt = CMTime(seconds: clip.trimStart - bAdvance, preferredTimescale: 600)
-                    let actualSrcDur = CMTime(seconds: srcContentDurSec + bAdvance + aExtend, preferredTimescale: 600)
-                    let actualRange  = CMTimeRange(start: actualTrimSt, duration: actualSrcDur)
-                    let at           = CMTime(seconds: clip.startTime - bAdvance, preferredTimescale: 600)
-                    let targetDurSec = useDur.seconds + bAdvance + aExtend   // timeline 上的目标时长
-                    if track.isVisible,
-                       let vAsset = try? await asset.loadTracks(withMediaType: .video).first,
-                       let vt = composition.addMutableTrack(withMediaType: .video,
-                                                            preferredTrackID: kCMPersistentTrackID_Invalid) {
-                        try? vt.insertTimeRange(actualRange, of: vAsset, at: at)
-                        // 变速：把 actualSrcDur 缩放到 targetDur
-                        if abs(speed - 1.0) > 0.001 {
-                            let compRange = CMTimeRange(start: at, duration: actualSrcDur)
-                            vt.scaleTimeRange(compRange, toDuration: CMTime(seconds: targetDurSec, preferredTimescale: 600))
-                        }
-                        videoCompTracks.append((vt, clip,
-                                                clip.startTime - bAdvance,         // 实际开始（B 提前）
-                                                clip.startTime + useDur.seconds + aExtend)) // 实际结束（A 延伸）
-                    }
-                    if !track.isMuted {
-                        let audioAt = CMTime(seconds: clip.startTime, preferredTimescale: 44100)
-                        if abs(speed - 1.0) > 0.001 {
-                            // 变速：ffmpeg atempo 预处理，生成已变速的临时音频文件（正常速度 insert）
-                            if let speedURL = await self.generateSpeedAudio(
-                                inputURL: url, trimStart: clip.trimStart,
-                                srcDurSec: srcContentDurSec, speed: speed,
-                                audioTrackIndex: clip.audioTrackIndex),
-                               let at2 = composition.addMutableTrack(withMediaType: .audio,
-                                                                      preferredTrackID: kCMPersistentTrackID_Invalid) {
-                                let sAsset = AVURLAsset(url: speedURL)
-                                if let sTrack = try? await sAsset.loadTracks(withMediaType: .audio).first {
-                                    let sDur = (try? await sAsset.load(.duration)) ?? .zero
-                                    let ins = CMTimeMinimum(sDur, CMTime(seconds: useDur.seconds, preferredTimescale: 44100))
-                                    try? at2.insertTimeRange(CMTimeRange(start: .zero, duration: ins), of: sTrack, at: audioAt)
-                                    audioParams.append((at2.trackID, clip.volume, 1.0, 1.0, clip.startTime, ins.seconds, 0, 0))
-                                }
-                            }
-                        } else {
-                            // 正常速度
-                            let allAudioTracks = (try? await asset.loadTracks(withMediaType: .audio)) ?? []
-                            let idx = min(clip.audioTrackIndex, max(allAudioTracks.count - 1, 0))
-                            if let aAsset = allAudioTracks.isEmpty ? nil : allAudioTracks[idx] as AVAssetTrack?,
-                               let at2 = composition.addMutableTrack(withMediaType: .audio,
-                                                                      preferredTrackID: kCMPersistentTrackID_Invalid) {
-                                let ats: CMTimeScale = 44100
-                                let trimSt  = CMTime(seconds: clip.trimStart, preferredTimescale: ats)
-                                let useDurC = CMTime(seconds: useDur.seconds, preferredTimescale: ats)
-                                try? at2.insertTimeRange(CMTimeRange(start: trimSt, duration: useDurC), of: aAsset, at: audioAt)
-                                audioParams.append((at2.trackID, clip.volume, 1.0, 1.0, clip.startTime, useDur.seconds, 0, 0))
+                        let actualTrimSt = CMTime(seconds: clip.trimStart - bAdvance, preferredTimescale: 600)
+                        let actualSrcDur = CMTime(seconds: srcContentDurSec + bAdvance + aExtend, preferredTimescale: 600)
+                        let actualRange  = CMTimeRange(start: actualTrimSt, duration: actualSrcDur)
+                        let at           = CMTime(seconds: clip.startTime - bAdvance, preferredTimescale: 600)
+                        let targetDurSec = useDur.seconds + bAdvance + aExtend
+                        // 倒放：预生成反转视频
+                        var effAsset: AVURLAsset = asset
+                        var effTrimSt = actualTrimSt
+                        var effSrcDur = actualSrcDur
+                        var effAudioURL = url
+                        var effAudioTrim: Double = clip.trimStart
+                        if clip.reversed {
+                            let revStart = max(0, actualTrimSt.seconds)
+                            if let revURL = await self.generateReversedVideo(
+                                inputURL: url, trimStart: revStart, srcDurSec: actualSrcDur.seconds) {
+                                effAsset = AVURLAsset(url: revURL)
+                                effTrimSt = .zero
+                                effSrcDur = (try? await effAsset.load(.duration)) ?? actualSrcDur
+                                effAudioURL = revURL
+                                effAudioTrim = 0
                             }
                         }
-                    }
-                }
-            }
-
-            // 复合片段内的视频子内容
-            for cTrack in cTracks {
-                guard cTrack.isVisible else { continue }
-                for compound in cTrack.clips {
-                    for subTrack in compound.videoTracks {
-                        for subClip in subTrack.clips {
-                            guard let url = subClip.url else { continue }
-                            let parentStart = compound.startTime + (subClip.startTime - compound.internalStart)
-                            let parentEnd   = compound.startTime + (subClip.endTime - compound.internalStart)
-                            let clampedStart = max(parentStart, compound.startTime)
-                            let clampedEnd   = min(parentEnd, compound.endTime)
-                            guard clampedEnd > clampedStart + 0.01 else { continue }
-                            let trimOffset = clampedStart - parentStart
-                            let effectiveTrimStart = subClip.trimStart + trimOffset * max(0.01, subClip.speed)
-                            let effectiveDur = clampedEnd - clampedStart
-
-                            let asset = self.cachedAVAsset(url: url)
-                            let speed = max(0.01, subClip.speed)
-                            let srcDurSec = effectiveDur * speed
-                            let trimSt = CMTime(seconds: effectiveTrimStart, preferredTimescale: 600)
-                            let srcDur = CMTime(seconds: srcDurSec, preferredTimescale: 600)
-                            let at = CMTime(seconds: clampedStart, preferredTimescale: 600)
-
-                            if let vAsset = try? await asset.loadTracks(withMediaType: .video).first,
-                               let vt = composition.addMutableTrack(withMediaType: .video,
-                                                                     preferredTrackID: kCMPersistentTrackID_Invalid) {
-                                try? vt.insertTimeRange(CMTimeRange(start: trimSt, duration: srcDur), of: vAsset, at: at)
-                                if abs(speed - 1.0) > 0.001 {
-                                    let compRange = CMTimeRange(start: at, duration: srcDur)
-                                    vt.scaleTimeRange(compRange, toDuration: CMTime(seconds: effectiveDur, preferredTimescale: 600))
-                                }
-                                var dummyClip = subClip
-                                dummyClip.startTime = clampedStart
-                                dummyClip.endTime = clampedEnd
-                                videoCompTracks.append((vt, dummyClip, clampedStart, clampedEnd))
+                        if track.isVisible,
+                           let vAsset = try? await effAsset.loadTracks(withMediaType: .video).first,
+                           let vt = composition.addMutableTrack(withMediaType: .video,
+                                                                preferredTrackID: kCMPersistentTrackID_Invalid) {
+                            try? vt.insertTimeRange(CMTimeRange(start: effTrimSt, duration: effSrcDur),
+                                                    of: vAsset, at: at)
+                            if abs(speed - 1.0) > 0.001 {
+                                let compRange = CMTimeRange(start: at, duration: effSrcDur)
+                                vt.scaleTimeRange(compRange, toDuration: CMTime(seconds: targetDurSec, preferredTimescale: 600))
                             }
-                            if !cTrack.isMuted {
-                                if let aAsset = try? await asset.loadTracks(withMediaType: .audio).first,
+                            videoCompTracks.append((vt, clip,
+                                                    clip.startTime - bAdvance,
+                                                    clip.startTime + useDur.seconds + aExtend))
+                        }
+                        if !track.isMuted {
+                            let audioAt = CMTime(seconds: clip.startTime, preferredTimescale: 44100)
+                            if abs(speed - 1.0) > 0.001 {
+                                if let speedURL = await self.generateSpeedAudio(
+                                    inputURL: effAudioURL, trimStart: effAudioTrim,
+                                    srcDurSec: srcContentDurSec, speed: speed,
+                                    audioTrackIndex: clip.reversed ? 0 : clip.audioTrackIndex),
+                                   let at2 = composition.addMutableTrack(withMediaType: .audio,
+                                                                          preferredTrackID: kCMPersistentTrackID_Invalid) {
+                                    let sAsset = AVURLAsset(url: speedURL)
+                                    if let sTrack = try? await sAsset.loadTracks(withMediaType: .audio).first {
+                                        let sDur = (try? await sAsset.load(.duration)) ?? .zero
+                                        let ins = CMTimeMinimum(sDur, CMTime(seconds: useDur.seconds, preferredTimescale: 44100))
+                                        try? at2.insertTimeRange(CMTimeRange(start: .zero, duration: ins), of: sTrack, at: audioAt)
+                                        audioParams.append((at2.trackID, clip.volume, 1.0, 1.0, clip.startTime, ins.seconds, 0, 0))
+                                    }
+                                }
+                            } else if clip.reversed {
+                                let revAudioTracks = (try? await effAsset.loadTracks(withMediaType: .audio)) ?? []
+                                if let aTrack = revAudioTracks.first,
+                                   let at2 = composition.addMutableTrack(withMediaType: .audio,
+                                                                          preferredTrackID: kCMPersistentTrackID_Invalid) {
+                                    let revDur = (try? await effAsset.load(.duration)) ?? .zero
+                                    let useDurC = CMTimeMinimum(revDur, CMTime(seconds: useDur.seconds, preferredTimescale: 44100))
+                                    try? at2.insertTimeRange(CMTimeRange(start: .zero, duration: useDurC), of: aTrack, at: audioAt)
+                                    audioParams.append((at2.trackID, clip.volume, 1.0, 1.0, clip.startTime, useDurC.seconds, 0, 0))
+                                }
+                            } else {
+                                let allAudioTracks = (try? await asset.loadTracks(withMediaType: .audio)) ?? []
+                                let idx = min(clip.audioTrackIndex, max(allAudioTracks.count - 1, 0))
+                                if let aAsset = allAudioTracks.isEmpty ? nil : allAudioTracks[idx] as AVAssetTrack?,
                                    let at2 = composition.addMutableTrack(withMediaType: .audio,
                                                                           preferredTrackID: kCMPersistentTrackID_Invalid) {
                                     let ats: CMTimeScale = 44100
+                                    let trimSt  = CMTime(seconds: clip.trimStart, preferredTimescale: ats)
+                                    let useDurC = CMTime(seconds: useDur.seconds, preferredTimescale: ats)
+                                    try? at2.insertTimeRange(CMTimeRange(start: trimSt, duration: useDurC), of: aAsset, at: audioAt)
+                                    audioParams.append((at2.trackID, clip.volume, 1.0, 1.0, clip.startTime, useDur.seconds, 0, 0))
+                                }
+                            }
+                        }
+                    }
+                case .compound(let trackID):
+                    guard let cTrack = cTracks.first(where: { $0.id == trackID }),
+                          cTrack.isVisible else { continue }
+                    for compound in cTrack.clips {
+                        for subTrack in compound.videoTracks {
+                            for subClip in subTrack.clips {
+                                guard let url = subClip.url else { continue }
+                                let parentStart = compound.startTime + (subClip.startTime - compound.internalStart)
+                                let parentEnd   = compound.startTime + (subClip.endTime - compound.internalStart)
+                                let clampedStart = max(parentStart, compound.startTime)
+                                let clampedEnd   = min(parentEnd, compound.endTime)
+                                guard clampedEnd > clampedStart + 0.01 else { continue }
+                                let trimOffset = clampedStart - parentStart
+                                let effectiveTrimStart = subClip.trimStart + trimOffset * max(0.01, subClip.speed)
+                                let effectiveDur = clampedEnd - clampedStart
+
+                                let asset = self.cachedAVAsset(url: url)
+                                let speed = max(0.01, subClip.speed)
+                                let srcDurSec = effectiveDur * speed
+                                let trimSt = CMTime(seconds: effectiveTrimStart, preferredTimescale: 600)
+                                let srcDur = CMTime(seconds: srcDurSec, preferredTimescale: 600)
+                                let at = CMTime(seconds: clampedStart, preferredTimescale: 600)
+
+                                // 倒放
+                                var cEffAsset: AVURLAsset = asset
+                                var cEffTrimSt = trimSt
+                                var cEffSrcDur = srcDur
+                                var cEffAudioURL = url
+                                var cEffAudioTrim = effectiveTrimStart
+                                if subClip.reversed {
+                                    let revStart = max(0, effectiveTrimStart)
+                                    if let revURL = await self.generateReversedVideo(
+                                        inputURL: url, trimStart: revStart, srcDurSec: srcDurSec) {
+                                        cEffAsset = AVURLAsset(url: revURL)
+                                        cEffTrimSt = .zero
+                                        cEffSrcDur = (try? await cEffAsset.load(.duration)) ?? srcDur
+                                        cEffAudioURL = revURL
+                                        cEffAudioTrim = 0
+                                    }
+                                }
+                                if let vAsset = try? await cEffAsset.loadTracks(withMediaType: .video).first,
+                                   let vt = composition.addMutableTrack(withMediaType: .video,
+                                                                         preferredTrackID: kCMPersistentTrackID_Invalid) {
+                                    try? vt.insertTimeRange(CMTimeRange(start: cEffTrimSt, duration: cEffSrcDur),
+                                                            of: vAsset, at: at)
+                                    if abs(speed - 1.0) > 0.001 {
+                                        let compRange = CMTimeRange(start: at, duration: cEffSrcDur)
+                                        vt.scaleTimeRange(compRange, toDuration: CMTime(seconds: effectiveDur, preferredTimescale: 600))
+                                    }
+                                    var dummyClip = subClip
+                                    dummyClip.startTime = clampedStart
+                                    dummyClip.endTime = clampedEnd
+                                    videoCompTracks.append((vt, dummyClip, clampedStart, clampedEnd))
+                                }
+                                if !cTrack.isMuted {
+                                    let ats: CMTimeScale = 44100
                                     if abs(speed - 1.0) > 0.001 {
                                         if let speedURL = await self.generateSpeedAudio(
-                                            inputURL: url, trimStart: effectiveTrimStart,
-                                            srcDurSec: srcDurSec, speed: speed, audioTrackIndex: 0) {
+                                            inputURL: cEffAudioURL, trimStart: cEffAudioTrim,
+                                            srcDurSec: srcDurSec, speed: speed, audioTrackIndex: 0),
+                                           let at2 = composition.addMutableTrack(withMediaType: .audio,
+                                                                                  preferredTrackID: kCMPersistentTrackID_Invalid) {
                                             let sAsset = AVURLAsset(url: speedURL)
                                             if let sTrack = try? await sAsset.loadTracks(withMediaType: .audio).first {
                                                 let sDur = (try? await sAsset.load(.duration)) ?? .zero
@@ -221,12 +267,27 @@ extension ProjectState {
                                                 audioParams.append((at2.trackID, subClip.volume, 1.0, 1.0, clampedStart, ins.seconds, 0, 0))
                                             }
                                         }
+                                    } else if subClip.reversed {
+                                        let revAudioTracks = (try? await cEffAsset.loadTracks(withMediaType: .audio)) ?? []
+                                        if let aTrack = revAudioTracks.first,
+                                           let at2 = composition.addMutableTrack(withMediaType: .audio,
+                                                                                  preferredTrackID: kCMPersistentTrackID_Invalid) {
+                                            let revDur = (try? await cEffAsset.load(.duration)) ?? .zero
+                                            let uDur = CMTimeMinimum(revDur, CMTime(seconds: effectiveDur, preferredTimescale: ats))
+                                            try? at2.insertTimeRange(CMTimeRange(start: .zero, duration: uDur), of: aTrack,
+                                                                     at: CMTime(seconds: clampedStart, preferredTimescale: ats))
+                                            audioParams.append((at2.trackID, subClip.volume, 1.0, 1.0, clampedStart, uDur.seconds, 0, 0))
+                                        }
                                     } else {
-                                        let tSt = CMTime(seconds: effectiveTrimStart, preferredTimescale: ats)
-                                        let uDur = CMTime(seconds: effectiveDur, preferredTimescale: ats)
-                                        try? at2.insertTimeRange(CMTimeRange(start: tSt, duration: uDur), of: aAsset,
-                                                                 at: CMTime(seconds: clampedStart, preferredTimescale: ats))
-                                        audioParams.append((at2.trackID, subClip.volume, 1.0, 1.0, clampedStart, effectiveDur, 0, 0))
+                                        if let aAsset = try? await asset.loadTracks(withMediaType: .audio).first,
+                                           let at2 = composition.addMutableTrack(withMediaType: .audio,
+                                                                                  preferredTrackID: kCMPersistentTrackID_Invalid) {
+                                            let tSt = CMTime(seconds: effectiveTrimStart, preferredTimescale: ats)
+                                            let uDur = CMTime(seconds: effectiveDur, preferredTimescale: ats)
+                                            try? at2.insertTimeRange(CMTimeRange(start: tSt, duration: uDur), of: aAsset,
+                                                                     at: CMTime(seconds: clampedStart, preferredTimescale: ats))
+                                            audioParams.append((at2.trackID, subClip.volume, 1.0, 1.0, clampedStart, effectiveDur, 0, 0))
+                                        }
                                     }
                                 }
                             }
@@ -476,6 +537,9 @@ extension ProjectState {
                         guard segStartCM >= clipStart && segStartCM < clipEnd else { continue }
                         guard (try? await entry.track.load(.naturalSize)) != nil else { continue }
                         let clip = entry.clip
+                        if clip.mirrorH || clip.mirrorV || clip.rotation != 0 {
+                            NSLog("[Preview] CompositorEntry: mirrorH=\(clip.mirrorH) mirrorV=\(clip.mirrorV) rot=\(clip.rotation)")
+                        }
                         var te = CompositorTrackEntry(
                             trackID:     entry.track.trackID,
                             userScaleX:  CGFloat(clip.scaleX),
@@ -487,6 +551,9 @@ extension ProjectState {
                             cropLeft:    CGFloat(clip.cropLeft),
                             cropRight:   CGFloat(clip.cropRight),
                             colorAdjust: clip.colorAdjust,
+                            mirrorH:     clip.mirrorH,
+                            mirrorV:     clip.mirrorV,
+                            rotation:    clip.rotation,
                             opacityRamp: nil,
                             pushRamp:    nil)
                         // 转场渐变
@@ -567,6 +634,9 @@ extension ProjectState {
                             cropLeft:    CGFloat(iclip.cropLeft),
                             cropRight:   CGFloat(iclip.cropRight),
                             colorAdjust: iclip.colorAdjust,
+                            mirrorH:     iclip.mirrorH,
+                            mirrorV:     iclip.mirrorV,
+                            rotation:    iclip.rotation,
                             opacityRamp: nil,
                             pushRamp:    nil)
                         entries.append(te)
@@ -593,7 +663,8 @@ extension ProjectState {
                 }
             }
 
-            let visualEnd = max(vEnd, iEnd)
+            let compoundVideoEnd = cTracks.flatMap(\.clips).filter { !$0.videoTracks.flatMap(\.clips).isEmpty }.map(\.endTime).max() ?? 0
+            let visualEnd = max(vEnd, max(iEnd, compoundVideoEnd))
 
             guard !Task.isCancelled else { return }
             await MainActor.run {

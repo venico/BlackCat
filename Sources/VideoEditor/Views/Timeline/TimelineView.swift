@@ -60,6 +60,11 @@ struct TimelineView: View {
     @State private var lastThumbPPS: Double = 0
     @State private var lastCompoundClickID: UUID? = nil
     @State private var lastCompoundClickTime: Date = .distantPast
+    @State private var hoveredMarkerID: UUID? = nil
+    @State private var hoveredMarkerY: CGFloat = 0
+    @State private var editingMarkerID: UUID? = nil
+    @State private var lastMarkerClickID: UUID? = nil
+    @State private var lastMarkerClickTime: Date = .distantPast
 
     // 轨道标签拖拽排序
     private enum TrackDragType: Equatable { case video, audio, overlay }
@@ -99,7 +104,7 @@ struct TimelineView: View {
     }
 
     struct DragItem {
-        enum Kind { case video, image, audio, subtitle, text, shape }
+        enum Kind { case video, image, audio, subtitle, text, shape, compound }
         let id: UUID
         let kind: Kind
         let originStart: Double
@@ -225,9 +230,9 @@ struct TimelineView: View {
             let off = max(0, -v)
             if abs(vScrollOffset - off) > 0.5 { vScrollOffset = off }
         }
-        .background(GeometryReader { geo -> Color in
-            DispatchQueue.main.async { viewportH = geo.size.height }
-            return Color.clear
+        .background(GeometryReader { geo in
+            let _ = DispatchQueue.main.async { viewportH = geo.size.height }
+            Color.clear
         })
         .clipped()
         .simultaneousGesture(
@@ -266,11 +271,11 @@ struct TimelineView: View {
                             let connector = CGRect(x: px - 0.5, y: 16, width: 1, height: rulerH - 16)
                             ctx.fill(Path(connector), with: .color(Color.accent))
                         }
+                        .allowsHitTesting(false)
                     }
                     .frame(width: clipW, height: rulerH)
                     .background(Color(red: 0.09, green: 0.09, blue: 0.10))
                     .clipped()
-                    // 刻度尺条不拦截点击：穿透回原有的 seek / 滚动条 / 轨道逻辑
                     .allowsHitTesting(false)
                 }
             }
@@ -280,6 +285,9 @@ struct TimelineView: View {
         // 翻译进度已移至右下角全局浮层
         .onAppear { setupMonitors(); lastThumbPPS = project.pixelsPerSecond }
         .onDisappear { teardownMonitors() }
+        .onChange(of: clock.currentTime) { _ in
+            if project.selectedMarkerID != nil { project.selectedMarkerID = nil }
+        }
         .onChange(of: project.pixelsPerSecond) { newPPS in
             let ratio = max(newPPS, lastThumbPPS) / max(min(newPPS, lastThumbPPS), 1)
             guard ratio > 1.8 else { return }
@@ -396,9 +404,9 @@ struct TimelineView: View {
     /// "+" 添加轨道菜单：放在固定顶条左角，不随竖滑动
     private var addTrackMenu: some View {
         Menu {
-            Button("添加视频轨道") { project.videoTracks.append(Track(label: "视频")) }
+            Button("添加视频轨道") { project.videoTracks.append(Track(label: "视频")); project.syncVideoSectionOrder() }
             Button("添加图片轨道") { project.imageTracks.append(Track(label: "图片")); project.syncOverlayOrder() }
-            Button("添加音频轨道") { project.audioTracks.append(Track(label: "音频")) }
+            Button("添加音频轨道") { project.audioTracks.append(Track(label: "音频")); project.syncAudioSectionOrder() }
             Button("添加字幕轨道") {
                 var newTrack = Track<SubtitleClip>(label: "字幕")
                 newTrack.subtitleStyle = SubtitleStyle()
@@ -435,46 +443,60 @@ struct TimelineView: View {
                     .opacity(isTrackDragging(.overlay, ovIdx) ? 0.55 : 1.0)
             }
             if project.showVideoTracks {
-                ForEach(project.videoTracks.indices, id:\.self) { i in
-                    TrackLabel(icon:"film", title: project.videoTracks[i].label,
-                               count: project.videoTracks[i].clips.count, hasMute: true,
-                               isMuted: project.videoTracks[i].isMuted, isVis: project.videoTracks[i].isVisible,
-                               onMute: { project.pushUndo(); project.videoTracks[i].isMuted.toggle(); project.rebuildTimelinePreview() },
-                               onVis:  { project.pushUndo(); project.videoTracks[i].isVisible.toggle(); project.rebuildTimelinePreview() },
-                               onDel:  { project.pushUndo(); project.videoTracks.remove(at:i); project.rebuildTimelinePreview() },
-                               onDragChanged: { handleDragChanged(type: .video, index: i, offsetY: $0) },
-                               onDragEnded:   { handleDragEnded(type: .video, index: i, offsetY: $0) })
-                        .frame(height: vidH(i))
-                        .offset(y: isTrackDragging(.video, i) ? trackLabelDragOffset : 0)
-                        .zIndex(isTrackDragging(.video, i) ? 10 : 0)
-                        .opacity(isTrackDragging(.video, i) ? 0.55 : 1.0)
+                let vs = resolvedVideoSection
+                ForEach(vs.indices, id:\.self) { secIdx in
+                    let item = vs[secIdx]
+                    if item.kind == .video {
+                        let i = item.trackIndex
+                        TrackLabel(icon:"film", title: project.videoTracks[i].label,
+                                   count: project.videoTracks[i].clips.count, hasMute: true,
+                                   isMuted: project.videoTracks[i].isMuted, isVis: project.videoTracks[i].isVisible,
+                                   onMute: { project.pushUndo(); project.videoTracks[i].isMuted.toggle(); project.rebuildTimelinePreview() },
+                                   onVis:  { project.pushUndo(); project.videoTracks[i].isVisible.toggle(); project.rebuildTimelinePreview() },
+                                   onDel:  { project.pushUndo(); project.videoTracks.remove(at:i); project.syncVideoSectionOrder(); project.rebuildTimelinePreview() },
+                                   onDragChanged: { handleDragChanged(type: .video, index: secIdx, offsetY: $0) },
+                                   onDragEnded:   { handleDragEnded(type: .video, index: secIdx, offsetY: $0) })
+                            .frame(height: vidH(i))
+                            .offset(y: isTrackDragging(.video, secIdx) ? trackLabelDragOffset : 0)
+                            .zIndex(isTrackDragging(.video, secIdx) ? 10 : 0)
+                            .opacity(isTrackDragging(.video, secIdx) ? 0.55 : 1.0)
+                    } else {
+                        let ti = item.trackIndex
+                        compoundTrackLabel(ti, dragType: .video, secIdx: secIdx)
+                            .frame(height: cmpH(ti))
+                            .offset(y: isTrackDragging(.video, secIdx) ? trackLabelDragOffset : 0)
+                            .zIndex(isTrackDragging(.video, secIdx) ? 10 : 0)
+                            .opacity(isTrackDragging(.video, secIdx) ? 0.55 : 1.0)
+                    }
                 }
-            }
-            // 视频类复合片段轨道标签
-            ForEach(videoCompoundIndices, id:\.self) { ti in
-                compoundTrackLabel(ti)
-                    .frame(height: cmpH(ti))
             }
             if project.showAudioTracks {
-                ForEach(project.audioTracks.indices, id:\.self) { i in
-                    TrackLabel(icon:"music.note", title: project.audioTracks[i].label,
-                               count: project.audioTracks[i].clips.count, hasMute: true,
-                               isMuted: project.audioTracks[i].isMuted, isVis: true, hasVis: false,
-                               onMute: { project.pushUndo(); project.audioTracks[i].isMuted.toggle(); project.rebuildTimelinePreview() },
-                               onVis:  {},
-                               onDel:  { project.pushUndo(); project.audioTracks.remove(at:i); project.rebuildTimelinePreview() },
-                               onDragChanged: { handleDragChanged(type: .audio, index: i, offsetY: $0) },
-                               onDragEnded:   { handleDragEnded(type: .audio, index: i, offsetY: $0) })
-                        .frame(height: audH(i))
-                        .offset(y: isTrackDragging(.audio, i) ? trackLabelDragOffset : 0)
-                        .zIndex(isTrackDragging(.audio, i) ? 10 : 0)
-                        .opacity(isTrackDragging(.audio, i) ? 0.55 : 1.0)
+                let as_ = resolvedAudioSection
+                ForEach(as_.indices, id:\.self) { secIdx in
+                    let item = as_[secIdx]
+                    if item.kind == .audio {
+                        let i = item.trackIndex
+                        TrackLabel(icon:"music.note", title: project.audioTracks[i].label,
+                                   count: project.audioTracks[i].clips.count, hasMute: true,
+                                   isMuted: project.audioTracks[i].isMuted, isVis: true, hasVis: false,
+                                   onMute: { project.pushUndo(); project.audioTracks[i].isMuted.toggle(); project.rebuildTimelinePreview() },
+                                   onVis:  {},
+                                   onDel:  { project.pushUndo(); project.audioTracks.remove(at:i); project.syncAudioSectionOrder(); project.rebuildTimelinePreview() },
+                                   onDragChanged: { handleDragChanged(type: .audio, index: secIdx, offsetY: $0) },
+                                   onDragEnded:   { handleDragEnded(type: .audio, index: secIdx, offsetY: $0) })
+                            .frame(height: audH(i))
+                            .offset(y: isTrackDragging(.audio, secIdx) ? trackLabelDragOffset : 0)
+                            .zIndex(isTrackDragging(.audio, secIdx) ? 10 : 0)
+                            .opacity(isTrackDragging(.audio, secIdx) ? 0.55 : 1.0)
+                    } else {
+                        let ti = item.trackIndex
+                        compoundTrackLabel(ti, dragType: .audio, secIdx: secIdx)
+                            .frame(height: cmpH(ti))
+                            .offset(y: isTrackDragging(.audio, secIdx) ? trackLabelDragOffset : 0)
+                            .zIndex(isTrackDragging(.audio, secIdx) ? 10 : 0)
+                            .opacity(isTrackDragging(.audio, secIdx) ? 0.55 : 1.0)
+                    }
                 }
-            }
-            // 音频类复合片段轨道标签
-            ForEach(audioCompoundIndices, id:\.self) { ti in
-                compoundTrackLabel(ti)
-                    .frame(height: cmpH(ti))
             }
             } // end inner VStack
             .overlay(trackDropIndicatorLine())
@@ -485,14 +507,15 @@ struct TimelineView: View {
     }
 
     @ViewBuilder
-    private func compoundTrackLabel(_ ti: Int) -> some View {
+    private func compoundTrackLabel(_ ti: Int, dragType: TrackDragType? = nil, secIdx: Int = 0) -> some View {
         TrackLabel(icon: "rectangle.on.rectangle", title: project.compoundTracks[ti].label.isEmpty ? "复合" : project.compoundTracks[ti].label,
                    count: project.compoundTracks[ti].clips.count, hasMute: true,
                    isMuted: project.compoundTracks[ti].isMuted, isVis: project.compoundTracks[ti].isVisible,
                    onMute: { project.pushUndo(); project.compoundTracks[ti].isMuted.toggle(); project.rebuildTimelinePreview() },
                    onVis:  { project.pushUndo(); project.compoundTracks[ti].isVisible.toggle(); project.rebuildTimelinePreview() },
                    onDel:  { project.pushUndo(); project.compoundTracks.remove(at: ti); project.syncOverlayOrder(); project.rebuildTimelinePreview() },
-                   onDragChanged: { _ in }, onDragEnded: { _ in })
+                   onDragChanged: { dy in if let dt = dragType { handleDragChanged(type: dt, index: secIdx, offsetY: dy) } },
+                   onDragEnded:   { dy in if let dt = dragType { handleDragEnded(type: dt, index: secIdx, offsetY: dy) } })
     }
 
     private struct ResolvedOverlay {
@@ -532,7 +555,7 @@ struct TimelineView: View {
             case .subtitle: return project.showSubtitleTracks
             case .text: return project.showTextTracks
             case .shape: return project.showShapeTracks
-            case .compound: return true
+            case .compound: return project.showCompoundTracks
             }
         }
     }
@@ -554,16 +577,59 @@ struct TimelineView: View {
         project.compoundTracks.indices.filter { project.compoundTrackKind(project.compoundTracks[$0]) == .audio }
     }
 
+    private struct SectionItem {
+        enum Kind { case video, compound, audio }
+        let kind: Kind
+        let trackIndex: Int
+    }
+
+    private var resolvedVideoSection: [SectionItem] {
+        project.videoSectionOrder.compactMap { ref in
+            switch ref {
+            case .video(let id):
+                guard let idx = project.videoTracks.firstIndex(where: { $0.id == id }) else { return nil }
+                return SectionItem(kind: .video, trackIndex: idx)
+            case .compound(let id):
+                guard project.showCompoundTracks else { return nil }
+                guard let idx = project.compoundTracks.firstIndex(where: { $0.id == id }) else { return nil }
+                return SectionItem(kind: .compound, trackIndex: idx)
+            }
+        }
+    }
+
+    private var resolvedAudioSection: [SectionItem] {
+        project.audioSectionOrder.compactMap { ref in
+            switch ref {
+            case .audio(let id):
+                guard let idx = project.audioTracks.firstIndex(where: { $0.id == id }) else { return nil }
+                return SectionItem(kind: .audio, trackIndex: idx)
+            case .compound(let id):
+                guard project.showCompoundTracks else { return nil }
+                guard let idx = project.compoundTracks.firstIndex(where: { $0.id == id }) else { return nil }
+                return SectionItem(kind: .compound, trackIndex: idx)
+            }
+        }
+    }
+
+    private func videoSectionH(_ item: SectionItem) -> CGFloat {
+        item.kind == .video ? vidH(item.trackIndex) : cmpH(item.trackIndex)
+    }
+    private func audioSectionH(_ item: SectionItem) -> CGFloat {
+        item.kind == .audio ? audH(item.trackIndex) : cmpH(item.trackIndex)
+    }
+
     private func trackLabelDropTarget(type: TrackDragType, source: Int, offset: CGFloat) -> Int {
         let count: Int
         let heights: [CGFloat]
         switch type {
         case .video:
-            count = project.videoTracks.count
-            heights = (0..<count).map { vidH($0) }
+            let vs = resolvedVideoSection
+            count = vs.count
+            heights = vs.map { videoSectionH($0) }
         case .audio:
-            count = project.audioTracks.count
-            heights = (0..<count).map { audH($0) }
+            let as_ = resolvedAudioSection
+            count = as_.count
+            heights = as_.map { audioSectionH($0) }
         case .overlay:
             let ovs = visibleOverlays
             count = ovs.count
@@ -597,11 +663,11 @@ struct TimelineView: View {
             project.pushUndo()
             switch type {
             case .video:
-                let t = project.videoTracks.remove(at: trackLabelDragSrc)
-                project.videoTracks.insert(t, at: target)
+                let item = project.videoSectionOrder.remove(at: trackLabelDragSrc)
+                project.videoSectionOrder.insert(item, at: target)
             case .audio:
-                let t = project.audioTracks.remove(at: trackLabelDragSrc)
-                project.audioTracks.insert(t, at: target)
+                let item = project.audioSectionOrder.remove(at: trackLabelDragSrc)
+                project.audioSectionOrder.insert(item, at: target)
             case .overlay:
                 let ovs = visibleOverlays
                 guard trackLabelDragSrc < ovs.count, target < ovs.count else { break }
@@ -682,18 +748,19 @@ struct TimelineView: View {
             heights = ovs.map { overlayH($0) }
             baseY = 0
         case .video:
-            heights = project.videoTracks.indices.map { vidH($0) }
+            let vs = resolvedVideoSection
+            heights = vs.map { videoSectionH($0) }
             let ovs = visibleOverlays
             baseY = ovs.reduce(CGFloat(0)) { $0 + overlayH($1) } + (ovs.isEmpty ? 0 : CGFloat(ovs.count))
         case .audio:
-            heights = project.audioTracks.indices.map { audH($0) }
+            let as_ = resolvedAudioSection
+            heights = as_.map { audioSectionH($0) }
             let ovs = visibleOverlays
             baseY = ovs.reduce(CGFloat(0)) { $0 + overlayH($1) } + (ovs.isEmpty ? 0 : CGFloat(ovs.count))
             if project.showVideoTracks {
-                baseY += project.videoTracks.indices.reduce(CGFloat(0)) { $0 + vidH($1) } + CGFloat(project.videoTracks.count)
+                let vs = resolvedVideoSection
+                baseY += vs.reduce(CGFloat(0)) { $0 + videoSectionH($1) } + CGFloat(vs.count)
             }
-            let vcIndices = videoCompoundIndices
-            if !vcIndices.isEmpty { baseY += vcIndices.reduce(CGFloat(0)) { $0 + cmpH($1) } + CGFloat(vcIndices.count) }
         }
         let insertBefore = dropIdx < trackLabelDragSrc
         let lineIdx = insertBefore ? dropIdx : dropIdx + 1
@@ -795,6 +862,28 @@ struct TimelineView: View {
 
                     DraggablePlayhead(pps: project.pixelsPerSecond, fullHeight: effectiveH)
                         .zIndex(10)
+
+                    if let hid = hoveredMarkerID, editingMarkerID == nil,
+                       let hm = project.allMarkersAbsolute.first(where: { $0.id == hid }) {
+                        let t = hm.absoluteTime
+                        let mm = Int(t) / 60, ss = Int(t) % 60, ff = Int((t - floor(t)) * 30)
+                        VStack(spacing: 2) {
+                            Text(hm.marker.title.isEmpty ? "标记" : hm.marker.title)
+                                .font(.system(size: 10, weight: .medium))
+                                .foregroundColor(Color.labelPrimary)
+                            Text(String(format: "%02d:%02d:%02d", mm, ss, ff))
+                                .font(.system(size: 9))
+                                .foregroundColor(Color.labelSecondary)
+                        }
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 4)
+                        .background(RoundedRectangle(cornerRadius: 4).fill(Color(red: 0.18, green: 0.18, blue: 0.19)))
+                        .overlay(RoundedRectangle(cornerRadius: 4).stroke(Color.white.opacity(0.1), lineWidth: 0.5))
+                        .fixedSize()
+                        .position(x: t * project.pixelsPerSecond + 1, y: hoveredMarkerY + 17)
+                        .zIndex(12)
+                        .allowsHitTesting(false)
+                    }
                 }
                 .frame(width: totalW, alignment: .topLeading)
                 .frame(minHeight: effectiveH)
@@ -805,37 +894,60 @@ struct TimelineView: View {
                               ?? project.selectedTextClipID ?? project.selectedShapeClipID
                               ?? project.selectedCompoundClipID
                               ?? project.selectedClipIDs.first
-                    if let id = selID {
-                        Button { project.selectLeftOf(id) } label: { Label("向左全选", systemImage: "arrow.left.to.line") }
-                        Button { project.selectRightOf(id) } label: { Label("向右全选", systemImage: "arrow.right.to.line") }
-                        Divider()
-                    }
-                    if let textID = project.selectedTextClipID {
-                        Button {
-                            project.saveTextTemplateFromClip(textID)
-                        } label: { Label("保存为文字模板", systemImage: "square.and.arrow.down") }
-                        Divider()
-                    }
-                    Button { project.copySelected() } label: { Label("复制", systemImage: "doc.on.doc") }
-                        .disabled(selID == nil)
-                    Button { project.cutSelected() } label: { Label("剪切", systemImage: "scissors") }
-                        .disabled(selID == nil)
-                    Button { project.pasteAtPlayhead() } label: { Label("粘贴", systemImage: "doc.on.clipboard") }
-                        .disabled(project.clipboard.isEmpty)
-                    if selID != nil {
-                        Divider()
-                        Button { project.createCompoundFromSelected() } label: { Label("创建复合片段", systemImage: "rectangle.on.rectangle") }
-                        if let cid = project.selectedCompoundClipID {
-                            Button { project.dissolveCompound(cid) } label: { Label("解除复合片段", systemImage: "rectangle.on.rectangle.slash") }
+                    if let mid = project.selectedMarkerID, selID == nil {
+                        Button(role: .destructive) {
+                            project.removeMarker(id: mid)
+                        } label: { Label("删除标记", systemImage: "xmark.circle") }
+                    } else {
+                        if let id = selID {
+                            Button { project.selectLeftOf(id) } label: { Label("向左全选", systemImage: "arrow.left.to.line") }
+                            Button { project.selectRightOf(id) } label: { Label("向右全选", systemImage: "arrow.right.to.line") }
+                            Divider()
                         }
-                        Divider()
-                        Button(role: .destructive) { project.deleteSelected() } label: { Label("删除", systemImage: "trash") }
+                        if let textID = project.selectedTextClipID, project.selectedClipIDs.isEmpty {
+                            Button {
+                                project.saveTextTemplateFromClip(textID)
+                            } label: { Label("保存为文字模板", systemImage: "square.and.arrow.down") }
+                            Divider()
+                        }
+                        Button { project.copySelected() } label: { Label("复制", systemImage: "doc.on.doc") }
+                            .disabled(selID == nil)
+                        Button { project.cutSelected() } label: { Label("剪切", systemImage: "scissors") }
+                            .disabled(selID == nil)
+                        Button { project.pasteAtPlayhead() } label: { Label("粘贴", systemImage: "doc.on.clipboard") }
+                            .disabled(project.clipboard.isEmpty)
+                        if selID != nil {
+                            Divider()
+                            Button { project.createCompoundFromSelected() } label: { Label("创建复合片段", systemImage: "rectangle.on.rectangle") }
+                            if let cid = project.selectedCompoundClipID {
+                                Button { project.dissolveCompound(cid) } label: { Label("解除复合片段", systemImage: "rectangle.on.rectangle.slash") }
+                            }
+                            Divider()
+                            Button(role: .destructive) { project.deleteSelected() } label: { Label("删除", systemImage: "trash") }
+                        }
+                        if let mid = project.selectedMarkerID {
+                            Divider()
+                            Button(role: .destructive) {
+                                project.removeMarker(id: mid)
+                            } label: { Label("删除标记", systemImage: "xmark.circle") }
+                        }
                     }
                 }
                 .onContinuousHover { phase in
                     switch phase {
                     case .active(let loc):
                         scrollBarHovered = loc.y > effectiveH - 24
+                        let hoverTime = loc.x / project.pixelsPerSecond
+                        if loc.y >= rulerH, let hm = project.allMarkersAbsolute.first(where: {
+                            abs($0.absoluteTime - hoverTime) * project.pixelsPerSecond < 6
+                        }) {
+                            if hoveredMarkerID != hm.id {
+                                hoveredMarkerID = hm.id
+                                hoveredMarkerY = trackTopFromY(loc.y) + 25
+                            }
+                        } else {
+                            hoveredMarkerID = nil
+                        }
                         guard dragOp == nil else { return }
                         if trackGapHit(y: loc.y) != nil {
                             NSCursor.resizeUpDown.set()
@@ -848,6 +960,7 @@ struct TimelineView: View {
                         }
                     case .ended:
                         scrollBarHovered = false
+                        hoveredMarkerID = nil
                         NSCursor.arrow.set()
                     }
                 }
@@ -905,7 +1018,6 @@ struct TimelineView: View {
                 if dragOp == nil {
                     let loc = v.startLocation
                     if loc.y < rulerH {
-                        // Ruler strip (includes playhead triangle): move playhead immediately.
                         dragOp = .movingPlayhead
                     } else if let kind = trackGapHit(y: loc.y) {
                         // 轨道间隙：开始调整轨道高度
@@ -927,6 +1039,28 @@ struct TimelineView: View {
             .onEnded { v in
                 // 点击（没有拖动）→ 优先检测转场图标，然后选中clip或取消选择
                 if dragOp == nil && v.startLocation.y >= rulerH {
+                    // 标记 click 检测
+                    let clickTime = v.startLocation.x / project.pixelsPerSecond
+                    if let hitMA = project.allMarkersAbsolute.first(where: {
+                        abs($0.absoluteTime - clickTime) * project.pixelsPerSecond < 6
+                    }) {
+                        let hitMarker = hitMA.marker
+                        if project.selectedMarkerID == hitMarker.id {
+                            project.selectedMarkerID = nil
+                        } else {
+                            project.selectedMarkerID = hitMarker.id
+                        }
+                        if lastMarkerClickID == hitMarker.id,
+                           Date().timeIntervalSince(lastMarkerClickTime) < 0.4 {
+                            editingMarkerID = hitMarker.id
+                            lastMarkerClickID = nil
+                        } else {
+                            lastMarkerClickID = hitMarker.id
+                            lastMarkerClickTime = Date()
+                        }
+                        dragOp = nil; return
+                    }
+                    project.selectedMarkerID = nil
                     // 转场图标优先（图标在片段内部，不在边缘）
                     if let transClipID = hitTestTransitionIcon(at: v.startLocation) {
                         project.selectedTransitionClipID = transClipID
@@ -941,14 +1075,13 @@ struct TimelineView: View {
                     let isShift = NSEvent.modifierFlags.contains(.shift)
                     let hitTransition = hitTestTransitionIcon(at: v.startLocation) != nil
                     if !hitTransition, let (hit, _) = findClipTarget(at: v.startLocation) {
-                        if case .compound(let id, _, _, let ti, let ci) = hit {
+                        if case .compound(let id, _, _, let ti, let ci) = hit, !isShift {
                             if lastCompoundClickID == id && Date().timeIntervalSince(lastCompoundClickTime) < 0.35 {
                                 project.enterCompound(trackIndex: ti, clipIndex: ci)
                                 lastCompoundClickID = nil
                             } else {
                                 lastCompoundClickID = id
                                 lastCompoundClickTime = Date()
-                                // 单击选中
                                 project.selectedCompoundClipID = id
                                 project.selectedVideoClipID = nil
                                 project.selectedImageClipID = nil
@@ -1073,35 +1206,8 @@ struct TimelineView: View {
                         if let dst = destTrack.compoundIndex, dst != srcTrack {
                             project.moveCompoundClipToTrack(id: id, from: srcTrack, to: dst)
                         }
-                    case .moveMulti(let items):
-                        for it in items {
-                            switch it.kind {
-                            case .subtitle:
-                                if let dst = destTrack.subtitleIndex, dst != it.srcTrack {
-                                    project.moveSubtitleClipToTrack(id: it.id, from: it.srcTrack, to: dst)
-                                }
-                            case .text:
-                                if let dst = destTrack.textIndex, dst != it.srcTrack {
-                                    project.moveTextClipToTrack(id: it.id, from: it.srcTrack, to: dst)
-                                }
-                            case .image:
-                                if let dst = destTrack.imageIndex, dst != it.srcTrack {
-                                    project.moveImageClipToTrack(id: it.id, from: it.srcTrack, to: dst)
-                                }
-                            case .video:
-                                if let dst = destTrack.videoIndex, dst != it.srcTrack {
-                                    project.moveVideoClipToTrack(id: it.id, from: it.srcTrack, to: dst)
-                                }
-                            case .audio:
-                                if let dst = destTrack.audioIndex, dst != it.srcTrack {
-                                    project.moveAudioClipToTrack(id: it.id, from: it.srcTrack, to: dst)
-                                }
-                            case .shape:
-                                if let dst = destTrack.shapeIndex, dst != it.srcTrack {
-                                    project.moveShapeClipToTrack(id: it.id, from: it.srcTrack, to: dst)
-                                }
-                            }
-                        }
+                    case .moveMulti:
+                        break
                     default: break
                     }
                 }
@@ -1131,6 +1237,7 @@ struct TimelineView: View {
                             case .subtitle: project.resolveSubtitleOverlap(id: it.id)
                             case .text:     project.resolveTextOverlap(id: it.id)
                             case .shape:    project.resolveShapeOverlap(id: it.id)
+                            case .compound: project.resolveCompoundOverlap(id: it.id)
                             }
                         }
                     default: break
@@ -1170,6 +1277,7 @@ struct TimelineView: View {
     }
 
     private func startDrag(at pt: CGPoint) {
+        project.selectedMarkerID = nil
         let playheadX = clock.currentTime * project.pixelsPerSecond
         // Dragging anywhere on the playhead stem (±10 px) moves the playhead.
         if abs(pt.x - playheadX) < 10 { dragOp = .movingPlayhead; return }
@@ -1433,6 +1541,18 @@ struct TimelineView: View {
                                           originStart: c.startTime, originDur: c.duration, srcTrack: ti))
                 }
             }
+            for (ti, t) in project.shapeTracks.enumerated() {
+                if let c = t.clips.first(where: { $0.id == id }) {
+                    items.append(DragItem(id: id, kind: .shape,
+                                          originStart: c.startTime, originDur: c.duration, srcTrack: ti))
+                }
+            }
+            for (ti, t) in project.compoundTracks.enumerated() {
+                if let c = t.clips.first(where: { $0.id == id }) {
+                    items.append(DragItem(id: id, kind: .compound,
+                                          originStart: c.startTime, originDur: c.duration, srcTrack: ti))
+                }
+            }
         }
         return items
     }
@@ -1566,6 +1686,7 @@ struct TimelineView: View {
                 case .subtitle: project.updateSubtitleTime(id: it.id, start: ns, end: ne)
                 case .text:     project.updateTextTime(id: it.id, start: ns, end: ne)
                 case .shape:    project.updateShapeTime(id: it.id, start: ns, end: ne)
+                case .compound: project.updateCompoundTime(id: it.id, start: ns, end: ne)
                 }
             }
         case .trimVideoLeft(let id, let originStart, let originEnd, let originTrimStart, let assetDur):
@@ -1799,73 +1920,53 @@ struct TimelineView: View {
                         { $0.startTime }, { $0.endTime }) { return m }
                 case .compound:
                     let ti = entry.index
-                    for (ci, c) in project.compoundTracks[ti].clips.enumerated() {
-                        let xMin = CGFloat(c.startTime * pps) + 1
-                        let xMax = CGFloat(c.endTime * pps) + 1
-                        if pt.x >= xMin - threshold && pt.x <= xMax + threshold {
-                            return (.compound(id: c.id, start: c.startTime, dur: c.duration, trackIndex: ti, clipIndex: ci), nil)
-                        }
-                    }
+                    if let m = bestMatch(project.compoundTracks[ti].clips.enumerated().map { ($0, $1) }, x: pt.x,
+                        { pair, _, _ in let (ci, c) = pair; return .compound(id: c.id, start: c.startTime, dur: c.duration, trackIndex: ti, clipIndex: ci) },
+                        { $0.1.startTime }, { $0.1.endTime }) { return m }
                 }
                 return nil
             }
             rowTop += h
         }
         if project.showVideoTracks {
-            for ti in project.videoTracks.indices {
+            for item in resolvedVideoSection {
                 if !first { rowTop += 1 }; first = false
-                let h = vidH(ti)
+                let h = videoSectionH(item)
                 if pt.y >= rowTop && pt.y < rowTop + h {
-                    if let m = bestMatch(project.videoTracks[ti].clips, x: pt.x,
-                        { c, _, _ in .video(id: c.id, start: c.startTime, dur: c.duration) },
-                        { $0.startTime }, { $0.endTime }) { return m }
+                    if item.kind == .video {
+                        if let m = bestMatch(project.videoTracks[item.trackIndex].clips, x: pt.x,
+                            { c, _, _ in .video(id: c.id, start: c.startTime, dur: c.duration) },
+                            { $0.startTime }, { $0.endTime }) { return m }
+                    } else {
+                        let ti = item.trackIndex
+                        if let m = bestMatch(project.compoundTracks[ti].clips.enumerated().map { ($0, $1) }, x: pt.x,
+                            { pair, _, _ in let (ci, c) = pair; return .compound(id: c.id, start: c.startTime, dur: c.duration, trackIndex: ti, clipIndex: ci) },
+                            { $0.1.startTime }, { $0.1.endTime }) { return m }
+                    }
                     return nil
                 }
                 rowTop += h
             }
-        }
-        for ti in videoCompoundIndices {
-            if !first { rowTop += 1 }; first = false
-            let h = cmpH(ti)
-            if pt.y >= rowTop && pt.y < rowTop + h {
-                for (ci, c) in project.compoundTracks[ti].clips.enumerated() {
-                    let xMin = CGFloat(c.startTime * pps) + 1
-                    let xMax = CGFloat(c.endTime * pps) + 1
-                    if pt.x >= xMin - threshold && pt.x <= xMax + threshold {
-                        return (.compound(id: c.id, start: c.startTime, dur: c.duration, trackIndex: ti, clipIndex: ci), nil)
-                    }
-                }
-                return nil
-            }
-            rowTop += h
         }
         if project.showAudioTracks {
-            for ti in project.audioTracks.indices {
+            for item in resolvedAudioSection {
                 if !first { rowTop += 1 }; first = false
-                let h = audH(ti)
+                let h = audioSectionH(item)
                 if pt.y >= rowTop && pt.y < rowTop + h {
-                    if let m = bestMatch(project.audioTracks[ti].clips, x: pt.x,
-                        { c, _, _ in .audio(id: c.id, start: c.startTime, dur: c.duration) },
-                        { $0.startTime }, { $0.endTime }) { return m }
+                    if item.kind == .audio {
+                        if let m = bestMatch(project.audioTracks[item.trackIndex].clips, x: pt.x,
+                            { c, _, _ in .audio(id: c.id, start: c.startTime, dur: c.duration) },
+                            { $0.startTime }, { $0.endTime }) { return m }
+                    } else {
+                        let ti = item.trackIndex
+                        if let m = bestMatch(project.compoundTracks[ti].clips.enumerated().map { ($0, $1) }, x: pt.x,
+                            { pair, _, _ in let (ci, c) = pair; return .compound(id: c.id, start: c.startTime, dur: c.duration, trackIndex: ti, clipIndex: ci) },
+                            { $0.1.startTime }, { $0.1.endTime }) { return m }
+                    }
                     return nil
                 }
                 rowTop += h
             }
-        }
-        for ti in audioCompoundIndices {
-            if !first { rowTop += 1 }; first = false
-            let h = cmpH(ti)
-            if pt.y >= rowTop && pt.y < rowTop + h {
-                for (ci, c) in project.compoundTracks[ti].clips.enumerated() {
-                    let xMin = CGFloat(c.startTime * pps) + 1
-                    let xMax = CGFloat(c.endTime * pps) + 1
-                    if pt.x >= xMin - threshold && pt.x <= xMax + threshold {
-                        return (.compound(id: c.id, start: c.startTime, dur: c.duration, trackIndex: ti, clipIndex: ci), nil)
-                    }
-                }
-                return nil
-            }
-            rowTop += h
         }
         return nil
     }
@@ -1910,50 +2011,42 @@ struct TimelineView: View {
             rowTop += h
         }
         if project.showVideoTracks {
-            for ti in project.videoTracks.indices {
+            for item in resolvedVideoSection {
                 if !first { rowTop += 1 }; first = false
-                let h = vidH(ti)
+                let h = videoSectionH(item)
                 let yRange = rowTop ... (rowTop + h)
-                for c in project.videoTracks[ti].clips {
-                    let xEnd = max(c.startTime*pps, c.endTime*pps)
-                    let xRange = (c.startTime*pps) ... xEnd
-                    if rectIntersects(rect, xRange: xRange, yRange: yRange) { ids.insert(c.id) }
+                if item.kind == .video {
+                    for c in project.videoTracks[item.trackIndex].clips {
+                        let xEnd = max(c.startTime*pps, c.endTime*pps)
+                        if rectIntersects(rect, xRange: (c.startTime*pps)...xEnd, yRange: yRange) { ids.insert(c.id) }
+                    }
+                } else {
+                    for c in project.compoundTracks[item.trackIndex].clips {
+                        let xEnd = max(c.startTime*pps, c.endTime*pps)
+                        if rectIntersects(rect, xRange: (c.startTime*pps)...xEnd, yRange: yRange) { ids.insert(c.id) }
+                    }
                 }
                 rowTop += h
             }
-        }
-        for ti in videoCompoundIndices {
-            if !first { rowTop += 1 }; first = false
-            let h = cmpH(ti)
-            let yRange = rowTop ... (rowTop + h)
-            for c in project.compoundTracks[ti].clips {
-                let xEnd = max(c.startTime*pps, c.endTime*pps)
-                if rectIntersects(rect, xRange: (c.startTime*pps)...xEnd, yRange: yRange) { ids.insert(c.id) }
-            }
-            rowTop += h
         }
         if project.showAudioTracks {
-            for ti in project.audioTracks.indices {
+            for item in resolvedAudioSection {
                 if !first { rowTop += 1 }; first = false
-                let h = audH(ti)
+                let h = audioSectionH(item)
                 let yRange = rowTop ... (rowTop + h)
-                for c in project.audioTracks[ti].clips {
-                    let xEnd = max(c.startTime*pps, c.endTime*pps)
-                    let xRange = (c.startTime*pps) ... xEnd
-                    if rectIntersects(rect, xRange: xRange, yRange: yRange) { ids.insert(c.id) }
+                if item.kind == .audio {
+                    for c in project.audioTracks[item.trackIndex].clips {
+                        let xEnd = max(c.startTime*pps, c.endTime*pps)
+                        if rectIntersects(rect, xRange: (c.startTime*pps)...xEnd, yRange: yRange) { ids.insert(c.id) }
+                    }
+                } else {
+                    for c in project.compoundTracks[item.trackIndex].clips {
+                        let xEnd = max(c.startTime*pps, c.endTime*pps)
+                        if rectIntersects(rect, xRange: (c.startTime*pps)...xEnd, yRange: yRange) { ids.insert(c.id) }
+                    }
                 }
                 rowTop += h
             }
-        }
-        for ti in audioCompoundIndices {
-            if !first { rowTop += 1 }; first = false
-            let h = cmpH(ti)
-            let yRange = rowTop ... (rowTop + h)
-            for c in project.compoundTracks[ti].clips {
-                let xEnd = max(c.startTime*pps, c.endTime*pps)
-                if rectIntersects(rect, xRange: (c.startTime*pps)...xEnd, yRange: yRange) { ids.insert(c.id) }
-            }
-            rowTop += h
         }
 
         project.selectedClipIDs = ids
@@ -1986,42 +2079,66 @@ struct TimelineView: View {
             }
         }
         if project.showVideoTracks {
-            for i in project.videoTracks.indices {
+            for item in resolvedVideoSection {
                 if !first { top += 1 }; first = false
-                top += vidH(i)
-                if abs(y - top) <= threshold { return .video(i) }
+                top += videoSectionH(item)
+                if abs(y - top) <= threshold {
+                    return item.kind == .video ? .video(item.trackIndex) : .compound(item.trackIndex)
+                }
             }
-        }
-        for ti in videoCompoundIndices {
-            if !first { top += 1 }; first = false
-            top += cmpH(ti)
-            if abs(y - top) <= threshold { return .compound(ti) }
         }
         if project.showAudioTracks {
-            for i in project.audioTracks.indices {
+            for item in resolvedAudioSection {
                 if !first { top += 1 }; first = false
-                top += audH(i)
-                if abs(y - top) <= threshold { return .audio(i) }
+                top += audioSectionH(item)
+                if abs(y - top) <= threshold {
+                    return item.kind == .audio ? .audio(item.trackIndex) : .compound(item.trackIndex)
+                }
             }
         }
-        for ti in audioCompoundIndices {
-            if !first { top += 1 }; first = false
-            top += cmpH(ti)
-            if abs(y - top) <= threshold { return .compound(ti) }
-        }
         return nil
+    }
+
+    private func trackTopFromY(_ y: CGFloat) -> CGFloat {
+        var top = rulerH
+        var first = true
+        for entry in visibleOverlays {
+            if !first { top += 1 }; first = false
+            let h = overlayH(entry)
+            if y >= top && y < top + h { return top }
+            top += h
+        }
+        if project.showVideoTracks {
+            for item in resolvedVideoSection {
+                if !first { top += 1 }; first = false
+                let h = videoSectionH(item)
+                if y >= top && y < top + h { return top }
+                top += h
+            }
+        }
+        if project.showAudioTracks {
+            for item in resolvedAudioSection {
+                if !first { top += 1 }; first = false
+                let h = audioSectionH(item)
+                if y >= top && y < top + h { return top }
+                top += h
+            }
+        }
+        return rulerH
     }
 
     private func totalContentH() -> CGFloat {
         var h = rulerH
         var trackCount = 0
         for entry in visibleOverlays { h += overlayH(entry); trackCount += 1 }
-        if project.showVideoTracks { for i in project.videoTracks.indices { h += vidH(i) }; trackCount += project.videoTracks.count }
-        let vcIdx = videoCompoundIndices
-        if !vcIdx.isEmpty { for ti in vcIdx { h += cmpH(ti) }; trackCount += vcIdx.count }
-        if project.showAudioTracks { for i in project.audioTracks.indices { h += audH(i) }; trackCount += project.audioTracks.count }
-        let acIdx = audioCompoundIndices
-        if !acIdx.isEmpty { for ti in acIdx { h += cmpH(ti) }; trackCount += acIdx.count }
+        if project.showVideoTracks {
+            let vs = resolvedVideoSection
+            for item in vs { h += videoSectionH(item) }; trackCount += vs.count
+        }
+        if project.showAudioTracks {
+            let as_ = resolvedAudioSection
+            for item in as_ { h += audioSectionH(item) }; trackCount += as_.count
+        }
         if trackCount > 1 { h += CGFloat(trackCount - 1) }
         return h
     }
@@ -2052,57 +2169,79 @@ struct TimelineView: View {
                 .opacity(isTrackDragging(.overlay, ovIdx) ? 0.55 : 1.0)
         }
         if project.showVideoTracks {
-            ForEach(project.videoTracks.indices, id:\.self) { i in
-                trackRow(height: vidH(i), hidden: !project.videoTracks[i].isVisible, tint: Color(hex: "#3DBFBA")) {
-                    ForEach(project.videoTracks[i].clips.filter { isClipVisible(startTime: $0.startTime, endTime: $0.endTime) }) { clip in
-                        VideoClipView(clip: clip, pps: project.pixelsPerSecond, h: vidH(i),
-                                      sel: isSelected(clip.id, primary: project.selectedVideoClipID),
-                                      isDragging: draggingClipID == clip.id,
-                                      scrollOffsetX: scrollOffsetX)
+            let vs = resolvedVideoSection
+            ForEach(vs.indices, id:\.self) { secIdx in
+                let item = vs[secIdx]
+                if item.kind == .video {
+                    let i = item.trackIndex
+                    trackRow(height: vidH(i), hidden: !project.videoTracks[i].isVisible, tint: Color(hex: "#3DBFBA")) {
+                        ForEach(project.videoTracks[i].clips.filter { isClipVisible(startTime: $0.startTime, endTime: $0.endTime) }) { clip in
+                            VideoClipView(clip: clip, pps: project.pixelsPerSecond, h: vidH(i),
+                                          sel: isSelected(clip.id, primary: project.selectedVideoClipID),
+                                          isDragging: draggingClipID == clip.id,
+                                          scrollOffsetX: scrollOffsetX)
+                        }
+                        transitionIcons(trackIndex: i, trackHeight: vidH(i))
+                        clipMarkerPins(project.videoTracks[i].clips, pps: project.pixelsPerSecond,
+                                       trackHeight: vidH(i), startTime: \.startTime, markers: \.markers)
                     }
-                    transitionIcons(trackIndex: i, trackHeight: vidH(i))
-                }
-                .offset(y: isTrackDragging(.video, i) ? trackLabelDragOffset : 0)
-                .zIndex(isTrackDragging(.video, i) ? 10 : 0)
-                .opacity(isTrackDragging(.video, i) ? 0.55 : 1.0)
-            }
-        }
-        // 视频类复合片段轨道
-        ForEach(videoCompoundIndices, id:\.self) { ti in
-            trackRow(height: cmpH(ti), hidden: !project.compoundTracks[ti].isVisible,
-                     muted: project.compoundTracks[ti].isMuted, tint: Color(hex: "#FF9F43")) {
-                ForEach(project.compoundTracks[ti].clips.filter { isClipVisible(startTime: $0.startTime, endTime: $0.endTime) }) { clip in
-                    CompoundClipView(clip: clip, pps: project.pixelsPerSecond, h: cmpH(ti),
-                                     scrollOffsetX: scrollOffsetX,
-                                     sel: clip.id == project.selectedCompoundClipID,
-                                     isDragging: draggingClipID == clip.id)
+                    .offset(y: isTrackDragging(.video, secIdx) ? trackLabelDragOffset : 0)
+                    .zIndex(isTrackDragging(.video, secIdx) ? 10 : 0)
+                    .opacity(isTrackDragging(.video, secIdx) ? 0.55 : 1.0)
+                } else {
+                    let ti = item.trackIndex
+                    trackRow(height: cmpH(ti), hidden: !project.compoundTracks[ti].isVisible,
+                             muted: project.compoundTracks[ti].isMuted, tint: Color(hex: "#FF9F43")) {
+                        ForEach(project.compoundTracks[ti].clips.filter { isClipVisible(startTime: $0.startTime, endTime: $0.endTime) }) { clip in
+                            CompoundClipView(clip: clip, pps: project.pixelsPerSecond, h: cmpH(ti),
+                                             scrollOffsetX: scrollOffsetX,
+                                             sel: isSelected(clip.id, primary: project.selectedCompoundClipID),
+                                             isDragging: draggingClipID == clip.id)
+                        }
+                        clipMarkerPins(project.compoundTracks[ti].clips, pps: project.pixelsPerSecond,
+                                       trackHeight: cmpH(ti), startTime: \.startTime, markers: \.markers)
+                    }
+                    .offset(y: isTrackDragging(.video, secIdx) ? trackLabelDragOffset : 0)
+                    .zIndex(isTrackDragging(.video, secIdx) ? 10 : 0)
+                    .opacity(isTrackDragging(.video, secIdx) ? 0.55 : 1.0)
                 }
             }
         }
         if project.showAudioTracks {
-            ForEach(project.audioTracks.indices, id:\.self) { i in
-                trackRow(height: audH(i), hidden: !project.audioTracks[i].isVisible, muted: project.audioTracks[i].isMuted, tint: Color(hex: "#5DB85D")) {
-                    ForEach(project.audioTracks[i].clips.filter { isClipVisible(startTime: $0.startTime, endTime: $0.endTime) }) { clip in
-                        AudioClipView(clip: clip, pps: project.pixelsPerSecond, h: audH(i),
-                                      sel: isSelected(clip.id, primary: project.selectedAudioClipID),
-                                      isDragging: draggingClipID == clip.id,
-                                      scrollOffsetX: scrollOffsetX)
+            let as_ = resolvedAudioSection
+            ForEach(as_.indices, id:\.self) { secIdx in
+                let item = as_[secIdx]
+                if item.kind == .audio {
+                    let i = item.trackIndex
+                    trackRow(height: audH(i), hidden: !project.audioTracks[i].isVisible, muted: project.audioTracks[i].isMuted, tint: Color(hex: "#5DB85D")) {
+                        ForEach(project.audioTracks[i].clips.filter { isClipVisible(startTime: $0.startTime, endTime: $0.endTime) }) { clip in
+                            AudioClipView(clip: clip, pps: project.pixelsPerSecond, h: audH(i),
+                                          sel: isSelected(clip.id, primary: project.selectedAudioClipID),
+                                          isDragging: draggingClipID == clip.id,
+                                          scrollOffsetX: scrollOffsetX)
+                        }
+                        clipMarkerPins(project.audioTracks[i].clips, pps: project.pixelsPerSecond,
+                                       trackHeight: audH(i), startTime: \.startTime, markers: \.markers)
                     }
-                }
-                .offset(y: isTrackDragging(.audio, i) ? trackLabelDragOffset : 0)
-                .zIndex(isTrackDragging(.audio, i) ? 10 : 0)
-                .opacity(isTrackDragging(.audio, i) ? 0.55 : 1.0)
-            }
-        }
-        // 音频类复合片段轨道
-        ForEach(audioCompoundIndices, id:\.self) { ti in
-            trackRow(height: cmpH(ti), hidden: !project.compoundTracks[ti].isVisible,
-                     muted: project.compoundTracks[ti].isMuted, tint: Color(hex: "#FF9F43")) {
-                ForEach(project.compoundTracks[ti].clips.filter { isClipVisible(startTime: $0.startTime, endTime: $0.endTime) }) { clip in
-                    CompoundClipView(clip: clip, pps: project.pixelsPerSecond, h: cmpH(ti),
-                                     scrollOffsetX: scrollOffsetX,
-                                     sel: clip.id == project.selectedCompoundClipID,
-                                     isDragging: draggingClipID == clip.id)
+                    .offset(y: isTrackDragging(.audio, secIdx) ? trackLabelDragOffset : 0)
+                    .zIndex(isTrackDragging(.audio, secIdx) ? 10 : 0)
+                    .opacity(isTrackDragging(.audio, secIdx) ? 0.55 : 1.0)
+                } else {
+                    let ti = item.trackIndex
+                    trackRow(height: cmpH(ti), hidden: !project.compoundTracks[ti].isVisible,
+                             muted: project.compoundTracks[ti].isMuted, tint: Color(hex: "#FF9F43")) {
+                        ForEach(project.compoundTracks[ti].clips.filter { isClipVisible(startTime: $0.startTime, endTime: $0.endTime) }) { clip in
+                            CompoundClipView(clip: clip, pps: project.pixelsPerSecond, h: cmpH(ti),
+                                             scrollOffsetX: scrollOffsetX,
+                                             sel: isSelected(clip.id, primary: project.selectedCompoundClipID),
+                                             isDragging: draggingClipID == clip.id)
+                        }
+                        clipMarkerPins(project.compoundTracks[ti].clips, pps: project.pixelsPerSecond,
+                                       trackHeight: cmpH(ti), startTime: \.startTime, markers: \.markers)
+                    }
+                    .offset(y: isTrackDragging(.audio, secIdx) ? trackLabelDragOffset : 0)
+                    .zIndex(isTrackDragging(.audio, secIdx) ? 10 : 0)
+                    .opacity(isTrackDragging(.audio, secIdx) ? 0.55 : 1.0)
                 }
             }
         }
@@ -2181,6 +2320,8 @@ struct TimelineView: View {
                                   isDragging: draggingClipID == clip.id,
                                   scrollOffsetX: scrollOffsetX)
                 }
+                clipMarkerPins(project.imageTracks[i].clips, pps: project.pixelsPerSecond,
+                               trackHeight: imgH(i), startTime: \.startTime, markers: \.markers)
             }
         case .subtitle:
             trackRow(height: subH(i), hidden: !project.subtitleTracks[i].isVisible, tint: Color(hex: "#7B6FC4")) {
@@ -2190,6 +2331,8 @@ struct TimelineView: View {
                                      isDragging: draggingClipID == clip.id,
                                      scrollOffsetX: scrollOffsetX)
                 }
+                clipMarkerPins(project.subtitleTracks[i].clips, pps: project.pixelsPerSecond,
+                               trackHeight: subH(i), startTime: \.startTime, markers: \.markers)
             }
         case .text:
             trackRow(height: txtH(i), hidden: !project.textTracks[i].isVisible, tint: Color(hex: "#D4668E")) {
@@ -2199,6 +2342,8 @@ struct TimelineView: View {
                                  isDragging: draggingClipID == clip.id,
                                  scrollOffsetX: scrollOffsetX)
                 }
+                clipMarkerPins(project.textTracks[i].clips, pps: project.pixelsPerSecond,
+                               trackHeight: txtH(i), startTime: \.startTime, markers: \.markers)
             }
         case .shape:
             trackRow(height: shpH(i), hidden: !project.shapeTracks[i].isVisible, tint: Color(hex: "#5B8FF9")) {
@@ -2208,6 +2353,8 @@ struct TimelineView: View {
                                           isDragging: draggingClipID == clip.id,
                                           scrollOffsetX: scrollOffsetX)
                 }
+                clipMarkerPins(project.shapeTracks[i].clips, pps: project.pixelsPerSecond,
+                               trackHeight: shpH(i), startTime: \.startTime, markers: \.markers)
             }
         case .compound:
             trackRow(height: cmpH(i), hidden: !project.compoundTracks[i].isVisible,
@@ -2215,9 +2362,11 @@ struct TimelineView: View {
                 ForEach(project.compoundTracks[i].clips.filter { isClipVisible(startTime: $0.startTime, endTime: $0.endTime) }) { clip in
                     CompoundClipView(clip: clip, pps: project.pixelsPerSecond, h: cmpH(i),
                                      scrollOffsetX: scrollOffsetX,
-                                     sel: clip.id == project.selectedCompoundClipID,
+                                     sel: isSelected(clip.id, primary: project.selectedCompoundClipID),
                                      isDragging: draggingClipID == clip.id)
                 }
+                clipMarkerPins(project.compoundTracks[i].clips, pps: project.pixelsPerSecond,
+                               trackHeight: cmpH(i), startTime: \.startTime, markers: \.markers)
             }
         }
     }
@@ -2282,7 +2431,7 @@ struct TimelineView: View {
     private func trackRowForClip(_ hit: ClipHit) -> Int {
         let overlays = resolvedOverlays
         let oCount = overlays.count
-        let vCount = project.videoTracks.count
+        let vs = resolvedVideoSection
         switch hit {
         case .image(let id, _, _):
             let ti = project.imageTracks.firstIndex { $0.clips.contains { $0.id == id } } ?? 0
@@ -2302,10 +2451,13 @@ struct TimelineView: View {
             return overlays.firstIndex { $0.trackID == trackID } ?? 0
         case .video(let id, _, _):
             let ti = project.videoTracks.firstIndex { $0.clips.contains { $0.id == id } } ?? 0
-            return oCount + ti
+            let trackID = project.videoTracks[ti].id
+            return oCount + (vs.firstIndex { $0.kind == .video && $0.trackIndex == ti } ?? 0)
         case .audio(let id, _, _):
             let ti = project.audioTracks.firstIndex { $0.clips.contains { $0.id == id } } ?? 0
-            return oCount + vCount + videoCompoundIndices.count + ti
+            let trackID = project.audioTracks[ti].id
+            let as_ = resolvedAudioSection
+            return oCount + vs.count + (as_.firstIndex { $0.kind == .audio && $0.trackIndex == ti } ?? 0)
         case .compound(_, _, _, let ti, _):
             let kind = project.compoundTrackKind(project.compoundTracks[ti])
             switch kind {
@@ -2313,11 +2465,10 @@ struct TimelineView: View {
                 let trackID = project.compoundTracks[ti].id
                 return overlays.firstIndex { $0.trackID == trackID } ?? 0
             case .video:
-                let vcIdx = videoCompoundIndices.firstIndex(of: ti) ?? 0
-                return oCount + vCount + vcIdx
+                return oCount + (vs.firstIndex { $0.kind == .compound && $0.trackIndex == ti } ?? 0)
             case .audio:
-                let acIdx = audioCompoundIndices.firstIndex(of: ti) ?? 0
-                return oCount + vCount + videoCompoundIndices.count + project.audioTracks.count + acIdx
+                let as_ = resolvedAudioSection
+                return oCount + vs.count + (as_.firstIndex { $0.kind == .compound && $0.trackIndex == ti } ?? 0)
             }
         }
     }
@@ -2325,23 +2476,16 @@ struct TimelineView: View {
     private func trackCenterY(row: Int) -> CGFloat {
         let overlays = resolvedOverlays
         let oCount = overlays.count
-        let vCount = project.showVideoTracks ? project.videoTracks.count : 0
-        let vcIdx = videoCompoundIndices
-        let vcCount = vcIdx.count
-        let aCount = project.showAudioTracks ? project.audioTracks.count : 0
-        let acIdx = audioCompoundIndices
+        let vs = project.showVideoTracks ? resolvedVideoSection : []
+        let as_ = project.showAudioTracks ? resolvedAudioSection : []
         var top = rulerH
 
         func heightForRow(_ r: Int) -> CGFloat {
             if r < oCount { return overlayH(overlays[r]) }
             let afterOverlay = r - oCount
-            if afterOverlay < vCount { return vidH(afterOverlay) }
-            let afterVideo = afterOverlay - vCount
-            if afterVideo < vcCount { return cmpH(vcIdx[afterVideo]) }
-            let afterVC = afterVideo - vcCount
-            if afterVC < aCount { return audH(afterVC) }
-            let afterAudio = afterVC - aCount
-            if afterAudio < acIdx.count { return cmpH(acIdx[afterAudio]) }
+            if afterOverlay < vs.count { return videoSectionH(vs[afterOverlay]) }
+            let afterVideo = afterOverlay - vs.count
+            if afterVideo < as_.count { return audioSectionH(as_[afterVideo]) }
             return defaultTrackH
         }
 
@@ -2371,32 +2515,26 @@ struct TimelineView: View {
             top += h
         }
         if project.showVideoTracks {
-            for i in project.videoTracks.indices {
+            for item in resolvedVideoSection {
                 if !first { top += 1 }; first = false
-                let h = vidH(i)
-                if y < top + h { return TrackTarget(videoIndex: i) }
+                let h = videoSectionH(item)
+                if y < top + h {
+                    if item.kind == .video { return TrackTarget(videoIndex: item.trackIndex) }
+                    return TrackTarget(compoundIndex: item.trackIndex)
+                }
                 top += h
             }
-        }
-        for ti in videoCompoundIndices {
-            if !first { top += 1 }; first = false
-            let h = cmpH(ti)
-            if y < top + h { return TrackTarget(compoundIndex: ti) }
-            top += h
         }
         if project.showAudioTracks {
-            for i in project.audioTracks.indices {
+            for item in resolvedAudioSection {
                 if !first { top += 1 }; first = false
-                let h = audH(i)
-                if y < top + h { return TrackTarget(audioIndex: i) }
+                let h = audioSectionH(item)
+                if y < top + h {
+                    if item.kind == .audio { return TrackTarget(audioIndex: item.trackIndex) }
+                    return TrackTarget(compoundIndex: item.trackIndex)
+                }
                 top += h
             }
-        }
-        for ti in audioCompoundIndices {
-            if !first { top += 1 }; first = false
-            let h = cmpH(ti)
-            if y < top + h { return TrackTarget(compoundIndex: ti) }
-            top += h
         }
         return TrackTarget()
     }
@@ -2450,6 +2588,46 @@ struct TimelineView: View {
     }
 
     @ViewBuilder
+    private func clipMarkerPins<Clip>(_ clips: [Clip], pps: Double, trackHeight: CGFloat,
+                                      startTime: KeyPath<Clip, Double>, markers: KeyPath<Clip, [Marker]?>) -> some View {
+        ForEach(clips.flatMap { clip in
+            (clip[keyPath: markers] ?? []).map { m in
+                (id: m.id, absTime: clip[keyPath: startTime] + m.time, marker: m)
+            }
+        }, id: \.id) { entry in
+            let isSel = project.selectedMarkerID == entry.id
+            let isHov = hoveredMarkerID == entry.id
+            Canvas { ctx, size in
+                let w = size.width, h = size.height
+                var pin = Path()
+                let r: CGFloat = 1.5
+                pin.move(to: CGPoint(x: r, y: 0))
+                pin.addLine(to: CGPoint(x: w - r, y: 0))
+                pin.addQuadCurve(to: CGPoint(x: w, y: r), control: CGPoint(x: w, y: 0))
+                pin.addLine(to: CGPoint(x: w, y: h * 0.6))
+                pin.addLine(to: CGPoint(x: w / 2, y: h))
+                pin.addLine(to: CGPoint(x: 0, y: h * 0.6))
+                pin.addLine(to: CGPoint(x: 0, y: r))
+                pin.addQuadCurve(to: CGPoint(x: r, y: 0), control: CGPoint(x: 0, y: 0))
+                pin.closeSubpath()
+                ctx.fill(pin, with: .color(entry.marker.color.swiftUIColor))
+                if isSel {
+                    ctx.stroke(pin, with: .color(.white), lineWidth: 1)
+                }
+            }
+            .frame(width: isHov ? 10 : 8, height: isHov ? 14 : 12)
+            .popover(isPresented: Binding(
+                get: { self.editingMarkerID == entry.id },
+                set: { if !$0 { self.editingMarkerID = nil } }
+            )) {
+                MarkerEditPopover(markerID: entry.id)
+                    .environmentObject(project)
+            }
+            .position(x: entry.absTime * pps + 1, y: 8)
+            .allowsHitTesting(false)
+        }
+    }
+
     private func trackRow<C: View>(height: CGFloat, hidden: Bool = false, muted: Bool = false, tint: Color = .white, @ViewBuilder clips: () -> C) -> some View {
         ZStack(alignment: .leading) {
             Rectangle().fill(tint.opacity(0.08)).allowsHitTesting(false)
@@ -2554,6 +2732,52 @@ private struct TrackLabel: View {
         .onHover { isHovered = $0 }
         .animation(.easeInOut(duration: 0.15), value: isHovered)
     }
+}
+
+private struct TrackVisibilityMenu: View {
+    @EnvironmentObject var project: ProjectState
+    @State private var hov = false
+    var body: some View {
+        Button {
+            let menu = NSMenu()
+            func item(_ title: String, _ on: Bool, _ toggle: @escaping () -> Void) {
+                let mi = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+                mi.state = on ? .on : .off
+                mi.target = nil
+                let action = ToggleAction(toggle)
+                mi.target = action
+                mi.action = #selector(ToggleAction.doToggle)
+                objc_setAssociatedObject(mi, "action", action, .OBJC_ASSOCIATION_RETAIN)
+                menu.addItem(mi)
+            }
+            item("图片轨道", project.showImageTracks) { project.showImageTracks.toggle() }
+            item("视频轨道", project.showVideoTracks) { project.showVideoTracks.toggle() }
+            item("音频轨道", project.showAudioTracks) { project.showAudioTracks.toggle() }
+            item("字幕轨道", project.showSubtitleTracks) { project.showSubtitleTracks.toggle() }
+            item("文字轨道", project.showTextTracks) { project.showTextTracks.toggle() }
+            item("图形轨道", project.showShapeTracks) { project.showShapeTracks.toggle() }
+            item("复合片段", project.showCompoundTracks) { project.showCompoundTracks.toggle() }
+            if let event = NSApp.currentEvent {
+                NSMenu.popUpContextMenu(menu, with: event, for: event.window!.contentView!)
+            }
+        } label: {
+            Image(systemName: "eye")
+                .font(.system(size: 12, weight: .light))
+                .foregroundColor(hov ? Color.labelPrimary : Color.labelSecondary)
+                .frame(width: 28, height: 28)
+                .background(hov ? Color.white.opacity(0.08) : Color.clear)
+                .cornerRadius(5)
+        }
+        .buttonStyle(.plain)
+        .onHover { hov = $0 }
+        .help("显示/隐藏轨道")
+    }
+}
+
+private class ToggleAction: NSObject {
+    let closure: () -> Void
+    init(_ closure: @escaping () -> Void) { self.closure = closure }
+    @objc func doToggle() { closure() }
 }
 
 private struct TrackToggleBtn: View {
@@ -2708,8 +2932,15 @@ private struct VideoClipView: View {
         return 5
     }
 
+    private var durationText: String {
+        let d = clip.duration
+        let h = Int(d) / 3600; let m = Int(d) / 60 % 60; let s = Int(d) % 60
+        return h > 0 ? String(format: "%d:%02d:%02d", h, m, s) : String(format: "%02d:%02d", m, s)
+    }
+
     var body: some View {
         let w = max(clip.duration*pps, 5)
+        let showDurRight = w >= 100
         ZStack(alignment:.leading) {
             // Thumbnail strip or solid color
             if let frames = project.assetThumbnails[clip.assetID], !frames.isEmpty {
@@ -2733,6 +2964,22 @@ private struct VideoClipView: View {
                 .padding(.leading, stickyTitleX)
                 .padding(.top, 4)
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            // 时长
+            if showDurRight {
+                Text(durationText)
+                    .font(.system(size: 8).monospacedDigit())
+                    .foregroundColor(.white.opacity(0.7))
+                    .shadow(color: .black.opacity(0.4), radius: 2, x: 0, y: 1)
+                    .padding(.trailing, 5).padding(.top, 5)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
+            } else {
+                Text(durationText)
+                    .font(.system(size: 8).monospacedDigit())
+                    .foregroundColor(.white.opacity(0.7))
+                    .shadow(color: .black.opacity(0.4), radius: 2, x: 0, y: 1)
+                    .padding(.leading, stickyTitleX).padding(.top, 16)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            }
             // 速率徽章（speed != 1.0 时显示）
             if abs(clip.speed - 1.0) > 0.01 {
                 let speedLabel: String = {
@@ -2868,8 +3115,15 @@ private struct AudioClipView: View {
         return 5
     }
 
+    private var durationText: String {
+        let d = clip.duration
+        let hh = Int(d) / 3600; let m = Int(d) / 60 % 60; let s = Int(d) % 60
+        return hh > 0 ? String(format: "%d:%02d:%02d", hh, m, s) : String(format: "%02d:%02d", m, s)
+    }
+
     var body: some View {
         let w = max(clip.duration*pps, 5)
+        let showDurRight = w >= 100
         ZStack(alignment: .leading) {
             RoundedRectangle(cornerRadius:6).fill(Color(hex:"#5DB85D").opacity(0.78))
             if let wave = project.waveformCache[clip.assetID] {
@@ -2888,6 +3142,21 @@ private struct AudioClipView: View {
                 .padding(.leading, stickyTitleX)
                 .padding(.top, 4)
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            if showDurRight {
+                Text(durationText)
+                    .font(.system(size: 8).monospacedDigit())
+                    .foregroundColor(.white.opacity(0.7))
+                    .shadow(color: .black.opacity(0.4), radius: 2, x: 0, y: 1)
+                    .padding(.trailing, 5).padding(.top, 5)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
+            } else {
+                Text(durationText)
+                    .font(.system(size: 8).monospacedDigit())
+                    .foregroundColor(.white.opacity(0.7))
+                    .shadow(color: .black.opacity(0.4), radius: 2, x: 0, y: 1)
+                    .padding(.leading, stickyTitleX).padding(.top, 16)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            }
             if abs(clip.speed - 1.0) > 0.01 {
                 let speedLabel: String = {
                     let s = clip.speed
@@ -3151,13 +3420,18 @@ private struct CompoundClipView: View {
         return 5
     }
 
+    private var durationText: String {
+        let d = clip.duration
+        let h = Int(d) / 3600; let m = Int(d) / 60 % 60; let s = Int(d) % 60
+        return h > 0 ? String(format: "%d:%02d:%02d", h, m, s) : String(format: "%02d:%02d", m, s)
+    }
+
     var body: some View {
         let w = max(clip.duration * pps, 5)
         let clipH = h - 4
+        let showDurRight = w >= 100
         ZStack(alignment: .leading) {
             contentBackground(w: w, clipH: clipH)
-            RoundedRectangle(cornerRadius: 6)
-                .stroke(sel ? Color.white : Color(hex: "#FFBE76").opacity(0.4), lineWidth: sel ? 2 : 1)
             HStack(spacing: 3) {
                 Image(systemName: "rectangle.on.rectangle")
                     .font(.system(size: 8))
@@ -3171,9 +3445,30 @@ private struct CompoundClipView: View {
             .padding(.leading, stickyTitleX)
             .padding(.top, 4)
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            if showDurRight {
+                Text(durationText)
+                    .font(.system(size: 8).monospacedDigit())
+                    .foregroundColor(.white.opacity(0.7))
+                    .shadow(color: .black.opacity(0.4), radius: 2, x: 0, y: 1)
+                    .padding(.trailing, 5)
+                    .padding(.top, 5)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
+            } else {
+                Text(durationText)
+                    .font(.system(size: 8).monospacedDigit())
+                    .foregroundColor(.white.opacity(0.7))
+                    .shadow(color: .black.opacity(0.4), radius: 2, x: 0, y: 1)
+                    .padding(.leading, stickyTitleX)
+                    .padding(.top, 16)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            }
         }
         .frame(width: w, height: clipH)
         .clipShape(RoundedRectangle(cornerRadius: 6))
+        .overlay(
+            RoundedRectangle(cornerRadius: 6)
+                .stroke(sel ? Color.white : Color.clear, lineWidth: sel ? 1 : 0)
+        )
         .opacity(isDragging ? 0 : 1.0)
         .offset(x: clip.startTime * pps + 1)
         .allowsHitTesting(false)
@@ -3206,19 +3501,17 @@ private struct CompoundClipView: View {
                         .opacity(0.5)
                 }
             }
-        case .text(let txt):
+        case .text:
             ZStack {
                 RoundedRectangle(cornerRadius: 6).fill(Color(hex: "#FF9F43").opacity(0.82))
-                Text(txt).font(.system(size: 10)).foregroundColor(.white.opacity(0.5))
-                    .lineLimit(2).padding(.horizontal, 6).padding(.top, 16)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                Text("T").font(.system(size: 16, weight: .bold, design: .serif))
+                    .foregroundColor(.white.opacity(0.3))
             }
-        case .subtitle(let txt):
+        case .subtitle:
             ZStack {
                 RoundedRectangle(cornerRadius: 6).fill(Color(hex: "#FF9F43").opacity(0.82))
-                Text(txt).font(.system(size: 10)).foregroundColor(.white.opacity(0.5))
-                    .lineLimit(2).padding(.horizontal, 6).padding(.top, 16)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                Text("T").font(.system(size: 16, weight: .bold, design: .serif))
+                    .foregroundColor(.white.opacity(0.3))
             }
         case .shape:
             ZStack {
@@ -3452,6 +3745,68 @@ struct TimelineToolbar: View {
         project.selectedCompoundClipID != nil || !project.selectedClipIDs.isEmpty
     }
     private var canSplit: Bool { hasSelection }
+
+    private var canMirrorRotate: Bool {
+        project.selectedVideoClipID != nil ||
+        project.selectedImageClipID != nil ||
+        project.selectedShapeClipID != nil ||
+        compoundHasVideo
+    }
+    private var canReverse: Bool {
+        project.selectedVideoClipID != nil || compoundHasVideo
+    }
+    private var compoundHasVideo: Bool {
+        guard let c = project.selectedCompoundClip else { return false }
+        return c.videoTracks.contains(where: { !$0.clips.isEmpty })
+    }
+
+    private func toggleMirrorH() {
+        project.pushUndo()
+        if let id = project.selectedVideoClipID {
+            project.updateVideoClip(id: id) { $0.mirrorH.toggle() }
+            let v = project.selectedVideoClip?.mirrorH ?? false
+            debugLog("[Mirror] video id=\(id) mirrorH=\(v)")
+        } else if let id = project.selectedImageClipID {
+            project.updateImageClip(id: id) { $0.mirrorH.toggle() }
+            debugLog("[Mirror] image mirrorH toggled")
+        } else if let id = project.selectedShapeClipID {
+            project.updateShapeClip(id: id) { $0.mirrorH.toggle() }
+            debugLog("[Mirror] shape mirrorH toggled")
+        } else {
+            debugLog("[Mirror] no clip selected, canMirrorRotate=\(canMirrorRotate)")
+        }
+        project.rebuildTimelinePreview()
+    }
+    private func toggleMirrorV() {
+        project.pushUndo()
+        if let id = project.selectedVideoClipID {
+            project.updateVideoClip(id: id) { $0.mirrorV.toggle() }
+        } else if let id = project.selectedImageClipID {
+            project.updateImageClip(id: id) { $0.mirrorV.toggle() }
+        } else if let id = project.selectedShapeClipID {
+            project.updateShapeClip(id: id) { $0.mirrorV.toggle() }
+        }
+        project.rebuildTimelinePreview()
+    }
+    private func rotateClip() {
+        project.pushUndo()
+        if let id = project.selectedVideoClipID {
+            project.updateVideoClip(id: id) { $0.rotation = ($0.rotation + 90) % 360 }
+        } else if let id = project.selectedImageClipID {
+            project.updateImageClip(id: id) { $0.rotation = ($0.rotation + 90) % 360 }
+        } else if let id = project.selectedShapeClipID {
+            project.updateShapeClip(id: id) { $0.rotation += 90 }
+        }
+        project.rebuildTimelinePreview()
+    }
+    private func toggleReverse() {
+        project.pushUndo()
+        if let id = project.selectedVideoClipID {
+            project.updateVideoClip(id: id) { $0.reversed.toggle() }
+        }
+        project.rebuildTimelinePreview()
+    }
+
     var body: some View {
         HStack(spacing:0) {
             // 左侧：编辑工具
@@ -3469,6 +3824,17 @@ struct TimelineToolbar: View {
 
                 Divider().frame(height:16).padding(.horizontal,4)
 
+                TransformBtn(style: .mirror, help: "水平镜像", enabled: canMirrorRotate) { toggleMirrorH() }
+                TransformBtn(style: .mirrorV, help: "垂直镜像", enabled: canMirrorRotate) { toggleMirrorV() }
+                TransformBtn(style: .rotate, help: "旋转90°", enabled: canMirrorRotate) { rotateClip() }
+                TransformBtn(style: .reverse, help: "倒放", enabled: canReverse) { toggleReverse() }
+
+                Divider().frame(height:16).padding(.horizontal,4)
+
+                MarkerBtn()
+
+                Divider().frame(height:16).padding(.horizontal,4)
+
                 // 翻译 & 样式工具
                 TranslateToolGroup()
 
@@ -3481,14 +3847,9 @@ struct TimelineToolbar: View {
             Spacer()
 
             // 轨道显示开关
-            HStack(spacing: 2) {
-                TrackToggleBtn(icon: "photo", on: $project.showImageTracks, help: "图片轨道")
-                TrackToggleBtn(icon: "film", on: $project.showVideoTracks, help: "视频轨道")
-                TrackToggleBtn(icon: "music.note", on: $project.showAudioTracks, help: "音频轨道")
-                TrackToggleBtn(icon: "captions.bubble", on: $project.showSubtitleTracks, help: "字幕轨道")
-                TrackToggleBtnT(on: $project.showTextTracks, help: "文字轨道")
-            }
-            .padding(.trailing, 4)
+            TrackVisibilityMenu()
+                .environmentObject(project)
+                .padding(.trailing, 4)
 
             // 吸附开关
             Button { project.snapEnabled.toggle() } label: {
@@ -3961,6 +4322,63 @@ private struct TBtn: View {
     }
 }
 
+private struct TransformBtn: View {
+    enum Style { case reverse, mirror, mirrorV, rotate }
+    let style: Style
+    var help: String? = nil
+    var enabled: Bool = true
+    let action: () -> Void
+    @State private var hov = false
+    var body: some View {
+        Button(action: action) {
+            let icon: NSImage = {
+                switch style {
+                case .reverse: return svgIconReverse
+                case .mirror:  return svgIconMirrorH
+                case .mirrorV: return svgIconMirrorV
+                case .rotate:  return svgIconRotate
+                }
+            }()
+            let sz: CGFloat = style == .mirrorV ? 14 : 16
+            Image(nsImage: icon)
+                .renderingMode(.template)
+                .resizable()
+                .aspectRatio(contentMode: .fit)
+                .frame(width: sz, height: sz)
+                .foregroundColor(enabled ? (hov ? Color.labelPrimary : Color.labelSecondary) : Color.labelSecondary.opacity(0.35))
+                .frame(width: 28, height: 28)
+                .background((enabled && hov) ? Color.white.opacity(0.08) : Color.clear)
+                .cornerRadius(5)
+        }
+        .buttonStyle(.plain)
+        .disabled(!enabled)
+        .onHover { hov = $0 }
+        .help(help ?? "")
+    }
+}
+
+private func _makeSVGIcon(_ svg: String) -> NSImage {
+    let img = NSImage(data: svg.data(using: .utf8)!)!
+    img.isTemplate = true
+    return img
+}
+
+let svgIconReverse: NSImage = _makeSVGIcon("""
+<svg viewBox="0 0 32 32" xmlns="http://www.w3.org/2000/svg"><path d="M10.1108105,3.29291824 C10.459868,3.64290397 10.5006219,4.19549117 10.2066852,4.59289712 L10.1091855,4.70664526 L9.15043905,5.66537967 L23.9996349,5.66537967 C26.6577942,5.66505694 28.8515654,7.7445802 28.9932417,10.3989278 L28.9997417,10.6670484 L28.9997417,23.9999567 C29.0000644,26.6580825 26.9205149,28.851826 24.2661339,28.9935006 L23.9996349,29.0000026 L7.99994323,29.0000026 C5.34178397,29.0003232 3.14801276,26.9208 3.00633644,24.2664524 L2.99978862,23.9999567 L2.99978862,10.6670484 C2.99470561,10.137941 3.40289374,9.69653888 3.93079304,9.66034052 C4.45869234,9.62414217 4.92331241,10.0056953 4.9904542,10.5305506 L5.00020417,10.6670484 L5.00020417,23.9999567 C4.99994344,25.5773706 6.22143902,26.8854906 7.79519398,26.9931581 L7.99994323,26.999658 L23.9996349,26.999658 C25.5767542,26.9991213 26.8844311,25.7780703 26.992874,24.2047034 L26.999374,23.9999567 L26.999374,10.6670484 C27.0004896,9.08900872 25.7787639,7.77993189 24.2043841,7.67222207 L23.9996349,7.66572217 L9.01231454,7.66572217 L10.1124355,8.76420432 C10.4633264,9.1146531 10.5041381,9.6694084 10.2083102,10.0674331 L10.1108105,10.1811813 C9.7608204,10.5302344 9.20822624,10.5709877 8.81081528,10.2770547 L8.69706569,10.1795563 L5.96220066,7.44310078 C5.75593059,7.23923889 5.6485705,6.95571694 5.66807672,6.66636342 C5.66807672,6.27961972 5.88745093,5.94650013 6.20757476,5.77750285 L8.6954407,3.29291824 C8.88287624,3.10537352 9.13716035,3.00000262 9.40231312,3.00000262 C9.66746589,3.00000262 9.92175,3.10537352 10.1091855,3.29291824 L10.1108105,3.29291824 Z M13.9994213,12.2530207 C14.4755446,12.2530207 14.9419179,12.3765206 15.3562914,12.6137668 L19.4610264,14.9602286 C20.3120201,15.4470253 20.8371055,16.3523111 20.8371055,17.3326901 C20.8371055,18.3130691 20.3120201,19.2183549 19.4610264,19.7051515 L15.3546664,22.0532384 C14.5087667,22.5369834 13.4692951,22.5337919 12.626382,22.0448615 C11.7834688,21.5559312 11.2645563,20.6552191 11.2645563,19.6807769 L11.2645563,14.9846032 C11.264987,14.2594302 11.5535889,13.5641533 12.0668271,13.0518358 C12.5800654,12.5395183 13.2758646,12.2521602 14.0010463,12.2530207 L13.9994213,12.2530207 Z M13.9994213,14.2517402 C13.8047696,14.2517402 13.618114,14.3291748 13.480627,14.466965 C13.34314,14.6047551 13.2661174,14.7915794 13.2665472,14.9862282 L13.2665472,19.6791519 C13.266224,19.9406392 13.4052494,20.1824901 13.6313743,20.3138084 C13.8574991,20.4451267 14.1364626,20.4460158 14.36342,20.3161416 L18.4697801,17.9696797 C18.6988016,17.8393857 18.8402495,17.5961784 18.8402495,17.3326901 C18.8402495,17.0692018 18.6988016,16.8259945 18.4697801,16.6957004 L14.36342,14.3492386 C14.2526594,14.2855682 14.1271785,14.2519576 13.9994213,14.2517402 L13.9994213,14.2517402 Z" fill="black"/></svg>
+""")
+
+let svgIconMirrorH: NSImage = _makeSVGIcon("""
+<svg viewBox="0 0 32 32" xmlns="http://www.w3.org/2000/svg"><path d="M13.2516222,4 C12.6080802,4 12.0125371,4.35657144 11.6818774,4.94114286 L0.261673381,25.0668571 C-0.25920453,25.984 0.0216784324,27.1737143 0.889215712,27.724 C1.17365418,27.904 1.50075838,28 1.83141813,28 L13.2516222,28 C14.2649342,28 15.0826947,27.1325714 15.0826947,26.0628571 L15.0826947,5.93714288 C15.0826947,4.8674286 14.2649342,4 13.2516222,4 Z M18.7483954,4 C17.7350834,4 16.9173228,4.86742856 16.9173228,5.93714288 L16.9173228,26.0628571 C16.9173228,27.1325714 17.7350834,28 18.7483954,28 L30.1668217,28 C30.4992591,28 30.8245856,27.904 31.109024,27.724 C31.9783391,27.1737143 32.259222,25.984 31.7383441,25.0668571 L20.3181401,4.94114286 C20.0136034,4.37345058 19.4110842,4.01220928 18.7483954,4 L18.7483954,4 Z M12.7040781,8.03371429 L12.7040781,25.48 L2.80561983,25.48 L12.7040781,8.03371429 Z M19.2994948,8.03714285 L29.1961754,25.48 L19.2994948,25.48 L19.2994948,8.03714285 Z" fill="black"/></svg>
+""")
+
+let svgIconMirrorV: NSImage = _makeSVGIcon("""
+<svg viewBox="0 0 32 32" xmlns="http://www.w3.org/2000/svg"><g transform="rotate(-90,16,16)"><path d="M13.2516222,4 C12.6080802,4 12.0125371,4.35657144 11.6818774,4.94114286 L0.261673381,25.0668571 C-0.25920453,25.984 0.0216784324,27.1737143 0.889215712,27.724 C1.17365418,27.904 1.50075838,28 1.83141813,28 L13.2516222,28 C14.2649342,28 15.0826947,27.1325714 15.0826947,26.0628571 L15.0826947,5.93714288 C15.0826947,4.8674286 14.2649342,4 13.2516222,4 Z M18.7483954,4 C17.7350834,4 16.9173228,4.86742856 16.9173228,5.93714288 L16.9173228,26.0628571 C16.9173228,27.1325714 17.7350834,28 18.7483954,28 L30.1668217,28 C30.4992591,28 30.8245856,27.904 31.109024,27.724 C31.9783391,27.1737143 32.259222,25.984 31.7383441,25.0668571 L20.3181401,4.94114286 C20.0136034,4.37345058 19.4110842,4.01220928 18.7483954,4 L18.7483954,4 Z M12.7040781,8.03371429 L12.7040781,25.48 L2.80561983,25.48 L12.7040781,8.03371429 Z M19.2994948,8.03714285 L29.1961754,25.48 L19.2994948,25.48 L19.2994948,8.03714285 Z" fill="black"/></g></svg>
+""")
+
+let svgIconRotate: NSImage = _makeSVGIcon("""
+<svg viewBox="0 0 32 32" xmlns="http://www.w3.org/2000/svg"><path d="M21.7,30 L6.1,30 C4.115625,30 2.5,28.3875 2.5,26.409375 L2.5,14.4375 C2.5,12.45625 4.115625,10.846875 6.1,10.846875 L21.7,10.846875 C23.684375,10.846875 25.3,12.459375 25.3,14.4375 L25.3,26.409375 C25.3,28.3875 23.684375,30 21.7,30 Z M6.1,13.240625 C5.4375,13.240625 4.9,13.778125 4.9,14.4375 L4.9,26.409375 C4.9,27.06875 5.4375,27.60625 6.1,27.60625 L21.7,27.60625 C22.3625,27.60625 22.9,27.06875 22.9,26.409375 L22.9,14.4375 C22.9,13.778125 22.3625,13.240625 21.7,13.240625 L6.1,13.240625 Z" fill="black"/><path d="M28.3,14.071875 C27.8375,14.071875 27.396875,13.803125 27.2,13.353125 C24.64375,7.525 18.521875,6.65625 15.1,6.65625 C14.4375,6.65625 13.9,6.11875 13.9,5.459375 C13.9,4.8 14.4375,4.2625 15.1,4.2625 C21.91875,4.2625 27.13125,7.228125 29.4,12.396875 C29.665625,13.003125 29.3875,13.709375 28.78125,13.975 C28.625,14.040625 28.459375,14.071875 28.3,14.071875 Z" fill="black"/><path d="M14.8,8.91875 C14.49375,8.91875 14.184375,8.803125 13.95,8.56875 L11.684375,6.30625 C11.215625,5.8375 11.215625,5.08125 11.684375,4.6125 L13.95,2.35 C14.41875,1.88125 15.178125,1.88125 15.646875,2.35 C16.115625,2.81875 16.115625,3.575 15.646875,4.04375 L14.228125,5.459375 L15.646875,6.875 C16.115625,7.34375 16.115625,8.1 15.646875,8.56875 C15.415625,8.8 15.10625,8.91875 14.8,8.91875 Z" fill="black"/></svg>
+""")
+
 private struct TextToolBtn: View {
     let action: () -> Void
     @State private var hov = false
@@ -3976,6 +4394,183 @@ private struct TextToolBtn: View {
         .onHover { hov = $0 }
         .help("添加文字/标题图层")
     }
+}
+
+// MARK: - Marker Button
+
+let svgIconMarkerAdd: NSImage = _makeSVGIcon("""
+<svg viewBox="0 0 32 32" xmlns="http://www.w3.org/2000/svg"><path d="M22,3 L10,3 C8.895,3 8,3.895 8,5 L8,22 C8,22.72 8.39,23.375 9.008,23.72 L15.504,27.484 C15.812,27.662 16.188,27.662 16.496,27.484 L22.992,23.72 C23.61,23.375 24,22.72 24,22 L24,5 C24,3.895 23.105,3 22,3 Z M22,22 L16,25.474 L10,22 L10,5 L22,5 L22,22 Z" fill="black"/></svg>
+""")
+
+let svgIconMarkerDel: NSImage = _makeSVGIcon("""
+<svg viewBox="0 0 32 32" xmlns="http://www.w3.org/2000/svg"><path d="M22,3 L10,3 C8.895,3 8,3.895 8,5 L8,22 C8,22.72 8.39,23.375 9.008,23.72 L15.504,27.484 C15.812,27.662 16.188,27.662 16.496,27.484 L22.992,23.72 C23.61,23.375 24,22.72 24,22 L24,5 C24,3.895 23.105,3 22,3 Z M22,22 L16,25.474 L10,22 L10,5 L22,5 L22,22 Z" fill="black"/><rect x="26" y="3" width="6" height="2" rx="1" fill="black"/></svg>
+""")
+
+private struct MarkerBtn: View {
+    @EnvironmentObject private var project: ProjectState
+    @EnvironmentObject private var clock: PlaybackClock
+    @State private var hov = false
+    private var hasMarkerSelected: Bool { project.selectedMarkerID != nil }
+    private var canAdd: Bool {
+        let t = clock.currentTime
+        func inRange(_ start: Double, _ dur: Double) -> Bool { t >= start && t <= start + dur }
+        if let c = project.selectedVideoClip { return inRange(c.startTime, c.duration) }
+        if let id = project.selectedAudioClipID, let c = project.audioTracks.flatMap(\.clips).first(where: { $0.id == id }) { return inRange(c.startTime, c.duration) }
+        if let id = project.selectedImageClipID, let c = project.imageTracks.flatMap(\.clips).first(where: { $0.id == id }) { return inRange(c.startTime, c.duration) }
+        if let id = project.selectedSubtitleClipID, let c = project.subtitleTracks.flatMap(\.clips).first(where: { $0.id == id }) { return inRange(c.startTime, c.duration) }
+        if let id = project.selectedTextClipID, let c = project.textTracks.flatMap(\.clips).first(where: { $0.id == id }) { return inRange(c.startTime, c.duration) }
+        if let id = project.selectedShapeClipID, let c = project.shapeTracks.flatMap(\.clips).first(where: { $0.id == id }) { return inRange(c.startTime, c.duration) }
+        if let id = project.selectedCompoundClipID, let c = project.compoundTracks.flatMap(\.clips).first(where: { $0.id == id }) { return inRange(c.startTime, c.duration) }
+        if !project.selectedClipIDs.isEmpty { return true }
+        return false
+    }
+    private var isDisabled: Bool { !hasMarkerSelected && !canAdd }
+    var body: some View {
+        Button {
+            if let mid = project.selectedMarkerID {
+                project.removeMarker(id: mid)
+            } else {
+                project.addMarkerToSelectedClip()
+            }
+        } label: {
+            Image(nsImage: hasMarkerSelected ? svgIconMarkerDel : svgIconMarkerAdd)
+                .renderingMode(.template)
+                .resizable()
+                .aspectRatio(contentMode: .fit)
+                .frame(width: 16, height: 16)
+                .foregroundColor(isDisabled ? Color.labelSecondary.opacity(0.3) : (hasMarkerSelected ? Color(hex: "#E8A54B") : (hov ? Color.labelPrimary : Color.labelSecondary)))
+                .frame(width: 28, height: 28)
+                .background(hov && !isDisabled ? Color.white.opacity(0.08) : Color.clear)
+                .cornerRadius(5)
+        }
+        .buttonStyle(.plain)
+        .disabled(isDisabled)
+        .onHover { hov = $0 }
+        .help(hasMarkerSelected ? "删除标记" : "添加标记")
+    }
+}
+
+// MARK: - Marker Edit Popover
+
+private struct MarkerEditPopover: View {
+    let markerID: UUID
+    @EnvironmentObject private var project: ProjectState
+    @State private var title: String = ""
+    @State private var appeared = false
+    @Environment(\.dismiss) private var dismiss
+
+    private var marker: Marker? { project.findMarker(id: markerID)?.marker }
+    private var markerAbsTime: Double? { project.findMarker(id: markerID)?.absoluteTime }
+
+    var body: some View {
+        VStack(spacing: 10) {
+            TextField("标记名称", text: $title)
+                .textFieldStyle(.plain)
+                .font(.system(size: 13))
+                .padding(8)
+                .background(Color.white.opacity(0.08))
+                .cornerRadius(6)
+                .onSubmit { save() }
+
+            if let absT = markerAbsTime {
+                let t = absT
+                let h = Int(t) / 3600, min = (Int(t) % 3600) / 60, s = Int(t) % 60, f = Int((t - floor(t)) * 30)
+                TextField("", text: .constant(String(format: "%02d:%02d:%02d:%02d", h, min, s, f)))
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 13, design: .monospaced))
+                    .padding(8)
+                    .background(Color.white.opacity(0.08))
+                    .cornerRadius(6)
+                    .disabled(true)
+            }
+
+            HStack(spacing: 10) {
+                Spacer()
+                ForEach(Marker.MarkerColor.allCases, id: \.self) { mc in
+                    Canvas { ctx, size in
+                        let w = size.width, h = size.height
+                        var p = Path()
+                        let r: CGFloat = 2
+                        p.move(to: CGPoint(x: r, y: 0))
+                        p.addLine(to: CGPoint(x: w - r, y: 0))
+                        p.addQuadCurve(to: CGPoint(x: w, y: r), control: CGPoint(x: w, y: 0))
+                        p.addLine(to: CGPoint(x: w, y: h * 0.6))
+                        p.addLine(to: CGPoint(x: w / 2, y: h))
+                        p.addLine(to: CGPoint(x: 0, y: h * 0.6))
+                        p.addLine(to: CGPoint(x: 0, y: r))
+                        p.addQuadCurve(to: CGPoint(x: r, y: 0), control: CGPoint(x: 0, y: 0))
+                        p.closeSubpath()
+                        ctx.fill(p, with: .color(mc.swiftUIColor))
+                        if marker?.color == mc {
+                            ctx.stroke(p, with: .color(.white), lineWidth: 1)
+                        }
+                    }
+                    .frame(width: 12, height: 16)
+                    .onTapGesture {
+                        project.updateMarker(id: markerID) { $0.color = mc }
+                    }
+                }
+                Spacer()
+            }
+
+            HStack(spacing: 10) {
+                Button {
+                    project.removeMarker(id: markerID)
+                    dismiss()
+                } label: {
+                    Text("删除")
+                        .font(.system(size: 13))
+                        .foregroundColor(Color.labelSecondary)
+                        .frame(maxWidth: .infinity)
+                        .frame(height: 36)
+                        .background(Color.white.opacity(0.08))
+                        .cornerRadius(8)
+                }
+                .buttonStyle(.plain)
+
+                Button {
+                    save()
+                    dismiss()
+                } label: {
+                    Text("完成")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundColor(.black)
+                        .frame(maxWidth: .infinity)
+                        .frame(height: 36)
+                        .background(Color.accent)
+                        .cornerRadius(8)
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(14)
+        .frame(width: 260)
+        .onAppear {
+            if !appeared, let m = marker {
+                title = m.title
+                appeared = true
+            }
+        }
+    }
+
+    private func save() {
+        project.updateMarker(id: markerID) { $0.title = title }
+    }
+}
+
+// MARK: - Debug
+
+private func debugLog(_ msg: String) {
+    let line = "[\(Date())] \(msg)\n"
+    let path = "/tmp/blackcat_debug.log"
+    if let fh = FileHandle(forWritingAtPath: path) {
+        fh.seekToEndOfFile()
+        fh.write(line.data(using: .utf8)!)
+        fh.closeFile()
+    } else {
+        FileManager.default.createFile(atPath: path, contents: line.data(using: .utf8))
+    }
+    NSLog(msg)
 }
 
 // MARK: - Helpers

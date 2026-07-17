@@ -29,6 +29,10 @@ final class AppSettings: ObservableObject {
         static let seedance15Endpoint = "settings.ai.seedance15.endpoint"
         static let llmProvider = "settings.llm.provider"
         static let llmAPIKey = "settings.llm.apiKey"
+        static let searchEngine = "settings.ai.searchEngine"
+        static let bingSearchKey = "settings.ai.bing.searchKey"
+        static let googleSearchKey = "settings.ai.google.searchKey"
+        static let googleSearchCX = "settings.ai.google.searchCX"
     }
 
     // MARK: - 文件保存位置
@@ -238,6 +242,35 @@ final class AppSettings: ObservableObject {
         didSet { ud.set(seedance15Endpoint, forKey: K.seedance15Endpoint) }
     }
 
+    // MARK: - 联网搜索
+
+    enum SearchEngine: String, CaseIterable {
+        case bing = "Bing"
+        case google = "Google"
+    }
+
+    @Published var searchEngine: SearchEngine = .bing {
+        didSet { ud.set(searchEngine.rawValue, forKey: K.searchEngine) }
+    }
+    @Published var bingSearchKey: String {
+        didSet { ud.set(bingSearchKey, forKey: K.bingSearchKey) }
+    }
+    @Published var googleSearchKey: String {
+        didSet { ud.set(googleSearchKey, forKey: K.googleSearchKey) }
+    }
+    @Published var googleSearchCX: String {
+        didSet { ud.set(googleSearchCX, forKey: K.googleSearchCX) }
+    }
+
+    func providerAPIKey(for provider: String) -> String {
+        ud.string(forKey: "settings.ai.providerKey.\(provider)") ?? ""
+    }
+
+    func setProviderAPIKey(_ key: String, for provider: String) {
+        ud.set(key, forKey: "settings.ai.providerKey.\(provider)")
+        objectWillChange.send()
+    }
+
     // MARK: - Init
 
     private init() {
@@ -289,5 +322,15 @@ final class AppSettings: ObservableObject {
             llmProvider = .deepseek
         }
         llmAPIKey = ud.string(forKey: K.llmAPIKey) ?? ""
+
+        if let raw = ud.string(forKey: K.searchEngine),
+           let eng = SearchEngine(rawValue: raw) {
+            searchEngine = eng
+        } else {
+            searchEngine = .bing
+        }
+        bingSearchKey = ud.string(forKey: K.bingSearchKey) ?? ""
+        googleSearchKey = ud.string(forKey: K.googleSearchKey) ?? ""
+        googleSearchCX = ud.string(forKey: K.googleSearchCX) ?? ""
     }
 }

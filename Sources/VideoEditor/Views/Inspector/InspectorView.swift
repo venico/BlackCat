@@ -8,6 +8,8 @@ import CryptoKit
 import Translation
 #endif
 
+enum TransformIconType { case mirrorH, mirrorV, rotate, reverse }
+
 // MARK: - Root
 
 struct InspectorView: View {
@@ -31,6 +33,8 @@ struct InspectorView: View {
                     VideoInspector(clip: clip).id(clip.id)
                 } else if let clip = project.selectedAudioClip {
                     AudioInspector(clip: clip).id(clip.id)
+                } else if let clip = project.selectedCompoundClip {
+                    CompoundInspector(clip: clip).id(clip.id)
                 } else if let clip = defaultClip {
                     // 未选择时，默认显示第一个视频片段；无视频则显示第一个片段
                     switch clip {
@@ -89,6 +93,7 @@ struct InspectorView: View {
         if project.selectedImageClipID      != nil { return "图片片段" }
         if project.selectedVideoClipID      != nil { return "视频片段" }
         if project.selectedAudioClipID      != nil { return "音频片段" }
+        if project.selectedCompoundClipID   != nil { return "复合片段" }
         // 默认片段的标签
         if let clip = defaultClip {
             switch clip {
@@ -99,6 +104,67 @@ struct InspectorView: View {
             }
         }
         return ""
+    }
+}
+
+// MARK: - Compound
+
+private struct CompoundInspector: View {
+    @EnvironmentObject private var project: ProjectState
+    let clip: CompoundClip
+    @State private var editName: String = ""
+
+    private var trackSummary: String {
+        var parts: [String] = []
+        if !clip.videoTracks.isEmpty    { parts.append("视频 \(clip.videoTracks.flatMap(\.clips).count)") }
+        if !clip.audioTracks.isEmpty    { parts.append("音频 \(clip.audioTracks.flatMap(\.clips).count)") }
+        if !clip.imageTracks.isEmpty    { parts.append("图片 \(clip.imageTracks.flatMap(\.clips).count)") }
+        if !clip.subtitleTracks.isEmpty { parts.append("字幕 \(clip.subtitleTracks.flatMap(\.clips).count)") }
+        if !clip.textTracks.isEmpty     { parts.append("文字 \(clip.textTracks.flatMap(\.clips).count)") }
+        if !clip.shapeTracks.isEmpty    { parts.append("图形 \(clip.shapeTracks.flatMap(\.clips).count)") }
+        return parts.isEmpty ? "空" : parts.joined(separator: "、")
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            ISection(title: "片段信息") {
+                HStack {
+                    Text("名称").font(.system(size: 10)).foregroundColor(Color.labelSecondary)
+                    Spacer()
+                    TextField("", text: $editName, onCommit: {
+                        project.updateCompoundClip(id: clip.id) { $0.name = editName }
+                    })
+                    .font(.system(size: 10))
+                    .textFieldStyle(.plain)
+                    .multilineTextAlignment(.trailing)
+                    .frame(maxWidth: 140)
+                }
+                InfoRow(label: "时长", value: String(format: "%.1f 秒", clip.duration))
+                InfoRow(label: "内容", value: trackSummary)
+            }
+            ISection(title: nil) {
+                Button {
+                    guard let ti = project.compoundTracks.firstIndex(where: { $0.clips.contains { $0.id == clip.id } }),
+                          let ci = project.compoundTracks[ti].clips.firstIndex(where: { $0.id == clip.id })
+                    else { return }
+                    project.enterCompound(trackIndex: ti, clipIndex: ci)
+                } label: {
+                    HStack {
+                        Image(systemName: "rectangle.on.rectangle")
+                        Text("进入编辑")
+                    }
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundColor(.white)
+                    .frame(maxWidth: .infinity, minHeight: 28)
+                    .background(Color(hex: "#FF9F43").opacity(0.8))
+                    .clipShape(RoundedRectangle(cornerRadius: 6))
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(.horizontal, 14)
+        .onAppear { editName = clip.name }
+        .onChange(of: clip.id) { _ in editName = clip.name }
     }
 }
 
@@ -1279,6 +1345,29 @@ private struct ImageInspector: View {
                 InfoRow(label: "时长",   value: String(format: "%.1f 秒", clip.duration))
             }
 
+            ISection(title: "变换") {
+                HStack(spacing: 4) {
+                    imgCanvasBtn(.mirrorH, label: "水平镜像", active: clip.mirrorH) {
+                        project.updateImageClip(id: clip.id) { $0.mirrorH.toggle() }
+                        project.rebuildTimelinePreview()
+                    }
+                    imgCanvasBtn(.mirrorV, label: "垂直镜像", active: clip.mirrorV) {
+                        project.updateImageClip(id: clip.id) { $0.mirrorV.toggle() }
+                        project.rebuildTimelinePreview()
+                    }
+                    imgCanvasBtn(.rotate, label: "旋转90°", active: clip.rotation != 0) {
+                        project.updateImageClip(id: clip.id) { $0.rotation = ($0.rotation + 90) % 360 }
+                        project.rebuildTimelinePreview()
+                    }
+                    Spacer()
+                }
+                if clip.rotation != 0 {
+                    Text("旋转 \(clip.rotation)°")
+                        .font(.system(size: 10))
+                        .foregroundColor(Color.labelSecondary)
+                }
+            }
+
             ISection(title: nil) {
                 imgSectionHeader("位置") {
                     Button { offsetX = 0; offsetY = 0; applyTransform() } label: {
@@ -1478,6 +1567,33 @@ private struct ImageInspector: View {
                        unit: unit, displayScale: scale, labelWidth: 14,
                        onChange: onChange)
     }
+
+    private func imgCanvasBtn(_ icon: TransformIconType, label: String, active: Bool, action: @escaping () -> Void) -> some View {
+        let nsImg: NSImage = {
+            switch icon {
+            case .mirrorH: return svgIconMirrorH
+            case .mirrorV: return svgIconMirrorV
+            case .rotate:  return svgIconRotate
+            case .reverse: return svgIconReverse
+            }
+        }()
+        return Button {
+            project.pushUndo()
+            action()
+        } label: {
+            Image(nsImage: nsImg)
+                .renderingMode(.template)
+                .resizable()
+                .aspectRatio(contentMode: .fit)
+                .frame(width: 14, height: 14)
+                .foregroundColor(active ? .black : Color.labelSecondary)
+                .frame(width: 28, height: 22)
+                .background(active ? Color(hex: "#E8A54B") : Color.white.opacity(0.08))
+                .clipShape(RoundedRectangle(cornerRadius: 4))
+        }
+        .buttonStyle(.plain)
+        .help(label)
+    }
 }
 
 // MARK: - Video Inspector
@@ -1585,6 +1701,33 @@ private struct VideoInspector: View {
                             .foregroundColor(Color.labelSecondary)
                     }
                     .padding(.top, 2)
+                }
+            }
+
+            ISection(title: "变换") {
+                HStack(spacing: 4) {
+                    canvasBtn(.mirrorH, label: "水平镜像", active: clip.mirrorH) {
+                        project.updateVideoClip(id: clip.id) { $0.mirrorH.toggle() }
+                        project.rebuildTimelinePreview()
+                    }
+                    canvasBtn(.mirrorV, label: "垂直镜像", active: clip.mirrorV) {
+                        project.updateVideoClip(id: clip.id) { $0.mirrorV.toggle() }
+                        project.rebuildTimelinePreview()
+                    }
+                    canvasBtn(.rotate, label: "旋转90°", active: clip.rotation != 0) {
+                        project.updateVideoClip(id: clip.id) { $0.rotation = ($0.rotation + 90) % 360 }
+                        project.rebuildTimelinePreview()
+                    }
+                    canvasBtn(.reverse, label: "倒放", active: clip.reversed) {
+                        project.updateVideoClip(id: clip.id) { $0.reversed.toggle() }
+                        project.rebuildTimelinePreview()
+                    }
+                    Spacer()
+                }
+                if clip.rotation != 0 {
+                    Text("旋转 \(clip.rotation)°")
+                        .font(.system(size: 10))
+                        .foregroundColor(Color.labelSecondary)
                 }
             }
 
@@ -1845,6 +1988,33 @@ private struct VideoInspector: View {
                 await MainActor.run { audioTrackLabels = labels }
             }
         }
+    }
+
+    private func canvasBtn(_ icon: TransformIconType, label: String, active: Bool, action: @escaping () -> Void) -> some View {
+        let nsImg: NSImage = {
+            switch icon {
+            case .mirrorH: return svgIconMirrorH
+            case .mirrorV: return svgIconMirrorV
+            case .rotate:  return svgIconRotate
+            case .reverse: return svgIconReverse
+            }
+        }()
+        return Button {
+            project.pushUndo()
+            action()
+        } label: {
+            Image(nsImage: nsImg)
+                .renderingMode(.template)
+                .resizable()
+                .aspectRatio(contentMode: .fit)
+                .frame(width: 14, height: 14)
+                .foregroundColor(active ? .black : Color.labelSecondary)
+                .frame(width: 28, height: 22)
+                .background(active ? Color(hex: "#E8A54B") : Color.white.opacity(0.08))
+                .clipShape(RoundedRectangle(cornerRadius: 4))
+        }
+        .buttonStyle(.plain)
+        .help(label)
     }
 }
 
@@ -2431,7 +2601,16 @@ struct IPicker<T: Hashable>: View {
             item.target = IPickerItemHandler.shared
             item.tag = i
             IPickerItemHandler.shared.actions[i] = { selection = options[i].0 }
-            if options[i].0 == selection { item.state = .on }
+            let title = NSMutableAttributedString(string: label, attributes: [
+                .font: NSFont.systemFont(ofSize: 13)
+            ])
+            if options[i].0 == selection {
+                title.append(NSAttributedString(string: "  ✓", attributes: [
+                    .font: NSFont.systemFont(ofSize: 12, weight: .semibold),
+                    .foregroundColor: NSColor.white
+                ]))
+            }
+            item.attributedTitle = title
             menu.addItem(item)
         }
         let view = NSApp.keyWindow?.contentView ?? NSView()

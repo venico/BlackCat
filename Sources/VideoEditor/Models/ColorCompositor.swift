@@ -52,9 +52,11 @@ struct CompositorTrackEntry {
     let cropLeft:    CGFloat
     let cropRight:   CGFloat
     let colorAdjust: ColorAdjust
+    var mirrorH: Bool = false
+    var mirrorV: Bool = false
+    var rotation: Int = 0
     var opacityRamp: (from: Float,  to: Float,  start: Double, end: Double)?
     var pushRamp:    (dx: CGFloat, dy: CGFloat, isA: Bool, start: Double, end: Double)?
-    // 缩放转场：以画面中心为锚的整体缩放比例渐变（zoom）
     var zoomRamp:    (from: CGFloat, to: CGFloat, start: Double, end: Double)?
 
     func effectiveOpacity(at t: Double) -> Float {
@@ -211,25 +213,38 @@ final class ColorCompositor: NSObject, AVVideoCompositing {
                 ci = ColorAdjust.apply(ci, entry.colorAdjust)
             }
 
-            // 2. 裁剪
-            var efW = srcW, efH = srcH
+            // 2. Fit 到渲染区域（使用原始尺寸，裁剪不影响缩放）
+            let fitT = entry.fitTransform(
+                srcSize: CGSize(width: srcW, height: srcH),
+                renderSize: renderSize, at: t)
+            ci = ci.transformed(by: fitT)
+
+            // 3. 裁剪（在渲染坐标中遮罩，保持位置不变）
             if entry.cropTop > 0.001 || entry.cropBottom > 0.001 ||
                entry.cropLeft > 0.001 || entry.cropRight > 0.001 {
-                let cx = srcW * entry.cropLeft
-                let cy = srcH * entry.cropTop
-                let cw = max(1, srcW * (1 - entry.cropLeft - entry.cropRight))
-                let ch = max(1, srcH * (1 - entry.cropTop  - entry.cropBottom))
-                ci = ci.cropped(to: CGRect(x: cx, y: cy, width: cw, height: ch))
-                    .transformed(by: CGAffineTransform(translationX: -cx, y: -cy))
-                efW = cw; efH = ch
+                let cropRect = CGRect(
+                    x: srcW * entry.cropLeft,
+                    y: srcH * entry.cropBottom,
+                    width:  max(1, srcW * (1 - entry.cropLeft - entry.cropRight)),
+                    height: max(1, srcH * (1 - entry.cropTop  - entry.cropBottom)))
+                let cropInRender = cropRect.applying(fitT)
+                ci = ci.cropped(to: cropInRender)
             }
 
-            // 3. Fit + push 转场偏移
-            ci = ci.transformed(by: entry.fitTransform(
-                srcSize: CGSize(width: efW, height: efH),
-                renderSize: renderSize, at: t))
+            // 4. 镜像 / 旋转（以画面中心为锚）
+            if entry.mirrorH || entry.mirrorV || entry.rotation != 0 {
+                let ext = ci.extent
+                let cx = ext.midX, cy = ext.midY
+                var combined = CGAffineTransform(translationX: -cx, y: -cy)
+                if entry.mirrorH { combined = combined.concatenating(CGAffineTransform(scaleX: -1, y: 1)) }
+                if entry.mirrorV { combined = combined.concatenating(CGAffineTransform(scaleX: 1, y: -1)) }
+                let rad = CGFloat(entry.rotation) * .pi / 180
+                if abs(rad) > 0.001 { combined = combined.concatenating(CGAffineTransform(rotationAngle: rad)) }
+                combined = combined.concatenating(CGAffineTransform(translationX: cx, y: cy))
+                ci = ci.transformed(by: combined)
+            }
 
-            // 4. 不透明度
+            // 5. 不透明度
             let op = entry.effectiveOpacity(at: t)
             if op < 0.999 {
                 ci = ci.applyingFilter("CIColorMatrix", parameters: [
@@ -237,10 +252,10 @@ final class ColorCompositor: NSObject, AVVideoCompositing {
                 ])
             }
 
-            // 5. 裁到 render 边界
+            // 6. 裁到 render 边界
             ci = ci.cropped(to: bounds)
 
-            // 6. 叠加
+            // 7. 叠加
             result = ci.composited(over: result)
         }
 
