@@ -408,8 +408,11 @@ struct ContentView: View {
 
     private var toggleButton: some View {
         Button { sidebarVisible.toggle() } label: {
-            Image(systemName: "sidebar.left")
-                .font(.system(size: 13, weight: .regular))
+            Image(nsImage: TimelineSVGIcon.load("sidebarToggle"))
+                .renderingMode(.template)
+                .resizable()
+                .aspectRatio(contentMode: .fit)
+                .frame(width: 15, height: 15)
                 .foregroundColor(Color.labelSecondary)
                 .frame(width: 28, height: 22)
         }

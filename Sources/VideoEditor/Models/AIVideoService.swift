@@ -115,6 +115,9 @@ final class AIVideoService: ObservableObject {
         var videoURL: URL?
         var imageURL: URL?
         var audioURL: URL?
+        var videoBookmark: Data?
+        var imageBookmark: Data?
+        var audioBookmark: Data?
         var status: TaskStatus
         let timestamp: Date
 
@@ -129,6 +132,26 @@ final class AIVideoService: ObservableObject {
             self.audioURL = audioURL
             self.status = status
             self.timestamp = Date()
+        }
+
+        func resolvedVideoURL() -> URL? {
+            if let bm = videoBookmark, let url = Self.resolve(bm), FileManager.default.fileExists(atPath: url.path) { return url }
+            if let url = videoURL, FileManager.default.fileExists(atPath: url.path) { return url }
+            return nil
+        }
+        func resolvedImageURL() -> URL? {
+            if let bm = imageBookmark, let url = Self.resolve(bm), FileManager.default.fileExists(atPath: url.path) { return url }
+            if let url = imageURL, FileManager.default.fileExists(atPath: url.path) { return url }
+            return nil
+        }
+        func resolvedAudioURL() -> URL? {
+            if let bm = audioBookmark, let url = Self.resolve(bm), FileManager.default.fileExists(atPath: url.path) { return url }
+            if let url = audioURL, FileManager.default.fileExists(atPath: url.path) { return url }
+            return nil
+        }
+        private static func resolve(_ data: Data) -> URL? {
+            var stale = false
+            return try? URL(resolvingBookmarkData: data, options: [], relativeTo: nil, bookmarkDataIsStale: &stale)
         }
     }
 
@@ -234,9 +257,15 @@ final class AIVideoService: ObservableObject {
                 messages[idx].content = content
                 messages[idx].status = status
                 switch status {
-                case .completed(let url): messages[idx].videoURL = url
-                case .completedImage(let url): messages[idx].imageURL = url
-                case .completedAudio(let url): messages[idx].audioURL = url
+                case .completed(let url):
+                    messages[idx].videoURL = url
+                    messages[idx].videoBookmark = createBookmark(for: url)
+                case .completedImage(let url):
+                    messages[idx].imageURL = url
+                    messages[idx].imageBookmark = createBookmark(for: url)
+                case .completedAudio(let url):
+                    messages[idx].audioURL = url
+                    messages[idx].audioBookmark = createBookmark(for: url)
                 default: break
                 }
             }
@@ -295,11 +324,17 @@ final class AIVideoService: ObservableObject {
                 return ChatMessage(role: .user, content: entry.text)
             } else {
                 if let url = resolveMediaURL(path: entry.videoPath, bookmark: entry.videoBookmark) {
-                    return ChatMessage(role: .assistant, content: entry.text, videoURL: url, status: .completed(url: url))
+                    var msg = ChatMessage(role: .assistant, content: entry.text, videoURL: url, status: .completed(url: url))
+                    msg.videoBookmark = entry.videoBookmark
+                    return msg
                 } else if let url = resolveMediaURL(path: entry.imagePath, bookmark: entry.imageBookmark) {
-                    return ChatMessage(role: .assistant, content: entry.text, imageURL: url, status: .completedImage(url: url))
+                    var msg = ChatMessage(role: .assistant, content: entry.text, imageURL: url, status: .completedImage(url: url))
+                    msg.imageBookmark = entry.imageBookmark
+                    return msg
                 } else if let url = resolveMediaURL(path: entry.audioPath, bookmark: entry.audioBookmark) {
-                    return ChatMessage(role: .assistant, content: entry.text, audioURL: url, status: .completedAudio(url: url))
+                    var msg = ChatMessage(role: .assistant, content: entry.text, audioURL: url, status: .completedAudio(url: url))
+                    msg.audioBookmark = entry.audioBookmark
+                    return msg
                 } else {
                     return ChatMessage(role: .assistant, content: entry.text)
                 }
@@ -1388,13 +1423,13 @@ final class AIVideoService: ObservableObject {
     }
 
     private func createBookmark(for url: URL) -> Data? {
-        try? url.bookmarkData(options: [.withSecurityScope], includingResourceValuesForKeys: nil, relativeTo: nil)
+        try? url.bookmarkData(options: [], includingResourceValuesForKeys: nil, relativeTo: nil)
     }
 
     private func resolveBookmark(_ data: Data) -> URL? {
         var stale = false
-        guard let url = try? URL(resolvingBookmarkData: data, options: [.withSecurityScope], relativeTo: nil, bookmarkDataIsStale: &stale) else { return nil }
-        if stale { return nil }
+        guard let url = try? URL(resolvingBookmarkData: data, options: [], relativeTo: nil, bookmarkDataIsStale: &stale) else { return nil }
+        guard FileManager.default.fileExists(atPath: url.path) else { return nil }
         return url
     }
 

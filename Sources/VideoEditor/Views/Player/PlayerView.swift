@@ -3,6 +3,8 @@ import Combine
 import AVKit
 import AVFoundation
 
+private let kPreviewInset: CGFloat = 8
+
 struct PlayerView: View {
     @EnvironmentObject private var project: ProjectState
     @EnvironmentObject private var clock: PlaybackClock
@@ -20,18 +22,50 @@ struct PlayerView: View {
     var body: some View {
         VStack(spacing: 0) {
             ZStack {
-                Color.previewBg
-                AVPlayerNSView(player: ctrl.player)
-                if !hasAnyVisibleClips
-                    || (clock.lastVideoEndTime > 0 && clock.currentTime >= clock.lastVideoEndTime) {
-                    Color.black
+                Color.panelBg
+                ZStack {
+                    GeometryReader { geo in
+                        let rs = project.previewRenderSize
+                        let fitScale = min(geo.size.width / max(rs.width, 1),
+                                           geo.size.height / max(rs.height, 1))
+                        let fitW = rs.width * fitScale
+                        let fitH = rs.height * fitScale
+                        Color.black
+                            .frame(width: fitW, height: fitH)
+                            .position(x: geo.size.width / 2, y: geo.size.height / 2)
+                    }
+                    .allowsHitTesting(false)
+                    AVPlayerNSView(player: ctrl.player)
+                    GeometryReader { geo in
+                        let rs = project.previewRenderSize
+                        let fitScale = min(geo.size.width / max(rs.width, 1),
+                                           geo.size.height / max(rs.height, 1))
+                        let fitW = rs.width * fitScale
+                        let fitH = rs.height * fitScale
+                        Color.clear.contentShape(Rectangle())
+                            .onTapGesture {
+                                project.selectedShapeClipID = nil; project.selectedImageClipID = nil
+                                project.selectedTextClipID = nil; project.selectedVideoClipID = nil
+                                project.selectedSubtitleClipID = nil; project.selectedClipIDs.removeAll()
+                                if project.editingTextClipID != nil { project.editingTextClipID = nil }
+                            }
+                        OverlayStack()
+                            .frame(width: fitW, height: fitH)
+                            .clipped()
+                            .position(x: geo.size.width / 2, y: geo.size.height / 2)
+                        ZStack {
+                            VideoTransformOverlay()
+                            ImageTransformOverlay()
+                            TextTransformOverlay()
+                            ShapeTransformOverlay()
+                            PenDrawingOverlay()
+                            PenEditOverlay()
+                        }
+                        .frame(width: fitW, height: fitH)
+                        .position(x: geo.size.width / 2, y: geo.size.height / 2)
+                    }
                 }
-                OverlayStack()
-                VideoTransformOverlay()
-                ImageTransformOverlay()
-                ShapeTransformOverlay()
-                PenDrawingOverlay()
-                PenEditOverlay()
+                .padding(EdgeInsets(top: kPreviewInset, leading: kPreviewInset, bottom: 0, trailing: kPreviewInset))
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .overlay(alignment: .top) {
@@ -63,6 +97,10 @@ struct PlayerView: View {
         .onChange(of: clock.seekRequest) {
             ctrl.seek(to: clock.currentTime)
         }
+        .onChange(of: clock.refreshSeekRequest) {
+            let jitter = (1.0 / 600.0) * (clock.refreshSeekRequest % 2 == 0 ? 1.0 : -1.0)
+            ctrl.seek(to: clock.currentTime + jitter)
+        }
         .onAppear {
             // 绑定回调：Timer 驱动 currentTime，不依赖 AVPlayer
             ctrl.onTime     = { t in clock.currentTime = t }
@@ -77,14 +115,34 @@ struct PlayerView: View {
 
 // MARK: - AVPlayerView
 
+private class VideoLayerView: NSView {
+    let playerLayer = AVPlayerLayer()
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
+        layer?.addSublayer(playerLayer)
+        playerLayer.videoGravity = .resizeAspect
+    }
+    required init?(coder: NSCoder) { fatalError() }
+    override func layout() {
+        super.layout()
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        playerLayer.frame = bounds
+        CATransaction.commit()
+    }
+}
+
 private struct AVPlayerNSView: NSViewRepresentable {
     let player: AVPlayer
-    func makeNSView(context: Context) -> AVPlayerView {
-        let v = AVPlayerView()
-        v.player = player; v.controlsStyle = .none; v.videoGravity = .resizeAspect
+    func makeNSView(context: Context) -> VideoLayerView {
+        let v = VideoLayerView()
+        v.playerLayer.player = player
         return v
     }
-    func updateNSView(_ v: AVPlayerView, context: Context) { v.player = player }
+    func updateNSView(_ v: VideoLayerView, context: Context) {
+        v.playerLayer.player = player
+    }
 }
 
 // MARK: - Overlay Stack（按 overlayTrackOrder 统一渲染字幕/文字/图形）
@@ -92,9 +150,8 @@ private struct AVPlayerNSView: NSViewRepresentable {
 private struct OverlayStack: View {
     @EnvironmentObject private var project: ProjectState
     @EnvironmentObject private var clock: PlaybackClock
-    @State private var editingTextID: UUID? = nil
     @State private var editText: String = ""
-    @State private var shapeDragStart: [UUID: CGPoint] = [:]
+    @State private var dragStart: [UUID: CGPoint] = [:]
     @State private var subtitleHeights: [UUID: CGFloat] = [:]   // 每条字幕实测高度，用于精确堆叠
 
     var body: some View {
@@ -103,11 +160,13 @@ private struct OverlayStack: View {
         ZStack {
             Color.clear.contentShape(Rectangle())
                 .onTapGesture {
-                    if editingTextID != nil { commitTextEdit() }
-                    if project.selectedShapeClipID != nil {
-                        project.selectedShapeClipID = nil
-                        project.selectedClipIDs.removeAll()
-                    }
+                    if project.editingTextClipID != nil { commitTextEdit() }
+                    project.selectedShapeClipID = nil
+                    project.selectedImageClipID = nil
+                    project.selectedTextClipID = nil
+                    project.selectedVideoClipID = nil
+                    project.selectedSubtitleClipID = nil
+                    project.selectedClipIDs.removeAll()
                 }
                 .zIndex(-1)
 
@@ -145,9 +204,30 @@ private struct OverlayStack: View {
             if let track = project.imageTracks.first(where: { $0.id == trackID }),
                track.isVisible,
                let clip = track.clips.first(where: { $0.startTime <= clock.currentTime && $0.endTime > clock.currentTime }) {
+                let imgRect = imageRenderRect(clip: clip, viewSize: geo.size)
                 ImageLayerView(clip: clip, viewSize: geo.size, videoSize: project.previewRenderSize)
-                    .contentShape(Rectangle())
-                    .onTapGesture { selectImageExclusive(clip.id) }
+                    .allowsHitTesting(false)
+                if imgRect.width > 0, imgRect.height > 0 {
+                    if project.selectedClipIDs.count > 1 && project.selectedClipIDs.contains(clip.id) {
+                        Rectangle().stroke(Color.accent, lineWidth: 1.5)
+                            .frame(width: imgRect.width, height: imgRect.height)
+                            .rotationEffect(.degrees(Double(clip.rotation)))
+                            .position(x: imgRect.midX, y: imgRect.midY)
+                            .allowsHitTesting(false)
+                    }
+                    Color.clear
+                        .frame(width: imgRect.width, height: imgRect.height)
+                        .contentShape(Rectangle())
+                        .onTapGesture {
+                            if project.editingTextClipID != nil { commitTextEdit() }
+                            if NSEvent.modifierFlags.contains(.shift) {
+                                project.shiftToggleClip(clip.id)
+                            } else {
+                                selectImageExclusive(clip.id)
+                            }
+                        }
+                        .position(x: imgRect.midX, y: imgRect.midY)
+                }
             }
         }
     }
@@ -159,27 +239,67 @@ private struct OverlayStack: View {
             if let track = project.textTracks.first(where: { $0.id == trackID }),
                track.isVisible,
                let clip = track.clips.first(where: { $0.startTime <= clock.currentTime && $0.endTime > clock.currentTime }) {
-                if editingTextID == clip.id {
+                if project.editingTextClipID == clip.id {
                     TextEditField(text: $editText, clip: clip, scale: scale, onCommit: { commitTextEdit() })
                         .fixedSize()
+                        .background(GeometryReader { g in
+                            Color.clear.onChange(of: g.size) { _ in project.textClipViewSizes[clip.id] = g.size }
+                                .onAppear { project.textClipViewSizes[clip.id] = g.size }
+                        })
                         .overlay(RoundedRectangle(cornerRadius: 4 * scale).strokeBorder(Color.accent, lineWidth: 1.5))
+                        .onDisappear {
+                            project.updateTextClip(id: clip.id) { $0.text = editText }
+                        }
                         .position(x: geo.size.width * clip.posX, y: geo.size.height * clip.posY)
                 } else {
-                    TextLabel(clip: clip, scale: scale, selected: project.selectedTextClipID == clip.id)
-                        .position(x: geo.size.width * clip.posX, y: geo.size.height * clip.posY)
-                        .gesture(DragGesture().onChanged { v in
-                            project.selectedTextClipID = clip.id
-                            project.updateTextClip(id: clip.id) {
-                                $0.posX = min(1, max(0, v.location.x / geo.size.width))
-                                $0.posY = min(1, max(0, v.location.y / geo.size.height))
-                            }
+                    TextLabel(clip: clip, scale: scale, selected: false)
+                        .overlay(
+                            project.selectedClipIDs.count > 1 && project.selectedClipIDs.contains(clip.id)
+                            ? Rectangle().stroke(Color.accent, lineWidth: 1.5) : nil
+                        )
+                        .background(GeometryReader { g in
+                            Color.clear.onChange(of: g.size) { _ in project.textClipViewSizes[clip.id] = g.size }
+                                .onAppear { project.textClipViewSizes[clip.id] = g.size }
                         })
+                        .position(x: geo.size.width * clip.posX, y: geo.size.height * clip.posY)
+                        .gesture(DragGesture(minimumDistance: 1).onChanged { v in
+                            if dragStart.isEmpty {
+                                let multi = project.selectedClipIDs.contains(clip.id) && project.selectedClipIDs.count > 1
+                                if multi {
+                                    for id in project.selectedClipIDs {
+                                        if let c = shapeByID(id) { dragStart[id] = CGPoint(x: c.posX, y: c.posY) }
+                                        else if let tc = project.textTracks.flatMap(\.clips).first(where: { $0.id == id }) { dragStart[id] = CGPoint(x: tc.posX, y: tc.posY) }
+                                        else if let ic = project.imageTracks.flatMap(\.clips).first(where: { $0.id == id }) { dragStart[id] = CGPoint(x: ic.offsetX, y: ic.offsetY) }
+                                    }
+                                } else {
+                                    if project.selectedTextClipID != clip.id { selectTextExclusive(clip.id) }
+                                    dragStart[clip.id] = CGPoint(x: clip.posX, y: clip.posY)
+                                }
+                            }
+                            let dx = v.translation.width / geo.size.width
+                            let dy = v.translation.height / geo.size.height
+                            for (id, s) in dragStart {
+                                if project.shapeTracks.flatMap(\.clips).contains(where: { $0.id == id }) {
+                                    project.updateShapeClip(id: id) { $0.posX = min(1, max(0, s.x + dx)); $0.posY = min(1, max(0, s.y + dy)) }
+                                } else if project.textTracks.flatMap(\.clips).contains(where: { $0.id == id }) {
+                                    project.updateTextClip(id: id) { $0.posX = min(1, max(0, s.x + dx)); $0.posY = min(1, max(0, s.y + dy)) }
+                                } else if project.imageTracks.flatMap(\.clips).contains(where: { $0.id == id }) {
+                                    project.updateImageClip(id: id) { $0.offsetX = s.x + dx; $0.offsetY = s.y + dy }
+                                }
+                            }
+                        }.onEnded { _ in dragStart = [:] })
                         .onTapGesture(count: 2) {
                             editText = clip.text
-                            editingTextID = clip.id
-                            project.selectedTextClipID = clip.id
+                            project.editingTextClipID = clip.id
+                            selectTextExclusive(clip.id)
                         }
-                        .onTapGesture { project.selectedTextClipID = clip.id }
+                        .onTapGesture {
+                            if NSEvent.modifierFlags.contains(.shift) {
+                                project.shiftToggleClip(clip.id)
+                            } else {
+                                selectTextExclusive(clip.id)
+                            }
+                        }
                 }
             }
         }
@@ -193,32 +313,37 @@ private struct OverlayStack: View {
                track.isVisible,
                let clip = track.clips.first(where: { $0.startTime <= clock.currentTime && $0.endTime > clock.currentTime }) {
                 ShapeClipView(clip: clip, scale: scale,
-                              selected: project.selectedClipIDs.contains(clip.id) && project.selectedShapeClipID != clip.id)
+                              selected: project.selectedClipIDs.count > 1 && project.selectedClipIDs.contains(clip.id))
                     .position(x: geo.size.width * clip.posX, y: geo.size.height * clip.posY)
                     .gesture(
                         DragGesture(minimumDistance: 1)
                             .onChanged { v in
-                                if shapeDragStart.isEmpty {
+                                if dragStart.isEmpty {
                                     let multi = project.selectedClipIDs.contains(clip.id) && project.selectedClipIDs.count > 1
                                     if multi {
                                         for id in project.selectedClipIDs {
-                                            if let c = shapeByID(id) { shapeDragStart[id] = CGPoint(x: c.posX, y: c.posY) }
+                                            if let c = shapeByID(id) { dragStart[id] = CGPoint(x: c.posX, y: c.posY) }
+                                            else if let tc = project.textTracks.flatMap(\.clips).first(where: { $0.id == id }) { dragStart[id] = CGPoint(x: tc.posX, y: tc.posY) }
+                                            else if let ic = project.imageTracks.flatMap(\.clips).first(where: { $0.id == id }) { dragStart[id] = CGPoint(x: ic.offsetX, y: ic.offsetY) }
                                         }
                                     } else {
                                         if project.selectedShapeClipID != clip.id { selectShapeExclusive(clip.id) }
-                                        if let c = shapeByID(clip.id) { shapeDragStart[clip.id] = CGPoint(x: c.posX, y: c.posY) }
+                                        if let c = shapeByID(clip.id) { dragStart[clip.id] = CGPoint(x: c.posX, y: c.posY) }
                                     }
                                 }
                                 let dx = v.translation.width / geo.size.width
                                 let dy = v.translation.height / geo.size.height
-                                for (id, s) in shapeDragStart {
-                                    project.updateShapeClip(id: id) {
-                                        $0.posX = min(1, max(0, Double(s.x) + Double(dx)))
-                                        $0.posY = min(1, max(0, Double(s.y) + Double(dy)))
+                                for (id, s) in dragStart {
+                                    if project.shapeTracks.flatMap(\.clips).contains(where: { $0.id == id }) {
+                                        project.updateShapeClip(id: id) { $0.posX = min(1, max(0, s.x + dx)); $0.posY = min(1, max(0, s.y + dy)) }
+                                    } else if project.textTracks.flatMap(\.clips).contains(where: { $0.id == id }) {
+                                        project.updateTextClip(id: id) { $0.posX = min(1, max(0, s.x + dx)); $0.posY = min(1, max(0, s.y + dy)) }
+                                    } else if project.imageTracks.flatMap(\.clips).contains(where: { $0.id == id }) {
+                                        project.updateImageClip(id: id) { $0.offsetX = s.x + dx; $0.offsetY = s.y + dy }
                                     }
                                 }
                             }
-                            .onEnded { _ in shapeDragStart = [:] }
+                            .onEnded { _ in dragStart = [:] }
                     )
                     .onTapGesture(count: 2) {
                         if clip.type == .pen { project.penEditingClipID = clip.id }
@@ -297,27 +422,61 @@ private struct OverlayStack: View {
     }
 
     private func commitTextEdit() {
-        guard let id = editingTextID else { return }
+        guard let id = project.editingTextClipID else { return }
         project.updateTextClip(id: id) { $0.text = editText }
-        editingTextID = nil
+        project.editingTextClipID = nil
     }
 
     private func selectShapeExclusive(_ id: UUID) {
+        if project.editingTextClipID != nil { commitTextEdit() }
         project.selectedShapeClipID = id
         project.selectedVideoClipID = nil; project.selectedImageClipID = nil
         project.selectedAudioClipID = nil; project.selectedSubtitleClipID = nil
         project.selectedTextClipID = nil
+        project.selectedClipIDs = [id]
     }
 
     private func selectImageExclusive(_ id: UUID) {
+        if project.editingTextClipID != nil { commitTextEdit() }
         project.selectedImageClipID = id
         project.selectedVideoClipID = nil; project.selectedShapeClipID = nil
         project.selectedAudioClipID = nil; project.selectedSubtitleClipID = nil
         project.selectedTextClipID = nil
+        project.selectedClipIDs = [id]
+    }
+
+    private func selectTextExclusive(_ id: UUID) {
+        if project.editingTextClipID != nil && project.editingTextClipID != id { commitTextEdit() }
+        project.selectedTextClipID = id
+        project.selectedVideoClipID = nil; project.selectedImageClipID = nil
+        project.selectedAudioClipID = nil; project.selectedSubtitleClipID = nil
+        project.selectedShapeClipID = nil
+        project.selectedClipIDs = [id]
     }
 
     private func shapeByID(_ id: UUID) -> ShapeClip? {
         project.shapeTracks.flatMap { $0.clips }.first { $0.id == id }
+    }
+
+    private func imageRenderRect(clip: ImageClip, viewSize: CGSize) -> CGRect {
+        let imgW = CGFloat(clip.imageWidth)
+        let imgH = CGFloat(clip.imageHeight)
+        guard imgW > 0, imgH > 0 else { return .zero }
+        let videoSize = project.previewRenderSize
+        let vs = viewSize.width / max(videoSize.width, 1)
+        let baseScale = min(videoSize.width / imgW, videoSize.height / imgH)
+        let finalSX = baseScale * clip.scaleX
+        let finalSY = baseScale * clip.scaleY
+        let fullW = imgW * finalSX
+        let fullH = imgH * finalSY
+        let cx = videoSize.width / 2 + clip.offsetX * videoSize.width
+        let cy = videoSize.height / 2 + clip.offsetY * videoSize.height
+        let cropX = cx - fullW / 2 + imgW * clip.cropLeft * finalSX
+        let cropY = cy - fullH / 2 + imgH * clip.cropTop * finalSY
+        let cropW = imgW * (1 - clip.cropLeft - clip.cropRight) * finalSX
+        let cropH = imgH * (1 - clip.cropTop - clip.cropBottom) * finalSY
+        guard cropW > 0, cropH > 0 else { return .zero }
+        return CGRect(x: cropX * vs, y: cropY * vs, width: cropW * vs, height: cropH * vs)
     }
 
     @ViewBuilder
@@ -413,7 +572,6 @@ private struct ImageLayerView: View {
         let imgH = CGFloat(clip.imageHeight)
         if imgW > 0, imgH > 0, let url = clip.imageURL,
            let nsImg = PreviewImageCache.shared.image(for: url) {
-            // 与 ImageTransformOverlay.computeImageRect 完全一致的几何
             let s = min(viewSize.width / videoSize.width, viewSize.height / videoSize.height)
             let renderW = videoSize.width * s
             let renderH = videoSize.height * s
@@ -652,7 +810,7 @@ private struct TextEditField: NSViewRepresentable {
         lm.ensureLayout(for: tc)
         let r = lm.usedRect(for: tc)
         let pad = tv.textContainerInset
-        let w = max(ceil(r.width) + pad.width * 2 + 4, 50 * scale)
+        let w = max(ceil(r.width) + pad.width * 2, 50 * scale)
         let h = max(ceil(r.height) + pad.height * 2, clip.fontSize * scale * 1.5)
         return CGSize(width: w, height: h)
     }
@@ -773,12 +931,6 @@ private struct PreviewToolbar: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            CustomSlider(value: $clock.currentTime, range: 0...max(clock.duration, 0.01)) { dragging in
-                if !dragging { ctrl.seek(to: clock.currentTime) }
-            }
-            .padding(.horizontal, 8)
-            .padding(.top, 4)
-
             HStack(spacing: 0) {
                 Text(timecode(clock.currentTime))
                     .font(.system(size: 10).monospacedDigit())
@@ -793,18 +945,21 @@ private struct PreviewToolbar: View {
                 Spacer()
 
                 HStack(spacing: 12) {
-                    toolBtn("backward.end.fill") { seekToStart() }
-                    toolBtn("backward.frame.fill") { stepFrame(-1) }
-                    toolBtn(ctrl.isPlaying ? "pause.fill" : "play.fill") { ctrl.toggle() }
-                    toolBtn("forward.frame.fill") { stepFrame(1) }
-                    toolBtn("forward.end.fill") { seekToEnd() }
+                    toolBtn("seekStart") { seekToStart() }
+                    toolBtn("prevFrame") { stepFrame(-1) }
+                    toolBtn(ctrl.isPlaying ? "pause" : "play") { ctrl.toggle() }
+                    toolBtn("nextFrame") { stepFrame(1) }
+                    toolBtn("seekEnd") { seekToEnd() }
                 }
 
                 Spacer()
 
                 Button { captureFrame() } label: {
-                    Image(systemName: "camera.fill")
-                        .font(.system(size: 11))
+                    Image(nsImage: TimelineSVGIcon.load("capture"))
+                        .renderingMode(.template)
+                        .resizable()
+                        .aspectRatio(contentMode: .fit)
+                        .frame(width: 12, height: 12)
                         .foregroundColor(Color.labelSecondary)
                         .frame(width: 24, height: 24)
                         .contentShape(Rectangle())
@@ -816,15 +971,18 @@ private struct PreviewToolbar: View {
                     .padding(.leading, 4)
             }
             .padding(.horizontal, 10)
-            .padding(.bottom, 4)
+            .padding(.vertical, 4)
         }
-        .background(Color.black.opacity(0.85))
+        .background(Color.panelBg)
     }
 
-    private func toolBtn(_ icon: String, action: @escaping () -> Void) -> some View {
+    private func toolBtn(_ svgName: String, action: @escaping () -> Void) -> some View {
         Button(action: action) {
-            Image(systemName: icon)
-                .font(.system(size: 11, weight: .medium))
+            Image(nsImage: TimelineSVGIcon.load(svgName))
+                .renderingMode(.template)
+                .resizable()
+                .aspectRatio(contentMode: .fit)
+                .frame(width: 12, height: 12)
                 .foregroundColor(Color.labelPrimary)
                 .frame(width: 26, height: 22)
                 .contentShape(Rectangle())
@@ -939,8 +1097,11 @@ private struct PlaybackBar: View {
             // PlayerController.isPlaying, so it updates no matter how playback
             // was toggled (button, space key, etc.)
             Button { ctrl.toggle() } label: {
-                Image(systemName: ctrl.isPlaying ? "pause.fill" : "play.fill")
-                    .font(.system(size: 13, weight: .light))
+                Image(nsImage: TimelineSVGIcon.load(ctrl.isPlaying ? "pause" : "play"))
+                    .renderingMode(.template)
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .frame(width: 14, height: 14)
                     .foregroundColor(Color.labelPrimary)
                     .frame(width: 26, height: 26)
             }.buttonStyle(.plain)
@@ -1000,69 +1161,160 @@ private struct VideoTransformOverlay: View {
                 let info = computeRenderInfo(viewSize: geo.size)
                 let vidRect = computeVideoRect(clip: clip, info: info)
 
+                let isMulti = project.selectedClipIDs.count > 1
                 ZStack {
                     // 移动区域
                     Color.clear
                         .frame(width: max(vidRect.width, 1), height: max(vidRect.height, 1))
                         .position(x: vidRect.midX, y: vidRect.midY)
-                        .contentShape(Rectangle())
+                        .contentShape(Path { p in p.addRect(vidRect) })
                         .onHover { h in
                             isHovering = h
                             if h { NSCursor.openHand.set() } else { NSCursor.arrow.set() }
                         }
-                        .gesture(moveDrag(clip: clip, info: info))
+                        .gesture(moveDrag(clip: clip, info: info, rect: vidRect, viewSize: geo.size))
 
-                    // 边框
-                    Rectangle()
-                        .stroke(accentColor, lineWidth: 1.5)
-                        .frame(width: max(vidRect.width, 1), height: max(vidRect.height, 1))
-                        .position(x: vidRect.midX, y: vidRect.midY)
-                        .allowsHitTesting(false)
+                    if !isMulti {
+                        // 边框
+                        Rectangle()
+                            .stroke(accentColor, lineWidth: 1.5)
+                            .frame(width: max(vidRect.width, 1), height: max(vidRect.height, 1))
+                            .position(x: vidRect.midX, y: vidRect.midY)
+                            .allowsHitTesting(false)
 
-                    // 四边裁剪手柄 — 绿色长细条
-                    ForEach(0..<4, id: \.self) { edge in
-                        let pos = edgeMidPos(edge, vidRect)
-                        let isH = edge < 2
-                        let barLen = isH ? max(min(vidRect.width * 0.35, 50), 20) : max(min(vidRect.height * 0.35, 50), 20)
-                        VideoCropEdgeBar(isHorizontal: isH, length: barLen, color: accentColor)
-                            .position(x: pos.x, y: pos.y)
-                            .gesture(cropDrag(clip: clip, info: info, edge: edge))
-                    }
+                        // 四边裁剪手柄 — 绿色长细条
+                        ForEach(0..<4, id: \.self) { edge in
+                            let pos = edgeMidPos(edge, vidRect)
+                            let isH = edge < 2
+                            let barLen = isH ? max(min(vidRect.width * 0.35, 50), 20) : max(min(vidRect.height * 0.35, 50), 20)
+                            VideoCropEdgeBar(isHorizontal: isH, length: barLen, color: accentColor)
+                                .position(x: pos.x, y: pos.y)
+                                .gesture(cropDrag(clip: clip, info: info, edge: edge))
+                        }
 
-                    // 四角缩放手柄 — 白色圆点绿色边
-                    ForEach(0..<4, id: \.self) { corner in
-                        let pos = cornerPos(corner, vidRect)
-                        VideoScaleHandleDot(color: accentColor)
-                            .position(x: pos.x, y: pos.y)
-                            .gesture(scaleDrag(clip: clip, info: info, corner: corner))
+                        // 四角缩放手柄 — 白色圆点绿色边
+                        ForEach(0..<4, id: \.self) { corner in
+                            let pos = cornerPos(corner, vidRect)
+                            VideoScaleHandleDot(color: accentColor)
+                                .position(x: pos.x, y: pos.y)
+                                .gesture(scaleDrag(clip: clip, info: info, corner: corner))
+                        }
                     }
                 }
             }
         }
     }
 
-    private func moveDrag(clip: VideoClip, info: RenderInfo) -> some Gesture {
-        DragGesture(minimumDistance: 1)
+    private func tapThrough(at pt: CGPoint, viewSize: CGSize) {
+        let t = clock.currentTime
+        let scale = viewSize.width / max(project.previewRenderSize.width, 1)
+        let shift = NSEvent.modifierFlags.contains(.shift)
+        for ref in project.overlayTrackOrder {
+            switch ref {
+            case .shape(let trackID):
+                guard let track = project.shapeTracks.first(where: { $0.id == trackID }),
+                      track.isVisible,
+                      let sc = track.clips.first(where: { $0.startTime <= t && $0.endTime > t }) else { continue }
+                let cx = viewSize.width * sc.posX, cy = viewSize.height * sc.posY
+                let w = sc.width * sc.scaleX * scale, h = sc.height * sc.scaleY * scale
+                guard CGRect(x: cx - w/2, y: cy - h/2, width: w, height: h).contains(pt) else { continue }
+                if shift { project.shiftToggleClip(sc.id) } else {
+                    project.editingTextClipID = nil
+                    project.selectedShapeClipID = sc.id
+                    project.selectedImageClipID = nil; project.selectedTextClipID = nil
+                    project.selectedVideoClipID = nil; project.selectedClipIDs = [sc.id]
+                }
+                return
+            case .text(let trackID):
+                guard let track = project.textTracks.first(where: { $0.id == trackID }),
+                      track.isVisible,
+                      let tc = track.clips.first(where: { $0.startTime <= t && $0.endTime > t }) else { continue }
+                let cx = viewSize.width * tc.posX, cy = viewSize.height * tc.posY
+                let sz = project.textClipViewSizes[tc.id] ?? CGSize(width: 100, height: 30)
+                guard CGRect(x: cx - sz.width/2, y: cy - sz.height/2, width: sz.width, height: sz.height).contains(pt) else { continue }
+                if shift { project.shiftToggleClip(tc.id) } else {
+                    project.editingTextClipID = nil
+                    project.selectedTextClipID = tc.id
+                    project.selectedImageClipID = nil; project.selectedShapeClipID = nil
+                    project.selectedVideoClipID = nil; project.selectedClipIDs = [tc.id]
+                }
+                return
+            case .image(let trackID):
+                guard let track = project.imageTracks.first(where: { $0.id == trackID }),
+                      track.isVisible,
+                      let ic = track.clips.first(where: { $0.startTime <= t && $0.endTime > t }) else { continue }
+                if shift { project.shiftToggleClip(ic.id) } else {
+                    project.editingTextClipID = nil
+                    project.selectedImageClipID = ic.id
+                    project.selectedShapeClipID = nil; project.selectedTextClipID = nil
+                    project.selectedVideoClipID = nil; project.selectedClipIDs = [ic.id]
+                }
+                return
+            default: continue
+            }
+        }
+        project.selectedImageClipID = nil; project.selectedShapeClipID = nil
+        project.selectedTextClipID = nil; project.selectedVideoClipID = nil
+        project.selectedClipIDs.removeAll()
+        project.editingTextClipID = nil
+    }
+
+    @State private var multiStart: [UUID: CGPoint] = [:]
+
+    private func moveDrag(clip: VideoClip, info: RenderInfo, rect: CGRect, viewSize: CGSize) -> some Gesture {
+        DragGesture(minimumDistance: 0)
             .onChanged { value in
-                if dragMode == .none {
+                let dist = hypot(value.translation.width, value.translation.height)
+                if dragMode == .none && dist > 3 {
                     pushUndoOnce()
                     dragMode = .move
                     NSCursor.closedHand.set()
                     dragStartOffset = CGPoint(x: clip.offsetX, y: clip.offsetY)
+                    multiStart.removeAll()
+                    if project.selectedClipIDs.count > 1 && project.selectedClipIDs.contains(clip.id) {
+                        for id in project.selectedClipIDs where id != clip.id {
+                            if let sc = project.shapeTracks.flatMap(\.clips).first(where: { $0.id == id }) {
+                                multiStart[id] = CGPoint(x: sc.posX, y: sc.posY)
+                            } else if let tc = project.textTracks.flatMap(\.clips).first(where: { $0.id == id }) {
+                                multiStart[id] = CGPoint(x: tc.posX, y: tc.posY)
+                            } else if let ic = project.imageTracks.flatMap(\.clips).first(where: { $0.id == id }) {
+                                multiStart[id] = CGPoint(x: ic.offsetX, y: ic.offsetY)
+                            }
+                        }
+                    }
                 }
                 guard dragMode == .move else { return }
                 let dx = value.translation.width / info.renderArea.width
                 let dy = value.translation.height / info.renderArea.height
+                let newOffX = dragStartOffset.x + dx
+                let newOffY = dragStartOffset.y + dy
                 project.updateVideoClip(id: clip.id) {
-                    $0.offsetX = dragStartOffset.x + dx
-                    $0.offsetY = dragStartOffset.y + dy
+                    $0.offsetX = newOffX
+                    $0.offsetY = newOffY
                 }
-                project.rebuildTimelinePreviewDebounced()
+                if let trackID = project.videoClipTrackIDMap[clip.id] {
+                    ColorCompositor.setDragOffset(trackID: trackID, offsetX: CGFloat(newOffX), offsetY: CGFloat(newOffY))
+                    clock.refreshSeekRequest &+= 1
+                }
+                let ndx = value.translation.width / viewSize.width
+                let ndy = value.translation.height / viewSize.height
+                for (id, s) in multiStart {
+                    if project.shapeTracks.flatMap(\.clips).contains(where: { $0.id == id }) {
+                        project.updateShapeClip(id: id) { $0.posX = min(1, max(0, s.x + ndx)); $0.posY = min(1, max(0, s.y + ndy)) }
+                    } else if project.textTracks.flatMap(\.clips).contains(where: { $0.id == id }) {
+                        project.updateTextClip(id: id) { $0.posX = min(1, max(0, s.x + ndx)); $0.posY = min(1, max(0, s.y + ndy)) }
+                    } else if project.imageTracks.flatMap(\.clips).contains(where: { $0.id == id }) {
+                        project.updateImageClip(id: id) { $0.offsetX = s.x + dx; $0.offsetY = s.y + dy }
+                    }
+                }
             }
-            .onEnded { _ in
-                dragMode = .none; didPushUndo = false
-                NSCursor.openHand.set()
-                project.rebuildTimelinePreview()
+            .onEnded { value in
+                if dragMode == .move {
+                    dragMode = .none; didPushUndo = false; multiStart.removeAll()
+                    NSCursor.openHand.set()
+                } else {
+                    tapThrough(at: value.location, viewSize: viewSize)
+                }
             }
     }
 
@@ -1277,56 +1529,74 @@ private struct ImageTransformOverlay: View {
                 let info = computeRenderInfo(viewSize: geo.size)
                 let imgRect = computeImageRect(clip: clip, info: info)
 
+                let isMulti = project.selectedClipIDs.count > 1
                 ZStack {
                     // 最底层：移动区域
                     Color.clear
                         .frame(width: max(imgRect.width, 1), height: max(imgRect.height, 1))
                         .position(x: imgRect.midX, y: imgRect.midY)
-                        .contentShape(Rectangle())
+                        .contentShape(Path { p in p.addRect(imgRect) })
                         .onHover { h in
                             isHoveringImage = h
                             if h { NSCursor.openHand.set() } else { NSCursor.arrow.set() }
                         }
-                        .gesture(moveDrag(clip: clip, info: info))
+                        .gesture(moveDrag(clip: clip, info: info, rect: imgRect, viewSize: geo.size))
 
-                    // 边框（不接受事件）
-                    Rectangle()
-                        .stroke(Color.accent, lineWidth: 1.5)
-                        .frame(width: max(imgRect.width, 1), height: max(imgRect.height, 1))
-                        .position(x: imgRect.midX, y: imgRect.midY)
-                        .allowsHitTesting(false)
+                    if !isMulti {
+                        // 边框（不接受事件）
+                        Rectangle()
+                            .stroke(Color.accent, lineWidth: 1.5)
+                            .frame(width: max(imgRect.width, 1), height: max(imgRect.height, 1))
+                            .position(x: imgRect.midX, y: imgRect.midY)
+                            .allowsHitTesting(false)
 
-                    // 四边裁剪手柄 — 橙色长细条（在缩放角下面渲染，但角和边不重叠）
-                    ForEach(0..<4, id: \.self) { edge in
-                        let pos = edgeMidPos(edge, imgRect)
-                        let isH = edge < 2
-                        let barLen = isH ? max(min(imgRect.width * 0.35, 50), 20) : max(min(imgRect.height * 0.35, 50), 20)
-                        CropEdgeBar(isHorizontal: isH, length: barLen)
-                            .position(x: pos.x, y: pos.y)
-                            .gesture(cropDrag(clip: clip, info: info, edge: edge))
-                    }
+                        // 四边裁剪手柄 — 橙色长细条
+                        ForEach(0..<4, id: \.self) { edge in
+                            let pos = edgeMidPos(edge, imgRect)
+                            let isH = edge < 2
+                            let barLen = isH ? max(min(imgRect.width * 0.35, 50), 20) : max(min(imgRect.height * 0.35, 50), 20)
+                            CropEdgeBar(isHorizontal: isH, length: barLen)
+                                .position(x: pos.x, y: pos.y)
+                                .gesture(cropDrag(clip: clip, info: info, edge: edge))
+                        }
 
-                    // 四角缩放手柄 — 白色圆点（最上层，优先接收角落事件）
-                    ForEach(0..<4, id: \.self) { corner in
-                        let pos = cornerPos(corner, imgRect)
-                        ScaleHandleDot()
-                            .position(x: pos.x, y: pos.y)
-                            .gesture(scaleDrag(clip: clip, info: info, corner: corner))
+                        // 四角缩放手柄 — 白色圆点
+                        ForEach(0..<4, id: \.self) { corner in
+                            let pos = cornerPos(corner, imgRect)
+                            ScaleHandleDot()
+                                .position(x: pos.x, y: pos.y)
+                                .gesture(scaleDrag(clip: clip, info: info, corner: corner))
+                        }
                     }
                 }
             }
         }
     }
 
-    // MARK: - 移动手势
-    private func moveDrag(clip: ImageClip, info: RenderInfo) -> some Gesture {
-        DragGesture(minimumDistance: 1)
+    // MARK: - 移动手势（含 tap 穿透）
+    @State private var multiStart: [UUID: CGPoint] = [:]
+
+    private func moveDrag(clip: ImageClip, info: RenderInfo, rect: CGRect, viewSize: CGSize) -> some Gesture {
+        DragGesture(minimumDistance: 0)
             .onChanged { value in
-                if dragMode == .none {
+                let dist = hypot(value.translation.width, value.translation.height)
+                if dragMode == .none && dist > 3 {
                     pushUndoOnce()
                     dragMode = .move
                     NSCursor.closedHand.set()
                     dragStartOffset = CGPoint(x: clip.offsetX, y: clip.offsetY)
+                    multiStart.removeAll()
+                    if project.selectedClipIDs.count > 1 && project.selectedClipIDs.contains(clip.id) {
+                        for id in project.selectedClipIDs where id != clip.id {
+                            if let sc = project.shapeTracks.flatMap(\.clips).first(where: { $0.id == id }) {
+                                multiStart[id] = CGPoint(x: sc.posX, y: sc.posY)
+                            } else if let tc = project.textTracks.flatMap(\.clips).first(where: { $0.id == id }) {
+                                multiStart[id] = CGPoint(x: tc.posX, y: tc.posY)
+                            } else if let ic = project.imageTracks.flatMap(\.clips).first(where: { $0.id == id }) {
+                                multiStart[id] = CGPoint(x: ic.offsetX, y: ic.offsetY)
+                            }
+                        }
+                    }
                 }
                 guard dragMode == .move else { return }
                 let dx = value.translation.width / info.renderArea.width
@@ -1335,12 +1605,27 @@ private struct ImageTransformOverlay: View {
                     $0.offsetX = dragStartOffset.x + dx
                     $0.offsetY = dragStartOffset.y + dy
                 }
+                let ndx = value.translation.width / viewSize.width
+                let ndy = value.translation.height / viewSize.height
+                for (id, s) in multiStart {
+                    if project.shapeTracks.flatMap(\.clips).contains(where: { $0.id == id }) {
+                        project.updateShapeClip(id: id) { $0.posX = min(1, max(0, s.x + ndx)); $0.posY = min(1, max(0, s.y + ndy)) }
+                    } else if project.textTracks.flatMap(\.clips).contains(where: { $0.id == id }) {
+                        project.updateTextClip(id: id) { $0.posX = min(1, max(0, s.x + ndx)); $0.posY = min(1, max(0, s.y + ndy)) }
+                    } else if project.imageTracks.flatMap(\.clips).contains(where: { $0.id == id }) {
+                        project.updateImageClip(id: id) { $0.offsetX = s.x + dx; $0.offsetY = s.y + dy }
+                    }
+                }
                 project.rebuildTimelinePreviewDebounced()
             }
-            .onEnded { _ in
-                dragMode = .none; didPushUndo = false
-                NSCursor.openHand.set()
-                project.rebuildTimelinePreview()
+            .onEnded { value in
+                if dragMode == .move {
+                    dragMode = .none; didPushUndo = false; multiStart.removeAll()
+                    NSCursor.openHand.set()
+                    project.rebuildTimelinePreview()
+                } else {
+                    tapThrough(at: value.location, viewSize: viewSize, currentClipID: clip.id)
+                }
             }
     }
 
@@ -1429,6 +1714,50 @@ private struct ImageTransformOverlay: View {
         guard !didPushUndo else { return }
         project.pushUndo()
         didPushUndo = true
+    }
+
+    // MARK: - Tap 穿透选择
+    private func tapThrough(at pt: CGPoint, viewSize: CGSize, currentClipID: UUID) {
+        let t = clock.currentTime
+        let scale = viewSize.width / max(project.previewRenderSize.width, 1)
+        let shift = NSEvent.modifierFlags.contains(.shift)
+        for ref in project.overlayTrackOrder {
+            switch ref {
+            case .shape(let trackID):
+                guard let track = project.shapeTracks.first(where: { $0.id == trackID }),
+                      track.isVisible,
+                      let sc = track.clips.first(where: { $0.startTime <= t && $0.endTime > t }) else { continue }
+                let cx = viewSize.width * sc.posX, cy = viewSize.height * sc.posY
+                let w = sc.width * sc.scaleX * scale, h = sc.height * sc.scaleY * scale
+                guard CGRect(x: cx - w/2, y: cy - h/2, width: w, height: h).contains(pt) else { continue }
+                if shift { project.shiftToggleClip(sc.id) } else {
+                    project.editingTextClipID = nil
+                    project.selectedShapeClipID = sc.id
+                    project.selectedImageClipID = nil; project.selectedTextClipID = nil
+                    project.selectedVideoClipID = nil; project.selectedClipIDs = [sc.id]
+                }
+                return
+            case .text(let trackID):
+                guard let track = project.textTracks.first(where: { $0.id == trackID }),
+                      track.isVisible,
+                      let tc = track.clips.first(where: { $0.startTime <= t && $0.endTime > t }) else { continue }
+                let cx = viewSize.width * tc.posX, cy = viewSize.height * tc.posY
+                let sz = project.textClipViewSizes[tc.id] ?? CGSize(width: 100, height: 30)
+                guard CGRect(x: cx - sz.width/2, y: cy - sz.height/2, width: sz.width, height: sz.height).contains(pt) else { continue }
+                if shift { project.shiftToggleClip(tc.id) } else {
+                    project.editingTextClipID = nil
+                    project.selectedTextClipID = tc.id
+                    project.selectedImageClipID = nil; project.selectedShapeClipID = nil
+                    project.selectedVideoClipID = nil; project.selectedClipIDs = [tc.id]
+                }
+                return
+            default: continue
+            }
+        }
+        project.selectedImageClipID = nil; project.selectedShapeClipID = nil
+        project.selectedTextClipID = nil; project.selectedVideoClipID = nil
+        project.selectedClipIDs.removeAll()
+        project.editingTextClipID = nil
     }
 
     // MARK: - 手柄
@@ -1711,7 +2040,7 @@ private struct ShapeOverlay: View {
                 }
                 ForEach(activeClips, id: \.id) { clip in
                     ShapeClipView(clip: clip, scale: scale,
-                                  selected: project.selectedClipIDs.contains(clip.id) && project.selectedShapeClipID != clip.id)
+                                  selected: project.selectedClipIDs.count > 1 && project.selectedClipIDs.contains(clip.id))
                         .position(x: geo.size.width * clip.posX, y: geo.size.height * clip.posY)
                         .gesture(
                             DragGesture(minimumDistance: 1)
@@ -1762,6 +2091,139 @@ private struct ShapeOverlay: View {
     }
 }
 
+// MARK: - Text Transform Overlay
+
+private struct TextTransformOverlay: View {
+    @EnvironmentObject private var project: ProjectState
+    @EnvironmentObject private var clock: PlaybackClock
+
+    @State private var dragMode = 0   // 0=none 1=scale 2=rotate
+    @State private var didPushUndo = false
+    @State private var startFontSize: CGFloat = 64
+    @State private var startRotation = 0.0
+    @State private var startAngle = 0.0
+
+    private let accent = Color.accent
+
+    var body: some View {
+        GeometryReader { geo in
+            if let clip = project.selectedTextClip,
+               clip.startTime <= clock.currentTime, clip.endTime > clock.currentTime,
+               project.selectedClipIDs.count <= 1 {
+                let scale = geo.size.width / max(project.previewRenderSize.width, 1)
+                let center = CGPoint(x: geo.size.width * clip.posX, y: geo.size.height * clip.posY)
+                let sz = project.textClipViewSizes[clip.id] ?? textBoundsSize(clip: clip, scale: scale)
+                let w = max(sz.width, 8)
+                let h = max(sz.height, 8)
+
+                ZStack {
+                    if project.editingTextClipID != clip.id {
+                        Rectangle().stroke(accent, lineWidth: 1.5)
+                            .frame(width: w, height: h)
+                            .rotationEffect(.degrees(clip.rotation))
+                            .position(center)
+                            .allowsHitTesting(false)
+                    }
+
+                    ForEach(0..<4, id: \.self) { i in
+                        handleDot()
+                            .position(rotatedCorner(i, center: center, w: w, h: h, rot: clip.rotation))
+                            .gesture(scaleGesture(clip: clip, center: center))
+                    }
+
+                    rotHandleView()
+                        .position(rotationHandlePos(center: center, h: h, rot: clip.rotation))
+                        .gesture(rotateGesture(clip: clip, center: center))
+                }
+            }
+        }
+    }
+
+    private func handleDot() -> some View {
+        ZStack {
+            Circle().fill(Color.white).frame(width: 11, height: 11)
+            Circle().stroke(accent, lineWidth: 1.5).frame(width: 11, height: 11)
+        }
+        .shadow(color: .black.opacity(0.3), radius: 2, y: 1)
+        .frame(width: 26, height: 26)
+        .contentShape(Circle())
+    }
+
+    private func rotHandleView() -> some View {
+        ZStack {
+            Circle().fill(Color.white).frame(width: 14, height: 14)
+            Image(systemName: "arrow.triangle.2.circlepath")
+                .font(.system(size: 8, weight: .bold)).foregroundColor(accent)
+        }
+        .shadow(color: .black.opacity(0.3), radius: 2, y: 1)
+        .frame(width: 28, height: 28)
+        .contentShape(Circle())
+    }
+
+    private func rotate(_ dx: CGFloat, _ dy: CGFloat, _ deg: Double) -> CGPoint {
+        let r = CGFloat(deg * .pi / 180)
+        return CGPoint(x: dx * cos(r) - dy * sin(r), y: dx * sin(r) + dy * cos(r))
+    }
+
+    private func rotatedCorner(_ i: Int, center: CGPoint, w: CGFloat, h: CGFloat, rot: Double) -> CGPoint {
+        let hw = w / 2, hh = h / 2
+        let offs = [(-hw, -hh), (hw, -hh), (-hw, hh), (hw, hh)][i]
+        let p = rotate(offs.0, offs.1, rot)
+        return CGPoint(x: center.x + p.x, y: center.y + p.y)
+    }
+
+    private func rotationHandlePos(center: CGPoint, h: CGFloat, rot: Double) -> CGPoint {
+        let p = rotate(0, -h / 2 - 26, rot)
+        return CGPoint(x: center.x + p.x, y: center.y + p.y)
+    }
+
+    private func textBoundsSize(clip: TextClip, scale: CGFloat) -> CGSize {
+        let fs = clip.fontSize * scale
+        var font = NSFont(name: clip.fontName, size: fs)
+        if font == nil { font = NSFont.systemFont(ofSize: fs) }
+        if clip.bold, let f = font {
+            font = NSFontManager.shared.convert(f, toHaveTrait: .boldFontMask)
+        }
+        let text = clip.text.isEmpty ? " " : clip.text
+        let size = (text as NSString).size(withAttributes: [.font: font!])
+        return CGSize(width: size.width + 20 * scale, height: size.height + 10 * scale)
+    }
+
+    private func pushUndoOnce() {
+        if !didPushUndo { project.pushUndo(); didPushUndo = true }
+    }
+
+    private func scaleGesture(clip: TextClip, center: CGPoint) -> some Gesture {
+        DragGesture(minimumDistance: 1)
+            .onChanged { v in
+                if dragMode != 1 { pushUndoOnce(); dragMode = 1; startFontSize = clip.fontSize }
+                let d0 = hypot(v.startLocation.x - center.x, v.startLocation.y - center.y)
+                let d1 = hypot(v.location.x - center.x, v.location.y - center.y)
+                guard d0 > 1 else { return }
+                project.updateTextClip(id: clip.id) {
+                    $0.fontSize = max(8, startFontSize * (d1 / d0))
+                }
+            }
+            .onEnded { _ in dragMode = 0; didPushUndo = false }
+    }
+
+    private func rotateGesture(clip: TextClip, center: CGPoint) -> some Gesture {
+        DragGesture(minimumDistance: 1)
+            .onChanged { v in
+                if dragMode != 2 {
+                    pushUndoOnce(); dragMode = 2
+                    startRotation = clip.rotation
+                    startAngle = atan2(Double(v.startLocation.y - center.y),
+                                       Double(v.startLocation.x - center.x)) * 180 / .pi
+                }
+                let cur = atan2(Double(v.location.y - center.y),
+                                Double(v.location.x - center.x)) * 180 / .pi
+                project.updateTextClip(id: clip.id) { $0.rotation = startRotation + (cur - startAngle) }
+            }
+            .onEnded { _ in dragMode = 0; didPushUndo = false }
+    }
+}
+
 // MARK: - Shape Transform Overlay（选中边框；缩放/旋转手柄见 2b）
 
 private struct ShapeTransformOverlay: View {
@@ -1781,13 +2243,12 @@ private struct ShapeTransformOverlay: View {
         GeometryReader { geo in
             if let clip = project.selectedShapeClip,
                clip.startTime <= clock.currentTime, clip.endTime > clock.currentTime,
-               !project.penDrawingMode, project.penEditingClipID != clip.id {
+               !project.penDrawingMode, project.penEditingClipID != clip.id,
+               project.selectedClipIDs.count <= 1 {
                 let scale = geo.size.width / max(project.previewRenderSize.width, 1)
                 let center = CGPoint(x: geo.size.width * clip.posX, y: geo.size.height * clip.posY)
                 let w = max(clip.width * clip.scaleX * scale, 8)
                 let h = max(clip.height * clip.scaleY * scale, 8)
-                let isMulti = project.selectedClipIDs.count > 1
-
                 ZStack {
                     // 边框
                     Rectangle().stroke(accent, lineWidth: 1.5)
@@ -1796,7 +2257,6 @@ private struct ShapeTransformOverlay: View {
                         .position(center)
                         .allowsHitTesting(false)
 
-                    if !isMulti {
                     if clip.effectiveIsClosed || clip.type == .pen {
                         // 四边单向缩放条（橙色，和图片一致）
                         ForEach(0..<4, id: \.self) { e in
@@ -1826,7 +2286,6 @@ private struct ShapeTransformOverlay: View {
                     rotHandleView()
                         .position(rotationHandlePos(center: center, h: h, rot: clip.rotation))
                         .gesture(rotateGesture(clip: clip, center: center))
-                    }
                 }
                 .onAppear { installPenEnterMonitor() }
                 .onDisappear { removePenEnterMonitor() }
@@ -2364,19 +2823,17 @@ final class PlayerController: ObservableObject {
 
         player.replaceCurrentItem(with: item)
 
-        // item ready 后 seek 到目标位置
         if let item = item {
             var obs: NSKeyValueObservation?
-            obs = item.observe(\.status, options: [.initial, .new]) { [weak self] it, _ in
+            obs = item.observe(\.status, options: [.new]) { it, _ in
                 if it.status == .failed {
                     NSLog("[Player] AVPlayerItem FAILED: %@", it.error?.localizedDescription ?? "unknown")
-                    obs?.invalidate(); obs = nil
-                    return
                 }
-                guard it.status == .readyToPlay else { return }
-                obs?.invalidate(); obs = nil
-                self?.player.seek(to: CMTime(seconds: seekTo, preferredTimescale: 600),
-                                  toleranceBefore: .zero, toleranceAfter: .zero)
+                if it.status != .unknown { obs?.invalidate(); obs = nil }
+            }
+            player.seek(to: CMTime(seconds: seekTo, preferredTimescale: 600),
+                         toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] _ in
+                ColorCompositor.clearDragOffsets()
                 if wasPlaying { DispatchQueue.main.async { self?.play() } }
             }
         }

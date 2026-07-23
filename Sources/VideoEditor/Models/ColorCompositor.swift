@@ -45,8 +45,8 @@ struct CompositorTrackEntry {
     let trackID:     CMPersistentTrackID
     let userScaleX:  CGFloat
     let userScaleY:  CGFloat
-    let userOffsetX: CGFloat
-    let userOffsetY: CGFloat
+    var userOffsetX: CGFloat
+    var userOffsetY: CGFloat
     let cropTop:     CGFloat
     let cropBottom:  CGFloat
     let cropLeft:    CGFloat
@@ -55,6 +55,7 @@ struct CompositorTrackEntry {
     var mirrorH: Bool = false
     var mirrorV: Bool = false
     var rotation: Int = 0
+    var naturalSize: CGSize?
     var opacityRamp: (from: Float,  to: Float,  start: Double, end: Double)?
     var pushRamp:    (dx: CGFloat, dy: CGFloat, isA: Bool, start: Double, end: Double)?
     var zoomRamp:    (from: CGFloat, to: CGFloat, start: Double, end: Double)?
@@ -65,14 +66,15 @@ struct CompositorTrackEntry {
         return r.from + (r.to - r.from) * Swift.max(0, Swift.min(1, frac))
     }
 
-    /// 根据实际 source buffer 尺寸（裁剪后）在 render 空间中计算 CIImage 变换。
+    /// 根据实际 source buffer 尺寸在 render 空间中计算 CIImage 变换。
+    /// 公式和导出 videoTransform 一致（y-down 语义），由 ColorCompositor 统一做 y 翻转。
     func fitTransform(srcSize: CGSize, renderSize: CGSize, at t: Double) -> CGAffineTransform {
         guard srcSize.width > 0, srcSize.height > 0 else { return .identity }
         let baseScale = min(renderSize.width / srcSize.width, renderSize.height / srcSize.height)
         let sx = baseScale * userScaleX
         let sy = baseScale * userScaleY
         let tx = (renderSize.width  - srcSize.width  * sx) / 2 + userOffsetX * renderSize.width
-        let ty = (renderSize.height - srcSize.height * sy) / 2 + userOffsetY * renderSize.height
+        let ty = (renderSize.height - srcSize.height * sy) / 2 - userOffsetY * renderSize.height
         var result = CGAffineTransform(scaleX: sx, y: sy)
             .concatenating(CGAffineTransform(translationX: tx, y: ty))
         // 推入/滑入：平移偏移
@@ -124,6 +126,7 @@ final class ColorCompositor: NSObject, AVVideoCompositing {
     // 静态数据存储（线程安全）
     private static let lock = NSLock()
     private static var store: [Int64: ColorCompositionData] = [:]
+    private static var dragOffsets: [CMPersistentTrackID: (x: CGFloat, y: CGFloat)] = [:]
 
     /// 注册一个 segment 的数据（在 rebuildTimelinePreview 主线程调用）
     static func setData(_ data: ColorCompositionData, forStartValue key: Int64) {
@@ -135,6 +138,22 @@ final class ColorCompositor: NSObject, AVVideoCompositing {
     static func clearStore() {
         lock.lock(); defer { lock.unlock() }
         store.removeAll()
+        dragOffsets.removeAll()
+    }
+
+    static func setDragOffset(trackID: CMPersistentTrackID, offsetX: CGFloat, offsetY: CGFloat) {
+        lock.lock(); defer { lock.unlock() }
+        dragOffsets[trackID] = (offsetX, offsetY)
+    }
+
+    static func clearDragOffsets() {
+        lock.lock(); defer { lock.unlock() }
+        dragOffsets.removeAll()
+    }
+
+    private static func getDragOffset(trackID: CMPersistentTrackID) -> (x: CGFloat, y: CGFloat)? {
+        lock.lock(); defer { lock.unlock() }
+        return dragOffsets[trackID]
     }
 
     private static func getData(for timeRange: CMTimeRange) -> ColorCompositionData? {
@@ -201,8 +220,13 @@ final class ColorCompositor: NSObject, AVVideoCompositing {
         var result: CIImage = CIImage(color: CIColor(red: 0, green: 0, blue: 0, alpha: 1))
             .cropped(to: bounds)
 
-        for entry in data.entries {
+        for var entry in data.entries {
             guard let srcBuf = req.sourceFrame(byTrackID: entry.trackID) else { continue }
+
+            if let drag = Self.getDragOffset(trackID: entry.trackID) {
+                entry.userOffsetX = drag.x
+                entry.userOffsetY = drag.y
+            }
 
             let srcW = CGFloat(CVPixelBufferGetWidth(srcBuf))
             let srcH = CGFloat(CVPixelBufferGetHeight(srcBuf))
@@ -213,9 +237,18 @@ final class ColorCompositor: NSObject, AVVideoCompositing {
                 ci = ColorAdjust.apply(ci, entry.colorAdjust)
             }
 
-            // 2. Fit 到渲染区域（使用原始尺寸，裁剪不影响缩放）
+            // 2. Fit 到渲染区域
+            // 使用 naturalSize（和导出 videoTransform 一致）。如果 naturalSize 和 buffer 尺寸不同，
+            // 先将 CIImage pre-scale 到 naturalSize，使 fitTransform 的定位与导出一致。
+            var effectiveSize = CGSize(width: srcW, height: srcH)
+            if let ns = entry.naturalSize, ns.width > 0, ns.height > 0 {
+                if abs(ns.width - srcW) > 0.5 || abs(ns.height - srcH) > 0.5 {
+                    ci = ci.transformed(by: CGAffineTransform(scaleX: ns.width / srcW, y: ns.height / srcH))
+                }
+                effectiveSize = ns
+            }
             let fitT = entry.fitTransform(
-                srcSize: CGSize(width: srcW, height: srcH),
+                srcSize: effectiveSize,
                 renderSize: renderSize, at: t)
             ci = ci.transformed(by: fitT)
 
@@ -223,10 +256,10 @@ final class ColorCompositor: NSObject, AVVideoCompositing {
             if entry.cropTop > 0.001 || entry.cropBottom > 0.001 ||
                entry.cropLeft > 0.001 || entry.cropRight > 0.001 {
                 let cropRect = CGRect(
-                    x: srcW * entry.cropLeft,
-                    y: srcH * entry.cropBottom,
-                    width:  max(1, srcW * (1 - entry.cropLeft - entry.cropRight)),
-                    height: max(1, srcH * (1 - entry.cropTop  - entry.cropBottom)))
+                    x: effectiveSize.width * entry.cropLeft,
+                    y: effectiveSize.height * entry.cropBottom,
+                    width:  max(1, effectiveSize.width * (1 - entry.cropLeft - entry.cropRight)),
+                    height: max(1, effectiveSize.height * (1 - entry.cropTop  - entry.cropBottom)))
                 let cropInRender = cropRect.applying(fitT)
                 ci = ci.cropped(to: cropInRender)
             }

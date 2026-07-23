@@ -535,7 +535,7 @@ extension ProjectState {
                         let clipStart = videoClipCMRanges[idx].start
                         let clipEnd   = videoClipCMRanges[idx].end
                         guard segStartCM >= clipStart && segStartCM < clipEnd else { continue }
-                        guard (try? await entry.track.load(.naturalSize)) != nil else { continue }
+                        guard let natSize = try? await entry.track.load(.naturalSize) else { continue }
                         let clip = entry.clip
                         if clip.mirrorH || clip.mirrorV || clip.rotation != 0 {
                             NSLog("[Preview] CompositorEntry: mirrorH=\(clip.mirrorH) mirrorV=\(clip.mirrorV) rot=\(clip.rotation)")
@@ -554,6 +554,7 @@ extension ProjectState {
                             mirrorH:     clip.mirrorH,
                             mirrorV:     clip.mirrorV,
                             rotation:    clip.rotation,
+                            naturalSize: natSize,
                             opacityRamp: nil,
                             pushRamp:    nil)
                         // 转场渐变
@@ -666,8 +667,11 @@ extension ProjectState {
             let compoundVideoEnd = cTracks.flatMap(\.clips).filter { !$0.videoTracks.flatMap(\.clips).isEmpty }.map(\.endTime).max() ?? 0
             let visualEnd = max(vEnd, max(iEnd, compoundVideoEnd))
 
+            let trackMap = Dictionary(uniqueKeysWithValues: videoCompTracks.map { ($0.clip.id, $0.track.trackID) })
+
             guard !Task.isCancelled else { return }
             await MainActor.run {
+                self.videoClipTrackIDMap = trackMap
                 self.lastVideoEndTime = visualEnd
                 self.duration = max(endTime, 0.01)
                 self.pendingSeekTime = restoreTime

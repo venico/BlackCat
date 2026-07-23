@@ -188,6 +188,7 @@ final class ProjectState: ObservableObject {
         set { clock.pendingSeekTime = newValue }
     }
     @Published var playerItem: AVPlayerItem? = nil
+    var videoClipTrackIDMap: [UUID: CMPersistentTrackID] = [:]
 
     // Timeline
     @Published var pixelsPerSecond: Double = 30
@@ -292,6 +293,7 @@ final class ProjectState: ObservableObject {
     @Published var selectedImageClipID: UUID?    = nil
     @Published var selectedSubtitleClipID: UUID? = nil
     @Published var selectedTextClipID: UUID?     = nil
+    @Published var editingTextClipID: UUID?     = nil
     @Published var selectedShapeClipID: UUID?    = nil
     @Published var selectedCompoundClipID: UUID? = nil
     @Published var penDrawingMode: Bool = false
@@ -397,6 +399,7 @@ final class ProjectState: ObservableObject {
     @Published var mediaSearchText: String = ""
     // Multi-selection (used by box-select & bulk delete)
     @Published var selectedClipIDs: Set<UUID>    = []
+    @Published var textClipViewSizes: [UUID: CGSize] = [:]
 
     // Clipboard for copy/cut/paste
     enum ClipboardItem {

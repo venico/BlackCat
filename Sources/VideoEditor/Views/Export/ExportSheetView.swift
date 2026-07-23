@@ -306,8 +306,11 @@ struct ExportSheetView: View {
                     ESection(title: "输出位置") {
                         HStack(spacing: 10) {
                             HStack(spacing: 6) {
-                                Image(systemName: "folder")
-                                    .font(.system(size: 12, weight: .light))
+                                Image(nsImage: SidebarSVGIcon.load("folder"))
+                                    .renderingMode(.template)
+                                    .resizable()
+                                    .aspectRatio(contentMode: .fit)
+                                    .frame(width: 14, height: 14)
                                     .foregroundColor(Color.labelSecondary)
                                 Text(effectiveOutputPath.path)
                                     .font(.system(size: 11))
@@ -430,8 +433,11 @@ struct ExportSheetView: View {
                                 let selected = project.exportSettings.content == kind
                                 Button { project.exportSettings.content = kind } label: {
                                     HStack(spacing: 5) {
-                                        Image(systemName: contentIcon(kind))
-                                            .font(.system(size: 11, weight: .light))
+                                        Image(nsImage: contentIcon(kind))
+                                            .renderingMode(.template)
+                                            .resizable()
+                                            .aspectRatio(contentMode: .fit)
+                                            .frame(width: 12, height: 12)
                                         Text(contentLabel(kind))
                                             .font(.system(size: 12, weight: .medium))
                                     }
@@ -503,11 +509,11 @@ struct ExportSheetView: View {
         return "BlackCat_\(f.string(from: Date()))"
     }
 
-    private func contentIcon(_ c: ExportContent) -> String {
+    private func contentIcon(_ c: ExportContent) -> NSImage {
         switch c {
-        case .video:        return "film"
-        case .audioOnly:    return "music.note"
-        case .subtitleOnly: return "captions.bubble"
+        case .video:        return SidebarSVGIcon.load("video")
+        case .audioOnly:    return SidebarSVGIcon.load("audio")
+        case .subtitleOnly: return SidebarSVGIcon.load("subtitle")
         }
     }
 

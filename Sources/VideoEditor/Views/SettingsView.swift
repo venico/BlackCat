@@ -149,7 +149,7 @@ struct SettingsView: View {
                             settings.translateProvider = p
                         }
                     }
-                ), options: AppSettings.TranslateProvider.allCases.map { ($0.displayName, $0.displayName) })
+                ), options: AppSettings.TranslateProvider.allCases.map { ($0.displayName, $0.displayName) }, height: 32)
 
                 if settings.translateProvider == .google {
                     Text("免费，无需配置")
@@ -276,7 +276,7 @@ struct SettingsView: View {
                             settings.llmProvider = p
                         }
                     }
-                ), options: AppSettings.LLMProvider.allCases.map { ($0.displayName, $0.displayName) })
+                ), options: AppSettings.LLMProvider.allCases.map { ($0.displayName, $0.displayName) }, height: 32)
 
                 apiKeyField(
                     label: "API Key",

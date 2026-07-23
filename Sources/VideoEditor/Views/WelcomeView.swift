@@ -119,8 +119,11 @@ struct WelcomeView: View {
                     .foregroundColor(Color.labelSecondary)
                 HStack(spacing: 8) {
                     HStack(spacing: 6) {
-                        Image(systemName: "folder")
-                            .font(.system(size: 12, weight: .light))
+                        Image(nsImage: SidebarSVGIcon.load("folder"))
+                            .renderingMode(.template)
+                            .resizable()
+                            .aspectRatio(contentMode: .fit)
+                            .frame(width: 14, height: 14)
                             .foregroundColor(Color.labelSecondary)
                         Text(saveDirectory?.path ?? "未选择")
                             .font(.system(size: 11))

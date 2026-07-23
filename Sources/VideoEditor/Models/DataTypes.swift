@@ -14,6 +14,7 @@ final class PlaybackClock: ObservableObject {
     @Published var duration: Double = 60
     @Published var lastVideoEndTime: Double = 0
     @Published var seekRequest: Int = 0
+    @Published var refreshSeekRequest: Int = 0
     var pendingSeekTime: Double? = nil
 }
 

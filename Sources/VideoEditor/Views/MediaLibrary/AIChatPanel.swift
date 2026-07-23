@@ -202,6 +202,8 @@ struct AIChatPanel: View {
                         Text(service.selectedProvider.displayName)
                             .font(.system(size: 10))
                             .foregroundColor(Color.labelSecondary)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
                             .padding(.horizontal, 6)
                             .padding(.vertical, 3)
                             .background(Color.white.opacity(0.06))
@@ -460,7 +462,7 @@ private struct MessageBubble: View {
 
             case .completed(let url):
                 VStack(alignment: .leading, spacing: 6) {
-                    VideoThumbnailView(url: url)
+                    VideoThumbnailView(url: message.resolvedVideoURL() ?? url)
 
                     HStack(spacing: 4) {
                         Image(systemName: "checkmark.circle.fill")
@@ -473,18 +475,18 @@ private struct MessageBubble: View {
 
                         Spacer()
 
-                        HoverIconButton(icon: "film.stack", tip: "插入视频轨道") {
-                            onInsertToTimeline(url)
+                        HoverIconButton(icon: "film.stack", svgName: "addToVideoTrack", tip: "插入视频轨道") {
+                            onInsertToTimeline(message.resolvedVideoURL() ?? url)
                         }
-                        HoverIconButton(icon: "folder", tip: "在 Finder 中显示") {
-                            NSWorkspace.shared.activateFileViewerSelecting([url])
+                        HoverIconButton(icon: "folder", svgName: "folder", tip: "在 Finder 中显示") {
+                            NSWorkspace.shared.activateFileViewerSelecting([message.resolvedVideoURL() ?? url])
                         }
                     }
                 }
 
             case .completedImage(let url):
                 VStack(alignment: .leading, spacing: 6) {
-                    ImageThumbnailView(url: url)
+                    ImageThumbnailView(url: message.resolvedImageURL() ?? url)
 
                     HStack(spacing: 4) {
                         Image(systemName: "checkmark.circle.fill")
@@ -498,17 +500,17 @@ private struct MessageBubble: View {
                         Spacer()
 
                         HoverIconButton(icon: "photo.on.rectangle", tip: "插入图片轨道") {
-                            onInsertToTimeline(url)
+                            onInsertToTimeline(message.resolvedImageURL() ?? url)
                         }
-                        HoverIconButton(icon: "folder", tip: "在 Finder 中显示") {
-                            NSWorkspace.shared.activateFileViewerSelecting([url])
+                        HoverIconButton(icon: "folder", svgName: "folder", tip: "在 Finder 中显示") {
+                            NSWorkspace.shared.activateFileViewerSelecting([message.resolvedImageURL() ?? url])
                         }
                     }
                 }
 
             case .completedAudio(let url):
                 VStack(alignment: .leading, spacing: 6) {
-                    AudioWaveformView(url: url)
+                    AudioWaveformView(url: message.resolvedAudioURL() ?? url)
 
                     HStack(spacing: 4) {
                         Image(systemName: "checkmark.circle.fill")
@@ -522,10 +524,10 @@ private struct MessageBubble: View {
                         Spacer()
 
                         HoverIconButton(icon: "waveform", tip: "插入音频轨道") {
-                            onInsertToTimeline(url)
+                            onInsertToTimeline(message.resolvedAudioURL() ?? url)
                         }
-                        HoverIconButton(icon: "folder", tip: "在 Finder 中显示") {
-                            NSWorkspace.shared.activateFileViewerSelecting([url])
+                        HoverIconButton(icon: "folder", svgName: "folder", tip: "在 Finder 中显示") {
+                            NSWorkspace.shared.activateFileViewerSelecting([message.resolvedAudioURL() ?? url])
                         }
                     }
                 }
@@ -850,19 +852,30 @@ private struct MarkdownContentView: View {
 
 private struct HoverIconButton: View {
     let icon: String
+    var svgName: String? = nil
     let tip: String
     let action: () -> Void
     @State private var hovering = false
 
     var body: some View {
         Button(action: action) {
-            Image(systemName: icon)
-                .font(.system(size: 11))
-                .foregroundColor(Color.labelSecondary)
-                .frame(width: 24, height: 24)
-                .background(hovering ? Color.white.opacity(0.12) : Color.clear)
-                .clipShape(RoundedRectangle(cornerRadius: 5))
-                .contentShape(Rectangle())
+            Group {
+                if let svgName, SidebarSVGIcon.svgs[svgName] != nil {
+                    Image(nsImage: SidebarSVGIcon.load(svgName))
+                        .renderingMode(.template)
+                        .resizable()
+                        .aspectRatio(contentMode: .fit)
+                        .frame(width: 14, height: 14)
+                } else {
+                    Image(systemName: icon)
+                        .font(.system(size: 11))
+                }
+            }
+            .foregroundColor(Color.labelSecondary)
+            .frame(width: 24, height: 24)
+            .background(hovering ? Color.white.opacity(0.12) : Color.clear)
+            .clipShape(RoundedRectangle(cornerRadius: 5))
+            .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         .onHover { hovering = $0 }

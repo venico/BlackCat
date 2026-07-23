@@ -416,15 +416,21 @@ struct TimelineView: View {
             Button("添加文字轨道") { project.textTracks.append(Track(label: "文字")); project.syncOverlayOrder() }
             Button("添加图形轨道") { project.shapeTracks.append(Track(label: "图形")); project.syncOverlayOrder() }
         } label: {
-            Image(systemName: "plus")
-                .font(.system(size: 13, weight: .light))
-                .foregroundColor(Color.labelSecondary)
+            Text("")
                 .frame(width: labelW, height: rulerH)
-                .contentShape(Rectangle())
         }
         .menuStyle(.borderlessButton)
         .menuIndicator(.hidden)
         .frame(width: labelW, height: rulerH)
+        .overlay {
+            Image(nsImage: TimelineSVGIcon.load("add"))
+                .renderingMode(.template)
+                .resizable()
+                .aspectRatio(contentMode: .fit)
+                .frame(width: 16, height: 16)
+                .foregroundColor(Color.labelSecondary)
+                .allowsHitTesting(false)
+        }
         .background(Color(red: 0.09, green: 0.09, blue: 0.10))
     }
 
@@ -448,7 +454,7 @@ struct TimelineView: View {
                     let item = vs[secIdx]
                     if item.kind == .video {
                         let i = item.trackIndex
-                        TrackLabel(icon:"film", title: project.videoTracks[i].label,
+                        TrackLabel(icon:"video", title: project.videoTracks[i].label,
                                    count: project.videoTracks[i].clips.count, hasMute: true,
                                    isMuted: project.videoTracks[i].isMuted, isVis: project.videoTracks[i].isVisible,
                                    onMute: { project.pushUndo(); project.videoTracks[i].isMuted.toggle(); project.rebuildTimelinePreview() },
@@ -476,7 +482,7 @@ struct TimelineView: View {
                     let item = as_[secIdx]
                     if item.kind == .audio {
                         let i = item.trackIndex
-                        TrackLabel(icon:"music.note", title: project.audioTracks[i].label,
+                        TrackLabel(icon:"audioSpeaker", title: project.audioTracks[i].label,
                                    count: project.audioTracks[i].clips.count, hasMute: true,
                                    isMuted: project.audioTracks[i].isMuted, isVis: true, hasVis: false,
                                    onMute: { project.pushUndo(); project.audioTracks[i].isMuted.toggle(); project.rebuildTimelinePreview() },
@@ -508,7 +514,7 @@ struct TimelineView: View {
 
     @ViewBuilder
     private func compoundTrackLabel(_ ti: Int, dragType: TrackDragType? = nil, secIdx: Int = 0) -> some View {
-        TrackLabel(icon: "rectangle.on.rectangle", title: project.compoundTracks[ti].label.isEmpty ? "复合" : project.compoundTracks[ti].label,
+        TrackLabel(icon: "compound", title: project.compoundTracks[ti].label.isEmpty ? "复合" : project.compoundTracks[ti].label,
                    count: project.compoundTracks[ti].clips.count, hasMute: true,
                    isMuted: project.compoundTracks[ti].isMuted, isVis: project.compoundTracks[ti].isVisible,
                    onMute: { project.pushUndo(); project.compoundTracks[ti].isMuted.toggle(); project.rebuildTimelinePreview() },
@@ -692,7 +698,7 @@ struct TimelineView: View {
         let ovIdx = overlayIndex
         switch entry.kind {
         case .image:
-            TrackLabel(icon:"photo", title: project.imageTracks[i].label,
+            TrackLabel(icon:"image", title: project.imageTracks[i].label,
                        count: project.imageTracks[i].clips.count, hasMute: false,
                        isMuted: false, isVis: project.imageTracks[i].isVisible,
                        onMute: nil,
@@ -701,7 +707,7 @@ struct TimelineView: View {
                        onDragChanged: { handleDragChanged(type: .overlay, index: ovIdx, offsetY: $0) },
                        onDragEnded:   { handleDragEnded(type: .overlay, index: ovIdx, offsetY: $0) })
         case .subtitle:
-            TrackLabel(icon:"text.bubble", title: project.subtitleTracks[i].label,
+            TrackLabel(icon:"subtitle", title: project.subtitleTracks[i].label,
                        count: project.subtitleTracks[i].clips.count, hasMute: false,
                        isMuted: false, isVis: project.subtitleTracks[i].isVisible,
                        onMute: nil,
@@ -718,7 +724,7 @@ struct TimelineView: View {
                        onDragChanged: { handleDragChanged(type: .overlay, index: ovIdx, offsetY: $0) },
                        onDragEnded:   { handleDragEnded(type: .overlay, index: ovIdx, offsetY: $0) })
         case .shape:
-            TrackLabel(icon:"square.on.circle", title: project.shapeTracks[i].label,
+            TrackLabel(icon:"shape", title: project.shapeTracks[i].label,
                        count: project.shapeTracks[i].clips.count, hasMute: false,
                        isMuted: false, isVis: project.shapeTracks[i].isVisible,
                        onMute: nil,
@@ -727,7 +733,7 @@ struct TimelineView: View {
                        onDragChanged: { handleDragChanged(type: .overlay, index: ovIdx, offsetY: $0) },
                        onDragEnded:   { handleDragEnded(type: .overlay, index: ovIdx, offsetY: $0) })
         case .compound:
-            TrackLabel(icon:"rectangle.on.rectangle", title: project.compoundTracks[i].label.isEmpty ? "复合" : project.compoundTracks[i].label,
+            TrackLabel(icon:"compound", title: project.compoundTracks[i].label.isEmpty ? "复合" : project.compoundTracks[i].label,
                        count: project.compoundTracks[i].clips.count, hasMute: true,
                        isMuted: project.compoundTracks[i].isMuted, isVis: project.compoundTracks[i].isVisible,
                        onMute: { project.pushUndo(); project.compoundTracks[i].isMuted.toggle(); project.rebuildTimelinePreview() },
@@ -900,8 +906,14 @@ struct TimelineView: View {
                         } label: { Label("删除标记", systemImage: "xmark.circle") }
                     } else {
                         if let id = selID {
-                            Button { project.selectLeftOf(id) } label: { Label("向左全选", systemImage: "arrow.left.to.line") }
-                            Button { project.selectRightOf(id) } label: { Label("向右全选", systemImage: "arrow.right.to.line") }
+                            Button { project.selectLeftOf(id) } label: {
+                                Image(nsImage: SidebarSVGIcon.load("selectLeft", size: 14))
+                                Text("向左全选")
+                            }
+                            Button { project.selectRightOf(id) } label: {
+                                Image(nsImage: SidebarSVGIcon.load("selectRight", size: 14))
+                                Text("向右全选")
+                            }
                             Divider()
                         }
                         if let textID = project.selectedTextClipID, project.selectedClipIDs.isEmpty {
@@ -910,20 +922,35 @@ struct TimelineView: View {
                             } label: { Label("保存为文字模板", systemImage: "square.and.arrow.down") }
                             Divider()
                         }
-                        Button { project.copySelected() } label: { Label("复制", systemImage: "doc.on.doc") }
+                        Button { project.copySelected() } label: {
+                            Image(nsImage: SidebarSVGIcon.load("copy", size: 14))
+                            Text("复制")
+                        }
                             .disabled(selID == nil)
-                        Button { project.cutSelected() } label: { Label("剪切", systemImage: "scissors") }
+                        Button { project.cutSelected() } label: {
+                            Image(nsImage: SidebarSVGIcon.load("cut", size: 14))
+                            Text("剪切")
+                        }
                             .disabled(selID == nil)
-                        Button { project.pasteAtPlayhead() } label: { Label("粘贴", systemImage: "doc.on.clipboard") }
+                        Button { project.pasteAtPlayhead() } label: {
+                            Image(nsImage: SidebarSVGIcon.load("paste", size: 14))
+                            Text("粘贴")
+                        }
                             .disabled(project.clipboard.isEmpty)
                         if selID != nil {
                             Divider()
-                            Button { project.createCompoundFromSelected() } label: { Label("创建复合片段", systemImage: "rectangle.on.rectangle") }
+                            Button { project.createCompoundFromSelected() } label: {
+                                Image(nsImage: SidebarSVGIcon.load("compound", size: 14))
+                                Text("创建复合片段")
+                            }
                             if let cid = project.selectedCompoundClipID {
                                 Button { project.dissolveCompound(cid) } label: { Label("解除复合片段", systemImage: "rectangle.on.rectangle.slash") }
                             }
                             Divider()
-                            Button(role: .destructive) { project.deleteSelected() } label: { Label("删除", systemImage: "trash") }
+                            Button(role: .destructive) { project.deleteSelected() } label: {
+                                Image(nsImage: TimelineSVGIcon.load("delete", size: 14))
+                                Text("删除")
+                            }
                         }
                         if let mid = project.selectedMarkerID {
                             Divider()
@@ -2681,9 +2708,18 @@ private struct TrackLabel: View {
         ZStack {
             // 默认：图标左对齐 + 数量右对齐
             HStack {
-                Image(systemName: icon)
-                    .font(.system(size: 10, weight: .light))
-                    .foregroundColor(Color.labelSecondary)
+                if SidebarSVGIcon.svgs[icon] != nil {
+                    Image(nsImage: SidebarSVGIcon.load(icon))
+                        .renderingMode(.template)
+                        .resizable()
+                        .aspectRatio(contentMode: .fit)
+                        .frame(width: 12, height: 12)
+                        .foregroundColor(Color.labelSecondary)
+                } else {
+                    Image(systemName: icon)
+                        .font(.system(size: 10, weight: .light))
+                        .foregroundColor(Color.labelSecondary)
+                }
                 Spacer()
                 Text("\(count)")
                     .font(.system(size: 9, weight: .medium).monospacedDigit())
@@ -2696,14 +2732,14 @@ private struct TrackLabel: View {
             if isHovered {
                 HStack(spacing: 2) {
                     if hasMute, let onMute {
-                        OverlayBtn(icon: isMuted ? "speaker.slash" : "speaker.wave.2",
+                        OverlayBtn(svgIcon: SidebarSVGIcon.load(isMuted ? "mute" : "audioSpeaker"),
                                    action: onMute)
                     }
                     if hasVis {
-                        OverlayBtn(icon: isVis ? "eye" : "eye.slash",
+                        OverlayBtn(svgIcon: SidebarSVGIcon.load(isVis ? "show" : "hide"),
                                    action: onVis)
                     }
-                    OverlayBtn(icon: "trash", destructive: true,
+                    OverlayBtn(svgIcon: TimelineSVGIcon.load("delete"), destructive: true,
                                action: onDel)
                 }
             }
@@ -2761,8 +2797,11 @@ private struct TrackVisibilityMenu: View {
                 NSMenu.popUpContextMenu(menu, with: event, for: event.window!.contentView!)
             }
         } label: {
-            Image(systemName: "eye")
-                .font(.system(size: 12, weight: .light))
+            Image(nsImage: TimelineSVGIcon.load("show"))
+                .renderingMode(.template)
+                .resizable()
+                .aspectRatio(contentMode: .fit)
+                .frame(width: 14, height: 14)
                 .foregroundColor(hov ? Color.labelPrimary : Color.labelSecondary)
                 .frame(width: 28, height: 28)
                 .background(hov ? Color.white.opacity(0.08) : Color.clear)
@@ -2825,8 +2864,11 @@ private struct TextTrackLabel: View {
     var body: some View {
         ZStack {
             HStack {
-                Text("T")
-                    .font(.system(size: 11, weight: .bold, design: .serif))
+                Image(nsImage: SidebarSVGIcon.load("text"))
+                    .renderingMode(.template)
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .frame(width: 12, height: 12)
                     .foregroundColor(Color.labelSecondary)
                 Spacer()
                 Text("\(count)")
@@ -2839,8 +2881,8 @@ private struct TextTrackLabel: View {
 
             if isHovered {
                 HStack(spacing: 2) {
-                    OverlayBtn(icon: isVis ? "eye" : "eye.slash", action: onVis)
-                    OverlayBtn(icon: "trash", destructive: true, action: onDel)
+                    OverlayBtn(svgIcon: SidebarSVGIcon.load(isVis ? "show" : "hide"), action: onVis)
+                    OverlayBtn(svgIcon: TimelineSVGIcon.load("delete"), destructive: true, action: onDel)
                 }
             }
 
@@ -2868,16 +2910,27 @@ private struct TextTrackLabel: View {
 }
 
 private struct OverlayBtn: View {
-    let icon: String
+    var icon: String = ""
+    var svgIcon: NSImage? = nil
     var destructive: Bool = false
     let action: () -> Void
     @State private var hov = false
     var body: some View {
         Button(action: action) {
-            Image(systemName: icon)
-                .font(.system(size: 9, weight: .medium))
-                .foregroundColor(hov ? (destructive ? .red.opacity(0.9) : .white.opacity(0.95)) : Color.labelSecondary)
-                .frame(width: 20, height: 20)
+            Group {
+                if let svgIcon {
+                    Image(nsImage: svgIcon)
+                        .renderingMode(.template)
+                        .resizable()
+                        .aspectRatio(contentMode: .fit)
+                        .frame(width: 11, height: 11)
+                } else {
+                    Image(systemName: icon)
+                        .font(.system(size: 9, weight: .medium))
+                }
+            }
+            .foregroundColor(hov ? (destructive ? .red.opacity(0.9) : .white.opacity(0.95)) : Color.labelSecondary)
+            .frame(width: 20, height: 20)
         }
         .buttonStyle(.plain)
         .onHover { hov = $0 }
@@ -3326,8 +3379,11 @@ private struct TextClipView: View {
                     .stroke(sel ? Color.white : Color(hex:"#E088A8").opacity(0.4), lineWidth: 1))
             if w > 16 {
                 HStack(spacing: 3) {
-                    Text("T")
-                        .font(.system(size: 8, weight: .bold, design: .serif))
+                    Image(nsImage: SidebarSVGIcon.load("text"))
+                        .renderingMode(.template)
+                        .resizable()
+                        .aspectRatio(contentMode: .fit)
+                        .frame(width: 8, height: 8)
                         .foregroundColor(.white.opacity(0.6))
                     Text(clip.text.components(separatedBy:"\n").first ?? clip.text)
                         .font(.system(size:8, weight:.medium))
@@ -3372,8 +3428,11 @@ private struct ShapeTimelineClipView: View {
                     .stroke(sel ? Color.white : Color(hex:"#8AB4FF").opacity(0.4), lineWidth: 1))
             if w > 16 {
                 HStack(spacing: 3) {
-                    Image(systemName: "square.on.circle")
-                        .font(.system(size: 8))
+                    Image(nsImage: SidebarSVGIcon.load("shape"))
+                        .renderingMode(.template)
+                        .resizable()
+                        .aspectRatio(contentMode: .fit)
+                        .frame(width: 8, height: 8)
                         .foregroundColor(.white.opacity(0.6))
                     Text(clip.type.label)
                         .font(.system(size:8, weight:.medium))
@@ -3433,8 +3492,11 @@ private struct CompoundClipView: View {
         ZStack(alignment: .leading) {
             contentBackground(w: w, clipH: clipH)
             HStack(spacing: 3) {
-                Image(systemName: "rectangle.on.rectangle")
-                    .font(.system(size: 8))
+                Image(nsImage: SidebarSVGIcon.load("compound"))
+                    .renderingMode(.template)
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .frame(width: 10, height: 10)
                     .foregroundColor(.white)
                 Text(clip.name)
                     .font(.system(size: 9, weight: .medium))
@@ -3504,20 +3566,32 @@ private struct CompoundClipView: View {
         case .text:
             ZStack {
                 RoundedRectangle(cornerRadius: 6).fill(Color(hex: "#FF9F43").opacity(0.82))
-                Text("T").font(.system(size: 16, weight: .bold, design: .serif))
+                Image(nsImage: SidebarSVGIcon.load("text"))
+                    .renderingMode(.template)
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .frame(width: 16, height: 16)
                     .foregroundColor(.white.opacity(0.3))
             }
         case .subtitle:
             ZStack {
                 RoundedRectangle(cornerRadius: 6).fill(Color(hex: "#FF9F43").opacity(0.82))
-                Text("T").font(.system(size: 16, weight: .bold, design: .serif))
+                Image(nsImage: SidebarSVGIcon.load("subtitle"))
+                    .renderingMode(.template)
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .frame(width: 16, height: 16)
                     .foregroundColor(.white.opacity(0.3))
             }
         case .shape:
             ZStack {
                 RoundedRectangle(cornerRadius: 6).fill(Color(hex: "#FF9F43").opacity(0.82))
-                Image(systemName: "square.on.circle")
-                    .font(.system(size: 16)).foregroundColor(.white.opacity(0.3))
+                Image(nsImage: SidebarSVGIcon.load("shape"))
+                    .renderingMode(.template)
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .frame(width: 16, height: 16)
+                    .foregroundColor(.white.opacity(0.3))
             }
         case .empty:
             RoundedRectangle(cornerRadius: 6).fill(Color(hex: "#FF9F43").opacity(0.82))
@@ -3811,16 +3885,16 @@ struct TimelineToolbar: View {
         HStack(spacing:0) {
             // 左侧：编辑工具
             HStack(spacing:2) {
-                TBtn(icon:"arrow.uturn.backward", help:"撤销", enabled: project.undoCount > 0) { project.undo() }
-                TBtn(icon:"arrow.uturn.forward",  help:"重做", enabled: project.redoCount > 0) { project.redo() }
+                TBtn(icon:"undo", help:"撤销", enabled: project.undoCount > 0) { project.undo() }
+                TBtn(icon:"redo",  help:"重做", enabled: project.redoCount > 0) { project.redo() }
                 Divider().frame(height:16).padding(.horizontal,4)
                 SplitBtn(style: .center, help: "在播放头分割片段", enabled: canSplit) { project.splitAtPlayhead() }
-                SplitBtn(style: .keepLeft, help: "保留左侧", enabled: canSplit) { project.splitKeepLeft() }
-                SplitBtn(style: .keepRight, help: "保留右侧", enabled: canSplit) { project.splitKeepRight() }
-                TBtn(icon:"trash",            help:"删除选中片段", enabled: hasSelection)   { project.deleteSelected() }
-                TBtn(icon:"text.alignleft",   help:"将选中片段对齐到播放头", enabled: hasSelection) { project.alignSelectedToPlayhead() }
-                TBtn(icon:"character.bubble", help:"在当前字幕轨道插入字幕")  { project.insertSubtitleAtPlayhead() }
-                TextToolBtn { project.addTextAtPlayhead() }
+                SplitBtn(style: .keepLeft, help: "裁掉右边", enabled: canSplit) { project.splitKeepLeft() }
+                SplitBtn(style: .keepRight, help: "裁掉左边", enabled: canSplit) { project.splitKeepRight() }
+                TBtn(icon:"delete",            help:"删除选中片段", enabled: hasSelection)   { project.deleteSelected() }
+                TBtn(icon:"alignPlayhead",   help:"将选中片段对齐到播放头", enabled: hasSelection) { project.alignSelectedToPlayhead() }
+                TBtn(icon:"subtitle", help:"在当前字幕轨道插入字幕") { project.insertSubtitleAtPlayhead() }
+                TBtn(icon:"text", help:"添加文字/标题图层") { project.addTextAtPlayhead() }
 
                 Divider().frame(height:16).padding(.horizontal,4)
 
@@ -3853,8 +3927,11 @@ struct TimelineToolbar: View {
 
             // 吸附开关
             Button { project.snapEnabled.toggle() } label: {
-                Image(systemName: "arrow.right.and.line.vertical.and.arrow.left")
-                    .font(.system(size: 11, weight: .medium))
+                Image(nsImage: TimelineSVGIcon.load("snap"))
+                    .renderingMode(.template)
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .frame(width: 14, height: 14)
                     .foregroundColor(project.snapEnabled ? Color.accent : Color.labelSecondary)
                     .frame(width: 24, height: 24)
             }
@@ -3864,13 +3941,13 @@ struct TimelineToolbar: View {
 
             // 右侧：缩放
             HStack(spacing:6) {
-                TBtn(icon:"arrow.left.and.right.square", help:"缩放至适合") { project.zoomToFit() }
-                TBtn(icon:"minus.magnifyingglass", help:"缩小") { project.zoomTo(project.pixelsPerSecond / 1.5) }
+                TBtn(icon:"zoomFit", help:"缩放至适合") { project.zoomToFit() }
+                TBtn(icon:"zoomOut", help:"缩小") { project.zoomTo(project.pixelsPerSecond / 1.5) }
                 LogSlider(value: Binding(
                     get: { project.pixelsPerSecond },
                     set: { project.zoomTo($0) }
                 ), range: min(project.minPixelsPerSecond, 3000)...3000).frame(width:100).help("时间轴缩放")
-                TBtn(icon:"plus.magnifyingglass", help:"放大")  { project.zoomTo(project.pixelsPerSecond * 1.5) }
+                TBtn(icon:"zoomIn", help:"放大")  { project.zoomTo(project.pixelsPerSecond * 1.5) }
             }.padding(.trailing,12)
         }
         .frame(height:36)
@@ -3969,9 +4046,9 @@ private struct TranslateToolGroup: View {
 
             TBtn(icon: "translate", help: "翻译选中字幕",
                  enabled: project.selectedSubtitleClipID != nil) { translateCurrent() }
-            TBtn(icon: "list.bullet.rectangle", help: "翻译整条轨道",
+            TBtn(icon: "translateTrack", help: "翻译整条轨道",
                  enabled: translateAllEnabled) { translateAll() }
-            TBtn(icon: project.isTranscribing ? "waveform" : "waveform.badge.mic",
+            TBtn(icon: "whisper",
                  help: project.isTranscribing ? "正在识别字幕…" : "自动识别字幕（按当前翻译目标语言生成）",
                  enabled: !project.isTranscribing) { project.autoTranscribeSelectedClip() }
         }
@@ -4191,8 +4268,11 @@ private struct AnalyzeMenuBtn: View {
             showMenu()
         } label: {
             HStack(spacing: 2) {
-                Image(systemName: "rectangle.split.3x1")
-                    .font(.system(size: 12, weight: .light))
+                Image(nsImage: TimelineSVGIcon.load("smartAnalysis"))
+                    .renderingMode(.template)
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .frame(width: 14, height: 14)
                 Image(systemName: "chevron.down")
                     .font(.system(size: 7, weight: .semibold))
             }
@@ -4242,7 +4322,7 @@ private final class AnalyzeMenuHandler: NSObject {
 }
 
 private struct SplitBtn: View {
-    enum Style { case center, keepLeft, keepRight }
+    enum Style: String { case center = "split", keepLeft = "trimRight", keepRight = "trimLeft" }
     let style: Style
     var help: String? = nil
     var enabled: Bool = true
@@ -4251,47 +4331,16 @@ private struct SplitBtn: View {
 
     var body: some View {
         Button(action: action) {
-            Canvas { ctx, size in
-                let cx = size.width / 2, cy = size.height / 2
-                let color = enabled ? (hov ? Color.labelPrimary : Color.labelSecondary)
-                                     : Color.labelSecondary.opacity(0.35)
-                let solid = GraphicsContext.Shading.color(color)
-                let dim = GraphicsContext.Shading.color(color.opacity(0.3))
-                let lw: CGFloat = 1.2
-                let h: CGFloat = 10
-                let tick: CGFloat = 3
-                let gap: CGFloat = 5
-
-                let leftSolid: Bool
-                let rightSolid: Bool
-                switch style {
-                case .center:    leftSolid = true;  rightSolid = true
-                case .keepLeft:  leftSolid = true;  rightSolid = false
-                case .keepRight: leftSolid = false; rightSolid = true
-                }
-
-                // 中间虚线（切割线）
-                for dy in stride(from: cy - h/2, to: cy + h/2, by: 3) {
-                    ctx.fill(Path(CGRect(x: cx - lw/2, y: dy, width: lw, height: 1.5)), with: solid)
-                }
-
-                // 左 ] 括号：竖线 + 上下横线向右
-                let lx = cx - gap
-                let ls = leftSolid ? solid : dim
-                ctx.fill(Path(CGRect(x: lx - lw/2, y: cy - h/2, width: lw, height: h)), with: ls)
-                ctx.fill(Path(CGRect(x: lx, y: cy - h/2, width: tick, height: lw)), with: ls)
-                ctx.fill(Path(CGRect(x: lx, y: cy + h/2 - lw, width: tick, height: lw)), with: ls)
-
-                // 右 [ 括号：竖线 + 上下横线向左
-                let rx = cx + gap
-                let rs = rightSolid ? solid : dim
-                ctx.fill(Path(CGRect(x: rx - lw/2, y: cy - h/2, width: lw, height: h)), with: rs)
-                ctx.fill(Path(CGRect(x: rx - tick, y: cy - h/2, width: tick, height: lw)), with: rs)
-                ctx.fill(Path(CGRect(x: rx - tick, y: cy + h/2 - lw, width: tick, height: lw)), with: rs)
-            }
-            .frame(width: 28, height: 28)
-            .background((enabled && hov) ? Color.white.opacity(0.08) : Color.clear)
-            .cornerRadius(5)
+            Image(nsImage: TimelineSVGIcon.load(style.rawValue))
+                .renderingMode(.template)
+                .resizable()
+                .aspectRatio(contentMode: .fit)
+                .frame(width: 14, height: 14)
+                .foregroundColor(enabled ? (hov ? Color.labelPrimary : Color.labelSecondary)
+                                         : Color.labelSecondary.opacity(0.35))
+                .frame(width: 28, height: 28)
+                .background((enabled && hov) ? Color.white.opacity(0.08) : Color.clear)
+                .cornerRadius(5)
         }
         .buttonStyle(.plain)
         .disabled(!enabled)
@@ -4308,7 +4357,11 @@ private struct TBtn: View {
     @State private var hov = false
     var body: some View {
         Button(action: action) {
-            Image(systemName: icon).font(.system(size: 12, weight: .light))
+            Image(nsImage: TimelineSVGIcon.load(icon))
+                .renderingMode(.template)
+                .resizable()
+                .aspectRatio(contentMode: .fit)
+                .frame(width: 14, height: 14)
                 .foregroundColor(enabled ? (hov ? Color.labelPrimary : Color.labelSecondary)
                                          : Color.labelSecondary.opacity(0.35))
                 .frame(width: 28, height: 28)
@@ -4323,7 +4376,7 @@ private struct TBtn: View {
 }
 
 private struct TransformBtn: View {
-    enum Style { case reverse, mirror, mirrorV, rotate }
+    enum Style: String { case reverse, mirror = "mirrorH", mirrorV, rotate }
     let style: Style
     var help: String? = nil
     var enabled: Bool = true
@@ -4331,20 +4384,11 @@ private struct TransformBtn: View {
     @State private var hov = false
     var body: some View {
         Button(action: action) {
-            let icon: NSImage = {
-                switch style {
-                case .reverse: return svgIconReverse
-                case .mirror:  return svgIconMirrorH
-                case .mirrorV: return svgIconMirrorV
-                case .rotate:  return svgIconRotate
-                }
-            }()
-            let sz: CGFloat = style == .mirrorV ? 14 : 16
-            Image(nsImage: icon)
+            Image(nsImage: TimelineSVGIcon.load(style.rawValue))
                 .renderingMode(.template)
                 .resizable()
                 .aspectRatio(contentMode: .fit)
-                .frame(width: sz, height: sz)
+                .frame(width: 14, height: 14)
                 .foregroundColor(enabled ? (hov ? Color.labelPrimary : Color.labelSecondary) : Color.labelSecondary.opacity(0.35))
                 .frame(width: 28, height: 28)
                 .background((enabled && hov) ? Color.white.opacity(0.08) : Color.clear)
@@ -4357,54 +4401,9 @@ private struct TransformBtn: View {
     }
 }
 
-private func _makeSVGIcon(_ svg: String) -> NSImage {
-    let img = NSImage(data: svg.data(using: .utf8)!)!
-    img.isTemplate = true
-    return img
-}
-
-let svgIconReverse: NSImage = _makeSVGIcon("""
-<svg viewBox="0 0 32 32" xmlns="http://www.w3.org/2000/svg"><path d="M10.1108105,3.29291824 C10.459868,3.64290397 10.5006219,4.19549117 10.2066852,4.59289712 L10.1091855,4.70664526 L9.15043905,5.66537967 L23.9996349,5.66537967 C26.6577942,5.66505694 28.8515654,7.7445802 28.9932417,10.3989278 L28.9997417,10.6670484 L28.9997417,23.9999567 C29.0000644,26.6580825 26.9205149,28.851826 24.2661339,28.9935006 L23.9996349,29.0000026 L7.99994323,29.0000026 C5.34178397,29.0003232 3.14801276,26.9208 3.00633644,24.2664524 L2.99978862,23.9999567 L2.99978862,10.6670484 C2.99470561,10.137941 3.40289374,9.69653888 3.93079304,9.66034052 C4.45869234,9.62414217 4.92331241,10.0056953 4.9904542,10.5305506 L5.00020417,10.6670484 L5.00020417,23.9999567 C4.99994344,25.5773706 6.22143902,26.8854906 7.79519398,26.9931581 L7.99994323,26.999658 L23.9996349,26.999658 C25.5767542,26.9991213 26.8844311,25.7780703 26.992874,24.2047034 L26.999374,23.9999567 L26.999374,10.6670484 C27.0004896,9.08900872 25.7787639,7.77993189 24.2043841,7.67222207 L23.9996349,7.66572217 L9.01231454,7.66572217 L10.1124355,8.76420432 C10.4633264,9.1146531 10.5041381,9.6694084 10.2083102,10.0674331 L10.1108105,10.1811813 C9.7608204,10.5302344 9.20822624,10.5709877 8.81081528,10.2770547 L8.69706569,10.1795563 L5.96220066,7.44310078 C5.75593059,7.23923889 5.6485705,6.95571694 5.66807672,6.66636342 C5.66807672,6.27961972 5.88745093,5.94650013 6.20757476,5.77750285 L8.6954407,3.29291824 C8.88287624,3.10537352 9.13716035,3.00000262 9.40231312,3.00000262 C9.66746589,3.00000262 9.92175,3.10537352 10.1091855,3.29291824 L10.1108105,3.29291824 Z M13.9994213,12.2530207 C14.4755446,12.2530207 14.9419179,12.3765206 15.3562914,12.6137668 L19.4610264,14.9602286 C20.3120201,15.4470253 20.8371055,16.3523111 20.8371055,17.3326901 C20.8371055,18.3130691 20.3120201,19.2183549 19.4610264,19.7051515 L15.3546664,22.0532384 C14.5087667,22.5369834 13.4692951,22.5337919 12.626382,22.0448615 C11.7834688,21.5559312 11.2645563,20.6552191 11.2645563,19.6807769 L11.2645563,14.9846032 C11.264987,14.2594302 11.5535889,13.5641533 12.0668271,13.0518358 C12.5800654,12.5395183 13.2758646,12.2521602 14.0010463,12.2530207 L13.9994213,12.2530207 Z M13.9994213,14.2517402 C13.8047696,14.2517402 13.618114,14.3291748 13.480627,14.466965 C13.34314,14.6047551 13.2661174,14.7915794 13.2665472,14.9862282 L13.2665472,19.6791519 C13.266224,19.9406392 13.4052494,20.1824901 13.6313743,20.3138084 C13.8574991,20.4451267 14.1364626,20.4460158 14.36342,20.3161416 L18.4697801,17.9696797 C18.6988016,17.8393857 18.8402495,17.5961784 18.8402495,17.3326901 C18.8402495,17.0692018 18.6988016,16.8259945 18.4697801,16.6957004 L14.36342,14.3492386 C14.2526594,14.2855682 14.1271785,14.2519576 13.9994213,14.2517402 L13.9994213,14.2517402 Z" fill="black"/></svg>
-""")
-
-let svgIconMirrorH: NSImage = _makeSVGIcon("""
-<svg viewBox="0 0 32 32" xmlns="http://www.w3.org/2000/svg"><path d="M13.2516222,4 C12.6080802,4 12.0125371,4.35657144 11.6818774,4.94114286 L0.261673381,25.0668571 C-0.25920453,25.984 0.0216784324,27.1737143 0.889215712,27.724 C1.17365418,27.904 1.50075838,28 1.83141813,28 L13.2516222,28 C14.2649342,28 15.0826947,27.1325714 15.0826947,26.0628571 L15.0826947,5.93714288 C15.0826947,4.8674286 14.2649342,4 13.2516222,4 Z M18.7483954,4 C17.7350834,4 16.9173228,4.86742856 16.9173228,5.93714288 L16.9173228,26.0628571 C16.9173228,27.1325714 17.7350834,28 18.7483954,28 L30.1668217,28 C30.4992591,28 30.8245856,27.904 31.109024,27.724 C31.9783391,27.1737143 32.259222,25.984 31.7383441,25.0668571 L20.3181401,4.94114286 C20.0136034,4.37345058 19.4110842,4.01220928 18.7483954,4 L18.7483954,4 Z M12.7040781,8.03371429 L12.7040781,25.48 L2.80561983,25.48 L12.7040781,8.03371429 Z M19.2994948,8.03714285 L29.1961754,25.48 L19.2994948,25.48 L19.2994948,8.03714285 Z" fill="black"/></svg>
-""")
-
-let svgIconMirrorV: NSImage = _makeSVGIcon("""
-<svg viewBox="0 0 32 32" xmlns="http://www.w3.org/2000/svg"><g transform="rotate(-90,16,16)"><path d="M13.2516222,4 C12.6080802,4 12.0125371,4.35657144 11.6818774,4.94114286 L0.261673381,25.0668571 C-0.25920453,25.984 0.0216784324,27.1737143 0.889215712,27.724 C1.17365418,27.904 1.50075838,28 1.83141813,28 L13.2516222,28 C14.2649342,28 15.0826947,27.1325714 15.0826947,26.0628571 L15.0826947,5.93714288 C15.0826947,4.8674286 14.2649342,4 13.2516222,4 Z M18.7483954,4 C17.7350834,4 16.9173228,4.86742856 16.9173228,5.93714288 L16.9173228,26.0628571 C16.9173228,27.1325714 17.7350834,28 18.7483954,28 L30.1668217,28 C30.4992591,28 30.8245856,27.904 31.109024,27.724 C31.9783391,27.1737143 32.259222,25.984 31.7383441,25.0668571 L20.3181401,4.94114286 C20.0136034,4.37345058 19.4110842,4.01220928 18.7483954,4 L18.7483954,4 Z M12.7040781,8.03371429 L12.7040781,25.48 L2.80561983,25.48 L12.7040781,8.03371429 Z M19.2994948,8.03714285 L29.1961754,25.48 L19.2994948,25.48 L19.2994948,8.03714285 Z" fill="black"/></g></svg>
-""")
-
-let svgIconRotate: NSImage = _makeSVGIcon("""
-<svg viewBox="0 0 32 32" xmlns="http://www.w3.org/2000/svg"><path d="M21.7,30 L6.1,30 C4.115625,30 2.5,28.3875 2.5,26.409375 L2.5,14.4375 C2.5,12.45625 4.115625,10.846875 6.1,10.846875 L21.7,10.846875 C23.684375,10.846875 25.3,12.459375 25.3,14.4375 L25.3,26.409375 C25.3,28.3875 23.684375,30 21.7,30 Z M6.1,13.240625 C5.4375,13.240625 4.9,13.778125 4.9,14.4375 L4.9,26.409375 C4.9,27.06875 5.4375,27.60625 6.1,27.60625 L21.7,27.60625 C22.3625,27.60625 22.9,27.06875 22.9,26.409375 L22.9,14.4375 C22.9,13.778125 22.3625,13.240625 21.7,13.240625 L6.1,13.240625 Z" fill="black"/><path d="M28.3,14.071875 C27.8375,14.071875 27.396875,13.803125 27.2,13.353125 C24.64375,7.525 18.521875,6.65625 15.1,6.65625 C14.4375,6.65625 13.9,6.11875 13.9,5.459375 C13.9,4.8 14.4375,4.2625 15.1,4.2625 C21.91875,4.2625 27.13125,7.228125 29.4,12.396875 C29.665625,13.003125 29.3875,13.709375 28.78125,13.975 C28.625,14.040625 28.459375,14.071875 28.3,14.071875 Z" fill="black"/><path d="M14.8,8.91875 C14.49375,8.91875 14.184375,8.803125 13.95,8.56875 L11.684375,6.30625 C11.215625,5.8375 11.215625,5.08125 11.684375,4.6125 L13.95,2.35 C14.41875,1.88125 15.178125,1.88125 15.646875,2.35 C16.115625,2.81875 16.115625,3.575 15.646875,4.04375 L14.228125,5.459375 L15.646875,6.875 C16.115625,7.34375 16.115625,8.1 15.646875,8.56875 C15.415625,8.8 15.10625,8.91875 14.8,8.91875 Z" fill="black"/></svg>
-""")
-
-private struct TextToolBtn: View {
-    let action: () -> Void
-    @State private var hov = false
-    var body: some View {
-        Button(action: action) {
-            Text("T").font(.system(size: 14, weight: .bold, design: .serif))
-                .foregroundColor(hov ? Color.labelPrimary : Color.labelSecondary)
-                .frame(width: 28, height: 28)
-                .background(hov ? Color.white.opacity(0.08) : Color.clear)
-                .cornerRadius(5)
-        }
-        .buttonStyle(.plain)
-        .onHover { hov = $0 }
-        .help("添加文字/标题图层")
-    }
-}
+// SVG icons are in TimelineSVGIcons.swift
 
 // MARK: - Marker Button
-
-let svgIconMarkerAdd: NSImage = _makeSVGIcon("""
-<svg viewBox="0 0 32 32" xmlns="http://www.w3.org/2000/svg"><path d="M22,3 L10,3 C8.895,3 8,3.895 8,5 L8,22 C8,22.72 8.39,23.375 9.008,23.72 L15.504,27.484 C15.812,27.662 16.188,27.662 16.496,27.484 L22.992,23.72 C23.61,23.375 24,22.72 24,22 L24,5 C24,3.895 23.105,3 22,3 Z M22,22 L16,25.474 L10,22 L10,5 L22,5 L22,22 Z" fill="black"/></svg>
-""")
-
-let svgIconMarkerDel: NSImage = _makeSVGIcon("""
-<svg viewBox="0 0 32 32" xmlns="http://www.w3.org/2000/svg"><path d="M22,3 L10,3 C8.895,3 8,3.895 8,5 L8,22 C8,22.72 8.39,23.375 9.008,23.72 L15.504,27.484 C15.812,27.662 16.188,27.662 16.496,27.484 L22.992,23.72 C23.61,23.375 24,22.72 24,22 L24,5 C24,3.895 23.105,3 22,3 Z M22,22 L16,25.474 L10,22 L10,5 L22,5 L22,22 Z" fill="black"/><rect x="26" y="3" width="6" height="2" rx="1" fill="black"/></svg>
-""")
 
 private struct MarkerBtn: View {
     @EnvironmentObject private var project: ProjectState
@@ -4433,7 +4432,7 @@ private struct MarkerBtn: View {
                 project.addMarkerToSelectedClip()
             }
         } label: {
-            Image(nsImage: hasMarkerSelected ? svgIconMarkerDel : svgIconMarkerAdd)
+            Image(nsImage: TimelineSVGIcon.load(hasMarkerSelected ? "markerDel" : "markerAdd"))
                 .renderingMode(.template)
                 .resizable()
                 .aspectRatio(contentMode: .fit)

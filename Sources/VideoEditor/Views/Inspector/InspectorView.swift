@@ -150,7 +150,11 @@ private struct CompoundInspector: View {
                     project.enterCompound(trackIndex: ti, clipIndex: ci)
                 } label: {
                     HStack {
-                        Image(systemName: "rectangle.on.rectangle")
+                        Image(nsImage: SidebarSVGIcon.load("compound"))
+                            .renderingMode(.template)
+                            .resizable()
+                            .aspectRatio(contentMode: .fit)
+                            .frame(width: 12, height: 12)
                         Text("进入编辑")
                     }
                     .font(.system(size: 11, weight: .medium))
@@ -312,10 +316,13 @@ private struct SubtitleInspector: View {
                         .foregroundColor(Color.labelSecondary)
                         .frame(width: 68, alignment: .leading)
                     HStack(spacing: 4) {
-                        ForEach([("text.alignleft","left"),("text.aligncenter","center"),("text.alignright","right")], id:\.1) { icon, val in
+                        ForEach([("alignLeft","left"),("alignVCenter","center"),("alignRight","right")], id:\.1) { svg, val in
                             Button { ls.alignment = val; writeStyle() } label: {
-                                Image(systemName: icon)
-                                    .font(.system(size: 12, weight: .light))
+                                Image(nsImage: SidebarSVGIcon.load(svg))
+                                    .renderingMode(.template)
+                                    .resizable()
+                                    .aspectRatio(contentMode: .fit)
+                                    .frame(width: 14, height: 14)
                                     .foregroundColor(ls.alignment == val ? Color.accent : Color.labelSecondary)
                                     .frame(width: 34, height: 26)
                                     .background(ls.alignment == val ? Color.accent.opacity(0.15) : Color.white.opacity(0.05))
@@ -829,7 +836,7 @@ private struct TextInspector: View {
                     .padding(6)
                     .background(Color.white.opacity(0.06))
                     .cornerRadius(6)
-                    .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.white.opacity(0.10)))
+                    .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.clear))
                     .onChange(of: text) { _ in write { $0.text = text } }
             }
 
@@ -875,9 +882,13 @@ private struct TextInspector: View {
                 HStack(spacing: 12) {
                     Text("对齐方式").font(.system(size:11)).foregroundColor(Color.labelSecondary).frame(width:68, alignment:.leading)
                     HStack(spacing: 4) {
-                        ForEach([("text.alignleft","left"),("text.aligncenter","center"),("text.alignright","right")], id:\.1) { icon, val in
+                        ForEach([("alignLeft","left"),("alignVCenter","center"),("alignRight","right")], id:\.1) { svg, val in
                             Button { alignment = val; write { $0.alignment = val } } label: {
-                                Image(systemName: icon).font(.system(size:12,weight:.light))
+                                Image(nsImage: SidebarSVGIcon.load(svg))
+                                    .renderingMode(.template)
+                                    .resizable()
+                                    .aspectRatio(contentMode: .fit)
+                                    .frame(width: 14, height: 14)
                                     .foregroundColor(alignment==val ? Color.accent : Color.labelSecondary)
                                     .frame(width:34,height:26)
                                     .background(alignment==val ? Color.accent.opacity(0.15) : Color.white.opacity(0.05))
@@ -896,7 +907,7 @@ private struct TextInspector: View {
 
             ISection(title: nil) {
                 Button { project.deleteTextClip(id: clip.id) } label: {
-                    HStack { Spacer(); Image(systemName: "trash"); Text("删除文字"); Spacer() }
+                    HStack { Spacer(); Image(nsImage: TimelineSVGIcon.load("delete")).renderingMode(.template).resizable().aspectRatio(contentMode: .fit).frame(width: 12, height: 12); Text("删除文字"); Spacer() }
                         .font(.system(size: 12, weight: .medium))
                         .foregroundColor(.red.opacity(0.9))
                         .frame(height: 32)
@@ -1047,15 +1058,15 @@ private struct ShapeInspector: View {
                 VStack(alignment: .leading, spacing: 6) {
                     Text("对齐").font(.system(size: 11)).foregroundColor(Color.labelSecondary)
                     HStack(spacing: 3) {
-                        alignBtn("align.horizontal.left.fill", .left)
-                        alignBtn("align.horizontal.center.fill", .hcenter)
-                        alignBtn("align.horizontal.right.fill", .right)
-                        alignBtn("align.vertical.top.fill", .top)
-                        alignBtn("align.vertical.center.fill", .vcenter)
-                        alignBtn("align.vertical.bottom.fill", .bottom)
+                        alignBtn("", .left, svgName: "alignLeft")
+                        alignBtn("", .hcenter, svgName: "alignHCenter")
+                        alignBtn("", .right, svgName: "alignRight")
+                        alignBtn("", .top, svgName: "alignTop")
+                        alignBtn("", .vcenter, svgName: "alignVCenter")
+                        alignBtn("", .bottom, svgName: "alignBottom")
                         Rectangle().fill(Color.white.opacity(0.15)).frame(width: 1, height: 18).padding(.horizontal, 2)
-                        alignBtn("arrow.left.and.right", .hdist)
-                        alignBtn("arrow.up.and.down", .vdist)
+                        alignBtn("", .hdist, svgName: "hDistribute")
+                        alignBtn("", .vdist, svgName: "vDistribute")
                         Spacer(minLength: 0)
                     }
                 }
@@ -1147,7 +1158,7 @@ private struct ShapeInspector: View {
 
             ISection(title: nil) {
                 Button { project.deleteShapeClip(id: clip.id) } label: {
-                    HStack { Spacer(); Image(systemName: "trash"); Text("删除图形"); Spacer() }
+                    HStack { Spacer(); Image(nsImage: TimelineSVGIcon.load("delete")).renderingMode(.template).resizable().aspectRatio(contentMode: .fit).frame(width: 12, height: 12); Text("删除图形"); Spacer() }
                         .font(.system(size: 12, weight: .medium))
                         .foregroundColor(.red.opacity(0.9))
                         .frame(height: 32)
@@ -1198,13 +1209,23 @@ private struct ShapeInspector: View {
     }
 
     @ViewBuilder
-    private func alignBtn(_ icon: String, _ mode: AlignMode) -> some View {
+    private func alignBtn(_ icon: String, _ mode: AlignMode, svgName: String? = nil) -> some View {
         let enabled = mode.needsThree ? project.selectedClipIDs.count >= 3 : true
         Button { alignShapes(mode) } label: {
-            Image(systemName: icon).font(.system(size: 11))
-                .foregroundColor(enabled ? Color.labelPrimary : Color.labelSecondary.opacity(0.3))
-                .frame(width: 28, height: 24)
-                .background(Color.white.opacity(enabled ? 0.06 : 0.02)).cornerRadius(4)
+            Group {
+                if let svgName {
+                    Image(nsImage: SidebarSVGIcon.load(svgName))
+                        .renderingMode(.template)
+                        .resizable()
+                        .aspectRatio(contentMode: .fit)
+                        .frame(width: 14, height: 14)
+                } else {
+                    Image(systemName: icon).font(.system(size: 11))
+                }
+            }
+            .foregroundColor(enabled ? Color.labelPrimary : Color.labelSecondary.opacity(0.3))
+            .frame(width: 28, height: 24)
+            .background(Color.white.opacity(enabled ? 0.06 : 0.02)).cornerRadius(4)
         }.buttonStyle(.plain).disabled(!enabled)
     }
 
@@ -1571,10 +1592,10 @@ private struct ImageInspector: View {
     private func imgCanvasBtn(_ icon: TransformIconType, label: String, active: Bool, action: @escaping () -> Void) -> some View {
         let nsImg: NSImage = {
             switch icon {
-            case .mirrorH: return svgIconMirrorH
-            case .mirrorV: return svgIconMirrorV
-            case .rotate:  return svgIconRotate
-            case .reverse: return svgIconReverse
+            case .mirrorH: return TimelineSVGIcon.load("mirrorH")
+            case .mirrorV: return TimelineSVGIcon.load("mirrorV")
+            case .rotate:  return TimelineSVGIcon.load("rotate")
+            case .reverse: return TimelineSVGIcon.load("reverse")
             }
         }()
         return Button {
@@ -1993,10 +2014,10 @@ private struct VideoInspector: View {
     private func canvasBtn(_ icon: TransformIconType, label: String, active: Bool, action: @escaping () -> Void) -> some View {
         let nsImg: NSImage = {
             switch icon {
-            case .mirrorH: return svgIconMirrorH
-            case .mirrorV: return svgIconMirrorV
-            case .rotate:  return svgIconRotate
-            case .reverse: return svgIconReverse
+            case .mirrorH: return TimelineSVGIcon.load("mirrorH")
+            case .mirrorV: return TimelineSVGIcon.load("mirrorV")
+            case .rotate:  return TimelineSVGIcon.load("rotate")
+            case .reverse: return TimelineSVGIcon.load("reverse")
             }
         }()
         return Button {
@@ -2386,8 +2407,8 @@ struct ICapsuleSlider: View {
         .cornerRadius(6)
         .overlay(
             RoundedRectangle(cornerRadius: 6)
-                .stroke(focused ? Color.accent : Color.white.opacity(0.08),
-                        lineWidth: focused ? 1 : 0.5)
+                .stroke(focused ? Color.accent : Color.clear,
+                        lineWidth: 1)
         )
     }
 
@@ -2543,7 +2564,7 @@ struct MiniStepper: View {
         .frame(height: 26)
         .background(Color.white.opacity(0.08))
         .cornerRadius(5)
-        .overlay(RoundedRectangle(cornerRadius: 5).stroke(isFocused ? Color.accent : Color.white.opacity(0.10)))
+        .overlay(RoundedRectangle(cornerRadius: 5).stroke(isFocused ? Color.accent : Color.clear))
     }
 
     private var formatted: String {
@@ -2563,6 +2584,7 @@ struct MiniStepper: View {
 struct IPicker<T: Hashable>: View {
     @Binding var selection: T
     let options: [(T, String)]
+    var height: CGFloat = 26
     @State private var hov = false
 
     var body: some View {
@@ -2578,7 +2600,7 @@ struct IPicker<T: Hashable>: View {
                     .foregroundColor(Color.labelSecondary)
             }
             .padding(.horizontal, 10)
-            .frame(maxWidth: .infinity, minHeight: 32, maxHeight: 32)
+            .frame(maxWidth: .infinity, minHeight: height, maxHeight: height)
             .background(Color.white.opacity(hov ? 0.10 : 0.06))
             .cornerRadius(7)
             .contentShape(Rectangle())
@@ -2709,7 +2731,7 @@ private struct SubtitleTextBox: View {
         .cornerRadius(5)
         .overlay(
             RoundedRectangle(cornerRadius: 5)
-                .stroke(isFocused ? Color.accent : Color.white.opacity(0.10), lineWidth: 1)
+                .stroke(isFocused ? Color.accent : Color.clear, lineWidth: 1)
         )
     }
 }
