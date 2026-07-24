@@ -374,6 +374,16 @@ final class ProjectState: ObservableObject {
     @Published var isDetectingScenes: Bool = false
     @Published var sceneDetectProgress: Double = 0
     var sceneDetectTask: Task<Void, Never>? = nil
+
+    func cancelSceneDetect() {
+        sceneDetectTask?.cancel()
+        sceneDetectTask = nil
+        SceneDetector.killCurrentProcess()
+        isDetectingScenes = false
+        sceneDetectProgress = 0
+        showSuccessToast(icon: "stop.fill", iconColor: .yellow, title: "智能分割", subtitle: "已停止", autoCountdown: false)
+    }
+
     @Published var isLLMAnalyzing: Bool = false
     @Published var llmAnalyzeProgress: Double = 0
     var llmAnalyzeTask: Task<Void, Never>? = nil

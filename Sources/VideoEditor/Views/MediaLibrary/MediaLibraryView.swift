@@ -805,6 +805,8 @@ private struct TranscribeFailBubble: View {
 
 struct SceneDetectBubble: View {
     let progress: Double
+    let onCancel: () -> Void
+    @State private var xHovering = false
 
     var body: some View {
         HStack(spacing: 10) {
@@ -835,6 +837,17 @@ struct SceneDetectBubble: View {
                 }
                 .frame(height: 14)
             }
+
+            Button(action: onCancel) {
+                Image(systemName: "xmark")
+                    .font(.system(size: 9, weight: .bold))
+                    .foregroundColor(xHovering ? Color.labelPrimary : Color.labelSecondary)
+                    .frame(width: 18, height: 18)
+                    .background(Color.white.opacity(xHovering ? 0.15 : 0.08))
+                    .clipShape(Circle())
+            }
+            .buttonStyle(.plain)
+            .onHover { xHovering = $0 }
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 10)

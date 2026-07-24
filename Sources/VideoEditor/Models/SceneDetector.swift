@@ -47,6 +47,17 @@ enum SceneDetector {
             userInfo: [NSLocalizedDescriptionKey: "下载失败"])
     }
 
+    private static var _currentProcess: Process?
+    private static let processLock = NSLock()
+
+    static func killCurrentProcess() {
+        processLock.lock()
+        let proc = _currentProcess
+        _currentProcess = nil
+        processLock.unlock()
+        if let proc = proc, proc.isRunning { proc.terminate() }
+    }
+
     static func detect(videoURL: URL, threshold: Double = 27.0,
                         progress: @escaping (Double) -> Void = { _ in }) async throws -> [Double] {
         guard isInstalled else { throw NSError(domain: "SceneDetect", code: 2,
@@ -75,6 +86,10 @@ enum SceneDetector {
         proc.standardError = errPipe
         try proc.run()
 
+        processLock.lock()
+        _currentProcess = proc
+        processLock.unlock()
+
         let errHandle = errPipe.fileHandleForReading
         var errData = Data()
         let readQueue = DispatchQueue(label: "scenedetect.stderr")
@@ -96,7 +111,16 @@ enum SceneDetector {
         proc.waitUntilExit()
         errHandle.readabilityHandler = nil
 
+        processLock.lock()
+        _currentProcess = nil
+        processLock.unlock()
+
+        try Task.checkCancellation()
+
         guard proc.terminationStatus == 0 else {
+            if proc.terminationStatus == 15 || proc.terminationStatus == 9 {
+                throw CancellationError()
+            }
             let output = String(data: errData, encoding: .utf8) ?? ""
             throw NSError(domain: "SceneDetect", code: 3,
                 userInfo: [NSLocalizedDescriptionKey: "分析失败: \(output.prefix(200))"])

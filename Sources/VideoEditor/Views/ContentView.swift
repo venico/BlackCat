@@ -205,7 +205,8 @@ struct ContentView: View {
                             removal: .opacity))
                 }
                 if project.isDetectingScenes {
-                    SceneDetectBubble(progress: project.sceneDetectProgress)
+                    SceneDetectBubble(progress: project.sceneDetectProgress,
+                                      onCancel: { project.cancelSceneDetect() })
                         .transition(.asymmetric(
                             insertion: .move(edge: .trailing).combined(with: .opacity),
                             removal: .opacity))

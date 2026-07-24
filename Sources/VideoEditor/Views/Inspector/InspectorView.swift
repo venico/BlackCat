@@ -1947,6 +1947,10 @@ private struct VideoInspector: View {
             $0.cropLeft = cropLeft
             $0.cropRight = cropRight
         }
+        if let trackID = project.videoClipTrackIDMap[clip.id] {
+            ColorCompositor.setDragOffset(trackID: trackID, offsetX: CGFloat(offsetX), offsetY: CGFloat(offsetY))
+            project.clock.refreshSeekRequest &+= 1
+        }
         project.rebuildTimelinePreviewDebounced()
     }
 
