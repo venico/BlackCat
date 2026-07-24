@@ -1,5 +1,6 @@
 import SwiftUI
 import AVFoundation
+import UniformTypeIdentifiers
 
 struct AIChatPanel: View {
     @EnvironmentObject private var project: ProjectState
@@ -7,9 +8,32 @@ struct AIChatPanel: View {
     @ObservedObject private var settings = AppSettings.shared
     @State private var inputText = ""
     @State private var showHistory = false
+    @State private var referenceContents: [RefContent] = []
+    @State private var firstFrameImage: (url: URL, image: NSImage)? = nil
+    @State private var lastFrameImage: (url: URL, image: NSImage)? = nil
+    @State private var imageMode: ImageInputMode = .reference
 
-    private let durations = ["5", "10"]
-    private let ratios = ["16:9", "9:16", "1:1"]
+    private enum RefContentType { case image, video, audio }
+    private struct RefContent: Identifiable {
+        let id = UUID()
+        let url: URL
+        let type: RefContentType
+        let thumbnail: NSImage
+    }
+
+    private enum ImageInputMode: String {
+        case reference, frames
+        var label: String {
+            switch self {
+            case .reference: return "参考内容"
+            case .frames: return "首尾帧"
+            }
+        }
+    }
+
+    private let durations = ["4", "5", "6", "7", "8", "9", "10"]
+    private let ratios = ["21:9", "16:9", "4:3", "1:1", "3:4", "9:16"]
+    private let resolutions = ["480P", "720P", "1080P", "4K"]
 
     var body: some View {
         VStack(spacing: 0) {
@@ -174,14 +198,37 @@ struct AIChatPanel: View {
 
     private var inputArea: some View {
         VStack(spacing: 0) {
-            VStack(spacing: 6) {
+            VStack(spacing: 0) {
+                HStack(alignment: .top) {
+                    if service.selectedProvider.category == .video {
+                        imagePreviewArea
+                    }
+                    Spacer()
+                    Button { showProviderMenu() } label: {
+                        HStack(spacing: 3) {
+                            Text(service.selectedProvider.displayName)
+                                .font(.system(size: 10))
+                                .lineLimit(1)
+                                .truncationMode(.tail)
+                            Image(systemName: "chevron.down")
+                                .font(.system(size: 7, weight: .bold))
+                        }
+                        .foregroundColor(Color.labelSecondary)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 3)
+                    }
+                    .buttonStyle(.plain)
+                }
+                .padding(.horizontal, 8)
+                .padding(.top, 8)
+
                 TextEditor(text: $inputText)
                     .font(.system(size: 12))
                     .foregroundColor(Color.labelPrimary)
                     .scrollContentBackground(.hidden)
                     .frame(minHeight: 30, maxHeight: 50)
                     .padding(.horizontal, 6)
-                    .padding(.top, 8)
+                    .padding(.top, 2)
                     .onKeyPress(.return) {
                         sendMessage()
                         return .handled
@@ -192,24 +239,39 @@ struct AIChatPanel: View {
                                 .font(.system(size: 12))
                                 .foregroundColor(Color.labelSecondary.opacity(0.4))
                                 .padding(.horizontal, 10)
-                                .padding(.top, 10)
+                                .padding(.top, 4)
                                 .allowsHitTesting(false)
                         }
                     }
 
                 HStack(spacing: 4) {
-                    Button { showProviderMenu() } label: {
-                        Text(service.selectedProvider.displayName)
-                            .font(.system(size: 10))
-                            .foregroundColor(Color.labelSecondary)
-                            .lineLimit(1)
-                            .truncationMode(.tail)
-                            .padding(.horizontal, 6)
-                            .padding(.vertical, 3)
-                            .background(Color.white.opacity(0.06))
-                            .clipShape(Capsule())
+                    if service.selectedProvider.category == .video {
+                        capsuleMenu(label: imageMode.label) {
+                            Button {
+                                firstFrameImage = nil; lastFrameImage = nil
+                                imageMode = .reference
+                            } label: { Text("参考内容") }
+                            Button {
+                                referenceContents.removeAll()
+                                imageMode = .frames
+                            } label: { Text("首尾帧") }
+                        }
+                        capsuleMenu(label: settings.aiDuration + "s") {
+                            ForEach(durations, id: \.self) { d in
+                                Button(d + "s") { settings.aiDuration = d }
+                            }
+                        }
+                        capsuleMenu(label: settings.aiRatio) {
+                            ForEach(ratios, id: \.self) { r in
+                                Button(r) { settings.aiRatio = r }
+                            }
+                        }
+                        capsuleMenu(label: settings.aiResolution) {
+                            ForEach(resolutions, id: \.self) { r in
+                                Button(r) { settings.aiResolution = r }
+                            }
+                        }
                     }
-                    .buttonStyle(.plain)
 
                     if service.selectedProvider.supportsWebSearch {
                         Button {
@@ -228,40 +290,6 @@ struct AIChatPanel: View {
                             .clipShape(Capsule())
                         }
                         .buttonStyle(.plain)
-                    }
-
-                    if service.selectedProvider.category == .video {
-                        Menu {
-                            ForEach(durations, id: \.self) { d in
-                                Button(d + "s") { settings.aiDuration = d }
-                            }
-                        } label: {
-                            Text(settings.aiDuration + "s")
-                                .font(.system(size: 10))
-                                .foregroundColor(Color.labelSecondary)
-                                .padding(.horizontal, 6)
-                                .padding(.vertical, 3)
-                                .background(Color.white.opacity(0.06))
-                                .clipShape(Capsule())
-                        }
-                        .menuStyle(.borderlessButton)
-                        .tint(Color.labelSecondary)
-
-                        Menu {
-                            ForEach(ratios, id: \.self) { r in
-                                Button(r) { settings.aiRatio = r }
-                            }
-                        } label: {
-                            Text(settings.aiRatio)
-                                .font(.system(size: 10))
-                                .foregroundColor(Color.labelSecondary)
-                                .padding(.horizontal, 6)
-                                .padding(.vertical, 3)
-                                .background(Color.white.opacity(0.06))
-                                .clipShape(Capsule())
-                        }
-                        .menuStyle(.borderlessButton)
-                        .tint(Color.labelSecondary)
                     }
 
                     Spacer()
@@ -290,11 +318,258 @@ struct AIChatPanel: View {
                 }
                 .padding(.horizontal, 8)
                 .padding(.bottom, 6)
+                .clipped()
             }
             .background(Color.white.opacity(0.06))
             .clipShape(RoundedRectangle(cornerRadius: 10))
             .padding(.horizontal, 8)
             .padding(.bottom, 8)
+        }
+    }
+
+    private func capsuleMenu<Content: View>(label: String, active: Bool = false, @ViewBuilder content: @escaping () -> Content) -> some View {
+        Menu { content() } label: {
+            Text(label)
+                .font(.system(size: 10))
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .foregroundColor(active ? Color.accent : Color.labelSecondary)
+                .padding(.horizontal, 6)
+                .padding(.vertical, 3)
+                .background(active ? Color.accent.opacity(0.15) : Color.white.opacity(0.06))
+                .clipShape(Capsule())
+        }
+        .menuStyle(.borderlessButton)
+        .tint(Color.labelSecondary)
+    }
+
+    // MARK: - 图片预览区
+
+    private var imagePreviewArea: some View {
+        HStack(spacing: 6) {
+            if imageMode == .reference {
+                refContentSlot
+            } else {
+                frameSlot(image: firstFrameImage, label: "首帧") {
+                    pickSingleImage { u, i in firstFrameImage = (u, i) }
+                }
+                Image(systemName: "arrow.left.arrow.right")
+                    .font(.system(size: 10))
+                    .foregroundColor(Color.labelSecondary.opacity(0.4))
+                frameSlot(image: lastFrameImage, label: "尾帧") {
+                    pickSingleImage { u, i in lastFrameImage = (u, i) }
+                }
+            }
+        }
+    }
+
+    private var refContentSlot: some View {
+        Group {
+            if referenceContents.isEmpty {
+                placeholderSlot(label: "参考内容", icon: "photo.badge.plus") { pickRefContents() }
+            } else {
+                ZStack {
+                    fanThumbnails
+                }
+                .frame(width: refFanWidth, height: 48)
+                .overlay(alignment: .topLeading) {
+                    if referenceContents.count > 1 {
+                        Text("\(referenceContents.count)")
+                            .font(.system(size: 8, weight: .bold))
+                            .foregroundColor(.black)
+                            .frame(width: 14, height: 14)
+                            .background(Color.accent)
+                            .clipShape(Circle())
+                            .offset(x: -3, y: -3)
+                    }
+                }
+                .overlay(alignment: .topTrailing) {
+                    Button { referenceContents.removeAll() } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.system(size: 12))
+                            .foregroundColor(.white.opacity(0.7))
+                    }
+                    .buttonStyle(.plain)
+                    .offset(x: 2, y: -3)
+                }
+                .onTapGesture { pickRefContents() }
+            }
+        }
+    }
+
+    private var refFanWidth: CGFloat {
+        let count = min(referenceContents.count, 3)
+        return count <= 1 ? 48 : 48 + CGFloat(count - 1) * 8
+    }
+
+    private var fanThumbnails: some View {
+        let items = Array(referenceContents.prefix(3))
+        let count = items.count
+        return ZStack {
+            ForEach(Array(items.enumerated()), id: \.offset) { i, item in
+                let angle = count == 1 ? 0.0 : Double(i - (count - 1)) * 8.0 + Double(count - 1) * 4.0
+                Image(nsImage: item.thumbnail)
+                    .resizable()
+                    .aspectRatio(contentMode: .fill)
+                    .frame(width: 48, height: 48)
+                    .clipShape(RoundedRectangle(cornerRadius: 6))
+                    .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.white.opacity(0.15), lineWidth: 0.5))
+                    .overlay(alignment: .bottomTrailing) {
+                        if item.type == .video {
+                            Image(systemName: "video.fill")
+                                .font(.system(size: 8))
+                                .foregroundColor(.white)
+                                .padding(2)
+                                .background(.black.opacity(0.5))
+                                .clipShape(RoundedRectangle(cornerRadius: 2))
+                                .padding(2)
+                        } else if item.type == .audio {
+                            Image(systemName: "waveform")
+                                .font(.system(size: 8))
+                                .foregroundColor(.white)
+                                .padding(2)
+                                .background(.black.opacity(0.5))
+                                .clipShape(RoundedRectangle(cornerRadius: 2))
+                                .padding(2)
+                        }
+                    }
+                    .shadow(color: .black.opacity(0.3), radius: 2, x: 0, y: 1)
+                    .rotationEffect(.degrees(angle))
+            }
+        }
+    }
+
+    private func frameSlot(image: (url: URL, image: NSImage)?, label: String, onPick: @escaping () -> Void) -> some View {
+        Group {
+            if let img = image {
+                Image(nsImage: img.image)
+                    .resizable()
+                    .aspectRatio(contentMode: .fill)
+                    .frame(width: 48, height: 48)
+                    .clipShape(RoundedRectangle(cornerRadius: 6))
+                    .overlay(alignment: .topTrailing) {
+                        Button {
+                            if label == "首帧" { firstFrameImage = nil } else { lastFrameImage = nil }
+                        } label: {
+                            Image(systemName: "xmark.circle.fill")
+                                .font(.system(size: 12))
+                                .foregroundColor(.white.opacity(0.7))
+                        }
+                        .buttonStyle(.plain)
+                        .offset(x: 2, y: -3)
+                    }
+                    .onTapGesture(perform: onPick)
+            } else {
+                placeholderSlot(label: label, icon: "photo", action: onPick)
+            }
+        }
+    }
+
+    private func placeholderSlot(label: String, icon: String = "photo", action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            RoundedRectangle(cornerRadius: 6)
+                .fill(Color.white.opacity(0.06))
+                .frame(width: 48, height: 48)
+                .overlay {
+                    VStack(spacing: 2) {
+                        Image(systemName: icon)
+                            .font(.system(size: 14, weight: .light))
+                            .foregroundColor(Color.labelSecondary.opacity(0.45))
+                        Text(label)
+                            .font(.system(size: 8))
+                            .foregroundColor(Color.labelSecondary.opacity(0.4))
+                    }
+                }
+        }
+        .buttonStyle(.plain)
+    }
+
+    // MARK: - 参考内容选择
+
+    private static let imageExts: Set<String> = ["jpg","jpeg","png","gif","bmp","tiff","webp","heic"]
+    private static let videoExts: Set<String> = ["mp4","mov","m4v","avi","mkv","webm"]
+    private static let audioExts: Set<String> = ["mp3","wav","m4a","aac","flac","ogg"]
+
+    private func pickRefContents() {
+        let totalLimit = 12
+        let remaining = totalLimit - referenceContents.count
+        guard remaining > 0 else { return }
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.image, .movie, .audio]
+        panel.allowsMultipleSelection = true
+        panel.canChooseDirectories = false
+        panel.message = "选择参考内容（图片≤9 视频≤3 音频≤3 总数≤12）"
+        panel.begin { [self] response in
+            guard response == .OK else { return }
+            let urls = Array(panel.urls.prefix(remaining))
+            var imgCount = referenceContents.filter { $0.type == .image }.count
+            var vidCount = referenceContents.filter { $0.type == .video }.count
+            var audCount = referenceContents.filter { $0.type == .audio }.count
+            var newItems: [RefContent] = []
+            for u in urls {
+                let ext = u.pathExtension.lowercased()
+                if Self.imageExts.contains(ext), imgCount < 9 {
+                    if let img = NSImage(contentsOf: u) {
+                        newItems.append(RefContent(url: u, type: .image, thumbnail: img.thumbnailImage(maxSize: 200)))
+                        imgCount += 1
+                    }
+                } else if Self.videoExts.contains(ext), vidCount < 3 {
+                    let thumb = Self.videoThumbnail(url: u)
+                    newItems.append(RefContent(url: u, type: .video, thumbnail: thumb))
+                    vidCount += 1
+                } else if Self.audioExts.contains(ext), audCount < 3 {
+                    let thumb = Self.audioThumbnail()
+                    newItems.append(RefContent(url: u, type: .audio, thumbnail: thumb))
+                    audCount += 1
+                }
+                if referenceContents.count + newItems.count >= totalLimit { break }
+            }
+            DispatchQueue.main.async { referenceContents.append(contentsOf: newItems) }
+        }
+    }
+
+    private static func videoThumbnail(url: URL) -> NSImage {
+        let asset = AVAsset(url: url)
+        let gen = AVAssetImageGenerator(asset: asset)
+        gen.appliesPreferredTrackTransform = true
+        gen.maximumSize = CGSize(width: 200, height: 200)
+        if let cg = try? gen.copyCGImage(at: .zero, actualTime: nil) {
+            return NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
+        }
+        let img = NSImage(size: NSSize(width: 48, height: 48))
+        img.lockFocus()
+        NSColor.darkGray.setFill()
+        NSBezierPath.fill(NSRect(origin: .zero, size: img.size))
+        img.unlockFocus()
+        return img
+    }
+
+    private static func audioThumbnail() -> NSImage {
+        let size = NSSize(width: 48, height: 48)
+        let img = NSImage(size: size)
+        img.lockFocus()
+        NSColor(white: 0.2, alpha: 1).setFill()
+        NSBezierPath(roundedRect: NSRect(origin: .zero, size: size), xRadius: 6, yRadius: 6).fill()
+        let symbol = NSImage(systemSymbolName: "waveform", accessibilityDescription: nil)
+        if let s = symbol {
+            let config = NSImage.SymbolConfiguration(pointSize: 20, weight: .light)
+            let configured = s.withSymbolConfiguration(config) ?? s
+            let r = NSRect(x: (48 - 28) / 2, y: (48 - 28) / 2, width: 28, height: 28)
+            configured.draw(in: r)
+        }
+        img.unlockFocus()
+        return img
+    }
+
+    private func pickSingleImage(completion: @escaping (URL, NSImage) -> Void) {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.image]
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        panel.begin { response in
+            guard response == .OK, let url = panel.url, let img = NSImage(contentsOf: url) else { return }
+            let thumb = img.thumbnailImage(maxSize: 200)
+            DispatchQueue.main.async { completion(url, thumb) }
         }
     }
 
@@ -380,7 +655,15 @@ struct AIChatPanel: View {
         let text = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty, !service.isGenerating else { return }
         inputText = ""
-        service.sendPrompt(text, duration: settings.aiDuration, aspectRatio: settings.aiRatio)
+        let refImageURLs = referenceContents.filter { $0.type == .image }.map(\.url)
+        let refVideoURLs = referenceContents.filter { $0.type == .video }.map(\.url)
+        let refAudioURLs = referenceContents.filter { $0.type == .audio }.map(\.url)
+        let firstURL = firstFrameImage?.url
+        let lastURL = lastFrameImage?.url
+        service.sendPrompt(text, duration: settings.aiDuration, aspectRatio: settings.aiRatio, resolution: settings.aiResolution, referenceImages: refImageURLs, referenceVideos: refVideoURLs, referenceAudios: refAudioURLs, firstFrame: firstURL, lastFrame: lastURL)
+        referenceContents.removeAll()
+        firstFrameImage = nil
+        lastFrameImage = nil
     }
 
     private func insertMediaToTimeline(_ url: URL) {
@@ -880,5 +1163,21 @@ private struct HoverIconButton: View {
         .buttonStyle(.plain)
         .onHover { hovering = $0 }
         .help(tip)
+    }
+}
+
+// MARK: - NSImage Thumbnail
+
+private extension NSImage {
+    func thumbnailImage(maxSize: CGFloat) -> NSImage {
+        let s = self.size
+        guard s.width > 0, s.height > 0 else { return self }
+        let scale = min(maxSize / s.width, maxSize / s.height, 1)
+        let newSize = NSSize(width: s.width * scale, height: s.height * scale)
+        let img = NSImage(size: newSize)
+        img.lockFocus()
+        self.draw(in: NSRect(origin: .zero, size: newSize), from: .zero, operation: .copy, fraction: 1)
+        img.unlockFocus()
+        return img
     }
 }

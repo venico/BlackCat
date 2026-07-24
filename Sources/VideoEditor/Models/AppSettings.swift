@@ -24,6 +24,7 @@ final class AppSettings: ObservableObject {
         static let aiProvider = "settings.ai.provider"
         static let aiDuration = "settings.ai.duration"
         static let aiRatio = "settings.ai.ratio"
+        static let aiResolution = "settings.ai.resolution"
         static let seedanceApiKey = "settings.ai.seedance.apiKey"
         static let seedanceEndpoint = "settings.ai.seedance.endpoint"
         static let seedance15Endpoint = "settings.ai.seedance15.endpoint"
@@ -232,6 +233,9 @@ final class AppSettings: ObservableObject {
     @Published var aiRatio: String {
         didSet { ud.set(aiRatio, forKey: K.aiRatio) }
     }
+    @Published var aiResolution: String {
+        didSet { ud.set(aiResolution, forKey: K.aiResolution) }
+    }
     @Published var seedanceApiKey: String {
         didSet { ud.set(seedanceApiKey, forKey: K.seedanceApiKey) }
     }
@@ -311,6 +315,7 @@ final class AppSettings: ObservableObject {
         aiProvider = ud.string(forKey: K.aiProvider) ?? "kling"
         aiDuration = ud.string(forKey: K.aiDuration) ?? "5"
         aiRatio = ud.string(forKey: K.aiRatio) ?? "16:9"
+        aiResolution = ud.string(forKey: K.aiResolution) ?? "720P"
         seedanceApiKey = ud.string(forKey: K.seedanceApiKey) ?? ""
         seedanceEndpoint = ud.string(forKey: K.seedanceEndpoint) ?? ""
         seedance15Endpoint = ud.string(forKey: K.seedance15Endpoint) ?? ""

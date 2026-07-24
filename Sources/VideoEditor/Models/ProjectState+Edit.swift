@@ -487,18 +487,32 @@ extension ProjectState {
                 collectedShape.append(newTrack)
             }
         }
+        var collectedCompound: [Track<CompoundClip>] = []
+        for ti in compoundTracks.indices {
+            let matched = compoundTracks[ti].clips.filter { ids.contains($0.id) }
+            if !matched.isEmpty {
+                for c in matched { minTime = min(minTime, c.startTime); maxTime = max(maxTime, c.endTime) }
+                collectedCompound.append(Track(clips: matched, label: compoundTracks[ti].label))
+            }
+        }
 
         guard minTime < maxTime else { return }
 
         // 确定复合片段类型和锚点（在移除源片段前记录）
-        let willBeVideo = !collectedVideo.isEmpty
-        let willBeAudio = !willBeVideo && !collectedAudio.isEmpty
+        let willBeVideo = !collectedVideo.isEmpty || collectedCompound.flatMap(\.clips).contains(where: { compoundHasVideo($0) })
+        let willBeAudio = !willBeVideo && (!collectedAudio.isEmpty || collectedCompound.flatMap(\.clips).contains(where: { compoundHasAudio($0) }))
         var anchorTrackID: UUID?
         var anchorOverlayIdx: Int?
         if willBeVideo {
             anchorTrackID = videoTracks.first(where: { t in t.clips.contains { ids.contains($0.id) } })?.id
+            if anchorTrackID == nil {
+                anchorTrackID = compoundTracks.first(where: { t in t.clips.contains { ids.contains($0.id) } })?.id
+            }
         } else if willBeAudio {
             anchorTrackID = audioTracks.first(where: { t in t.clips.contains { ids.contains($0.id) } })?.id
+            if anchorTrackID == nil {
+                anchorTrackID = compoundTracks.first(where: { t in t.clips.contains { ids.contains($0.id) } })?.id
+            }
         } else {
             for (oi, ref) in overlayTrackOrder.enumerated() {
                 let tid = ref.trackID
@@ -508,7 +522,7 @@ extension ProjectState {
                 case .subtitle: affected = subtitleTracks.first(where: { $0.id == tid })?.clips.contains { ids.contains($0.id) } ?? false
                 case .text: affected = textTracks.first(where: { $0.id == tid })?.clips.contains { ids.contains($0.id) } ?? false
                 case .shape: affected = shapeTracks.first(where: { $0.id == tid })?.clips.contains { ids.contains($0.id) } ?? false
-                case .compound: break
+                case .compound: affected = compoundTracks.first(where: { $0.id == tid })?.clips.contains { ids.contains($0.id) } ?? false
                 }
                 if affected { anchorOverlayIdx = oi; break }
             }
@@ -560,6 +574,12 @@ extension ProjectState {
                 collectedShape[ti].clips[ci].endTime -= offset
             }
         }
+        for ti in collectedCompound.indices {
+            for ci in collectedCompound[ti].clips.indices {
+                collectedCompound[ti].clips[ci].startTime -= offset
+                collectedCompound[ti].clips[ci].endTime -= offset
+            }
+        }
 
         // 从父时间线移除选中片段
         for ti in videoTracks.indices {
@@ -580,45 +600,37 @@ extension ProjectState {
         for ti in shapeTracks.indices {
             shapeTracks[ti].clips.removeAll { ids.contains($0.id) }
         }
+        for ti in compoundTracks.indices {
+            compoundTracks[ti].clips.removeAll { ids.contains($0.id) }
+        }
 
         // 清理变空的轨道
         let emptyImageIDs = imageTracks.filter { $0.clips.isEmpty }.map(\.id)
         let emptySubIDs = subtitleTracks.filter { $0.clips.isEmpty }.map(\.id)
         let emptyTextIDs = textTracks.filter { $0.clips.isEmpty }.map(\.id)
         let emptyShapeIDs = shapeTracks.filter { $0.clips.isEmpty }.map(\.id)
+        let emptyCompIDs = compoundTracks.filter { $0.clips.isEmpty }.map(\.id)
         videoTracks.removeAll { $0.clips.isEmpty }
         audioTracks.removeAll { $0.clips.isEmpty }
         imageTracks.removeAll { $0.clips.isEmpty }
         subtitleTracks.removeAll { $0.clips.isEmpty }
         textTracks.removeAll { $0.clips.isEmpty }
         shapeTracks.removeAll { $0.clips.isEmpty }
-        let removedOverlayIDs = Set(emptyImageIDs + emptySubIDs + emptyTextIDs + emptyShapeIDs)
+        compoundTracks.removeAll { $0.clips.isEmpty }
+        let removedOverlayIDs = Set(emptyImageIDs + emptySubIDs + emptyTextIDs + emptyShapeIDs + emptyCompIDs)
         if !removedOverlayIDs.isEmpty {
             overlayTrackOrder.removeAll { removedOverlayIDs.contains($0.trackID) }
         }
 
-        // 收集复合片段（嵌套支持）
-        var collectedCompound: [Track<CompoundClip>] = []
-        for ti in compoundTracks.indices {
-            let matched = compoundTracks[ti].clips.filter { ids.contains($0.id) }
-            if !matched.isEmpty {
-                for c in matched { minTime = min(minTime, c.startTime); maxTime = max(maxTime, c.endTime) }
-                collectedCompound.append(Track(clips: matched, label: compoundTracks[ti].label))
-            }
+        let parentNum: String
+        if let pn = compositionStack.last?.name {
+            parentNum = pn.replacingOccurrences(of: "复合片段", with: "").trimmingCharacters(in: .whitespaces)
+        } else {
+            parentNum = ""
         }
-        for ti in compoundTracks.indices {
-            compoundTracks[ti].clips.removeAll { ids.contains($0.id) }
-        }
-        for ti in collectedCompound.indices {
-            for ci in collectedCompound[ti].clips.indices {
-                collectedCompound[ti].clips[ci].startTime -= offset
-                collectedCompound[ti].clips[ci].endTime -= offset
-            }
-        }
-
-        let totalCount = compoundTracks.flatMap(\.clips).count + 1
+        let childIdx = compoundTracks.flatMap(\.clips).count + 1
         var compound = CompoundClip(
-            name: "复合片段 \(totalCount)",
+            name: "复合片段\(parentNum)\(childIdx)",
             startTime: minTime, endTime: maxTime,
             videoTracks: collectedVideo, audioTracks: collectedAudio,
             imageTracks: collectedImage, subtitleTracks: collectedSubtitle,
@@ -760,6 +772,18 @@ extension ProjectState {
         return nil
     }
 
+    private static func renameCompoundHierarchy(_ clip: inout CompoundClip, oldPrefix: String, newPrefix: String) {
+        let num = clip.name.replacingOccurrences(of: "复合片段", with: "")
+        if num.hasPrefix(oldPrefix) {
+            clip.name = "复合片段\(newPrefix)\(num.dropFirst(oldPrefix.count))"
+        }
+        for ti in clip.compoundTracks.indices {
+            for ci in clip.compoundTracks[ti].clips.indices {
+                renameCompoundHierarchy(&clip.compoundTracks[ti].clips[ci], oldPrefix: oldPrefix, newPrefix: newPrefix)
+            }
+        }
+    }
+
     func dissolveCompound(_ compoundID: UUID) {
         let snap = currentSnapshot()
         guard let ti = compoundTracks.firstIndex(where: { $0.clips.contains { $0.id == compoundID } }),
@@ -822,9 +846,28 @@ extension ProjectState {
             shapeTracks.append(newTrack)
             subIDtoNewRef[subTrack.id] = .shape(newTrack.id)
         }
+        let dissolvedNum = compound.name.replacingOccurrences(of: "复合片段", with: "")
+        let parentNum: String
+        if let pn = compositionStack.last?.name {
+            parentNum = pn.replacingOccurrences(of: "复合片段", with: "")
+        } else {
+            parentNum = ""
+        }
+        var usedNames = Set(compoundTracks.flatMap(\.clips).filter { $0.id != compoundID }.map(\.name))
         for subTrack in compound.compoundTracks {
             var clips = subTrack.clips
-            for i in clips.indices { clips[i].startTime += offset; clips[i].endTime += offset }
+            for i in clips.indices {
+                clips[i].startTime += offset; clips[i].endTime += offset
+                Self.renameCompoundHierarchy(&clips[i], oldPrefix: dissolvedNum, newPrefix: parentNum)
+                var name = clips[i].name
+                if usedNames.contains(name) {
+                    var n = 2
+                    while usedNames.contains("\(name)(\(n))") { n += 1 }
+                    name = "\(name)(\(n))"
+                    clips[i].name = name
+                }
+                usedNames.insert(name)
+            }
             compoundTracks.append(Track(clips: clips, label: subTrack.label))
         }
 

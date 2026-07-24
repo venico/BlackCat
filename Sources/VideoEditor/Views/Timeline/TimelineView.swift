@@ -944,7 +944,14 @@ struct TimelineView: View {
                                 Text("创建复合片段")
                             }
                             if let cid = project.selectedCompoundClipID {
-                                Button { project.dissolveCompound(cid) } label: { Label("解除复合片段", systemImage: "rectangle.on.rectangle.slash") }
+                                Button { project.renamingCompoundClipID = cid } label: {
+                                    Image(nsImage: SidebarSVGIcon.load("rename", size: 14))
+                                    Text("重命名")
+                                }
+                                Button { project.dissolveCompound(cid) } label: {
+                                    Image(nsImage: SidebarSVGIcon.load("dissolveCompound", size: 14))
+                                    Text("解除复合片段")
+                                }
                             }
                             Divider()
                             Button(role: .destructive) { project.deleteSelected() } label: {
@@ -3458,16 +3465,21 @@ private struct CompoundClipView: View {
     var sel: Bool = false
     var isDragging: Bool = false
     @EnvironmentObject var project: ProjectState
+    @State private var editName: String = ""
+    @FocusState private var nameFieldFocused: Bool
+
+    private var isRenaming: Bool { project.renamingCompoundClipID == clip.id }
 
     private enum ContentKind { case video(UUID), image(UUID), audio(UUID), subtitle(String), text(String), shape, empty }
 
     private var primaryContent: ContentKind {
-        if let vc = clip.videoTracks.flatMap(\.clips).first { return .video(vc.assetID) }
-        if let ic = clip.imageTracks.flatMap(\.clips).first { return .image(ic.assetID) }
-        if let tc = clip.textTracks.flatMap(\.clips).first { return .text(tc.text) }
-        if let sc = clip.shapeTracks.flatMap(\.clips).first { return .shape }
-        if let sub = clip.subtitleTracks.flatMap(\.clips).first { return .subtitle(sub.text) }
-        if let ac = clip.audioTracks.flatMap(\.clips).first { return .audio(ac.assetID) }
+        let c = clip.flattened()
+        if let vc = c.videoTracks.flatMap(\.clips).first { return .video(vc.assetID) }
+        if let ic = c.imageTracks.flatMap(\.clips).first { return .image(ic.assetID) }
+        if let ac = c.audioTracks.flatMap(\.clips).first { return .audio(ac.assetID) }
+        if !c.shapeTracks.flatMap(\.clips).isEmpty { return .shape }
+        if let tc = c.textTracks.flatMap(\.clips).first { return .text(tc.text) }
+        if let sub = c.subtitleTracks.flatMap(\.clips).first { return .subtitle(sub.text) }
         return .empty
     }
 
@@ -3498,10 +3510,27 @@ private struct CompoundClipView: View {
                     .aspectRatio(contentMode: .fit)
                     .frame(width: 10, height: 10)
                     .foregroundColor(.white)
-                Text(clip.name)
-                    .font(.system(size: 9, weight: .medium))
-                    .foregroundColor(.white)
-                    .lineLimit(1)
+                if isRenaming {
+                    TextField("", text: $editName)
+                        .textFieldStyle(.plain)
+                        .font(.system(size: 9, weight: .medium))
+                        .foregroundColor(.white)
+                        .focused($nameFieldFocused)
+                        .frame(minWidth: 40, maxWidth: 120)
+                        .onSubmit { commitRename() }
+                        .onAppear {
+                            editName = clip.name
+                            DispatchQueue.main.async { nameFieldFocused = true }
+                        }
+                        .onChange(of: nameFieldFocused) { focused in
+                            if !focused { commitRename() }
+                        }
+                } else {
+                    Text(clip.name)
+                        .font(.system(size: 9, weight: .medium))
+                        .foregroundColor(.white)
+                        .lineLimit(1)
+                }
             }
             .shadow(color: .black.opacity(0.4), radius: 2, x: 0, y: 1)
             .padding(.leading, stickyTitleX)
@@ -3533,7 +3562,16 @@ private struct CompoundClipView: View {
         )
         .opacity(isDragging ? 0 : 1.0)
         .offset(x: clip.startTime * pps + 1)
-        .allowsHitTesting(false)
+        .allowsHitTesting(isRenaming)
+    }
+
+    private func commitRename() {
+        guard project.renamingCompoundClipID == clip.id else { return }
+        let n = editName.trimmingCharacters(in: .whitespaces)
+        if !n.isEmpty && n != clip.name {
+            project.updateCompoundClip(id: clip.id) { $0.name = n }
+        }
+        project.renamingCompoundClipID = nil
     }
 
     @ViewBuilder

@@ -199,7 +199,8 @@ extension ProjectState {
                 case .compound(let trackID):
                     guard let cTrack = cTracks.first(where: { $0.id == trackID }),
                           cTrack.isVisible else { continue }
-                    for compound in cTrack.clips {
+                    for rawCompound in cTrack.clips {
+                        let compound = rawCompound.flattened()
                         for subTrack in compound.videoTracks {
                             for subClip in subTrack.clips {
                                 guard let url = subClip.url else { continue }

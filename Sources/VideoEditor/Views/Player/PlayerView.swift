@@ -489,9 +489,26 @@ private struct OverlayStack: View {
                 compoundShapes(compound: compound, it: it, geo: geo)
                 compoundTexts(compound: compound, it: it, geo: geo)
                 compoundSubtitles(compound: compound, it: it, geo: geo)
+                nestedCompoundOverlays(compound: compound, it: it, geo: geo)
             }
         }
         .allowsHitTesting(false)
+    }
+
+    private func nestedCompoundOverlays(compound: CompoundClip, it: Double, geo: GeometryProxy) -> AnyView {
+        let active = compound.compoundTracks
+            .filter { $0.isVisible }
+            .flatMap(\.clips)
+            .filter { $0.startTime <= it && $0.endTime > it }
+        guard !active.isEmpty else { return AnyView(EmptyView()) }
+        return AnyView(ForEach(active) { nested in
+            let nit = it - nested.startTime + nested.internalStart
+            self.compoundImages(compound: nested, it: nit, geo: geo)
+            self.compoundShapes(compound: nested, it: nit, geo: geo)
+            self.compoundTexts(compound: nested, it: nit, geo: geo)
+            self.compoundSubtitles(compound: nested, it: nit, geo: geo)
+            self.nestedCompoundOverlays(compound: nested, it: nit, geo: geo)
+        })
     }
 
     private func compoundClipAt(trackID: UUID, time: Double) -> (CompoundClip, Double)? {

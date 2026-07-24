@@ -829,7 +829,8 @@ actor TimelineExporter {
         // ── 复合片段视频子轨道 ──
         for compTrack in input.compoundTracks {
             guard compTrack.isVisible else { continue }
-            for compound in compTrack.clips {
+            for rawCompound in compTrack.clips {
+                let compound = rawCompound.flattened()
                 let cIntStart = compound.internalStart
                 let cIntEnd   = compound.internalStart + compound.duration
                 for subTrack in compound.videoTracks {
@@ -1012,7 +1013,8 @@ actor TimelineExporter {
         // ── 复合片段音频子轨道 ──
         for compTrack in input.compoundTracks {
             guard compTrack.isVisible && !compTrack.isMuted else { continue }
-            for compound in compTrack.clips {
+            for rawCompound in compTrack.clips {
+                let compound = rawCompound.flattened()
                 let cIntStart = compound.internalStart
                 let cIntEnd   = compound.internalStart + compound.duration
                 for subTrack in compound.audioTracks {
@@ -1767,7 +1769,8 @@ actor TimelineExporter {
                                                 }
                                             case .compound(let trackID):
                                                 if let track = compoundTracks.first(where: { $0.id == trackID && $0.isVisible }),
-                                                   let compound = track.clips.first(where: { $0.startTime <= targetTime && $0.endTime > targetTime }) {
+                                                   let rawCompound = track.clips.first(where: { $0.startTime <= targetTime && $0.endTime > targetTime }) {
+                                                    let compound = rawCompound.flattened()
                                                     let it = targetTime - compound.startTime + compound.internalStart
                                                     for imgTrack in compound.imageTracks {
                                                         if let clip = imgTrack.clips.first(where: { $0.startTime <= it && $0.endTime > it }),

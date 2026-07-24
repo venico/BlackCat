@@ -56,12 +56,28 @@ final class ProjectState: ObservableObject {
 
     func compoundTrackKind(_ track: Track<CompoundClip>) -> CompoundTrackKind {
         for clip in track.clips {
-            if !clip.videoTracks.flatMap(\.clips).isEmpty { return .video }
+            if compoundHasVideo(clip) { return .video }
         }
         for clip in track.clips {
-            if !clip.audioTracks.flatMap(\.clips).isEmpty { return .audio }
+            if compoundHasAudio(clip) { return .audio }
         }
         return .overlay
+    }
+
+    func compoundHasVideo(_ compound: CompoundClip) -> Bool {
+        if !compound.videoTracks.flatMap(\.clips).isEmpty { return true }
+        for t in compound.compoundTracks {
+            for c in t.clips { if compoundHasVideo(c) { return true } }
+        }
+        return false
+    }
+
+    func compoundHasAudio(_ compound: CompoundClip) -> Bool {
+        if !compound.audioTracks.flatMap(\.clips).isEmpty { return true }
+        for t in compound.compoundTracks {
+            for c in t.clips { if compoundHasAudio(c) { return true } }
+        }
+        return false
     }
     @Published var overlayTrackOrder: [OverlayTrackRef] = []
 
@@ -296,6 +312,7 @@ final class ProjectState: ObservableObject {
     @Published var editingTextClipID: UUID?     = nil
     @Published var selectedShapeClipID: UUID?    = nil
     @Published var selectedCompoundClipID: UUID? = nil
+    @Published var renamingCompoundClipID: UUID? = nil
     @Published var penDrawingMode: Bool = false
     @Published var penEditingClipID: UUID? = nil
     var penRawPoints: [(x: Double, y: Double, cInDX: Double, cInDY: Double, cOutDX: Double, cOutDY: Double, smooth: Bool)] = []

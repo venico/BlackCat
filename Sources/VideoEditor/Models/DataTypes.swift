@@ -758,6 +758,98 @@ struct CompoundClip: Identifiable, Equatable, Codable {
     var compoundTracks: [Track<CompoundClip>] = []
     var overlayTrackOrder: [ProjectState.OverlayTrackRef] = []
     var markers: [Marker]? = nil
+
+    func flattened() -> CompoundClip {
+        guard !compoundTracks.isEmpty else { return self }
+        var r = self
+        r.compoundTracks = []
+        for nTrack in compoundTracks {
+            guard nTrack.isVisible else { continue }
+            for nested in nTrack.clips {
+                let flat = nested.flattened()
+                let ni = flat.internalStart
+                let ne = flat.internalStart + flat.duration
+                let muted = nTrack.isMuted
+                for st in flat.videoTracks where st.isVisible {
+                    var mc: [VideoClip] = []
+                    for var c in st.clips {
+                        let vs = max(c.startTime, ni); let ve = min(c.endTime, ne)
+                        guard ve - vs > 0.01 else { continue }
+                        c.trimStart += (vs - c.startTime) * max(0.01, c.speed)
+                        c.startTime = nested.startTime + (vs - ni)
+                        c.endTime   = nested.startTime + (ve - ni)
+                        mc.append(c)
+                    }
+                    if !mc.isEmpty {
+                        var t = Track<VideoClip>(clips: mc)
+                        t.isMuted = st.isMuted || muted
+                        r.videoTracks.append(t)
+                    }
+                }
+                for st in flat.audioTracks where st.isVisible && !st.isMuted && !muted {
+                    var mc: [AudioClip] = []
+                    for var c in st.clips {
+                        let vs = max(c.startTime, ni); let ve = min(c.endTime, ne)
+                        guard ve - vs > 0.01 else { continue }
+                        c.trimStart += (vs - c.startTime) * max(0.01, c.speed)
+                        c.startTime = nested.startTime + (vs - ni)
+                        c.endTime   = nested.startTime + (ve - ni)
+                        mc.append(c)
+                    }
+                    if !mc.isEmpty { r.audioTracks.append(Track(clips: mc)) }
+                }
+                for st in flat.imageTracks where st.isVisible {
+                    var mc: [ImageClip] = []
+                    for var c in st.clips {
+                        let vs = max(c.startTime, ni); let ve = min(c.endTime, ne)
+                        guard ve - vs > 0.01 else { continue }
+                        c.startTime = nested.startTime + (vs - ni)
+                        c.endTime   = nested.startTime + (ve - ni)
+                        mc.append(c)
+                    }
+                    if !mc.isEmpty { r.imageTracks.append(Track(clips: mc)) }
+                }
+                for st in flat.subtitleTracks where st.isVisible {
+                    var mc: [SubtitleClip] = []
+                    for var c in st.clips {
+                        let vs = max(c.startTime, ni); let ve = min(c.endTime, ne)
+                        guard ve - vs > 0.01 else { continue }
+                        c.startTime = nested.startTime + (vs - ni)
+                        c.endTime   = nested.startTime + (ve - ni)
+                        mc.append(c)
+                    }
+                    if !mc.isEmpty {
+                        var t = Track<SubtitleClip>(clips: mc)
+                        t.subtitleStyle = st.subtitleStyle
+                        r.subtitleTracks.append(t)
+                    }
+                }
+                for st in flat.textTracks where st.isVisible {
+                    var mc: [TextClip] = []
+                    for var c in st.clips {
+                        let vs = max(c.startTime, ni); let ve = min(c.endTime, ne)
+                        guard ve - vs > 0.01 else { continue }
+                        c.startTime = nested.startTime + (vs - ni)
+                        c.endTime   = nested.startTime + (ve - ni)
+                        mc.append(c)
+                    }
+                    if !mc.isEmpty { r.textTracks.append(Track(clips: mc)) }
+                }
+                for st in flat.shapeTracks where st.isVisible {
+                    var mc: [ShapeClip] = []
+                    for var c in st.clips {
+                        let vs = max(c.startTime, ni); let ve = min(c.endTime, ne)
+                        guard ve - vs > 0.01 else { continue }
+                        c.startTime = nested.startTime + (vs - ni)
+                        c.endTime   = nested.startTime + (ve - ni)
+                        mc.append(c)
+                    }
+                    if !mc.isEmpty { r.shapeTracks.append(Track(clips: mc)) }
+                }
+            }
+        }
+        return r
+    }
 }
 
 // MARK: - Snapshot (for undo/redo)

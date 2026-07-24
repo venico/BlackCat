@@ -96,6 +96,44 @@ final class AIVideoService: ObservableObject {
         var supportsWebSearch: Bool {
             category == .text
         }
+
+        var maxReferenceImages: Int {
+            switch self {
+            case .seedance, .seedance15: return 9
+            case .kling, .runway, .minimax, .vidu: return 1
+            case .gptImage2: return 4
+            case .flux, .sd3, .wanxiang: return 1
+            default: return 0
+            }
+        }
+
+        var maxReferenceVideos: Int {
+            switch self {
+            case .seedance, .seedance15: return 3
+            default: return 0
+            }
+        }
+
+        var maxReferenceAudios: Int {
+            switch self {
+            case .seedance, .seedance15: return 3
+            default: return 0
+            }
+        }
+
+        var supportsFirstFrame: Bool {
+            switch self {
+            case .kling, .seedance, .seedance15, .runway, .minimax, .vidu: return true
+            default: return false
+            }
+        }
+
+        var supportsLastFrame: Bool {
+            switch self {
+            case .kling: return true
+            default: return false
+            }
+        }
     }
 
     enum TaskStatus: Equatable {
@@ -193,7 +231,7 @@ final class AIVideoService: ObservableObject {
         loadHistory()
     }
 
-    func sendPrompt(_ prompt: String, duration: String = "5", aspectRatio: String = "16:9") {
+    func sendPrompt(_ prompt: String, duration: String = "5", aspectRatio: String = "16:9", resolution: String = "720P", referenceImages: [URL] = [], referenceVideos: [URL] = [], referenceAudios: [URL] = [], firstFrame: URL? = nil, lastFrame: URL? = nil) {
         let userMsg = ChatMessage(role: .user, content: prompt)
         messages.append(userMsg)
 
@@ -222,7 +260,7 @@ final class AIVideoService: ObservableObject {
             do {
                 switch category {
                 case .video:
-                    let url = try await generateVideo(provider: provider, prompt: prompt, duration: duration, aspectRatio: aspectRatio)
+                    let url = try await generateVideo(provider: provider, prompt: prompt, duration: duration, aspectRatio: aspectRatio, resolution: resolution, referenceImages: referenceImages, referenceVideos: referenceVideos, referenceAudios: referenceAudios, firstFrame: firstFrame, lastFrame: lastFrame)
                     applyGenerationResult(convId: convId, msgId: msgId, content: "视频生成完成", mediaURL: url, status: .completed(url: url))
                 case .image:
                     let url = try await generateImage(provider: provider, prompt: prompt)
@@ -425,24 +463,24 @@ final class AIVideoService: ObservableObject {
 
     // MARK: - API 调用
 
-    private func generateVideo(provider: Provider, prompt: String, duration: String, aspectRatio: String) async throws -> URL {
+    private func generateVideo(provider: Provider, prompt: String, duration: String, aspectRatio: String, resolution: String, referenceImages: [URL], referenceVideos: [URL] = [], referenceAudios: [URL] = [], firstFrame: URL?, lastFrame: URL?) async throws -> URL {
         switch provider {
         case .kling:
-            return try await generateWithKling(prompt: prompt, duration: duration, aspectRatio: aspectRatio)
+            return try await generateWithKling(prompt: prompt, duration: duration, aspectRatio: aspectRatio, referenceImage: referenceImages.first ?? firstFrame, lastFrame: lastFrame)
         case .runway:
-            return try await generateWithRunway(prompt: prompt, duration: duration, aspectRatio: aspectRatio)
+            return try await generateWithRunway(prompt: prompt, duration: duration, aspectRatio: aspectRatio, referenceImage: referenceImages.first ?? firstFrame)
         case .seedance:
             let ep = settings.seedanceEndpoint
             guard !ep.isEmpty else { throw AIError.missingAPIKey("请先在设置中填写 Seedance 2.0 的接入点 ID") }
-            return try await generateWithSeedance(model: ep, prompt: prompt, duration: duration, aspectRatio: aspectRatio)
+            return try await generateWithSeedance(model: ep, prompt: prompt, duration: duration, aspectRatio: aspectRatio, referenceImages: referenceImages, referenceVideos: referenceVideos, referenceAudios: referenceAudios)
         case .seedance15:
             let ep = settings.seedance15Endpoint
             guard !ep.isEmpty else { throw AIError.missingAPIKey("请先在设置中填写 Seedance 1.5 Pro 的接入点 ID") }
-            return try await generateWithSeedance(model: ep, prompt: prompt, duration: duration, aspectRatio: aspectRatio)
+            return try await generateWithSeedance(model: ep, prompt: prompt, duration: duration, aspectRatio: aspectRatio, referenceImages: referenceImages, referenceVideos: referenceVideos, referenceAudios: referenceAudios)
         case .minimax:
-            return try await generateWithMiniMax(prompt: prompt, duration: duration, aspectRatio: aspectRatio)
+            return try await generateWithMiniMax(prompt: prompt, duration: duration, aspectRatio: aspectRatio, referenceImage: referenceImages.first ?? firstFrame)
         case .vidu:
-            return try await generateWithVidu(prompt: prompt, duration: duration, aspectRatio: aspectRatio)
+            return try await generateWithVidu(prompt: prompt, duration: duration, aspectRatio: aspectRatio, referenceImage: referenceImages.first ?? firstFrame)
         default:
             throw AIError.missingAPIKey("\(provider.displayName) 尚未支持，敬请期待")
         }
@@ -450,7 +488,7 @@ final class AIVideoService: ObservableObject {
 
     // MARK: - Kling API
 
-    private func generateWithKling(prompt: String, duration: String, aspectRatio: String) async throws -> URL {
+    private func generateWithKling(prompt: String, duration: String, aspectRatio: String, referenceImage: URL? = nil, lastFrame: URL? = nil) async throws -> URL {
         let accessKey = settings.aiAccessKey
         let secretKey = settings.aiSecretKey
         guard !accessKey.isEmpty, !secretKey.isEmpty else {
@@ -459,11 +497,12 @@ final class AIVideoService: ObservableObject {
 
         let token = try generateKlingJWT(accessKey: accessKey, secretKey: secretKey)
 
-        let taskId = try await createKlingTask(token: token, prompt: prompt, duration: duration, aspectRatio: aspectRatio)
+        let hasImage = referenceImage != nil
+        let taskId = try await createKlingTask(token: token, prompt: prompt, duration: duration, aspectRatio: aspectRatio, referenceImage: referenceImage, lastFrame: lastFrame)
 
         updateAssistantStatus(.generating(progress: "生成中，请等待…"))
 
-        let videoURLString = try await pollKlingTask(token: token, taskId: taskId)
+        let videoURLString = try await pollKlingTask(token: token, taskId: taskId, endpoint: hasImage ? "image2video" : "text2video")
 
         updateAssistantStatus(.downloading(progress: 0))
         let localURL = try await downloadFile(from: videoURLString, filename: "kling_\(taskId).mp4")
@@ -505,20 +544,28 @@ final class AIVideoService: ObservableObject {
         return Data(mac)
     }
 
-    private func createKlingTask(token: String, prompt: String, duration: String, aspectRatio: String) async throws -> String {
-        let url = URL(string: "https://api.klingai.com/v1/videos/text2video")!
+    private func createKlingTask(token: String, prompt: String, duration: String, aspectRatio: String, referenceImage: URL? = nil, lastFrame: URL? = nil) async throws -> String {
+        let hasImage = referenceImage != nil
+        let endpoint = hasImage ? "https://api.klingai.com/v1/videos/image2video" : "https://api.klingai.com/v1/videos/text2video"
+        let url = URL(string: endpoint)!
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
 
-        let body: [String: Any] = [
+        var body: [String: Any] = [
             "model_name": "kling-v2",
             "prompt": prompt,
             "duration": duration,
             "aspect_ratio": aspectRatio,
             "mode": "std"
         ]
+        if let imgURL = referenceImage, let b64 = imageToBase64(imgURL) {
+            body["image"] = b64
+        }
+        if let tailURL = lastFrame, let b64 = imageToBase64(tailURL) {
+            body["tail_image"] = b64
+        }
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
         let (data, response) = try await URLSession.shared.data(for: request)
@@ -535,8 +582,8 @@ final class AIVideoService: ObservableObject {
         return taskId
     }
 
-    private func pollKlingTask(token: String, taskId: String) async throws -> String {
-        let url = URL(string: "https://api.klingai.com/v1/videos/text2video/\(taskId)")!
+    private func pollKlingTask(token: String, taskId: String, endpoint: String = "text2video") async throws -> String {
+        let url = URL(string: "https://api.klingai.com/v1/videos/\(endpoint)/\(taskId)")!
         for _ in 0..<120 {
             try await Task.sleep(nanoseconds: 5_000_000_000)
 
@@ -569,13 +616,13 @@ final class AIVideoService: ObservableObject {
 
     // MARK: - Runway API
 
-    private func generateWithRunway(prompt: String, duration: String, aspectRatio: String) async throws -> URL {
+    private func generateWithRunway(prompt: String, duration: String, aspectRatio: String, referenceImage: URL? = nil) async throws -> URL {
         let apiKey = settings.aiAccessKey
         guard !apiKey.isEmpty else {
             throw AIError.missingAPIKey("请先在设置中填写 Runway API Key")
         }
 
-        let taskId = try await createRunwayTask(apiKey: apiKey, prompt: prompt, duration: duration, aspectRatio: aspectRatio)
+        let taskId = try await createRunwayTask(apiKey: apiKey, prompt: prompt, duration: duration, aspectRatio: aspectRatio, referenceImage: referenceImage)
 
         updateAssistantStatus(.generating(progress: "生成中，请等待…"))
 
@@ -587,8 +634,10 @@ final class AIVideoService: ObservableObject {
         return localURL
     }
 
-    private func createRunwayTask(apiKey: String, prompt: String, duration: String, aspectRatio: String) async throws -> String {
-        let url = URL(string: "https://api.dev.runwayml.com/v1/text_to_video")!
+    private func createRunwayTask(apiKey: String, prompt: String, duration: String, aspectRatio: String, referenceImage: URL? = nil) async throws -> String {
+        let hasImage = referenceImage != nil
+        let endpoint = hasImage ? "https://api.dev.runwayml.com/v1/image_to_video" : "https://api.dev.runwayml.com/v1/text_to_video"
+        let url = URL(string: endpoint)!
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
@@ -596,12 +645,15 @@ final class AIVideoService: ObservableObject {
         request.setValue("2024-11-06", forHTTPHeaderField: "X-Runway-Version")
 
         let durationInt = Int(duration) ?? 5
-        let body: [String: Any] = [
+        var body: [String: Any] = [
             "model": "gen4_turbo",
             "promptText": prompt,
             "duration": durationInt,
             "ratio": aspectRatio.replacingOccurrences(of: ":", with: "x")
         ]
+        if let imgURL = referenceImage, let b64 = imageToBase64DataURI(imgURL) {
+            body["promptImage"] = b64
+        }
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
         let (data, response) = try await URLSession.shared.data(for: request)
@@ -646,13 +698,13 @@ final class AIVideoService: ObservableObject {
 
     // MARK: - Seedance API
 
-    private func generateWithSeedance(model: String, prompt: String, duration: String, aspectRatio: String) async throws -> URL {
+    private func generateWithSeedance(model: String, prompt: String, duration: String, aspectRatio: String, referenceImages: [URL] = [], referenceVideos: [URL] = [], referenceAudios: [URL] = []) async throws -> URL {
         let apiKey = settings.seedanceApiKey
         guard !apiKey.isEmpty else {
             throw AIError.missingAPIKey("请先在设置中填写 Seedance API Key")
         }
 
-        let taskId = try await createSeedanceTask(apiKey: apiKey, model: model, prompt: prompt, duration: duration, aspectRatio: aspectRatio)
+        let taskId = try await createSeedanceTask(apiKey: apiKey, model: model, prompt: prompt, duration: duration, aspectRatio: aspectRatio, referenceImages: referenceImages, referenceVideos: referenceVideos, referenceAudios: referenceAudios)
 
         updateAssistantStatus(.generating(progress: "生成中，请等待…"))
 
@@ -664,16 +716,30 @@ final class AIVideoService: ObservableObject {
         return localURL
     }
 
-    private func createSeedanceTask(apiKey: String, model: String, prompt: String, duration: String, aspectRatio: String) async throws -> String {
+    private func createSeedanceTask(apiKey: String, model: String, prompt: String, duration: String, aspectRatio: String, referenceImages: [URL] = [], referenceVideos: [URL] = [], referenceAudios: [URL] = []) async throws -> String {
         let url = URL(string: "https://ark.cn-beijing.volces.com/api/v3/contents/generations/tasks")!
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
 
-        var reqContent: [[String: Any]] = [
-            ["type": "text", "text": prompt]
-        ]
+        var reqContent: [[String: Any]] = []
+        for imgURL in referenceImages {
+            if let b64 = imageToBase64DataURI(imgURL) {
+                reqContent.append(["type": "image_url", "image_url": ["url": b64]])
+            }
+        }
+        for vidURL in referenceVideos {
+            if let b64 = fileToBase64DataURI(vidURL, mime: "video/mp4") {
+                reqContent.append(["type": "video_url", "video_url": ["url": b64]])
+            }
+        }
+        for audURL in referenceAudios {
+            if let b64 = fileToBase64DataURI(audURL, mime: "audio/mpeg") {
+                reqContent.append(["type": "input_audio", "input_audio": ["url": b64]])
+            }
+        }
+        reqContent.append(["type": "text", "text": prompt])
         let durationSec: Int
         switch duration {
         case "10": durationSec = 10
@@ -1259,7 +1325,7 @@ final class AIVideoService: ObservableObject {
 
     // MARK: - MiniMax 视频
 
-    private func generateWithMiniMax(prompt: String, duration: String, aspectRatio: String) async throws -> URL {
+    private func generateWithMiniMax(prompt: String, duration: String, aspectRatio: String, referenceImage: URL? = nil) async throws -> URL {
         let apiKey = settings.providerAPIKey(for: Provider.minimax.rawValue)
         guard !apiKey.isEmpty else {
             throw AIError.missingAPIKey("请先在设置中填写海螺的 API Key")
@@ -1271,7 +1337,10 @@ final class AIVideoService: ObservableObject {
         request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
 
-        let body: [String: Any] = ["model": "video-01", "prompt": prompt]
+        var body: [String: Any] = ["model": "video-01", "prompt": prompt]
+        if let imgURL = referenceImage, let b64 = imageToBase64DataURI(imgURL) {
+            body["first_frame_image"] = b64
+        }
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
         let (data, resp) = try await URLSession.shared.data(for: request)
@@ -1310,7 +1379,7 @@ final class AIVideoService: ObservableObject {
 
     // MARK: - Vidu 视频
 
-    private func generateWithVidu(prompt: String, duration: String, aspectRatio: String) async throws -> URL {
+    private func generateWithVidu(prompt: String, duration: String, aspectRatio: String, referenceImage: URL? = nil) async throws -> URL {
         let apiKey = settings.providerAPIKey(for: Provider.vidu.rawValue)
         guard !apiKey.isEmpty else {
             throw AIError.missingAPIKey("请先在设置中填写 Vidu 的 API Key")
@@ -1322,10 +1391,18 @@ final class AIVideoService: ObservableObject {
         request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
 
+        var inputDict: [String: Any] = ["prompt": prompt]
+        let taskType: String
+        if let imgURL = referenceImage, let b64 = imageToBase64DataURI(imgURL) {
+            taskType = "img2video"
+            inputDict["image"] = ["url": b64]
+        } else {
+            taskType = "text2video"
+        }
         let body: [String: Any] = [
-            "type": "text2video",
+            "type": taskType,
             "model": "vidu-2.0",
-            "input": ["prompt": prompt],
+            "input": inputDict,
             "output_params": ["duration": Int(duration) ?? 4, "aspect_ratio": aspectRatio]
         ]
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
@@ -1441,6 +1518,28 @@ final class AIVideoService: ObservableObject {
             return URL(fileURLWithPath: p)
         }
         return nil
+    }
+
+    private func imageToBase64(_ url: URL) -> String? {
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        return data.base64EncodedString()
+    }
+
+    private func imageToBase64DataURI(_ url: URL) -> String? {
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        let ext = url.pathExtension.lowercased()
+        let mime: String
+        switch ext {
+        case "png": mime = "image/png"
+        case "webp": mime = "image/webp"
+        default: mime = "image/jpeg"
+        }
+        return "data:\(mime);base64,\(data.base64EncodedString())"
+    }
+
+    private func fileToBase64DataURI(_ url: URL, mime: String) -> String? {
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        return "data:\(mime);base64,\(data.base64EncodedString())"
     }
 
     enum AIError: LocalizedError {
