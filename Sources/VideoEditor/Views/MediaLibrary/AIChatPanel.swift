@@ -200,7 +200,7 @@ struct AIChatPanel: View {
         VStack(spacing: 0) {
             VStack(spacing: 0) {
                 HStack(alignment: .top) {
-                    if service.selectedProvider.category == .video {
+                    if service.selectedProvider.maxReferenceImages > 0 {
                         imagePreviewArea
                     }
                     Spacer()
@@ -270,6 +270,10 @@ struct AIChatPanel: View {
                             ForEach(resolutions, id: \.self) { r in
                                 Button(r) { settings.aiResolution = r }
                             }
+                        }
+                    } else if service.selectedProvider.maxReferenceImages > 0 {
+                        capsuleMenu(label: "参考图") {
+                            Text("最多 \(service.selectedProvider.maxReferenceImages) 张")
                         }
                     }
 
@@ -347,7 +351,7 @@ struct AIChatPanel: View {
 
     private var imagePreviewArea: some View {
         HStack(spacing: 6) {
-            if imageMode == .reference {
+            if imageMode == .reference || service.selectedProvider.category != .video {
                 refContentSlot
             } else {
                 frameSlot(image: firstFrameImage, label: "首帧") {

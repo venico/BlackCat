@@ -19,7 +19,9 @@ final class AIVideoService: ObservableObject {
         case runway = "runway"
         case minimax = "minimax"
         case vidu = "vidu"
+        case veo3 = "veo3"
         // 图片生成
+        case nanobanana2 = "nanobanana2"
         case gptImage2 = "gpt-image-2"
         case flux = "flux"
         case sd3 = "sd3"
@@ -39,8 +41,8 @@ final class AIVideoService: ObservableObject {
 
         var category: ProviderCategory {
             switch self {
-            case .kling, .seedance, .seedance15, .runway, .minimax, .vidu: return .video
-            case .gptImage2, .flux, .sd3, .wanxiang: return .image
+            case .kling, .seedance, .seedance15, .runway, .minimax, .vidu, .veo3: return .video
+            case .nanobanana2, .gptImage2, .flux, .sd3, .wanxiang: return .image
             case .elevenlabs, .openaiTTS, .fishAudio, .suno: return .audio
             case .claude, .gpt56, .deepseek_ai, .qwen: return .text
             }
@@ -54,6 +56,8 @@ final class AIVideoService: ObservableObject {
             case .runway: return "Runway Gen-4"
             case .minimax: return "海螺 (MiniMax)"
             case .vidu: return "Vidu"
+            case .veo3: return "Veo 3"
+            case .nanobanana2: return "Nanobanana 2"
             case .gptImage2: return "GPT-Image-2"
             case .flux: return "Flux"
             case .sd3: return "Stable Diffusion 3"
@@ -100,9 +104,9 @@ final class AIVideoService: ObservableObject {
         var maxReferenceImages: Int {
             switch self {
             case .seedance, .seedance15: return 9
-            case .kling, .runway, .minimax, .vidu: return 1
+            case .kling, .runway, .minimax, .vidu, .veo3: return 1
             case .gptImage2: return 4
-            case .flux, .sd3, .wanxiang: return 1
+            case .nanobanana2, .flux, .sd3, .wanxiang: return 1
             default: return 0
             }
         }
@@ -123,7 +127,7 @@ final class AIVideoService: ObservableObject {
 
         var supportsFirstFrame: Bool {
             switch self {
-            case .kling, .seedance, .seedance15, .runway, .minimax, .vidu: return true
+            case .kling, .seedance, .seedance15, .runway, .minimax, .vidu, .veo3: return true
             default: return false
             }
         }
@@ -263,7 +267,7 @@ final class AIVideoService: ObservableObject {
                     let url = try await generateVideo(provider: provider, prompt: prompt, duration: duration, aspectRatio: aspectRatio, resolution: resolution, referenceImages: referenceImages, referenceVideos: referenceVideos, referenceAudios: referenceAudios, firstFrame: firstFrame, lastFrame: lastFrame)
                     applyGenerationResult(convId: convId, msgId: msgId, content: "视频生成完成", mediaURL: url, status: .completed(url: url))
                 case .image:
-                    let url = try await generateImage(provider: provider, prompt: prompt)
+                    let url = try await generateImage(provider: provider, prompt: prompt, referenceImages: referenceImages)
                     applyGenerationResult(convId: convId, msgId: msgId, content: "图片生成完成", mediaURL: url, status: .completedImage(url: url))
                 case .audio:
                     let url = try await generateAudio(provider: provider, prompt: prompt)
@@ -481,6 +485,8 @@ final class AIVideoService: ObservableObject {
             return try await generateWithMiniMax(prompt: prompt, duration: duration, aspectRatio: aspectRatio, referenceImage: referenceImages.first ?? firstFrame)
         case .vidu:
             return try await generateWithVidu(prompt: prompt, duration: duration, aspectRatio: aspectRatio, referenceImage: referenceImages.first ?? firstFrame)
+        case .veo3:
+            return try await generateWithVeo3(prompt: prompt, duration: duration, aspectRatio: aspectRatio, referenceImage: referenceImages.first ?? firstFrame)
         default:
             throw AIError.missingAPIKey("\(provider.displayName) 尚未支持，敬请期待")
         }
@@ -802,14 +808,16 @@ final class AIVideoService: ObservableObject {
 
     // MARK: - 图片生成
 
-    private func generateImage(provider: Provider, prompt: String) async throws -> URL {
+    private func generateImage(provider: Provider, prompt: String, referenceImages: [URL] = []) async throws -> URL {
         let apiKey = settings.providerAPIKey(for: provider.rawValue)
         guard !apiKey.isEmpty else {
             throw AIError.missingAPIKey("请先在设置中填写 \(provider.displayName) 的 API Key")
         }
         switch provider {
+        case .nanobanana2:
+            return try await generateWithNanobanana2(prompt: prompt, referenceImages: referenceImages)
         case .gptImage2:
-            return try await generateWithGPTImage(apiKey: apiKey, prompt: prompt)
+            return try await generateWithGPTImage(apiKey: apiKey, prompt: prompt, referenceImages: referenceImages)
         case .flux:
             return try await generateWithFlux(apiKey: apiKey, prompt: prompt)
         case .sd3:
@@ -821,21 +829,103 @@ final class AIVideoService: ObservableObject {
         }
     }
 
-    // MARK: - GPT-Image-2
+    // MARK: - Nanobanana 2 (Google)
 
-    private func generateWithGPTImage(apiKey: String, prompt: String) async throws -> URL {
-        let url = URL(string: "https://api.openai.com/v1/images/generations")!
-        var request = URLRequest(url: url)
+    private func generateWithNanobanana2(prompt: String, referenceImages: [URL] = []) async throws -> URL {
+        var apiKey = settings.providerAPIKey(for: Provider.nanobanana2.rawValue)
+        if apiKey.isEmpty { apiKey = settings.providerAPIKey(for: Provider.veo3.rawValue) }
+        guard !apiKey.isEmpty else {
+            throw AIError.missingAPIKey("请先在设置中填写 Google AI 的 API Key")
+        }
+
+        let endpoint = URL(string: "https://generativelanguage.googleapis.com/v1beta/models/nanobanana2:generateImages?key=\(apiKey)")!
+        var request = URLRequest(url: endpoint)
         request.httpMethod = "POST"
-        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
 
-        let body: [String: Any] = ["model": "gpt-image-1", "prompt": prompt, "n": 1, "size": "1024x1024"]
+        var body: [String: Any] = [
+            "prompt": prompt,
+            "config": ["numberOfImages": 1]
+        ]
+        if let imgURL = referenceImages.first, let imgData = try? Data(contentsOf: imgURL) {
+            let ext = imgURL.pathExtension.lowercased()
+            let mime = ext == "png" ? "image/png" : "image/jpeg"
+            body["referenceImages"] = [["referenceImage": ["inlineData": ["mimeType": mime, "data": imgData.base64EncodedString()]], "referenceType": "STYLE"]]
+        }
+
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
         await MainActor.run { updateAssistantStatus(.generating(progress: "生成图片中…")) }
 
         let (data, resp) = try await URLSession.shared.data(for: request)
+        guard let http = resp as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
+            let msg = String(data: data, encoding: .utf8) ?? "请求失败"
+            throw AIError.apiError("Nanobanana 2: \(msg)")
+        }
+
+        let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        if let images = json?["generatedImages"] as? [[String: Any]],
+           let imageData = images.first?["image"] as? [String: Any],
+           let b64 = imageData["imageBytes"] as? String,
+           let decoded = Data(base64Encoded: b64) {
+            let saveDir = AppSettings.shared.effectiveProjectDir.appendingPathComponent("AI生成")
+            try FileManager.default.createDirectory(at: saveDir, withIntermediateDirectories: true)
+            let dest = saveDir.appendingPathComponent("nanobanana2_\(UUID().uuidString.prefix(8)).png")
+            try decoded.write(to: dest)
+            return dest
+        }
+
+        throw AIError.apiError("Nanobanana 2 返回数据格式错误")
+    }
+
+    // MARK: - GPT-Image-2
+
+    private func generateWithGPTImage(apiKey: String, prompt: String, referenceImages: [URL] = []) async throws -> URL {
+        await MainActor.run { updateAssistantStatus(.generating(progress: "生成图片中…")) }
+
+        let data: Data
+        let resp: URLResponse
+
+        if referenceImages.isEmpty {
+            let url = URL(string: "https://api.openai.com/v1/images/generations")!
+            var request = URLRequest(url: url)
+            request.httpMethod = "POST"
+            request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            let body: [String: Any] = ["model": "gpt-image-1", "prompt": prompt, "n": 1, "size": "1024x1024"]
+            request.httpBody = try JSONSerialization.data(withJSONObject: body)
+            (data, resp) = try await URLSession.shared.data(for: request)
+        } else {
+            let url = URL(string: "https://api.openai.com/v1/images/edits")!
+            let boundary = UUID().uuidString
+            var request = URLRequest(url: url)
+            request.httpMethod = "POST"
+            request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+            request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
+
+            var body = Data()
+            func appendField(_ name: String, _ value: String) {
+                body.append("--\(boundary)\r\nContent-Disposition: form-data; name=\"\(name)\"\r\n\r\n\(value)\r\n".data(using: .utf8)!)
+            }
+            appendField("model", "gpt-image-1")
+            appendField("prompt", prompt)
+            appendField("n", "1")
+            appendField("size", "1024x1024")
+            for (i, imgURL) in referenceImages.prefix(4).enumerated() {
+                if let imgData = try? Data(contentsOf: imgURL) {
+                    let ext = imgURL.pathExtension.lowercased()
+                    let mime = ext == "png" ? "image/png" : "image/jpeg"
+                    let fname = "ref\(i).\(ext.isEmpty ? "png" : ext)"
+                    body.append("--\(boundary)\r\nContent-Disposition: form-data; name=\"image[]\"; filename=\"\(fname)\"\r\nContent-Type: \(mime)\r\n\r\n".data(using: .utf8)!)
+                    body.append(imgData)
+                    body.append("\r\n".data(using: .utf8)!)
+                }
+            }
+            body.append("--\(boundary)--\r\n".data(using: .utf8)!)
+            request.httpBody = body
+            (data, resp) = try await URLSession.shared.data(for: request)
+        }
+
         guard let http = resp as? HTTPURLResponse, http.statusCode == 200 else {
             let msg = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["error"] as? [String: Any]
             throw AIError.apiError((msg?["message"] as? String) ?? "GPT-Image 请求失败")
@@ -1436,6 +1526,79 @@ final class AIVideoService: ObservableObject {
                 throw AIError.apiError("Vidu 完成但无视频")
             } else if status == "failed" {
                 throw AIError.apiError("Vidu 生成失败")
+            }
+        }
+        throw AIError.timeout
+    }
+
+    // MARK: - Veo 3 (Google)
+
+    private func generateWithVeo3(prompt: String, duration: String, aspectRatio: String, referenceImage: URL? = nil) async throws -> URL {
+        let apiKey = settings.providerAPIKey(for: Provider.veo3.rawValue)
+        guard !apiKey.isEmpty else {
+            throw AIError.missingAPIKey("请先在设置中填写 Google AI 的 API Key")
+        }
+
+        let endpoint = URL(string: "https://generativelanguage.googleapis.com/v1beta/models/veo-3:generateVideos?key=\(apiKey)")!
+        var request = URLRequest(url: endpoint)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+
+        var parts: [[String: Any]] = []
+        if let imgURL = referenceImage, let imgData = try? Data(contentsOf: imgURL) {
+            let ext = imgURL.pathExtension.lowercased()
+            let mime = ext == "png" ? "image/png" : "image/jpeg"
+            parts.append(["inline_data": ["mime_type": mime, "data": imgData.base64EncodedString()]])
+        }
+        parts.append(["text": prompt])
+
+        let body: [String: Any] = [
+            "contents": [["parts": parts]],
+            "generationConfig": [
+                "aspectRatio": aspectRatio,
+                "durationSeconds": Int(duration) ?? 5
+            ]
+        ]
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+
+        await MainActor.run { updateAssistantStatus(.generating(progress: "提交 Veo 3 任务…")) }
+
+        let (data, resp) = try await URLSession.shared.data(for: request)
+        guard let http = resp as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
+            let msg = String(data: data, encoding: .utf8) ?? "请求失败"
+            throw AIError.apiError("Veo 3: \(msg)")
+        }
+
+        let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        guard let opName = json?["name"] as? String else {
+            if let videos = (json?["generatedVideos"] as? [[String: Any]]),
+               let videoData = videos.first?["video"] as? [String: Any],
+               let uri = videoData["uri"] as? String {
+                await MainActor.run { updateAssistantStatus(.downloading(progress: 0)) }
+                return try await downloadFile(from: uri, filename: "veo3_\(UUID().uuidString.prefix(8)).mp4")
+            }
+            throw AIError.apiError("Veo 3 未返回操作 ID")
+        }
+
+        await MainActor.run { updateAssistantStatus(.generating(progress: "生成视频中…")) }
+
+        for _ in 0..<120 {
+            try await Task.sleep(nanoseconds: 5_000_000_000)
+            let pollURL = URL(string: "https://generativelanguage.googleapis.com/v1beta/\(opName)?key=\(apiKey)")!
+            let (pData, _) = try await URLSession.shared.data(for: URLRequest(url: pollURL))
+            let pJson = try JSONSerialization.jsonObject(with: pData) as? [String: Any]
+            if let done = pJson?["done"] as? Bool, done {
+                if let response = pJson?["response"] as? [String: Any],
+                   let videos = response["generatedVideos"] as? [[String: Any]],
+                   let videoData = videos.first?["video"] as? [String: Any],
+                   let uri = videoData["uri"] as? String {
+                    await MainActor.run { updateAssistantStatus(.downloading(progress: 0)) }
+                    return try await downloadFile(from: uri, filename: "veo3_\(UUID().uuidString.prefix(8)).mp4")
+                }
+                throw AIError.apiError("Veo 3 完成但无视频")
+            }
+            if let error = pJson?["error"] as? [String: Any] {
+                throw AIError.apiError("Veo 3: \((error["message"] as? String) ?? "生成失败")")
             }
         }
         throw AIError.timeout
