@@ -31,6 +31,10 @@ enum AssetType: String, Codable {
     var color: Color {
         switch self { case .video: return Color(hex:"#3DBFBA"); case .audio: return Color(hex:"#5DB85D"); case .subtitle: return Color(hex:"#8B7ED8"); case .image: return Color(hex:"#E8A54B") }
     }
+    /// 与素材库左侧标签页共用的 SVG 图标名
+    var svgIcon: String {
+        switch self { case .video: return "video"; case .audio: return "audio"; case .subtitle: return "subtitle"; case .image: return "image" }
+    }
 }
 
 // MARK: - Media Asset
@@ -701,8 +705,61 @@ struct ExportSettings {
     var fps: Int                 = 30
     var bitrate: Int             = 5000   // kbps（1080p 标准画质，网络视频常用 2-6 Mbps）
     var content: ExportContent   = .video
-    static let resolutions = ["原始分辨率","4K  3840×2160","1080p  1920×1080","720p  1280×720","480p  854×480"]
+    /// 画面比例，"原始" = 跟随素材比例
+    var aspectRatio: String      = "原始"
+    static let resolutions = ["原始", "4K", "1080p", "720p", "480p"]
+    static let aspectRatios = ["原始", "16:9", "1.85:1", "2:1", "2.35:1", "4:3", "1:1", "3:4", "9:16", "1:2", "自定义"]
+    static let customAspect = "自定义"
     static let fpsOptions  = [24, 25, 30, 60]
+
+    /// "16:9" → 1.777…；"原始" 返回 nil
+    static func parseAspect(_ s: String) -> CGFloat? {
+        let p = s.split(separator: ":").compactMap { Double($0.trimmingCharacters(in: .whitespaces)) }
+        guard p.count == 2, p[0] > 0, p[1] > 0 else { return nil }
+        return CGFloat(p[0] / p[1])
+    }
+
+    /// 分辨率标称值对应的**短边**像素。1080p 竖屏 = 1080 宽，横屏 = 1080 高。
+    /// 兼容旧格式 "1080p  1920×1080"
+    static func shortSide(for resolution: String, fallback: CGSize) -> CGFloat {
+        if resolution.hasPrefix("4K")   { return 2160 }
+        if resolution.hasPrefix("1080") { return 1080 }
+        if resolution.hasPrefix("720")  { return 720 }
+        if resolution.hasPrefix("480")  { return 480 }
+        return min(fallback.width, fallback.height)   // 原始
+    }
+
+    /// 分辨率 + 比例换算出的实际输出尺寸。
+    /// 分辨率定的是短边，比例决定另一边往哪个方向长 —— 1080p + 1:2 = 1080×2160。
+    /// 比例为「自定义」时直接用 custom 指定的尺寸
+    static func outputSize(resolution: String, aspectRatio: String, fallback: CGSize,
+                           custom: CGSize? = nil) -> CGSize {
+        if aspectRatio == customAspect, let c = custom, c.width >= 2, c.height >= 2 {
+            return CGSize(width: max(2, (c.width / 2).rounded() * 2),
+                          height: max(2, (c.height / 2).rounded() * 2))
+        }
+        let short = shortSide(for: resolution, fallback: fallback)
+        guard short > 0 else { return fallback }
+
+        // 比例「原始」= 跟随素材
+        let target: CGFloat
+        if let t = parseAspect(aspectRatio) {
+            target = t
+        } else {
+            guard fallback.width > 0, fallback.height > 0 else { return fallback }
+            target = fallback.width / fallback.height
+        }
+
+        let w: CGFloat, h: CGFloat
+        if target >= 1 {
+            h = short; w = short * target        // 横向或正方：短边是高
+        } else {
+            w = short; h = short / target        // 竖向：短边是宽
+        }
+        // 编码器要求偶数边长
+        return CGSize(width: max(2, (w / 2).rounded() * 2),
+                      height: max(2, (h / 2).rounded() * 2))
+    }
 }
 
 // MARK: - Thumbnail & Waveform
@@ -732,6 +789,11 @@ struct ProjectDocument: Codable {
     var mediaAssets: [MediaAsset]
     var exportSettings: ExportSettings
     var previewResolution: String
+    var previewAspectRatio: String?   // 向后兼容：旧 .bcj 无此字段
+    var customOutputWidth: Int?
+    var customOutputHeight: Int?
+    var projectFPS: Int?
+    var projectBitrate: Int?
     var subtitleBottomMargin: Double?
     var subtitleLineSpacing: Double?
     var overlayTrackOrder: [ProjectState.OverlayTrackRef]?

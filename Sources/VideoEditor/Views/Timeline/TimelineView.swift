@@ -482,7 +482,7 @@ struct TimelineView: View {
                     let item = as_[secIdx]
                     if item.kind == .audio {
                         let i = item.trackIndex
-                        TrackLabel(icon:"audioSpeaker", title: project.audioTracks[i].label,
+                        TrackLabel(icon:"audio", title: project.audioTracks[i].label,
                                    count: project.audioTracks[i].clips.count, hasMute: true,
                                    isMuted: project.audioTracks[i].isMuted, isVis: true, hasVis: false,
                                    onMute: { project.pushUndo(); project.audioTracks[i].isMuted.toggle(); project.rebuildTimelinePreview() },
@@ -937,11 +937,25 @@ struct TimelineView: View {
                             Text("粘贴")
                         }
                             .disabled(project.clipboard.isEmpty)
+                        if project.selectedVideoClipID != nil || project.selectedAudioClipID != nil {
+                            Divider()
+                            Button { project.removeBackgroundMusicForSelection() } label: {
+                                Label("分离音轨", systemImage: "waveform")
+                            }
+                            .disabled(!project.canRemoveBackgroundMusic)
+                        }
                         if selID != nil {
                             Divider()
                             Button { project.createCompoundFromSelected() } label: {
                                 Image(nsImage: SidebarSVGIcon.load("compound", size: 14))
                                 Text("创建复合片段")
+                            }
+                            if let rid = project.selectedVideoClipID ?? project.selectedImageClipID
+                                        ?? project.selectedAudioClipID {
+                                Button { project.renamingClipID = rid } label: {
+                                    Image(nsImage: SidebarSVGIcon.load("rename", size: 14))
+                                    Text("重命名")
+                                }
                             }
                             if let cid = project.selectedCompoundClipID {
                                 Button { project.renamingCompoundClipID = cid } label: {
@@ -1095,6 +1109,11 @@ struct TimelineView: View {
                         dragOp = nil; return
                     }
                     project.selectedMarkerID = nil
+                    // 点轨道区任意位置都结束重命名（输入框失焦会自动提交）
+                    if project.renamingClipID != nil || project.renamingCompoundClipID != nil {
+                        project.renamingClipID = nil
+                        project.renamingCompoundClipID = nil
+                    }
                     // 转场图标优先（图标在片段内部，不在边缘）
                     if let transClipID = hitTestTransitionIcon(at: v.startLocation) {
                         project.selectedTransitionClipID = transClipID
@@ -1215,6 +1234,12 @@ struct TimelineView: View {
                     case .moveVideo(let id, _, _, let srcTrack):
                         if let dst = destTrack.videoIndex, dst != srcTrack {
                             project.moveVideoClipToTrack(id: id, from: srcTrack, to: dst)
+                        } else if destTrack.videoIndex == nil, endY > rulerH {
+                            // 落点不在任何视频轨道上（空白区、或音频/字幕等其它类型轨道）：
+                            // 新建一条接住它。否则轨道没换、位置却已跟着拖动改了，看起来就是消失
+                            project.videoTracks.append(Track(label: "视频"))
+                            project.syncVideoSectionOrder()
+                            project.moveVideoClipToTrack(id: id, from: srcTrack, to: project.videoTracks.count - 1)
                         }
                     case .moveImage(let id, _, _, let srcTrack):
                         if let dst = destTrack.imageIndex, dst != srcTrack {
@@ -1223,6 +1248,10 @@ struct TimelineView: View {
                     case .moveAudio(let id, _, _, let srcTrack):
                         if let dst = destTrack.audioIndex, dst != srcTrack {
                             project.moveAudioClipToTrack(id: id, from: srcTrack, to: dst)
+                        } else if destTrack.audioIndex == nil, endY > rulerH {
+                            project.audioTracks.append(Track(label: "音频"))
+                            project.syncAudioSectionOrder()
+                            project.moveAudioClipToTrack(id: id, from: srcTrack, to: project.audioTracks.count - 1)
                         }
                     case .moveSubtitle(let id, _, _, let srcTrack):
                         if let dst = destTrack.subtitleIndex, dst != srcTrack {
@@ -1895,7 +1924,16 @@ struct TimelineView: View {
 
         // 边缘检测：当两个片段相邻时，左边缘优先（离片段中心更近的边优先）
         func edge(x: CGFloat, xMin: CGFloat, xMax: CGFloat) -> ClipTrimEdge? {
-            guard xMax - xMin >= 20 else { return nil }
+            let width = xMax - xMin
+            // 太窄时整体让给「移动」——移动是主操作，被拉伸抢走会导致一拖就把片段拉没
+            guard width >= 12 else { return nil }
+            // 12~20pt：边缘热区按比例收窄，中间始终保留移动区
+            if width < 20 {
+                let zone = width * 0.3
+                if x <= xMin + zone { return .left }
+                if x >= xMax - zone { return .right }
+                return nil
+            }
             let nearLeft = abs(x - xMin) <= threshold
             let nearRight = abs(x - xMax) <= threshold
             if nearLeft && nearRight {
@@ -2970,6 +3008,26 @@ private struct VisualEffectBlur: NSViewRepresentable {
 // which dispatches based on whether the drag origin lands on a clip or empty
 // timeline space. Tap behavior (selection) stays here on each clip.
 
+/// 时间轴片段的通用尺寸阈值
+enum TimelineClipMetrics {
+    /// 标题和时长能否并排放下。放不下就让时长换到第二行，
+    /// 固定阈值判断不了 —— 名字长的片段在同样宽度下早就撞上了
+    static func fitsOnOneLine(title: String, duration: String,
+                              clipWidth: CGFloat, leading: CGFloat) -> Bool {
+        let attrs: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: 8, weight: .medium)]
+        let titleW = (title as NSString).size(withAttributes: attrs).width
+        let durW = (duration as NSString).size(withAttributes: attrs).width
+        // 两侧内边距 + 中间至少 8pt 间隔
+        return leading + titleW + 8 + durW + 5 <= clipWidth
+    }
+
+    /// 窄于此宽度就不画缩略图/波形，只铺纯色 —— 那个尺度下内容本身也看不清，
+    /// 还要为每个片段做抽帧和绘制，缩到很小时白白拖慢时间轴
+    static let contentMinWidth: CGFloat = 16
+    /// 窄于此宽度连标题行都不画
+    static let labelMinWidth: CGFloat = 16
+}
+
 private struct VideoClipView: View {
     let clip: VideoClip
     let pps: Double
@@ -2984,11 +3042,26 @@ private struct VideoClipView: View {
         project.thumbnailsReloading.contains(clip.assetID)
     }
 
+    @State private var editName: String = ""
+    @State private var editing = false          // 本地编辑标志：置空 renamingClipID 后仍能提交
+    @FocusState private var nameFieldFocused: Bool
+    private var isRenaming: Bool { project.renamingClipID == clip.id }
+    private func commitRename() {
+        guard editing else { return }           // Esc 已把它置 false，则不提交
+        editing = false
+        project.renameClip(id: clip.id, to: editName)
+        project.renamingClipID = nil
+    }
+    private func cancelRename() {
+        editing = false
+        project.renamingClipID = nil
+    }
+
     private var stickyTitleX: CGFloat {
-        let w = max(clip.duration * pps, 5)
+        let w = max(clip.duration * pps, 4)
         let clipStart = CGFloat(clip.startTime * pps) + 1
         let clipLeftInViewport = clipStart - scrollOffsetX
-        if clipLeftInViewport < 5 { return min(-clipLeftInViewport + 5, w - 60) }
+        if clipLeftInViewport < 5 { return max(0, min(-clipLeftInViewport + 5, w - 60)) }
         return 5
     }
 
@@ -2999,11 +3072,15 @@ private struct VideoClipView: View {
     }
 
     var body: some View {
-        let w = max(clip.duration*pps, 5)
-        let showDurRight = w >= 100
+        let w = max(clip.duration*pps, 4)
+        // 标题前有 8pt 图标 + 3pt 间距
+        let showDurRight = TimelineClipMetrics.fitsOnOneLine(
+            title: clip.name, duration: durationText, clipWidth: w, leading: stickyTitleX + 11)
+        let showDuration = w > TimelineClipMetrics.labelMinWidth
         ZStack(alignment:.leading) {
-            // Thumbnail strip or solid color
-            if let frames = project.assetThumbnails[clip.assetID], !frames.isEmpty {
+            // Thumbnail strip or solid color —— 窄到画不下内容时只铺纯色
+            if w > TimelineClipMetrics.contentMinWidth,
+               let frames = project.assetThumbnails[clip.assetID], !frames.isEmpty {
                 thumbnailStrip(frames: frames, clipWidth: w)
             } else {
                 RoundedRectangle(cornerRadius:6).fill(Color(hex:"#3DBFBA").opacity(0.82))
@@ -3016,32 +3093,62 @@ private struct VideoClipView: View {
             // Selection border
             RoundedRectangle(cornerRadius:6)
                 .stroke(sel ? Color.white : Color.clear, lineWidth: sel ? 2 : 0)
-            // Name label — sticky to viewport left edge
-            Text(clip.name).font(.system(size:9, weight:.medium))
-                .foregroundColor(.white)
-                .shadow(color: .black.opacity(0.4), radius: 2, x: 0, y: 1)
-                .lineLimit(1)
+            // Name label — sticky to viewport left edge，太窄就整行不画
+            if w > TimelineClipMetrics.labelMinWidth {
+                HStack(spacing: 3) {
+                    Image(nsImage: SidebarSVGIcon.load("video"))
+                        .renderingMode(.template)
+                        .resizable()
+                        .aspectRatio(contentMode: .fit)
+                        .frame(width: 8, height: 8)
+                        .foregroundColor(.white.opacity(0.7))
+                        .fixedSize()
+                    if isRenaming {
+                        TextField("", text: $editName)
+                            .textFieldStyle(.plain)
+                            .font(.system(size: 8, weight: .medium))
+                            .foregroundColor(.white)
+                            .focused($nameFieldFocused)
+                            .frame(minWidth: 40, maxWidth: 120)
+                            .onSubmit { commitRename() }
+                            .onAppear {
+                                editName = clip.name
+                                editing = true
+                                DispatchQueue.main.async { nameFieldFocused = true }
+                            }
+                            .onChange(of: nameFieldFocused) { f in if !f { commitRename() } }
+                            .onDisappear { commitRename() }
+                            .onExitCommand { cancelRename() }
+                    } else {
+                        Text(clip.name).font(.system(size:8, weight:.medium))
+                            .foregroundColor(.white)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                    }
+                }
+                .shadow(color: .black.opacity(0.75), radius: 3, x: 0, y: 1)
                 .padding(.leading, stickyTitleX)
                 .padding(.top, 4)
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            }
             // 时长
-            if showDurRight {
+            if showDuration, showDurRight {
                 Text(durationText)
                     .font(.system(size: 8).monospacedDigit())
                     .foregroundColor(.white.opacity(0.7))
-                    .shadow(color: .black.opacity(0.4), radius: 2, x: 0, y: 1)
+                    .shadow(color: .black.opacity(0.75), radius: 3, x: 0, y: 1)
                     .padding(.trailing, 5).padding(.top, 5)
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
-            } else {
+            } else if showDuration {
                 Text(durationText)
                     .font(.system(size: 8).monospacedDigit())
                     .foregroundColor(.white.opacity(0.7))
-                    .shadow(color: .black.opacity(0.4), radius: 2, x: 0, y: 1)
+                    .shadow(color: .black.opacity(0.75), radius: 3, x: 0, y: 1)
                     .padding(.leading, stickyTitleX).padding(.top, 16)
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             }
             // 速率徽章（speed != 1.0 时显示）
-            if abs(clip.speed - 1.0) > 0.01 {
+            if showDuration, abs(clip.speed - 1.0) > 0.01 {
                 let speedLabel: String = {
                     let s = clip.speed
                     if s < 1.0 { return String(format: "%.2g×", s) }
@@ -3063,7 +3170,7 @@ private struct VideoClipView: View {
         .animation(isReloading ? .easeInOut(duration: 0.8).repeatForever(autoreverses: true) : .default, value: thumbBreathing)
         .onChange(of: isReloading) { loading in thumbBreathing = loading }
         .offset(x: clip.startTime*pps + 1)
-        .allowsHitTesting(false)
+        .allowsHitTesting(isRenaming)
         .onAppear {
             if let url = clip.url {
                 project.loadTimelineThumbnails(assetID: clip.assetID, url: url)
@@ -3098,7 +3205,10 @@ private struct VideoClipView: View {
                     .clipped()
             }
             if endIdx < count {
-                Color.clear.frame(width: thumbW * CGFloat(count - endIdx), height: thumbH)
+                // 尾部占位必须用「剩余真实宽度」，不能用 thumbW*格数：
+                // 最后一格是余数宽度，按整格算会让内容总宽 > clipWidth，
+                // HStack 居中后整条缩略图左右跳动
+                Color.clear.frame(width: max(0, clipWidth - thumbW * CGFloat(endIdx)), height: thumbH)
             }
         }
         .frame(width: clipWidth, height: thumbH)
@@ -3119,18 +3229,34 @@ private struct ImageClipView: View {
     var scrollOffsetX: CGFloat = 0
     @EnvironmentObject var project: ProjectState
 
+    @State private var editName: String = ""
+    @State private var editing = false          // 本地编辑标志：置空 renamingClipID 后仍能提交
+    @FocusState private var nameFieldFocused: Bool
+    private var isRenaming: Bool { project.renamingClipID == clip.id }
+    private func commitRename() {
+        guard editing else { return }           // Esc 已把它置 false，则不提交
+        editing = false
+        project.renameClip(id: clip.id, to: editName)
+        project.renamingClipID = nil
+    }
+    private func cancelRename() {
+        editing = false
+        project.renamingClipID = nil
+    }
+
     private var stickyTitleX: CGFloat {
-        let w = max(clip.duration * pps, 5)
+        let w = max(clip.duration * pps, 4)
         let clipStart = CGFloat(clip.startTime * pps) + 1
         let clipLeftInViewport = clipStart - scrollOffsetX
-        if clipLeftInViewport < 5 { return min(-clipLeftInViewport + 5, w - 60) }
+        if clipLeftInViewport < 5 { return max(0, min(-clipLeftInViewport + 5, w - 60)) }
         return 5
     }
 
     var body: some View {
-        let w = max(clip.duration*pps, 5)
+        let w = max(clip.duration*pps, 4)
         ZStack(alignment:.leading) {
-            if let thumb = project.mediaThumbnails[clip.assetID] {
+            if w > TimelineClipMetrics.contentMinWidth,
+               let thumb = project.mediaThumbnails[clip.assetID] {
                 Image(nsImage: thumb)
                     .resizable()
                     .aspectRatio(contentMode: .fill)
@@ -3142,19 +3268,49 @@ private struct ImageClipView: View {
             }
             RoundedRectangle(cornerRadius:6)
                 .stroke(sel ? Color.white : Color.clear, lineWidth: sel ? 2 : 0)
-            Text(clip.name).font(.system(size:9, weight:.medium))
-                .foregroundColor(.white)
-                .shadow(color: .black.opacity(0.4), radius: 2, x: 0, y: 1)
-                .lineLimit(1)
+            if w > TimelineClipMetrics.labelMinWidth {
+                HStack(spacing: 3) {
+                    Image(nsImage: SidebarSVGIcon.load("image"))
+                        .renderingMode(.template)
+                        .resizable()
+                        .aspectRatio(contentMode: .fit)
+                        .frame(width: 8, height: 8)
+                        .foregroundColor(.white.opacity(0.7))
+                        .fixedSize()
+                    if isRenaming {
+                        TextField("", text: $editName)
+                            .textFieldStyle(.plain)
+                            .font(.system(size: 8, weight: .medium))
+                            .foregroundColor(.white)
+                            .focused($nameFieldFocused)
+                            .frame(minWidth: 40, maxWidth: 120)
+                            .onSubmit { commitRename() }
+                            .onAppear {
+                                editName = clip.name
+                                editing = true
+                                DispatchQueue.main.async { nameFieldFocused = true }
+                            }
+                            .onChange(of: nameFieldFocused) { f in if !f { commitRename() } }
+                            .onDisappear { commitRename() }
+                            .onExitCommand { cancelRename() }
+                    } else {
+                        Text(clip.name).font(.system(size:8, weight:.medium))
+                            .foregroundColor(.white)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                    }
+                }
+                .shadow(color: .black.opacity(0.75), radius: 3, x: 0, y: 1)
                 .padding(.leading, stickyTitleX)
                 .padding(.top, 4)
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            }
         }
         .frame(width: w, height: h-4)
         .clipShape(RoundedRectangle(cornerRadius: 6))
         .opacity(isDragging ? 0 : (project.clipboardIsCut && project.clipboardSourceIDs.contains(clip.id) ? 0.35 : 1.0))
         .offset(x: clip.startTime*pps + 1)
-        .allowsHitTesting(false)
+        .allowsHitTesting(isRenaming)
     }
 }
 
@@ -3167,11 +3323,26 @@ private struct AudioClipView: View {
     var scrollOffsetX: CGFloat = 0
     @EnvironmentObject var project: ProjectState
 
+    @State private var editName: String = ""
+    @State private var editing = false          // 本地编辑标志：置空 renamingClipID 后仍能提交
+    @FocusState private var nameFieldFocused: Bool
+    private var isRenaming: Bool { project.renamingClipID == clip.id }
+    private func commitRename() {
+        guard editing else { return }           // Esc 已把它置 false，则不提交
+        editing = false
+        project.renameClip(id: clip.id, to: editName)
+        project.renamingClipID = nil
+    }
+    private func cancelRename() {
+        editing = false
+        project.renamingClipID = nil
+    }
+
     private var stickyTitleX: CGFloat {
-        let w = max(clip.duration * pps, 5)
+        let w = max(clip.duration * pps, 4)
         let clipStart = CGFloat(clip.startTime * pps) + 1
         let clipLeftInViewport = clipStart - scrollOffsetX
-        if clipLeftInViewport < 5 { return min(-clipLeftInViewport + 5, w - 60) }
+        if clipLeftInViewport < 5 { return max(0, min(-clipLeftInViewport + 5, w - 60)) }
         return 5
     }
 
@@ -3182,11 +3353,15 @@ private struct AudioClipView: View {
     }
 
     var body: some View {
-        let w = max(clip.duration*pps, 5)
-        let showDurRight = w >= 100
+        let w = max(clip.duration*pps, 4)
+        // 标题前有 8pt 图标 + 3pt 间距
+        let showDurRight = TimelineClipMetrics.fitsOnOneLine(
+            title: clip.name, duration: durationText, clipWidth: w, leading: stickyTitleX + 11)
+        let showDuration = w > TimelineClipMetrics.labelMinWidth
         ZStack(alignment: .leading) {
             RoundedRectangle(cornerRadius:6).fill(Color(hex:"#5DB85D").opacity(0.78))
-            if let wave = project.waveformCache[clip.assetID] {
+            if w > TimelineClipMetrics.contentMinWidth,
+               let wave = project.waveformCache[clip.assetID] {
                 AudioWaveformCanvas(waveData: wave, trimStart: clip.trimStart,
                                      clipDuration: clip.duration, fullHeight: true,
                                      clipStartX: CGFloat(clip.startTime * pps),
@@ -3195,29 +3370,59 @@ private struct AudioClipView: View {
                     .clipShape(RoundedRectangle(cornerRadius: 6))
             }
             RoundedRectangle(cornerRadius:6).stroke(sel ? Color.white : Color.clear, lineWidth: sel ? 2 : 0)
-            Text(clip.name).font(.system(size:9, weight:.medium))
-                .foregroundColor(.white)
-                .shadow(color: .black.opacity(0.4), radius: 2, x: 0, y: 1)
-                .lineLimit(1)
+            if w > TimelineClipMetrics.labelMinWidth {
+                HStack(spacing: 3) {
+                    Image(nsImage: SidebarSVGIcon.load("audio"))
+                        .renderingMode(.template)
+                        .resizable()
+                        .aspectRatio(contentMode: .fit)
+                        .frame(width: 8, height: 8)
+                        .foregroundColor(.white.opacity(0.7))
+                        .fixedSize()
+                    if isRenaming {
+                        TextField("", text: $editName)
+                            .textFieldStyle(.plain)
+                            .font(.system(size: 8, weight: .medium))
+                            .foregroundColor(.white)
+                            .focused($nameFieldFocused)
+                            .frame(minWidth: 40, maxWidth: 120)
+                            .onSubmit { commitRename() }
+                            .onAppear {
+                                editName = clip.name
+                                editing = true
+                                DispatchQueue.main.async { nameFieldFocused = true }
+                            }
+                            .onChange(of: nameFieldFocused) { f in if !f { commitRename() } }
+                            .onDisappear { commitRename() }
+                            .onExitCommand { cancelRename() }
+                    } else {
+                        Text(clip.name).font(.system(size:8, weight:.medium))
+                            .foregroundColor(.white)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                    }
+                }
+                .shadow(color: .black.opacity(0.75), radius: 3, x: 0, y: 1)
                 .padding(.leading, stickyTitleX)
                 .padding(.top, 4)
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-            if showDurRight {
+            }
+            if showDuration, showDurRight {
                 Text(durationText)
                     .font(.system(size: 8).monospacedDigit())
                     .foregroundColor(.white.opacity(0.7))
-                    .shadow(color: .black.opacity(0.4), radius: 2, x: 0, y: 1)
+                    .shadow(color: .black.opacity(0.75), radius: 3, x: 0, y: 1)
                     .padding(.trailing, 5).padding(.top, 5)
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
-            } else {
+            } else if showDuration {
                 Text(durationText)
                     .font(.system(size: 8).monospacedDigit())
                     .foregroundColor(.white.opacity(0.7))
-                    .shadow(color: .black.opacity(0.4), radius: 2, x: 0, y: 1)
+                    .shadow(color: .black.opacity(0.75), radius: 3, x: 0, y: 1)
                     .padding(.leading, stickyTitleX).padding(.top, 16)
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             }
-            if abs(clip.speed - 1.0) > 0.01 {
+            if showDuration, abs(clip.speed - 1.0) > 0.01 {
                 let speedLabel: String = {
                     let s = clip.speed
                     if s < 1.0 { return String(format: "%.2g×", s) }
@@ -3242,7 +3447,7 @@ private struct AudioClipView: View {
                 project.loadWaveform(assetID: clip.assetID, url: url)
             }
         }
-        .allowsHitTesting(false)
+        .allowsHitTesting(isRenaming)
     }
 }
 
@@ -3323,7 +3528,7 @@ private struct SubtitleClipView: View {
         let w = max(clip.duration * pps, 4)
         let clipStart = CGFloat(clip.startTime * pps) + 1
         let clipLeftInViewport = clipStart - scrollOffsetX
-        if clipLeftInViewport < 4 { return min(-clipLeftInViewport + 4, w - 40) }
+        if clipLeftInViewport < 4 { return max(0, min(-clipLeftInViewport + 4, w - 40)) }
         return 4
     }
 
@@ -3335,12 +3540,23 @@ private struct SubtitleClipView: View {
                 .fill(Color(hex:"#7B6FC4").opacity(isPlaceholder ? 0.35 : 0.85))
                 .overlay(RoundedRectangle(cornerRadius:6)
                     .stroke(sel ? Color.white : Color(hex:"#9B8FD4").opacity(0.4), lineWidth: 1))
-            if !isPlaceholder && w > 16 {
-                Text(clip.text.components(separatedBy:"\n").first ?? clip.text)
-                    .font(.system(size:8, weight:.medium))
-                    .foregroundColor(.white.opacity(0.9)).lineLimit(1)
-                    .padding(.leading, stickyTitleX)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+            if !isPlaceholder && w > TimelineClipMetrics.labelMinWidth {
+                HStack(spacing: 3) {
+                    Image(nsImage: SidebarSVGIcon.load("subtitle"))
+                        .renderingMode(.template)
+                        .resizable()
+                        .aspectRatio(contentMode: .fit)
+                        .frame(width: 8, height: 8)
+                        .foregroundColor(.white.opacity(0.6))
+                        .fixedSize()
+                    Text(clip.text.components(separatedBy:"\n").first ?? clip.text)
+                        .font(.system(size:8, weight:.medium))
+                        .foregroundColor(.white.opacity(0.9))
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                }
+                .padding(.leading, stickyTitleX)
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
         .frame(width: w, height: clipH)
@@ -3372,7 +3588,7 @@ private struct TextClipView: View {
         let w = max(clip.duration * pps, 4)
         let clipStart = CGFloat(clip.startTime * pps) + 1
         let clipLeftInViewport = clipStart - scrollOffsetX
-        if clipLeftInViewport < 4 { return min(-clipLeftInViewport + 4, w - 40) }
+        if clipLeftInViewport < 4 { return max(0, min(-clipLeftInViewport + 4, w - 40)) }
         return 4
     }
 
@@ -3384,7 +3600,7 @@ private struct TextClipView: View {
                 .fill(Color(hex:"#D4668E").opacity(0.85))
                 .overlay(RoundedRectangle(cornerRadius:6)
                     .stroke(sel ? Color.white : Color(hex:"#E088A8").opacity(0.4), lineWidth: 1))
-            if w > 16 {
+            if w > TimelineClipMetrics.labelMinWidth {
                 HStack(spacing: 3) {
                     Image(nsImage: SidebarSVGIcon.load("text"))
                         .renderingMode(.template)
@@ -3421,7 +3637,7 @@ private struct ShapeTimelineClipView: View {
         let w = max(clip.duration * pps, 4)
         let clipStart = CGFloat(clip.startTime * pps) + 1
         let clipLeftInViewport = clipStart - scrollOffsetX
-        if clipLeftInViewport < 4 { return min(-clipLeftInViewport + 4, w - 40) }
+        if clipLeftInViewport < 4 { return max(0, min(-clipLeftInViewport + 4, w - 40)) }
         return 4
     }
 
@@ -3433,7 +3649,7 @@ private struct ShapeTimelineClipView: View {
                 .fill(Color(hex:"#5B8FF9").opacity(0.85))
                 .overlay(RoundedRectangle(cornerRadius:6)
                     .stroke(sel ? Color.white : Color(hex:"#8AB4FF").opacity(0.4), lineWidth: 1))
-            if w > 16 {
+            if w > TimelineClipMetrics.labelMinWidth {
                 HStack(spacing: 3) {
                     Image(nsImage: SidebarSVGIcon.load("shape"))
                         .renderingMode(.template)
@@ -3466,6 +3682,7 @@ private struct CompoundClipView: View {
     var isDragging: Bool = false
     @EnvironmentObject var project: ProjectState
     @State private var editName: String = ""
+    @State private var editingCompound = false
     @FocusState private var nameFieldFocused: Bool
 
     private var isRenaming: Bool { project.renamingCompoundClipID == clip.id }
@@ -3484,10 +3701,11 @@ private struct CompoundClipView: View {
     }
 
     private var stickyTitleX: CGFloat {
-        let w = max(clip.duration * pps, 5)
+        let w = max(clip.duration * pps, 4)
         let clipStart = CGFloat(clip.startTime * pps) + 1
         let clipLeftInViewport = clipStart - scrollOffsetX
-        if clipLeftInViewport < 5 { return min(-clipLeftInViewport + 5, w - 60) }
+        // w - 60 在窄片段上是负数，直接当 padding 会把标题推出片段左边界
+        if clipLeftInViewport < 5 { return max(0, min(-clipLeftInViewport + 5, w - 60)) }
         return 5
     }
 
@@ -3497,58 +3715,79 @@ private struct CompoundClipView: View {
         return h > 0 ? String(format: "%d:%02d:%02d", h, m, s) : String(format: "%02d:%02d", m, s)
     }
 
+    /// 时长在右上角时标题要让出的宽度（8pt 等宽数字约 5pt/字符 + 两侧边距）
+    private var durationReserve: CGFloat {
+        CGFloat(durationText.count) * 5 + 10
+    }
+
     var body: some View {
-        let w = max(clip.duration * pps, 5)
+        let w = max(clip.duration * pps, 4)
         let clipH = h - 4
-        let showDurRight = w >= 100
+        // 复合片段标题前还有 8pt 图标 + 3pt 间距
+        let showDurRight = TimelineClipMetrics.fitsOnOneLine(
+            title: clip.name, duration: durationText, clipWidth: w, leading: stickyTitleX + 11)
+        let showDuration = w > TimelineClipMetrics.labelMinWidth
         ZStack(alignment: .leading) {
             contentBackground(w: w, clipH: clipH)
+            if w > TimelineClipMetrics.labelMinWidth {
             HStack(spacing: 3) {
                 Image(nsImage: SidebarSVGIcon.load("compound"))
                     .renderingMode(.template)
                     .resizable()
                     .aspectRatio(contentMode: .fit)
-                    .frame(width: 10, height: 10)
+                    .frame(width: 8, height: 8)
                     .foregroundColor(.white)
+                    .fixedSize()
                 if isRenaming {
                     TextField("", text: $editName)
                         .textFieldStyle(.plain)
-                        .font(.system(size: 9, weight: .medium))
+                        .font(.system(size: 8, weight: .medium))
                         .foregroundColor(.white)
                         .focused($nameFieldFocused)
                         .frame(minWidth: 40, maxWidth: 120)
                         .onSubmit { commitRename() }
                         .onAppear {
                             editName = clip.name
+                            editingCompound = true
                             DispatchQueue.main.async { nameFieldFocused = true }
                         }
                         .onChange(of: nameFieldFocused) { focused in
                             if !focused { commitRename() }
                         }
+                        .onDisappear { commitRename() }
+                        .onExitCommand {
+                            editingCompound = false
+                            project.renamingCompoundClipID = nil
+                        }
                 } else {
+                    // 宽度不够时优先压缩名字（复合片段1 → 复…），图标和时长保持原样
                     Text(clip.name)
-                        .font(.system(size: 9, weight: .medium))
+                        .font(.system(size: 8, weight: .medium))
                         .foregroundColor(.white)
                         .lineLimit(1)
+                        .truncationMode(.tail)
+                        .layoutPriority(-1)
                 }
             }
-            .shadow(color: .black.opacity(0.4), radius: 2, x: 0, y: 1)
+            .shadow(color: .black.opacity(0.75), radius: 3, x: 0, y: 1)
             .padding(.leading, stickyTitleX)
+            .padding(.trailing, showDurRight ? durationReserve : 4)
             .padding(.top, 4)
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-            if showDurRight {
+            }
+            if showDuration, showDurRight {
                 Text(durationText)
                     .font(.system(size: 8).monospacedDigit())
                     .foregroundColor(.white.opacity(0.7))
-                    .shadow(color: .black.opacity(0.4), radius: 2, x: 0, y: 1)
+                    .shadow(color: .black.opacity(0.75), radius: 3, x: 0, y: 1)
                     .padding(.trailing, 5)
                     .padding(.top, 5)
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
-            } else {
+            } else if showDuration {
                 Text(durationText)
                     .font(.system(size: 8).monospacedDigit())
                     .foregroundColor(.white.opacity(0.7))
-                    .shadow(color: .black.opacity(0.4), radius: 2, x: 0, y: 1)
+                    .shadow(color: .black.opacity(0.75), radius: 3, x: 0, y: 1)
                     .padding(.leading, stickyTitleX)
                     .padding(.top, 16)
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
@@ -3566,7 +3805,8 @@ private struct CompoundClipView: View {
     }
 
     private func commitRename() {
-        guard project.renamingCompoundClipID == clip.id else { return }
+        guard editingCompound else { return }
+        editingCompound = false
         let n = editName.trimmingCharacters(in: .whitespaces)
         if !n.isEmpty && n != clip.name {
             project.updateCompoundClip(id: clip.id) { $0.name = n }
@@ -3576,6 +3816,16 @@ private struct CompoundClipView: View {
 
     @ViewBuilder
     private func contentBackground(w: CGFloat, clipH: CGFloat) -> some View {
+        if w <= TimelineClipMetrics.contentMinWidth {
+            // 窄到画不下内容，只铺纯色
+            RoundedRectangle(cornerRadius: 6).fill(Color(hex: "#FF9F43").opacity(0.82))
+        } else {
+            compoundContent(w: w, clipH: clipH)
+        }
+    }
+
+    @ViewBuilder
+    private func compoundContent(w: CGFloat, clipH: CGFloat) -> some View {
         switch primaryContent {
         case .video(let assetID):
             if let frames = project.assetThumbnails[assetID], !frames.isEmpty {
@@ -3655,7 +3905,7 @@ private struct CompoundClipView: View {
                     .frame(width: i == count - 1 ? clipWidth - thumbW * CGFloat(count - 1) : thumbW, height: clipH)
                     .clipped()
             }
-            if endIdx < count { Color.clear.frame(width: thumbW * CGFloat(count - endIdx), height: clipH) }
+            if endIdx < count { Color.clear.frame(width: max(0, clipWidth - thumbW * CGFloat(endIdx)), height: clipH) }
         }
         .frame(width: clipWidth, height: clipH)
     }

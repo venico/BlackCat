@@ -261,6 +261,16 @@ struct ExportSheetView: View {
         project.exportSettings.outputPath ?? AppSettings.shared.effectiveExportDir
     }
 
+    /// 分辨率 + 比例换算出的实际输出尺寸
+    private var outputSizeText: String {
+        let s = ExportSettings.outputSize(
+            resolution: project.exportSettings.resolution,
+            aspectRatio: project.exportSettings.aspectRatio,
+            fallback: project.nativeVideoSize ?? CGSize(width: 1920, height: 1080),
+            custom: CGSize(width: project.customOutputWidth, height: project.customOutputHeight))
+        return "\(Int(s.width)) × \(Int(s.height))"
+    }
+
     /// 预估导出文件大小
     private var estimatedFileSize: String {
         let dur = project.duration
@@ -303,7 +313,7 @@ struct ExportSheetView: View {
             VStack(alignment: .leading, spacing: 12) {
 
                     // Output path
-                    ESection(title: "输出位置") {
+                    ESection(title: "保存位置") {
                         HStack(spacing: 10) {
                             HStack(spacing: 6) {
                                 Image(nsImage: SidebarSVGIcon.load("folder"))
@@ -347,7 +357,7 @@ struct ExportSheetView: View {
                     }
 
                     // File name
-                    ESection(title: "文件名") {
+                    ESection(title: "项目名称") {
                         HStack(spacing: 6) {
                             FocusTextField(text: $project.exportSettings.filename, placeholder: defaultFilename())
                             Text(extLabel)
@@ -360,6 +370,24 @@ struct ExportSheetView: View {
                     ESection(title: "分辨率") {
                         IPicker(selection: $project.exportSettings.resolution,
                                 options: ExportSettings.resolutions.map { ($0, $0) })
+                    }
+
+                    // Aspect ratio
+                    ESection(title: "比例") {
+                        IPicker(selection: $project.exportSettings.aspectRatio,
+                                options: ExportSettings.aspectRatios.map { ($0, $0) })
+                    }
+
+                    // Output size (derived)
+                    ESection(title: "输出尺寸") {
+                        Text(outputSizeText)
+                            .font(.system(size: 12, weight: .medium).monospacedDigit())
+                            .foregroundColor(Color.labelPrimary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.horizontal, 10)
+                            .frame(height: 32)
+                            .background(Color.white.opacity(0.06))
+                            .cornerRadius(7)
                     }
 
                     // Frame rate
@@ -493,6 +521,29 @@ struct ExportSheetView: View {
         }
         .frame(width: 540)
         .background(Color(red: 0.13, green: 0.13, blue: 0.14))
+        .onAppear { syncFromPreview() }
+    }
+
+    /// 打开时反显项目设置，保证所见即所得
+    private func syncFromPreview() {
+        let res = normalizedResolution(project.previewResolution)
+        if ExportSettings.resolutions.contains(res) {
+            project.exportSettings.resolution = res
+        }
+        if ExportSettings.aspectRatios.contains(project.previewAspectRatio) {
+            project.exportSettings.aspectRatio = project.previewAspectRatio
+        }
+        project.exportSettings.fps = project.projectFPS
+        project.exportSettings.bitrate = project.projectBitrate
+    }
+
+    /// 兼容旧项目里 "1080p  1920×1080" 这种带尺寸的存值
+    private func normalizedResolution(_ s: String) -> String {
+        if s.hasPrefix("4K")   { return "4K" }
+        if s.hasPrefix("1080") { return "1080p" }
+        if s.hasPrefix("720")  { return "720p" }
+        if s.hasPrefix("480")  { return "480p" }
+        return "原始"
     }
 
     private var extLabel: String {
@@ -503,7 +554,10 @@ struct ExportSheetView: View {
         }
     }
 
+    /// 默认用项目名称，未命名时回退到时间戳
     private func defaultFilename() -> String {
+        let name = project.projectName.trimmingCharacters(in: .whitespaces)
+        if !name.isEmpty, name != "未命名项目" { return name }
         let f = DateFormatter()
         f.dateFormat = "yyyyMMdd_HHmm"
         return "BlackCat_\(f.string(from: Date()))"
@@ -551,6 +605,7 @@ struct ExportSheetView: View {
             subtitleBottomMargin: project.subtitleBottomMargin,
             subtitleLineSpacing: project.subtitleLineSpacing,
             previewRenderSize: project.previewRenderSize,
+            customOutputSize: CGSize(width: project.customOutputWidth, height: project.customOutputHeight),
             settings: project.exportSettings,
             outputURL: outputURL)
 
@@ -574,6 +629,7 @@ struct ExportInput {
     let subtitleBottomMargin: Double
     let subtitleLineSpacing:  Double
     let previewRenderSize: CGSize          // 预览分辨率，用于字幕缩放基准
+    let customOutputSize: CGSize           // 比例为「自定义」时的输出尺寸
     let settings:       ExportSettings
     let outputURL:      URL
 }
@@ -1139,8 +1195,11 @@ actor TimelineExporter {
         // ── 字幕烧录 + 图片合成（仅 video 模式）──
         var videoComposition: AVMutableVideoComposition? = nil
         if includeVideo {
-            // 应用导出设置的分辨率
-            let renderSize = self.parseResolution(settings.resolution, fallback: sourceVideoSize)
+            // 应用导出设置的分辨率 + 比例（自定义比例时用项目设置里的尺寸）
+            let renderSize = ExportSettings.outputSize(resolution: settings.resolution,
+                                                       aspectRatio: settings.aspectRatio,
+                                                       fallback: sourceVideoSize,
+                                                       custom: input.customOutputSize)
             // renderSize 确定后，更新 transitionInfos 里的占位 renderSize
             transitionInfos = transitionInfos.map {
                 TransitionCompInfo(trackA: $0.trackA, trackB: $0.trackB,

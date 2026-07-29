@@ -348,6 +348,39 @@ private struct AssetRow: View {
     @EnvironmentObject private var project: ProjectState
     let assetID: UUID
     @State private var hovered = false
+    @State private var editName = ""
+    @State private var editingAsset = false
+    @FocusState private var nameFocused: Bool
+
+    private var isRenaming: Bool { project.renamingAssetID == assetID }
+
+    /// 原位输入框：Enter 或失焦（点素材区空白）确认，Esc 取消
+    private func nameEditor(fontSize: CGFloat) -> some View {
+        TextField("", text: $editName)
+            .textFieldStyle(.plain)
+            .font(.system(size: fontSize))
+            .foregroundColor(Color.labelPrimary)
+            .focused($nameFocused)
+            .onAppear {
+                editName = asset.name
+                editingAsset = true
+                DispatchQueue.main.async { nameFocused = true }
+            }
+            .onSubmit { commitRename() }
+            .onChange(of: nameFocused) { f in if !f { commitRename() } }
+            .onDisappear { commitRename() }
+            .onExitCommand {                                   // Esc 取消
+                editingAsset = false
+                project.renamingAssetID = nil
+            }
+    }
+
+    private func commitRename() {
+        guard editingAsset else { return }
+        editingAsset = false
+        project.renameAsset(id: assetID, to: editName)
+        project.renamingAssetID = nil
+    }
 
     private var asset: MediaAsset {
         project.mediaAssets.first(where: { $0.id == assetID }) ?? MediaAsset(url: URL(fileURLWithPath: "/"), name: "?", type: .video)
@@ -377,9 +410,16 @@ private struct AssetRow: View {
         .contextMenu {
             if asset.fileExists {
                 Button("添加到时间轴") { project.addToTimeline(asset) }
+                Button("添加到 AI 参考") { addToAIReference() }
             }
             if !asset.fileExists {
                 Button("重新关联文件…") { relinkAsset() }
+            }
+            Button("重命名") { project.renamingAssetID = assetID }
+            if asset.fileExists {
+                Button("在 Finder 中显示") {
+                    NSWorkspace.shared.activateFileViewerSelecting([asset.url])
+                }
             }
             Divider()
             Button("移除", role: .destructive) { confirmDeleteAsset() }
@@ -454,14 +494,20 @@ private struct AssetRow: View {
             }
 
             // Name
-            Text(asset.name)
-                .font(.system(size: 11))
-                .foregroundColor(asset.fileExists ? Color.labelPrimary : Color.labelSecondary)
-                .lineLimit(1)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.horizontal, 4)
-                .padding(.vertical, 5)
-                .help(asset.name)
+            Group {
+                if isRenaming {
+                    nameEditor(fontSize: 11)
+                } else {
+                    Text(asset.name)
+                        .font(.system(size: 11))
+                        .foregroundColor(asset.fileExists ? Color.labelPrimary : Color.labelSecondary)
+                        .lineLimit(1)
+                        .help(asset.name)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 4)
+            .padding(.vertical, 5)
         }
         .padding(4)
     }
@@ -471,8 +517,11 @@ private struct AssetRow: View {
     private var normalAssetRow: some View {
         HStack(spacing: 10) {
             if asset.fileExists {
-                Image(systemName: asset.type.icon)
-                    .font(.system(size: 14, weight: .medium))
+                Image(nsImage: SidebarSVGIcon.load(asset.type.svgIcon))
+                    .renderingMode(.template)
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .frame(width: 14, height: 14)
                     .foregroundColor(asset.type.color)
                     .frame(width: 20)
             } else {
@@ -483,12 +532,16 @@ private struct AssetRow: View {
             }
 
             VStack(alignment: .leading, spacing: 2) {
-                Text(asset.name)
-                    .font(.system(size: 12))
-                    .foregroundColor(asset.fileExists ? Color.labelPrimary : Color.labelSecondary)
-                    .lineLimit(2)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .help(asset.name)
+                if isRenaming {
+                    nameEditor(fontSize: 12)
+                } else {
+                    Text(asset.name)
+                        .font(.system(size: 12))
+                        .foregroundColor(asset.fileExists ? Color.labelPrimary : Color.labelSecondary)
+                        .lineLimit(2)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .help(asset.name)
+                }
 
                 if !asset.fileExists {
                     Text("素材丢失")
@@ -524,6 +577,22 @@ private struct AssetRow: View {
         } else {
             project.pendingDeleteAssetID = asset.id
             project.showAssetDeleteConfirm = true
+        }
+    }
+
+    /// 加进 AI 参考。不跳转标签页，状态存在 AIVideoService 上，切过去时还在
+    private func addToAIReference() {
+        let service = AIVideoService.shared
+        switch service.addToReference(url: asset.url) {
+        case .added:
+            let target = (service.selectedProvider.category == .video && service.imageMode == .frames) ? "首尾帧" : "参考内容"
+            project.showSuccessToast(icon: "sparkles", iconColor: .purple, title: "已添加到 AI \(target)", subtitle: asset.name)
+        case .duplicate:
+            project.showSuccessToast(icon: "exclamationmark.triangle", iconColor: .orange, title: "已经添加过了", subtitle: asset.name)
+        case .unsupportedType:
+            project.showSuccessToast(icon: "exclamationmark.triangle", iconColor: .orange, title: "不支持当前素材类型", subtitle: "当前占位不接受该类型素材")
+        case .limitReached(let msg):
+            project.showSuccessToast(icon: "exclamationmark.triangle", iconColor: .orange, title: "无法添加", subtitle: msg)
         }
     }
 
@@ -679,6 +748,103 @@ struct TranscribeOverlay: View {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 5, execute: work)
             }
         }
+    }
+}
+
+// MARK: - 音源分离浮层
+
+struct SeparateOverlay: View {
+    @EnvironmentObject private var project: ProjectState
+
+    var body: some View {
+        VStack(alignment: .trailing, spacing: 8) {
+            if project.isSeparatingAudio {
+                SeparateBubble(state: project.separateState, onCancel: { project.cancelSeparate() })
+                    .transition(.asymmetric(
+                        insertion: .move(edge: .trailing).combined(with: .opacity),
+                        removal: .opacity))
+            }
+        }
+        .animation(.spring(response: 0.35, dampingFraction: 0.8), value: project.separateState)
+    }
+}
+
+private struct SeparateBubble: View {
+    let state: ProjectState.SeparateState
+    let onCancel: () -> Void
+    @State private var xHovering = false
+
+    private var progressValue: Double {
+        switch state {
+        case .downloading(let p): return p * 0.1
+        case .running(let p, _):  return 0.1 + p * 0.9
+        default: return 0
+        }
+    }
+
+    private var stageText: String {
+        switch state {
+        case .downloading: return "下载分离模型…"
+        case .running(_, let stage): return stage
+        default: return ""
+        }
+    }
+
+    var body: some View {
+        HStack(spacing: 10) {
+            ZStack {
+                Circle().fill(Color.accent.opacity(0.2)).frame(width: 28, height: 28)
+                Image(systemName: "waveform.path.ecg")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundColor(Color.accent)
+            }
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text("分离音轨 · \(stageText)")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundColor(Color.labelPrimary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                GeometryReader { geo in
+                    HStack(spacing: 6) {
+                        ProgressView(value: progressValue)
+                            .progressViewStyle(.linear)
+                            .tint(Color.accent)
+                        Text("\(Int(progressValue * 100))%")
+                            .font(.system(size: 10).monospacedDigit())
+                            .foregroundColor(Color.labelSecondary)
+                            .fixedSize()
+                    }
+                    .frame(width: geo.size.width)
+                }
+                .frame(height: 14)
+            }
+
+            Button(action: onCancel) {
+                Image(systemName: "xmark")
+                    .font(.system(size: 9, weight: .bold))
+                    .foregroundColor(xHovering ? Color.labelPrimary : Color.labelSecondary)
+                    .frame(width: 18, height: 18)
+                    .background(Color.white.opacity(xHovering ? 0.15 : 0.08))
+                    .clipShape(Circle())
+            }
+            .buttonStyle(.plain)
+            .onHover { xHovering = $0 }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .frame(maxWidth: 280)
+        .background(
+            RoundedRectangle(cornerRadius: 10)
+                .fill(Color(red: 0.16, green: 0.16, blue: 0.17))
+                .shadow(color: .black.opacity(0.5), radius: 8, y: 4)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 10)
+                .stroke(Color.white.opacity(0.12), lineWidth: 0.5)
+        )
     }
 }
 
@@ -1640,7 +1806,13 @@ enum SidebarSVGIcon {
         <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path d="M17.7342304,18.9988039 L6.26576958,18.9988039 C5.9187563,18.9946176 5.7123853,18.9757792 5.5460095,18.8910065 C5.21095639,18.7202884 5,18.3760389 5,18 C5,17.6239611 5.21095639,17.2797116 5.5460095,17.1089935 C5.75992124,17 6.03994749,17 6.6,17 L17.4,17 C17.9600525,17 18.2400788,17 18.4539905,17.1089935 C18.7890436,17.2797116 19,17.6239611 19,18 C19,18.3760389 18.7890436,18.7202884 18.4539905,18.8910065 C18.2876147,18.9757792 18.0812437,18.9946176 17.7342304,18.9988039 Z M8.0007569,12.9865216 L8.0007569,7.0134784 C8.00454139,6.42266289 8.02724837,6.08640393 8.16349021,5.81901425 C8.41956734,5.31643459 8.93594166,5 9.5,5 C10.0640583,5 10.5804327,5.31643459 10.8365098,5.81901425 C11,6.13988186 11,6.55992124 11,7.4 L11,12.6 C11,13.4400788 11,13.8601181 10.8365098,14.1809857 C10.5804327,14.6835654 10.0640583,15 9.5,15 C8.93594166,15 8.41956734,14.6835654 8.16349021,14.1809857 C8.02724837,13.9135961 8.00454139,13.5773371 8.0007569,12.9865216 Z M13.0007569,12.9865216 L13.0007569,7.0134784 C13.0045414,6.42266289 13.0272484,6.08640393 13.1634902,5.81901425 C13.4195673,5.31643459 13.9359417,5 14.5,5 C15.0640583,5 15.5804327,5.31643459 15.8365098,5.81901425 C16,6.13988186 16,6.55992124 16,7.4 L16,12.6 C16,13.4400788 16,13.8601181 15.8365098,14.1809857 C15.5804327,14.6835654 15.0640583,15 14.5,15 C13.9359417,15 13.4195673,14.6835654 13.1634902,14.1809857 C13.0272484,13.9135961 13.0045414,13.5773371 13.0007569,12.9865216 L13.0007569,12.9865216 Z" fill="black" fill-rule="evenodd"/></svg>
         """,
         "addToVideoTrack": """
-        <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path d="M12,2 C17.5228475,2 22,6.4771525 22,12 C22,12.5522847 21.5522847,13 21,13 C20.4477153,13 20,12.5522847 20,12 C20,7.581722 16.418278,4 12,4 C7.581722,4 4,7.581722 4,12 C4,16.418278 7.581722,20 12,20 C13.0655121,20 14.1003227,19.7921357 15.0619036,19.3934044 C15.5720672,19.1818589 16.1571281,19.4239366 16.3686737,19.9341002 C16.5802192,20.4442639 16.3381415,21.0293248 15.8279779,21.2408703 C14.6245998,21.7398657 13.3295738,22 12,22 C6.4771525,22 2,17.5228475 2,12 C2,6.4771525 6.4771525,2 12,2 Z M20,15 C20.5522847,15 21,15.4477153 21,16 L21,17 L22,17 C22.5522847,17 23,17.4477153 23,18 C23,18.5522847 22.5522847,19 22,19 L21,19 L21,20 C21,20.5522847 20.5522847,21 20,21 C19.4477153,21 19,20.5522847 19,20 L19,19 L18,19 C17.4477153,19 17,18.5522847 17,18 C17,17.4477153 17.4477153,17 18,17 L19,17 L19,16 C19,15.4477153 19.4477153,15 20,15 Z M12,14 C13.1046,14 14,14.8954 14,16 C14,17.1046 13.1046,18 12,18 C10.8954,18 10,17.1046 10,16 C10,14.8954 10.8954,14 12,14 Z M8,10 C9.10457,10 10,10.8954 10,12 C10,13.1046 9.10457,14 8,14 C6.89543,14 6,13.1046 6,12 C6,10.8954 6.89543,10 8,10 Z M16,10 C17.1046,10 18,10.8954 18,12 C18,13.1046 17.1046,14 16,14 C14.8954,14 14,13.1046 14,12 C14,10.8954 14.8954,10 16,10 Z M12,6 C13.1046,6 14,6.89543 14,8 C14,9.10457 13.1046,10 12,10 C10.8954,10 10,9.10457 10,8 C10,6.89543 10.8954,6 12,6 Z" fill="black" fill-rule="nonzero"/></svg>
+        <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path d="M12,22 C17.5228475,22 22,17.5228475 22,12 C22,11.4477153 21.5522847,11 21,11 C20.4477153,11 20,11.4477153 20,12 C20,16.418278 16.418278,20 12,20 C7.581722,20 4,16.418278 4,12 C4,7.581722 7.581722,4 12,4 C13.0655121,4 14.1003227,4.20786433 15.0619036,4.60659557 C15.5720672,4.81814113 16.1571281,4.57606337 16.3686737,4.06589976 C16.5802192,3.55573614 16.3381415,2.97067525 15.8279779,2.75912968 C14.6245998,2.2601343 13.3295738,2 12,2 C6.4771525,2 2,6.4771525 2,12 C2,17.5228475 6.4771525,22 12,22 Z M20,9 C20.5522847,9 21,8.55228475 21,8 L21,7 L22,7 C22.5522847,7 23,6.55228475 23,6 C23,5.44771525 22.5522847,5 22,5 L21,5 L21,4 C21,3.44771525 20.5522847,3 20,3 C19.4477153,3 19,3.44771525 19,4 L19,5 L18,5 C17.4477153,5 17,5.44771525 17,6 C17,6.55228475 17.4477153,7 18,7 L19,7 L19,8 C19,8.55228475 19.4477153,9 20,9 Z M12,10 C13.1046,10 14,9.1046 14,8 C14,6.8954 13.1046,6 12,6 C10.8954,6 10,6.8954 10,8 C10,9.1046 10.8954,10 12,10 Z M8,14 C9.10457,14 10,13.1046 10,12 C10,10.8954 9.10457,10 8,10 C6.89543,10 6,10.8954 6,12 C6,13.1046 6.89543,14 8,14 Z M16,14 C17.1046,14 18,13.1046 18,12 C18,10.8954 17.1046,10 16,10 C14.8954,10 14,10.8954 14,12 C14,13.1046 14.8954,14 16,14 Z M12,18 C13.1046,18 14,17.10457 14,16 C14,14.89543 13.1046,14 12,14 C10.8954,14 10,14.89543 10,16 C10,17.10457 10.8954,18 12,18 Z" fill="black" fill-rule="nonzero"/></svg>
+        """,
+        "addToImageTrack": """
+        <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path d="M14,4 C14.5522847,4 15,4.44771525 15,5 C15,5.55228475 14.5522847,6 14,6 L7.8,6 C5.90085237,6 5.44707923,6.03707473 5.092019,6.21798695 C4.71569481,6.4097337 4.4097337,6.71569481 4.21798695,7.092019 C4.03707473,7.44707923 4,7.90085237 4,9.8 L4,14.2 C4,16.0991476 4.03707473,16.5529208 4.21798695,16.907981 C4.32668692,17.1213167 4.47209175,17.31204 4.64621255,17.4721619 L14.0790484,9.76231624 C15.1382553,8.89661825 16.7344869,9.32598077 17.2164648,10.6062345 L19.6659331,17.1066506 C19.7082502,17.0429467 19.7470322,16.9766347 19.782013,16.907981 C19.9629253,16.5529208 20,16.0991476 20,14.2 L20,12 C20,11.4477153 20.4477153,11 21,11 C21.5522847,11 22,11.4477153 22,12 L22,14.2 C22,16.5012462 21.9553296,17.0479856 21.5640261,17.815962 C21.1805326,18.5686104 20.5686104,19.1805326 19.815962,19.5640261 C19.0479856,19.9553296 18.5012462,20 16.2,20 L7.8,20 C5.49875384,20 4.95201441,19.9553296 4.184038,19.5640261 C3.43138963,19.1805326 2.8194674,18.5686104 2.4359739,17.815962 C2.04467038,17.0479856 2,16.5012462 2,14.2 L2,9.8 C2,7.49875384 2.04467038,6.95201441 2.4359739,6.184038 C2.8194674,5.43138963 3.43138963,4.8194674 4.184038,4.4359739 C4.95201441,4.04467038 5.49875384,4 7.8,4 L14,4 Z M7.5,9 C8.32842712,9 9,9.67157288 9,10.5 C9,11.3284271 8.32842712,12 7.5,12 C6.67157288,12 6,11.3284271 6,10.5 C6,9.67157288 6.67157288,9 7.5,9 Z M20,3 C20.5522847,3 21,3.44771525 21,4 L21,5 L22,5 C22.5522847,5 23,5.44771525 23,6 C23,6.55228475 22.5522847,7 22,7 L21,7 L21,8 C21,8.55228475 20.5522847,9 20,9 C19.4477153,9 19,8.55228475 19,8 L19,7 L18,7 C17.4477153,7 17,6.55228475 17,6 C17,5.44771525 17.4477153,5 18,5 L19,5 L19,4 C19,3.44771525 19.4477153,3 20,3 Z" fill="black" fill-rule="evenodd"/></svg>
+        """,
+        "addToAudioTrack": """
+        <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path d="M13,3 C13.5522847,3 14,3.44771525 14,4 C14,4.55228475 13.5522847,5 13,5 L9.6,5 C8.67118281,5 8,5.52916834 8,6.04987027 L8,18 L7.99543746,18.1827516 C7.91673116,19.7545041 6.8295744,21 5.5,21 C4.11928813,21 3,19.6568542 3,18 C3,16.3431458 4.11928813,15 5.5,15 C5.67129267,15 5.83856172,15.0206726 6.00016911,15.0600521 L6,6.04987027 C6,4.30634802 7.65693649,3 9.6,3 L13,3 Z M20,11 C20.5522847,11 21,11.4477153 21,12 L21,18 L20.9954375,18.1827516 C20.9167312,19.7545041 19.8295744,21 18.5,21 C17.1192881,21 16,19.6568542 16,18 C16,16.3431458 17.1192881,15 18.5,15 C18.6715236,15 18.8390128,15.0207284 19.0008228,15.0602115 L19,12 C19,11.4477153 19.4477153,11 20,11 Z M19.5,3 C20.0522847,3 20.5,3.44771525 20.5,4 L20.5,5 L21.5,5 C22.0522847,5 22.5,5.44771525 22.5,6 C22.5,6.55228475 22.0522847,7 21.5,7 L20.5,7 L20.5,8 C20.5,8.55228475 20.0522847,9 19.5,9 C18.9477153,9 18.5,8.55228475 18.5,8 L18.5,7 L17.5,7 C16.9477153,7 16.5,6.55228475 16.5,6 C16.5,5.44771525 16.9477153,5 17.5,5 L18.5,5 L18.5,4 C18.5,3.44771525 18.9477153,3 19.5,3 Z" fill="black" fill-rule="evenodd"/></svg>
         """,
         "hDistribute": """
         <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path d="M6.5,8.4 L6.5,15.6 C6.5,16.4400788 6.5,16.8601181 6.33650979,17.1809857 C6.08043266,17.6835654 5.56405834,18 5,18 C4.43594166,18 3.91956734,17.6835654 3.66349021,17.1809857 C3.5,16.8601181 3.5,16.4400788 3.5,15.6 L3.5,8.4 C3.5,7.55992124 3.5,7.13988186 3.66349021,6.81901425 C3.91956734,6.31643459 4.43594166,6 5,6 C5.56405834,6 6.08043266,6.31643459 6.33650979,6.81901425 C6.5,7.13988186 6.5,7.55992124 6.5,8.4 Z M13.5,8.4 L13.5,15.6 C13.5,16.4400788 13.5,16.8601181 13.3365098,17.1809857 C13.0804327,17.6835654 12.5640583,18 12,18 C11.4359417,18 10.9195673,17.6835654 10.6634902,17.1809857 C10.5,16.8601181 10.5,16.4400788 10.5,15.6 L10.5,8.4 C10.5,7.55992124 10.5,7.13988186 10.6634902,6.81901425 C10.9195673,6.31643459 11.4359417,6 12,6 C12.5640583,6 13.0804327,6.31643459 13.3365098,6.81901425 C13.5,7.13988186 13.5,7.55992124 13.5,8.4 Z M20.5,8.4 L20.5,15.6 C20.5,16.4400788 20.5,16.8601181 20.3365098,17.1809857 C20.0804327,17.6835654 19.5640583,18 19,18 C18.4359417,18 17.9195673,17.6835654 17.6634902,17.1809857 C17.5,16.8601181 17.5,16.4400788 17.5,15.6 L17.5,8.4 C17.5,7.55992124 17.5,7.13988186 17.6634902,6.81901425 C17.9195673,6.31643459 18.4359417,6 19,6 C19.5640583,6 20.0804327,6.31643459 20.3365098,6.81901425 C20.5,7.13988186 20.5,7.55992124 20.5,8.4 Z" fill="black" fill-rule="evenodd"/></svg>

@@ -86,6 +86,7 @@ extension ProjectState {
                     var newTrack = Track<VideoClip>(label: "视频")
                     newTrack.clips.append(removed)
                     videoTracks.append(newTrack)
+                    syncVideoSectionOrder()
                 }
             }
             return
@@ -137,6 +138,7 @@ extension ProjectState {
                     var newTrack = Track<AudioClip>(label: "音频")
                     newTrack.clips.append(removed)
                     audioTracks.append(newTrack)
+                    syncAudioSectionOrder()
                 }
             }
             return
@@ -227,6 +229,7 @@ extension ProjectState {
                 var newTrack = Track<CompoundClip>(label: "复合")
                 newTrack.clips.append(removed)
                 compoundTracks.append(newTrack)
+                syncOverlayOrder()
                 if kind == .overlay {
                     insertOverlayRefAbove(.compound(newTrack.id), above: anchorID)
                 } else if kind == .video {

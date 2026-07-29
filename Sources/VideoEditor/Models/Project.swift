@@ -313,6 +313,75 @@ final class ProjectState: ObservableObject {
     @Published var selectedShapeClipID: UUID?    = nil
     @Published var selectedCompoundClipID: UUID? = nil
     @Published var renamingCompoundClipID: UUID? = nil
+    /// 素材库里正在重命名的素材
+    @Published var renamingAssetID: UUID? = nil
+    /// 轨道区正在重命名的视频/图片/音频片段
+    @Published var renamingClipID: UUID? = nil
+
+    /// 改素材名，同时重命名磁盘文件。扩展名强制保持不变。
+    /// 片段与素材靠 assetID 关联，改名不影响关联；已在轨道上的片段保留自己的标题
+    func renameAsset(id: UUID, to newName: String) {
+        let input = newName.trimmingCharacters(in: .whitespaces)
+        guard !input.isEmpty, let i = mediaAssets.firstIndex(where: { $0.id == id }) else { return }
+        let oldURL = mediaAssets[i].url
+        let ext = oldURL.pathExtension
+
+        // 用户输入里若已带原扩展名就去掉，最后统一补回 —— 不允许改后缀
+        let ns = input as NSString
+        let base = ns.pathExtension.lowercased() == ext.lowercased() ? ns.deletingPathExtension : input
+        guard !base.isEmpty else { return }
+        let finalName = ext.isEmpty ? base : "\(base).\(ext)"
+        guard finalName != mediaAssets[i].name else { return }
+
+        let dir = oldURL.deletingLastPathComponent()
+        let newURL = dir.appendingPathComponent(finalName)
+
+        // 文件还在就改磁盘；改失败则整个操作放弃，避免素材名和文件名对不上
+        if FileManager.default.fileExists(atPath: oldURL.path) {
+            guard !FileManager.default.fileExists(atPath: newURL.path) else {
+                showSuccessToast(icon: "exclamationmark.triangle", iconColor: .orange,
+                                 title: "重命名失败", subtitle: "同目录下已存在 \(finalName)")
+                return
+            }
+            do {
+                try FileManager.default.moveItem(at: oldURL, to: newURL)
+            } catch {
+                showSuccessToast(icon: "xmark.circle.fill", iconColor: .red,
+                                 title: "重命名失败", subtitle: error.localizedDescription,
+                                 autoCountdown: false)
+                return
+            }
+            // 文件路径变了，素材和所有引用它的片段一起改指向
+            relinkAsset(id: id, newURL: newURL)
+        } else {
+            pushUndo()
+            mediaAssets[i].name = finalName
+        }
+    }
+
+    /// 改轨道片段标题，不动素材
+    func renameClip(id: UUID, to newName: String) {
+        let t = newName.trimmingCharacters(in: .whitespaces)
+        guard !t.isEmpty else { return }
+        for ti in videoTracks.indices {
+            if let ci = videoTracks[ti].clips.firstIndex(where: { $0.id == id }) {
+                guard videoTracks[ti].clips[ci].name != t else { return }
+                pushUndo(); videoTracks[ti].clips[ci].name = t; return
+            }
+        }
+        for ti in imageTracks.indices {
+            if let ci = imageTracks[ti].clips.firstIndex(where: { $0.id == id }) {
+                guard imageTracks[ti].clips[ci].name != t else { return }
+                pushUndo(); imageTracks[ti].clips[ci].name = t; return
+            }
+        }
+        for ti in audioTracks.indices {
+            if let ci = audioTracks[ti].clips.firstIndex(where: { $0.id == id }) {
+                guard audioTracks[ti].clips[ci].name != t else { return }
+                pushUndo(); audioTracks[ti].clips[ci].name = t; return
+            }
+        }
+    }
     @Published var penDrawingMode: Bool = false
     @Published var penEditingClipID: UUID? = nil
     var penRawPoints: [(x: Double, y: Double, cInDX: Double, cInDY: Double, cOutDX: Double, cOutDY: Double, smooth: Bool)] = []
@@ -386,6 +455,29 @@ final class ProjectState: ObservableObject {
         transcribeState = .idle
         showSuccessToast(icon: "stop.fill", iconColor: .yellow, title: "语音识别", subtitle: "已停止", autoCountdown: false)
     }
+    // 音源分离状态（demucs）
+    enum SeparateState: Equatable {
+        case idle
+        case downloading(Double)      // 首次下载模型，进度 0~1
+        case running(Double, String)  // 处理进度 0~1 + 当前阶段
+        case failed(String)
+    }
+    @Published var separateState: SeparateState = .idle
+    var separateTask: Task<Void, Never>? = nil
+    var isSeparatingAudio: Bool {
+        switch separateState {
+        case .downloading, .running: return true
+        default: return false
+        }
+    }
+    func cancelSeparate() {
+        separateTask?.cancel()
+        separateTask = nil
+        AudioSeparator.killCurrentProcess()
+        separateState = .idle
+        showSuccessToast(icon: "stop.fill", iconColor: .yellow, title: "分离音轨", subtitle: "已停止", autoCountdown: false)
+    }
+
     // MARK: - 场景检测 / 大模型分析
     @Published var isReversingVideo: Bool = false
     @Published var isDetectingScenes: Bool = false
@@ -531,19 +623,100 @@ final class ProjectState: ObservableObject {
     @Published var showSettings = false
 
     // Preview resolution (for subtitle/image scaling to match export)
-    @Published var previewResolution: String = "1080p  1920×1080"
-    static let previewResolutions = ["4K  3840×2160", "1080p  1920×1080", "720p  1280×720", "480p  854×480"]
+    @Published var previewResolution: String = "1080p"
+    static let previewResolutions = ExportSettings.resolutions
 
-    var previewRenderSize: CGSize {
-        let pattern = #"(\d{3,5})\s*[×xX]\s*(\d{3,5})"#
-        guard let regex = try? NSRegularExpression(pattern: pattern),
-              let match = regex.firstMatch(in: previewResolution, range: NSRange(previewResolution.startIndex..., in: previewResolution)),
-              let wRange = Range(match.range(at: 1), in: previewResolution),
-              let hRange = Range(match.range(at: 2), in: previewResolution),
-              let w = Int(previewResolution[wRange]), let h = Int(previewResolution[hRange])
-        else { return CGSize(width: 1920, height: 1080) }
-        return CGSize(width: w, height: h)
+    /// 源文件实测尺寸（已应用 preferredTransform）。clip.videoWidth 在部分路径下
+    /// 可能是 0 或未含旋转，不能作为唯一依据，这里按 URL 自己测一份
+    @Published var nativeSizeCache: [URL: CGSize] = [:]
+    private var loadingNativeSizes: Set<URL> = []
+
+    private func nativeSize(for clip: VideoClip) -> CGSize? {
+        guard let url = clip.url ?? mediaAssets.first(where: { $0.id == clip.assetID })?.url else { return nil }
+        if let cached = nativeSizeCache[url] { return applyRotation(cached, clip.rotation) }
+        loadNativeSize(url)
+        // 缓存未就绪时先用片段上的值顶着，加载完会刷新
+        guard clip.videoWidth > 0, clip.videoHeight > 0 else { return nil }
+        return applyRotation(CGSize(width: clip.videoWidth, height: clip.videoHeight), clip.rotation)
     }
+
+    private func applyRotation(_ size: CGSize, _ rotation: Int) -> CGSize {
+        abs(rotation % 180) == 90 ? CGSize(width: size.height, height: size.width) : size
+    }
+
+    private func loadNativeSize(_ url: URL) {
+        // nativeVideoSize 是计算属性，SwiftUI 每次重绘都会走到这里，
+        // 只靠 cache 判空挡不住异步写入前的重复启动
+        guard nativeSizeCache[url] == nil, !loadingNativeSizes.contains(url) else { return }
+        loadingNativeSizes.insert(url)
+        Task { [weak self] in
+            defer { Task { @MainActor in self?.loadingNativeSizes.remove(url) } }
+            let asset = AVURLAsset(url: url)
+            guard let track = try? await asset.loadTracks(withMediaType: .video).first,
+                  let sz = try? await track.load(.naturalSize) else { return }
+            // 竖屏素材常见 naturalSize 是横的，靠 preferredTransform 转正
+            var final = sz
+            if let tf = try? await track.load(.preferredTransform) {
+                let applied = sz.applying(tf)
+                final = CGSize(width: abs(applied.width), height: abs(applied.height))
+            }
+            guard final.width > 0, final.height > 0 else { return }
+            await MainActor.run { self?.nativeSizeCache[url] = final }
+        }
+    }
+
+    /// 「原始」预览用的源尺寸。选中片段优先 —— selectedVideoClipID 是 @Published，
+    /// 选中即刻重绘；currentTime 走独立的 PlaybackClock，不触发本对象刷新，只能兜底
+    var nativeVideoSize: CGSize? {
+        let allClips = videoTracks.flatMap(\.clips)
+
+        if let id = selectedVideoClipID,
+           let clip = allClips.first(where: { $0.id == id }),
+           let s = nativeSize(for: clip) { return s }
+
+        // 播放头命中的片段，多轨重叠时取上层（videoTracks 靠后的轨道压在上面）
+        let t = currentTime
+        for track in videoTracks.reversed() {
+            for clip in track.clips where clip.startTime <= t && clip.endTime > t {
+                if let s = nativeSize(for: clip) { return s }
+            }
+        }
+        for clip in allClips {
+            if let s = nativeSize(for: clip) { return s }
+        }
+        return nil
+    }
+
+    /// 预览画面比例。"原始" = 跟随素材比例，"自定义" = 用 customOutputSize
+    @Published var previewAspectRatio: String = "原始"
+    /// 比例选「自定义」时的输出尺寸
+    @Published var customOutputWidth: Int = 1920
+    @Published var customOutputHeight: Int = 1080
+    /// 项目级帧率 / 码率，导出时作为默认值
+    @Published var projectFPS: Int = 30
+    @Published var projectBitrate: Int = 5000
+    /// 预览比例选「自定义」时，让项目设置里的尺寸输入框获得焦点
+    @Published var focusCustomSizeField: Bool = false
+
+    /// 清空选中，让属性区回到项目设置
+    func clearSelectionForProjectSettings() {
+        selectedVideoClipID = nil; selectedImageClipID = nil; selectedAudioClipID = nil
+        selectedSubtitleClipID = nil; selectedTextClipID = nil; selectedShapeClipID = nil
+        selectedCompoundClipID = nil; selectedTransitionClipID = nil
+        selectedClipIDs.removeAll()
+    }
+    static let previewAspectRatios = ExportSettings.aspectRatios
+
+    /// 与导出共用同一套换算：分辨率定短边，比例决定朝哪个方向长
+    var previewRenderSize: CGSize {
+        ExportSettings.outputSize(
+            resolution: previewResolution,
+            aspectRatio: previewAspectRatio,
+            fallback: nativeVideoSize ?? CGSize(width: 1920, height: 1080),
+            custom: CGSize(width: customOutputWidth, height: customOutputHeight))
+    }
+
+    static func parseAspect(_ s: String) -> CGFloat? { ExportSettings.parseAspect(s) }
 
     // Undo / Redo
     @Published var undoCount: Int = 0

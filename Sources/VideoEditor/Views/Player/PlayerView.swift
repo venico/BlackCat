@@ -35,7 +35,9 @@ struct PlayerView: View {
                             .position(x: geo.size.width / 2, y: geo.size.height / 2)
                     }
                     .allowsHitTesting(false)
-                    AVPlayerNSView(player: ctrl.player)
+                    AVPlayerNSView(
+                        player: ctrl.player,
+                        renderAspect: project.previewRenderSize.width / max(project.previewRenderSize.height, 1))
                     GeometryReader { geo in
                         let rs = project.previewRenderSize
                         let fitScale = min(geo.size.width / max(rs.width, 1),
@@ -117,6 +119,16 @@ struct PlayerView: View {
 
 private class VideoLayerView: NSView {
     let playerLayer = AVPlayerLayer()
+
+    /// 画布比例，等于 previewRenderSize 的比例。合成层已按该尺寸输出，
+    /// 这里只需如实显示：画布多大画面就多大，素材超出画布的部分在合成时就已被裁掉
+    var renderAspect: CGFloat? {
+        didSet {
+            guard renderAspect != oldValue else { return }
+            needsLayout = true
+        }
+    }
+
     override init(frame: NSRect) {
         super.init(frame: frame)
         wantsLayer = true
@@ -124,24 +136,39 @@ private class VideoLayerView: NSView {
         playerLayer.videoGravity = .resizeAspect
     }
     required init?(coder: NSCoder) { fatalError() }
+
     override func layout() {
         super.layout()
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        playerLayer.frame = bounds
+        if let aspect = renderAspect, aspect > 0, bounds.width > 0, bounds.height > 0 {
+            // 与黑底框、选择框共用的内接矩形
+            let cur = bounds.width / bounds.height
+            var w = bounds.width, h = bounds.height
+            if cur > aspect { w = bounds.height * aspect } else { h = bounds.width / aspect }
+            playerLayer.frame = CGRect(x: (bounds.width - w) / 2, y: (bounds.height - h) / 2,
+                                       width: w, height: h)
+        } else {
+            playerLayer.frame = bounds
+        }
+        playerLayer.videoGravity = .resizeAspect
         CATransaction.commit()
     }
 }
 
 private struct AVPlayerNSView: NSViewRepresentable {
     let player: AVPlayer
+    var renderAspect: CGFloat? = nil
+
     func makeNSView(context: Context) -> VideoLayerView {
         let v = VideoLayerView()
         v.playerLayer.player = player
+        v.renderAspect = renderAspect
         return v
     }
     func updateNSView(_ v: VideoLayerView, context: Context) {
         v.playerLayer.player = player
+        v.renderAspect = renderAspect
     }
 }
 
@@ -899,6 +926,52 @@ private struct TextLabel: View {
     }
 }
 
+// MARK: - Preview Aspect Picker
+
+private struct PreviewAspectPicker: View {
+    @EnvironmentObject private var project: ProjectState
+
+    var body: some View {
+        Menu {
+            ForEach(ProjectState.previewAspectRatios, id: \.self) { ratio in
+                Button {
+                    if ratio == ExportSettings.customAspect {
+                        // 切自定义时以当前尺寸为起点，并把光标送到项目设置的尺寸输入框
+                        let s = project.previewRenderSize
+                        project.customOutputWidth = Int(s.width)
+                        project.customOutputHeight = Int(s.height)
+                        project.previewAspectRatio = ratio
+                        project.clearSelectionForProjectSettings()
+                        project.focusCustomSizeField = true
+                        project.rebuildTimelinePreview()
+                        return
+                    }
+                    guard project.previewAspectRatio != ratio else { return }
+                    project.previewAspectRatio = ratio
+                    // 画布尺寸变了，合成必须按新 renderSize 重出，否则素材还是旧画布的摆放
+                    project.rebuildTimelinePreview()
+                } label: {
+                    HStack {
+                        Text(ratio)
+                        if ratio == project.previewAspectRatio {
+                            Image(systemName: "checkmark")
+                        }
+                    }
+                }
+            }
+        } label: {
+            Text(project.previewAspectRatio)
+                .font(.system(size: 10, weight: .medium).monospacedDigit())
+                .foregroundColor(.white)
+                .shadow(color: .black.opacity(0.8), radius: 3, x: 0, y: 1)
+                .shadow(color: .black.opacity(0.5), radius: 6, x: 0, y: 2)
+        }
+        .menuStyle(.borderlessButton)
+        .fixedSize()
+        .help("画面比例，按当前分辨率内接裁剪")
+    }
+}
+
 // MARK: - Preview Resolution Picker
 
 private struct PreviewResolutionPicker: View {
@@ -908,7 +981,9 @@ private struct PreviewResolutionPicker: View {
         Menu {
             ForEach(ProjectState.previewResolutions, id: \.self) { res in
                 Button {
+                    guard project.previewResolution != res else { return }
                     project.previewResolution = res
+                    project.rebuildTimelinePreview()
                 } label: {
                     HStack {
                         Text(shortLabel(res))
@@ -948,19 +1023,8 @@ private struct PreviewToolbar: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack(spacing: 0) {
-                Text(timecode(clock.currentTime))
-                    .font(.system(size: 10).monospacedDigit())
-                    .foregroundColor(Color(hex: "#E8A54B"))
-                Text(" / ")
-                    .font(.system(size: 10))
-                    .foregroundColor(Color.labelSecondary.opacity(0.5))
-                Text(timecode(clock.duration))
-                    .font(.system(size: 10).monospacedDigit())
-                    .foregroundColor(Color.labelSecondary)
-
-                Spacer()
-
+            // 传输控件绝对居中：用 Spacer 均分的话，右侧比例/分辨率文字一变宽就会把它挤偏
+            ZStack {
                 HStack(spacing: 12) {
                     toolBtn("seekStart") { seekToStart() }
                     toolBtn("prevFrame") { stepFrame(-1) }
@@ -969,23 +1033,38 @@ private struct PreviewToolbar: View {
                     toolBtn("seekEnd") { seekToEnd() }
                 }
 
-                Spacer()
-
-                Button { captureFrame() } label: {
-                    Image(nsImage: TimelineSVGIcon.load("capture"))
-                        .renderingMode(.template)
-                        .resizable()
-                        .aspectRatio(contentMode: .fit)
-                        .frame(width: 12, height: 12)
+                HStack(spacing: 0) {
+                    Text(timecode(clock.currentTime))
+                        .font(.system(size: 10).monospacedDigit())
+                        .foregroundColor(Color(hex: "#E8A54B"))
+                    Text(" / ")
+                        .font(.system(size: 10))
+                        .foregroundColor(Color.labelSecondary.opacity(0.5))
+                    Text(timecode(clock.duration))
+                        .font(.system(size: 10).monospacedDigit())
                         .foregroundColor(Color.labelSecondary)
-                        .frame(width: 24, height: 24)
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .help("捕捉当前帧到素材库")
 
-                PreviewResolutionPicker()
-                    .padding(.leading, 4)
+                    Spacer(minLength: 12)
+
+                    Button { captureFrame() } label: {
+                        Image(nsImage: TimelineSVGIcon.load("capture"))
+                            .renderingMode(.template)
+                            .resizable()
+                            .aspectRatio(contentMode: .fit)
+                            .frame(width: 12, height: 12)
+                            .foregroundColor(Color.labelSecondary)
+                            .frame(width: 24, height: 24)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .help("捕捉当前帧到素材库")
+
+                    PreviewAspectPicker()
+                        .padding(.leading, 4)
+
+                    PreviewResolutionPicker()
+                        .padding(.leading, 4)
+                }
             }
             .padding(.horizontal, 10)
             .padding(.vertical, 4)
@@ -1495,6 +1574,7 @@ private struct VideoTransformOverlay: View {
         let natH = CGFloat(clip.videoHeight)
         guard natW > 0, natH > 0 else { return .zero }
 
+        // 素材在画布内等比摆放（合成层同样逻辑），裁剪框据此贴合素材边界
         let baseScale = min(info.videoSize.width / natW, info.videoSize.height / natH)
         let finalSX = baseScale * CGFloat(clip.scaleX)
         let finalSY = baseScale * CGFloat(clip.scaleY)

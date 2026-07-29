@@ -1,5 +1,24 @@
 import Foundation
 import CryptoKit
+import ImageIO
+import UniformTypeIdentifiers
+import AppKit
+import AVFoundation
+
+extension NSImage {
+    /// 等比缩放到 maxSize 以内，不放大
+    func aiThumbnail(maxSize: CGFloat) -> NSImage {
+        let s = self.size
+        guard s.width > 0, s.height > 0 else { return self }
+        let scale = min(maxSize / s.width, maxSize / s.height, 1)
+        let newSize = NSSize(width: s.width * scale, height: s.height * scale)
+        let img = NSImage(size: newSize)
+        img.lockFocus()
+        self.draw(in: NSRect(origin: .zero, size: newSize), from: .zero, operation: .copy, fraction: 1)
+        img.unlockFocus()
+        return img
+    }
+}
 
 final class AIVideoService: ObservableObject {
     static let shared = AIVideoService()
@@ -21,6 +40,7 @@ final class AIVideoService: ObservableObject {
         case vidu = "vidu"
         case veo3 = "veo3"
         // 图片生成
+        case seedream = "seedream"
         case nanobanana2 = "nanobanana2"
         case gptImage2 = "gpt-image-2"
         case flux = "flux"
@@ -42,7 +62,7 @@ final class AIVideoService: ObservableObject {
         var category: ProviderCategory {
             switch self {
             case .kling, .seedance, .seedance15, .runway, .minimax, .vidu, .veo3: return .video
-            case .nanobanana2, .gptImage2, .flux, .sd3, .wanxiang: return .image
+            case .seedream, .nanobanana2, .gptImage2, .flux, .sd3, .wanxiang: return .image
             case .elevenlabs, .openaiTTS, .fishAudio, .suno: return .audio
             case .claude, .gpt56, .deepseek_ai, .qwen: return .text
             }
@@ -57,6 +77,7 @@ final class AIVideoService: ObservableObject {
             case .minimax: return "海螺 (MiniMax)"
             case .vidu: return "Vidu"
             case .veo3: return "Veo 3"
+            case .seedream: return "Seedream 5.0 Pro"
             case .nanobanana2: return "Nanobanana 2"
             case .gptImage2: return "GPT-Image-2"
             case .flux: return "Flux"
@@ -79,7 +100,7 @@ final class AIVideoService: ObservableObject {
 
         var needsAccessKey: Bool {
             switch self {
-            case .seedance, .seedance15: return false
+            case .seedance, .seedance15, .seedream: return false
             default: return true
             }
         }
@@ -105,6 +126,7 @@ final class AIVideoService: ObservableObject {
             switch self {
             case .seedance, .seedance15: return 9
             case .kling, .runway, .minimax, .vidu, .veo3: return 1
+            case .seedream: return 10
             case .gptImage2: return 4
             case .nanobanana2, .flux, .sd3, .wanxiang: return 1
             default: return 0
@@ -134,8 +156,16 @@ final class AIVideoService: ObservableObject {
 
         var supportsLastFrame: Bool {
             switch self {
-            case .kling: return true
+            case .kling, .seedance, .seedance15: return true
             default: return false
+            }
+        }
+
+        /// 参考内容总数上限（图 + 视频 + 音频）
+        var maxReferenceTotal: Int {
+            switch self {
+            case .seedance, .seedance15: return 12
+            default: return max(maxReferenceImages, 1)
             }
         }
     }
@@ -150,6 +180,28 @@ final class AIVideoService: ObservableObject {
         case failed(error: String)
     }
 
+    /// 用户消息携带的参考内容/首尾帧，用于气泡底部回显和一键回填输入区
+    enum AttachmentKind: String, Codable {
+        case image, video, audio, firstFrame, lastFrame
+    }
+
+    struct Attachment: Identifiable, Codable, Equatable {
+        var id: UUID = UUID()
+        var url: URL
+        var kind: AttachmentKind
+        var bookmark: Data?
+
+        /// 优先用 bookmark 解析，兼容用户移动过文件的情况
+        func resolvedURL() -> URL? {
+            if let bm = bookmark {
+                var stale = false
+                if let u = try? URL(resolvingBookmarkData: bm, options: [], relativeTo: nil, bookmarkDataIsStale: &stale),
+                   FileManager.default.fileExists(atPath: u.path) { return u }
+            }
+            return FileManager.default.fileExists(atPath: url.path) ? url : nil
+        }
+    }
+
     struct ChatMessage: Identifiable {
         let id: UUID
         let role: Role
@@ -160,6 +212,7 @@ final class AIVideoService: ObservableObject {
         var videoBookmark: Data?
         var imageBookmark: Data?
         var audioBookmark: Data?
+        var attachments: [Attachment] = []
         var status: TaskStatus
         let timestamp: Date
 
@@ -213,7 +266,138 @@ final class AIVideoService: ObservableObject {
             var videoBookmark: Data?
             var imageBookmark: Data?
             var audioBookmark: Data?
+            /// optional：旧会话记录没有这个字段，解码时为 nil
+            var attachments: [Attachment]?
         }
+    }
+
+    // MARK: - 输入区状态
+    // 素材库和 AI 面板是互斥 tab，AIChatPanel 每次切回来都会重建。
+    // 这些状态必须放在 singleton 上，否则用户选好的参考内容/模式会在切 tab 时丢失。
+
+    enum RefContentType { case image, video, audio }
+
+    struct RefContent: Identifiable {
+        let id = UUID()
+        let url: URL
+        let type: RefContentType
+        let thumbnail: NSImage
+    }
+
+    enum ImageInputMode: String {
+        case reference, frames
+        var label: String {
+            switch self {
+            case .reference: return "参考内容"
+            case .frames: return "首尾帧"
+            }
+        }
+    }
+
+    @Published var referenceContents: [RefContent] = []
+    @Published var firstFrameImage: (url: URL, image: NSImage)? = nil
+    @Published var lastFrameImage: (url: URL, image: NSImage)? = nil
+    @Published var imageMode: ImageInputMode = .reference
+
+    static let imageExts: Set<String> = ["jpg","jpeg","png","gif","bmp","tiff","webp","heic"]
+    static let videoExts: Set<String> = ["mp4","mov","m4v","avi","mkv","webm"]
+    static let audioExts: Set<String> = ["mp3","wav","m4a","aac","flac","ogg"]
+
+    enum AddReferenceResult {
+        case added
+        case duplicate
+        case unsupportedType
+        case limitReached(String)
+    }
+
+    /// 把素材加进当前模式对应的占位。UI 层不必显示，AI 面板重建后状态仍在。
+    @discardableResult
+    func addToReference(url: URL) -> AddReferenceResult {
+        let ext = url.pathExtension.lowercased()
+        let type: RefContentType
+        if Self.imageExts.contains(ext) { type = .image }
+        else if Self.videoExts.contains(ext) { type = .video }
+        else if Self.audioExts.contains(ext) { type = .audio }
+        else { return .unsupportedType }
+
+        if selectedProvider.category == .video && imageMode == .frames {
+            return addAsFrame(url: url, type: type)
+        }
+        return addAsReference(url: url, type: type)
+    }
+
+    /// 首尾帧模式：先点的进首帧，后点的进尾帧，都满了从首帧重新开始
+    private func addAsFrame(url: URL, type: RefContentType) -> AddReferenceResult {
+        guard type == .image, let img = NSImage(contentsOf: url) else { return .unsupportedType }
+        let thumb = img.aiThumbnail(maxSize: 200)
+        if firstFrameImage == nil {
+            firstFrameImage = (url, thumb)
+        } else if selectedProvider.supportsLastFrame && lastFrameImage == nil {
+            lastFrameImage = (url, thumb)
+        } else {
+            firstFrameImage = (url, thumb)
+            if selectedProvider.supportsLastFrame { lastFrameImage = nil }
+        }
+        return .added
+    }
+
+    private func addAsReference(url: URL, type: RefContentType) -> AddReferenceResult {
+        guard !referenceContents.contains(where: { $0.url == url }) else { return .duplicate }
+
+        let limit: Int
+        let name: String
+        switch type {
+        case .image: limit = selectedProvider.maxReferenceImages; name = "图片"
+        case .video: limit = selectedProvider.maxReferenceVideos; name = "视频"
+        case .audio: limit = selectedProvider.maxReferenceAudios; name = "音频"
+        }
+        guard limit > 0 else { return .unsupportedType }
+        guard referenceContents.count < selectedProvider.maxReferenceTotal else {
+            return .limitReached("参考内容总数上限 \(selectedProvider.maxReferenceTotal) 个")
+        }
+        guard referenceContents.filter({ $0.type == type }).count < limit else {
+            return .limitReached("\(name)上限 \(limit) 个")
+        }
+
+        let thumb: NSImage
+        switch type {
+        case .image: thumb = (NSImage(contentsOf: url) ?? Self.audioPlaceholderThumbnail()).aiThumbnail(maxSize: 200)
+        case .video: thumb = Self.videoFrameThumbnail(url: url)
+        case .audio: thumb = Self.audioPlaceholderThumbnail()
+        }
+        referenceContents.append(RefContent(url: url, type: type, thumbnail: thumb))
+        return .added
+    }
+
+    static func videoFrameThumbnail(url: URL) -> NSImage {
+        let asset = AVURLAsset(url: url)
+        let gen = AVAssetImageGenerator(asset: asset)
+        gen.appliesPreferredTrackTransform = true
+        gen.maximumSize = CGSize(width: 200, height: 200)
+        if let cg = try? gen.copyCGImage(at: .zero, actualTime: nil) {
+            return NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
+        }
+        let img = NSImage(size: NSSize(width: 48, height: 48))
+        img.lockFocus()
+        NSColor.darkGray.setFill()
+        NSBezierPath.fill(NSRect(origin: .zero, size: img.size))
+        img.unlockFocus()
+        return img
+    }
+
+    static func audioPlaceholderThumbnail() -> NSImage {
+        let size = NSSize(width: 48, height: 48)
+        let img = NSImage(size: size)
+        img.lockFocus()
+        NSColor(white: 0.2, alpha: 1).setFill()
+        NSBezierPath(roundedRect: NSRect(origin: .zero, size: size), xRadius: 6, yRadius: 6).fill()
+        if let s = NSImage(systemSymbolName: "waveform", accessibilityDescription: nil) {
+            let config = NSImage.SymbolConfiguration(pointSize: 20, weight: .light)
+            let configured = s.withSymbolConfiguration(config) ?? s
+            configured.draw(in: NSRect(x: (48 - 28) / 2, y: (48 - 28) / 2, width: 28, height: 28))
+        }
+        img.unlockFocus()
+        return img
     }
 
     @Published var messages: [ChatMessage] = []
@@ -235,8 +419,15 @@ final class AIVideoService: ObservableObject {
         loadHistory()
     }
 
-    func sendPrompt(_ prompt: String, duration: String = "5", aspectRatio: String = "16:9", resolution: String = "720P", referenceImages: [URL] = [], referenceVideos: [URL] = [], referenceAudios: [URL] = [], firstFrame: URL? = nil, lastFrame: URL? = nil) {
-        let userMsg = ChatMessage(role: .user, content: prompt)
+    func sendPrompt(_ prompt: String, duration: String = "5", aspectRatio: String = "16:9", resolution: String = "720P", imageRatio: String = "1:1", referenceImages: [URL] = [], referenceVideos: [URL] = [], referenceAudios: [URL] = [], firstFrame: URL? = nil, lastFrame: URL? = nil) {
+        var userMsg = ChatMessage(role: .user, content: prompt)
+        var atts: [Attachment] = []
+        atts += referenceImages.map { Attachment(url: $0, kind: .image, bookmark: createBookmark(for: $0)) }
+        atts += referenceVideos.map { Attachment(url: $0, kind: .video, bookmark: createBookmark(for: $0)) }
+        atts += referenceAudios.map { Attachment(url: $0, kind: .audio, bookmark: createBookmark(for: $0)) }
+        if let f = firstFrame { atts.append(Attachment(url: f, kind: .firstFrame, bookmark: createBookmark(for: f))) }
+        if let l = lastFrame { atts.append(Attachment(url: l, kind: .lastFrame, bookmark: createBookmark(for: l))) }
+        userMsg.attachments = atts
         messages.append(userMsg)
 
         let category = selectedProvider.category
@@ -267,7 +458,7 @@ final class AIVideoService: ObservableObject {
                     let url = try await generateVideo(provider: provider, prompt: prompt, duration: duration, aspectRatio: aspectRatio, resolution: resolution, referenceImages: referenceImages, referenceVideos: referenceVideos, referenceAudios: referenceAudios, firstFrame: firstFrame, lastFrame: lastFrame)
                     applyGenerationResult(convId: convId, msgId: msgId, content: "视频生成完成", mediaURL: url, status: .completed(url: url))
                 case .image:
-                    let url = try await generateImage(provider: provider, prompt: prompt, referenceImages: referenceImages)
+                    let url = try await generateImage(provider: provider, prompt: prompt, referenceImages: referenceImages, ratio: imageRatio)
                     applyGenerationResult(convId: convId, msgId: msgId, content: "图片生成完成", mediaURL: url, status: .completedImage(url: url))
                 case .audio:
                     let url = try await generateAudio(provider: provider, prompt: prompt)
@@ -363,7 +554,9 @@ final class AIVideoService: ObservableObject {
         currentConversationId = conv.id
         messages = conv.entries.map { entry in
             if entry.isUser {
-                return ChatMessage(role: .user, content: entry.text)
+                var msg = ChatMessage(id: entry.id, role: .user, content: entry.text)
+                msg.attachments = entry.attachments ?? []
+                return msg
             } else {
                 if let url = resolveMediaURL(path: entry.videoPath, bookmark: entry.videoBookmark) {
                     var msg = ChatMessage(role: .assistant, content: entry.text, videoURL: url, status: .completed(url: url))
@@ -431,6 +624,7 @@ final class AIVideoService: ObservableObject {
             entry.videoBookmark = videoBookmark
             entry.imageBookmark = imageBookmark
             entry.audioBookmark = audioBookmark
+            entry.attachments = msg.attachments.isEmpty ? nil : msg.attachments
             return entry
         }
         let title = String((validMessages.first(where: { $0.role == .user })?.content ?? "对话").prefix(30))
@@ -476,11 +670,11 @@ final class AIVideoService: ObservableObject {
         case .seedance:
             let ep = settings.seedanceEndpoint
             guard !ep.isEmpty else { throw AIError.missingAPIKey("请先在设置中填写 Seedance 2.0 的接入点 ID") }
-            return try await generateWithSeedance(model: ep, prompt: prompt, duration: duration, aspectRatio: aspectRatio, referenceImages: referenceImages, referenceVideos: referenceVideos, referenceAudios: referenceAudios)
+            return try await generateWithSeedance(model: ep, prompt: prompt, duration: duration, aspectRatio: aspectRatio, referenceImages: referenceImages, referenceVideos: referenceVideos, referenceAudios: referenceAudios, firstFrame: firstFrame, lastFrame: lastFrame)
         case .seedance15:
             let ep = settings.seedance15Endpoint
             guard !ep.isEmpty else { throw AIError.missingAPIKey("请先在设置中填写 Seedance 1.5 Pro 的接入点 ID") }
-            return try await generateWithSeedance(model: ep, prompt: prompt, duration: duration, aspectRatio: aspectRatio, referenceImages: referenceImages, referenceVideos: referenceVideos, referenceAudios: referenceAudios)
+            return try await generateWithSeedance(model: ep, prompt: prompt, duration: duration, aspectRatio: aspectRatio, referenceImages: referenceImages, referenceVideos: referenceVideos, referenceAudios: referenceAudios, firstFrame: firstFrame, lastFrame: lastFrame)
         case .minimax:
             return try await generateWithMiniMax(prompt: prompt, duration: duration, aspectRatio: aspectRatio, referenceImage: referenceImages.first ?? firstFrame)
         case .vidu:
@@ -704,13 +898,13 @@ final class AIVideoService: ObservableObject {
 
     // MARK: - Seedance API
 
-    private func generateWithSeedance(model: String, prompt: String, duration: String, aspectRatio: String, referenceImages: [URL] = [], referenceVideos: [URL] = [], referenceAudios: [URL] = []) async throws -> URL {
+    private func generateWithSeedance(model: String, prompt: String, duration: String, aspectRatio: String, referenceImages: [URL] = [], referenceVideos: [URL] = [], referenceAudios: [URL] = [], firstFrame: URL? = nil, lastFrame: URL? = nil) async throws -> URL {
         let apiKey = settings.seedanceApiKey
         guard !apiKey.isEmpty else {
             throw AIError.missingAPIKey("请先在设置中填写 Seedance API Key")
         }
 
-        let taskId = try await createSeedanceTask(apiKey: apiKey, model: model, prompt: prompt, duration: duration, aspectRatio: aspectRatio, referenceImages: referenceImages, referenceVideos: referenceVideos, referenceAudios: referenceAudios)
+        let taskId = try await createSeedanceTask(apiKey: apiKey, model: model, prompt: prompt, duration: duration, aspectRatio: aspectRatio, referenceImages: referenceImages, referenceVideos: referenceVideos, referenceAudios: referenceAudios, firstFrame: firstFrame, lastFrame: lastFrame)
 
         updateAssistantStatus(.generating(progress: "生成中，请等待…"))
 
@@ -722,27 +916,40 @@ final class AIVideoService: ObservableObject {
         return localURL
     }
 
-    private func createSeedanceTask(apiKey: String, model: String, prompt: String, duration: String, aspectRatio: String, referenceImages: [URL] = [], referenceVideos: [URL] = [], referenceAudios: [URL] = []) async throws -> String {
+    private func createSeedanceTask(apiKey: String, model: String, prompt: String, duration: String, aspectRatio: String, referenceImages: [URL] = [], referenceVideos: [URL] = [], referenceAudios: [URL] = [], firstFrame: URL? = nil, lastFrame: URL? = nil) async throws -> String {
         let url = URL(string: "https://ark.cn-beijing.volces.com/api/v3/contents/generations/tasks")!
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
 
+        // 火山文档：首尾帧（role=first_frame/last_frame）与多模态参考（role=reference_image）
+        // 是互斥场景，role 必填。之前完全没传 role，参考图才不生效。
         var reqContent: [[String: Any]] = []
-        for imgURL in referenceImages {
-            if let b64 = imageToBase64DataURI(imgURL) {
-                reqContent.append(["type": "image_url", "image_url": ["url": b64]])
+        let useFrames = firstFrame != nil || lastFrame != nil
+
+        if useFrames {
+            if let f = firstFrame, let b64 = compressedImageDataURI(f, maxDimension: 2048) {
+                reqContent.append(["type": "image_url", "image_url": ["url": b64], "role": "first_frame"])
             }
-        }
-        for vidURL in referenceVideos {
-            if let b64 = fileToBase64DataURI(vidURL, mime: "video/mp4") {
-                reqContent.append(["type": "video_url", "video_url": ["url": b64]])
+            if let l = lastFrame, let b64 = compressedImageDataURI(l, maxDimension: 2048) {
+                reqContent.append(["type": "image_url", "image_url": ["url": b64], "role": "last_frame"])
             }
-        }
-        for audURL in referenceAudios {
-            if let b64 = fileToBase64DataURI(audURL, mime: "audio/mpeg") {
-                reqContent.append(["type": "input_audio", "input_audio": ["url": b64]])
+        } else {
+            for imgURL in referenceImages {
+                if let b64 = compressedImageDataURI(imgURL, maxDimension: 2048) {
+                    reqContent.append(["type": "image_url", "image_url": ["url": b64], "role": "reference_image"])
+                }
+            }
+            for vidURL in referenceVideos {
+                if let b64 = fileToBase64DataURI(vidURL, mime: "video/mp4") {
+                    reqContent.append(["type": "video_url", "video_url": ["url": b64], "role": "reference_video"])
+                }
+            }
+            for audURL in referenceAudios {
+                if let b64 = fileToBase64DataURI(audURL, mime: "audio/mpeg") {
+                    reqContent.append(["type": "input_audio", "input_audio": ["url": b64], "role": "reference_audio"])
+                }
             }
         }
         reqContent.append(["type": "text", "text": prompt])
@@ -806,32 +1013,152 @@ final class AIVideoService: ObservableObject {
         throw AIError.timeout
     }
 
+    // MARK: - 图片尺寸
+
+    /// 把 "16:9" 这类比例换算成像素宽高，长边贴近 targetLong，并对齐到 step 的整数倍
+    private func pixelSize(ratio: String, targetLong: Int, step: Int = 64) -> (w: Int, h: Int) {
+        let parts = ratio.split(separator: ":").compactMap { Double($0) }
+        guard parts.count == 2, parts[0] > 0, parts[1] > 0 else {
+            return (targetLong, targetLong)
+        }
+        let (rw, rh) = (parts[0], parts[1])
+        var w: Double, h: Double
+        if rw >= rh {
+            w = Double(targetLong)
+            h = w * rh / rw
+        } else {
+            h = Double(targetLong)
+            w = h * rw / rh
+        }
+        func align(_ v: Double) -> Int { max(step, Int((v / Double(step)).rounded()) * step) }
+        return (align(w), align(h))
+    }
+
+    /// Stability SD3 的 aspect_ratio 只接受固定枚举，取数值最接近的一个
+    private static func sd3AspectRatio(_ ratio: String) -> String {
+        let allowed = ["21:9", "16:9", "3:2", "5:4", "1:1", "4:5", "2:3", "9:16", "9:21"]
+        func value(_ s: String) -> Double? {
+            let p = s.split(separator: ":").compactMap { Double($0) }
+            guard p.count == 2, p[1] > 0 else { return nil }
+            return p[0] / p[1]
+        }
+        guard let target = value(ratio) else { return "1:1" }
+        if allowed.contains(ratio) { return ratio }
+        return allowed.min(by: { abs((value($0) ?? 1) - target) < abs((value($1) ?? 1) - target) }) ?? "1:1"
+    }
+
+    /// OpenAI 图片接口只接受三种尺寸，按比例取最接近的
+    private func openAISize(ratio: String) -> String {
+        let parts = ratio.split(separator: ":").compactMap { Double($0) }
+        guard parts.count == 2, parts[1] > 0 else { return "1024x1024" }
+        let r = parts[0] / parts[1]
+        if r > 1.15 { return "1536x1024" }
+        if r < 0.87 { return "1024x1536" }
+        return "1024x1024"
+    }
+
     // MARK: - 图片生成
 
-    private func generateImage(provider: Provider, prompt: String, referenceImages: [URL] = []) async throws -> URL {
+    private func generateImage(provider: Provider, prompt: String, referenceImages: [URL] = [], ratio: String = "1:1") async throws -> URL {
+        // Seedream 与 Seedance 同属火山方舟，共用 seedanceApiKey
+        if provider == .seedream {
+            return try await generateWithSeedream(prompt: prompt, referenceImages: referenceImages, ratio: ratio)
+        }
         let apiKey = settings.providerAPIKey(for: provider.rawValue)
         guard !apiKey.isEmpty else {
             throw AIError.missingAPIKey("请先在设置中填写 \(provider.displayName) 的 API Key")
         }
         switch provider {
         case .nanobanana2:
-            return try await generateWithNanobanana2(prompt: prompt, referenceImages: referenceImages)
+            return try await generateWithNanobanana2(prompt: prompt, referenceImages: referenceImages, ratio: ratio)
         case .gptImage2:
-            return try await generateWithGPTImage(apiKey: apiKey, prompt: prompt, referenceImages: referenceImages)
+            return try await generateWithGPTImage(apiKey: apiKey, prompt: prompt, referenceImages: referenceImages, ratio: ratio)
         case .flux:
-            return try await generateWithFlux(apiKey: apiKey, prompt: prompt)
+            return try await generateWithFlux(apiKey: apiKey, prompt: prompt, ratio: ratio)
         case .sd3:
-            return try await generateWithSD3(apiKey: apiKey, prompt: prompt)
+            return try await generateWithSD3(apiKey: apiKey, prompt: prompt, ratio: ratio)
         case .wanxiang:
-            return try await generateWithWanxiang(apiKey: apiKey, prompt: prompt)
+            return try await generateWithWanxiang(apiKey: apiKey, prompt: prompt, ratio: ratio)
         default:
             throw AIError.missingAPIKey("\(provider.displayName) 不支持图片生成")
         }
     }
 
+    // MARK: - Seedream 5.0 Pro (火山方舟)
+
+    private func generateWithSeedream(prompt: String, referenceImages: [URL] = [], ratio: String = "1:1") async throws -> URL {
+        let apiKey = settings.seedanceApiKey
+        guard !apiKey.isEmpty else {
+            throw AIError.missingAPIKey("请先在设置中填写火山方舟 API Key")
+        }
+        let ep = settings.seedreamEndpoint.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !ep.isEmpty else {
+            throw AIError.missingAPIKey("请先在设置中填写 Seedream 的接入点 ID 或模型名")
+        }
+
+        let url = URL(string: "https://ark.cn-beijing.volces.com/api/v3/images/generations")!
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        // 同步接口，2K 出图常超过 URLSession 默认的 60s
+        request.timeoutInterval = 300
+
+        let sz = pixelSize(ratio: ratio, targetLong: 2048)
+        var body: [String: Any] = [
+            "model": ep,
+            "prompt": prompt,
+            "size": "\(sz.w)x\(sz.h)",
+            "response_format": "url",
+            "watermark": false
+        ]
+        // 参考图：单张传字符串，多张传数组
+        let refs = referenceImages.compactMap { compressedImageDataURI($0) }
+        if refs.count == 1 {
+            body["image"] = refs[0]
+        } else if refs.count > 1 {
+            body["image"] = refs
+        }
+
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+
+        await MainActor.run { updateAssistantStatus(.generating(progress: "生成图片中…")) }
+
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await URLSession.shared.data(for: request)
+        } catch let err as URLError where err.code == .timedOut {
+            throw AIError.apiError("Seedream 请求超时（已等待 300 秒）。请检查接入点 ID 是否为图片生成模型、网络是否可达火山方舟")
+        }
+        guard let httpResp = response as? HTTPURLResponse, (200...299).contains(httpResp.statusCode) else {
+            let msg = String(data: data, encoding: .utf8) ?? "未知错误"
+            throw AIError.apiError("Seedream: \(msg)")
+        }
+
+        let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        guard let arr = json?["data"] as? [[String: Any]], let first = arr.first else {
+            throw AIError.apiError("Seedream 返回数据格式错误")
+        }
+
+        // url 或 b64_json 两种返回形式
+        if let imgURL = first["url"] as? String {
+            await MainActor.run { updateAssistantStatus(.downloading(progress: 0)) }
+            return try await downloadFile(from: imgURL, filename: "seedream_\(UUID().uuidString.prefix(8)).png")
+        }
+        if let b64 = first["b64_json"] as? String, let decoded = Data(base64Encoded: b64) {
+            let saveDir = AppSettings.shared.effectiveProjectDir.appendingPathComponent("AI生成")
+            try FileManager.default.createDirectory(at: saveDir, withIntermediateDirectories: true)
+            let dest = saveDir.appendingPathComponent("seedream_\(UUID().uuidString.prefix(8)).png")
+            try decoded.write(to: dest)
+            return dest
+        }
+        throw AIError.apiError("Seedream 返回数据格式错误")
+    }
+
     // MARK: - Nanobanana 2 (Google)
 
-    private func generateWithNanobanana2(prompt: String, referenceImages: [URL] = []) async throws -> URL {
+    private func generateWithNanobanana2(prompt: String, referenceImages: [URL] = [], ratio: String = "1:1") async throws -> URL {
         var apiKey = settings.providerAPIKey(for: Provider.nanobanana2.rawValue)
         if apiKey.isEmpty { apiKey = settings.providerAPIKey(for: Provider.veo3.rawValue) }
         guard !apiKey.isEmpty else {
@@ -842,22 +1169,39 @@ final class AIVideoService: ObservableObject {
         var request = URLRequest(url: endpoint)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        // 同步接口，出图常超过 URLSession 默认的 60s
+        request.timeoutInterval = 300
 
         var body: [String: Any] = [
             "prompt": prompt,
-            "config": ["numberOfImages": 1]
+            "config": ["numberOfImages": 1, "aspectRatio": ratio]
         ]
-        if let imgURL = referenceImages.first, let imgData = try? Data(contentsOf: imgURL) {
-            let ext = imgURL.pathExtension.lowercased()
-            let mime = ext == "png" ? "image/png" : "image/jpeg"
-            body["referenceImages"] = [["referenceImage": ["inlineData": ["mimeType": mime, "data": imgData.base64EncodedString()]], "referenceType": "STYLE"]]
+        if let imgURL = referenceImages.first {
+            let mime: String
+            let imgData: Data?
+            if let compressed = compressedImageData(imgURL) {
+                mime = "image/jpeg"
+                imgData = compressed
+            } else {
+                mime = imgURL.pathExtension.lowercased() == "png" ? "image/png" : "image/jpeg"
+                imgData = try? Data(contentsOf: imgURL)
+            }
+            if let imgData {
+                body["referenceImages"] = [["referenceImage": ["inlineData": ["mimeType": mime, "data": imgData.base64EncodedString()]], "referenceType": "STYLE"]]
+            }
         }
 
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
         await MainActor.run { updateAssistantStatus(.generating(progress: "生成图片中…")) }
 
-        let (data, resp) = try await URLSession.shared.data(for: request)
+        let data: Data
+        let resp: URLResponse
+        do {
+            (data, resp) = try await URLSession.shared.data(for: request)
+        } catch let err as URLError where err.code == .timedOut {
+            throw AIError.apiError("Nanobanana 2 请求超时（已等待 300 秒），请检查网络是否可达 Google API")
+        }
         guard let http = resp as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
             let msg = String(data: data, encoding: .utf8) ?? "请求失败"
             throw AIError.apiError("Nanobanana 2: \(msg)")
@@ -880,50 +1224,68 @@ final class AIVideoService: ObservableObject {
 
     // MARK: - GPT-Image-2
 
-    private func generateWithGPTImage(apiKey: String, prompt: String, referenceImages: [URL] = []) async throws -> URL {
+    private func generateWithGPTImage(apiKey: String, prompt: String, referenceImages: [URL] = [], ratio: String = "1:1") async throws -> URL {
         await MainActor.run { updateAssistantStatus(.generating(progress: "生成图片中…")) }
+        let size = openAISize(ratio: ratio)
 
         let data: Data
         let resp: URLResponse
 
-        if referenceImages.isEmpty {
-            let url = URL(string: "https://api.openai.com/v1/images/generations")!
-            var request = URLRequest(url: url)
-            request.httpMethod = "POST"
-            request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
-            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-            let body: [String: Any] = ["model": "gpt-image-1", "prompt": prompt, "n": 1, "size": "1024x1024"]
-            request.httpBody = try JSONSerialization.data(withJSONObject: body)
-            (data, resp) = try await URLSession.shared.data(for: request)
-        } else {
-            let url = URL(string: "https://api.openai.com/v1/images/edits")!
-            let boundary = UUID().uuidString
-            var request = URLRequest(url: url)
-            request.httpMethod = "POST"
-            request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
-            request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
+        do {
+            if referenceImages.isEmpty {
+                let url = URL(string: "https://api.openai.com/v1/images/generations")!
+                var request = URLRequest(url: url)
+                request.httpMethod = "POST"
+                request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+                request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                // 同步接口，出图常超过 URLSession 默认的 60s
+                request.timeoutInterval = 300
+                let body: [String: Any] = ["model": "gpt-image-1", "prompt": prompt, "n": 1, "size": size]
+                request.httpBody = try JSONSerialization.data(withJSONObject: body)
+                (data, resp) = try await URLSession.shared.data(for: request)
+            } else {
+                let url = URL(string: "https://api.openai.com/v1/images/edits")!
+                let boundary = UUID().uuidString
+                var request = URLRequest(url: url)
+                request.httpMethod = "POST"
+                request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+                request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
+                request.timeoutInterval = 300
 
-            var body = Data()
-            func appendField(_ name: String, _ value: String) {
-                body.append("--\(boundary)\r\nContent-Disposition: form-data; name=\"\(name)\"\r\n\r\n\(value)\r\n".data(using: .utf8)!)
-            }
-            appendField("model", "gpt-image-1")
-            appendField("prompt", prompt)
-            appendField("n", "1")
-            appendField("size", "1024x1024")
-            for (i, imgURL) in referenceImages.prefix(4).enumerated() {
-                if let imgData = try? Data(contentsOf: imgURL) {
-                    let ext = imgURL.pathExtension.lowercased()
-                    let mime = ext == "png" ? "image/png" : "image/jpeg"
-                    let fname = "ref\(i).\(ext.isEmpty ? "png" : ext)"
-                    body.append("--\(boundary)\r\nContent-Disposition: form-data; name=\"image[]\"; filename=\"\(fname)\"\r\nContent-Type: \(mime)\r\n\r\n".data(using: .utf8)!)
-                    body.append(imgData)
-                    body.append("\r\n".data(using: .utf8)!)
+                var body = Data()
+                func appendField(_ name: String, _ value: String) {
+                    body.append("--\(boundary)\r\nContent-Disposition: form-data; name=\"\(name)\"\r\n\r\n\(value)\r\n".data(using: .utf8)!)
                 }
+                appendField("model", "gpt-image-1")
+                appendField("prompt", prompt)
+                appendField("n", "1")
+                appendField("size", size)
+                for (i, imgURL) in referenceImages.prefix(4).enumerated() {
+                    let mime: String
+                    let fname: String
+                    let imgData: Data?
+                    if let compressed = compressedImageData(imgURL) {
+                        mime = "image/jpeg"
+                        fname = "ref\(i).jpg"
+                        imgData = compressed
+                    } else {
+                        let ext = imgURL.pathExtension.lowercased()
+                        mime = ext == "png" ? "image/png" : "image/jpeg"
+                        fname = "ref\(i).\(ext.isEmpty ? "png" : ext)"
+                        imgData = try? Data(contentsOf: imgURL)
+                    }
+                    if let imgData {
+                        body.append("--\(boundary)\r\nContent-Disposition: form-data; name=\"image[]\"; filename=\"\(fname)\"\r\nContent-Type: \(mime)\r\n\r\n".data(using: .utf8)!)
+                        body.append(imgData)
+                        body.append("\r\n".data(using: .utf8)!)
+                    }
+                }
+                body.append("--\(boundary)--\r\n".data(using: .utf8)!)
+                request.httpBody = body
+                (data, resp) = try await URLSession.shared.data(for: request)
             }
-            body.append("--\(boundary)--\r\n".data(using: .utf8)!)
-            request.httpBody = body
-            (data, resp) = try await URLSession.shared.data(for: request)
+        } catch let err as URLError where err.code == .timedOut {
+            throw AIError.apiError("GPT-Image 请求超时（已等待 300 秒），请检查网络是否可达 OpenAI API")
         }
 
         guard let http = resp as? HTTPURLResponse, http.statusCode == 200 else {
@@ -952,14 +1314,16 @@ final class AIVideoService: ObservableObject {
 
     // MARK: - Flux (BFL API)
 
-    private func generateWithFlux(apiKey: String, prompt: String) async throws -> URL {
+    private func generateWithFlux(apiKey: String, prompt: String, ratio: String = "1:1") async throws -> URL {
         let url = URL(string: "https://api.bfl.ml/v1/flux-pro-1.1")!
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("Key \(apiKey)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
 
-        let body: [String: Any] = ["prompt": prompt, "width": 1024, "height": 1024]
+        // BFL 要求宽高是 32 的倍数
+        let sz = pixelSize(ratio: ratio, targetLong: 1440, step: 32)
+        let body: [String: Any] = ["prompt": prompt, "width": sz.w, "height": sz.h]
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
         let (data, resp) = try await URLSession.shared.data(for: request)
@@ -994,7 +1358,7 @@ final class AIVideoService: ObservableObject {
 
     // MARK: - Stable Diffusion 3
 
-    private func generateWithSD3(apiKey: String, prompt: String) async throws -> URL {
+    private func generateWithSD3(apiKey: String, prompt: String, ratio: String = "1:1") async throws -> URL {
         let url = URL(string: "https://api.stability.ai/v2beta/stable-image/generate/sd3")!
         let boundary = UUID().uuidString
         var request = URLRequest(url: url)
@@ -1002,6 +1366,8 @@ final class AIVideoService: ObservableObject {
         request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
+        // 同步接口，出图常超过 URLSession 默认的 60s
+        request.timeoutInterval = 300
 
         var bodyData = Data()
         func addField(_ name: String, _ value: String) {
@@ -1010,12 +1376,19 @@ final class AIVideoService: ObservableObject {
         addField("prompt", prompt)
         addField("model", "sd3.5-large")
         addField("output_format", "png")
+        addField("aspect_ratio", Self.sd3AspectRatio(ratio))
         bodyData.append("--\(boundary)--\r\n".data(using: .utf8)!)
         request.httpBody = bodyData
 
         await MainActor.run { updateAssistantStatus(.generating(progress: "生成图片中…")) }
 
-        let (data, resp) = try await URLSession.shared.data(for: request)
+        let data: Data
+        let resp: URLResponse
+        do {
+            (data, resp) = try await URLSession.shared.data(for: request)
+        } catch let err as URLError where err.code == .timedOut {
+            throw AIError.apiError("SD3 请求超时（已等待 300 秒），请检查网络是否可达 Stability API")
+        }
         guard let http = resp as? HTTPURLResponse, http.statusCode == 200 else {
             let errJson = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
             throw AIError.apiError((errJson?["message"] as? String) ?? "SD3 请求失败 (\((resp as? HTTPURLResponse)?.statusCode ?? 0))")
@@ -1035,7 +1408,7 @@ final class AIVideoService: ObservableObject {
 
     // MARK: - 通义万相
 
-    private func generateWithWanxiang(apiKey: String, prompt: String) async throws -> URL {
+    private func generateWithWanxiang(apiKey: String, prompt: String, ratio: String = "1:1") async throws -> URL {
         let url = URL(string: "https://dashscope.aliyuncs.com/api/v1/services/aigc/text2image/image-synthesis")!
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
@@ -1043,10 +1416,12 @@ final class AIVideoService: ObservableObject {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("enable", forHTTPHeaderField: "X-DashScope-Async")
 
+        // 通义万相尺寸用 * 分隔，且要求 64 的倍数
+        let sz = pixelSize(ratio: ratio, targetLong: 1280)
         let body: [String: Any] = [
             "model": "wanx-v1",
             "input": ["prompt": prompt],
-            "parameters": ["n": 1, "size": "1024*1024"]
+            "parameters": ["n": 1, "size": "\(sz.w)*\(sz.h)"]
         ]
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
@@ -1698,6 +2073,30 @@ final class AIVideoService: ObservableObject {
         default: mime = "image/jpeg"
         }
         return "data:\(mime);base64,\(data.base64EncodedString())"
+    }
+
+    /// 压缩参考图：原图直传会让请求体膨胀到几 MB，导致上传/服务端解码超时。失败返回 nil，调用方回退原图
+    private func compressedImageData(_ url: URL, maxDimension: Int = 1536, quality: CGFloat = 0.85) -> Data? {
+        guard let src = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
+        let opts: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: maxDimension
+        ]
+        guard let cgImage = CGImageSourceCreateThumbnailAtIndex(src, 0, opts as CFDictionary) else { return nil }
+        let out = NSMutableData()
+        guard let dest = CGImageDestinationCreateWithData(out, UTType.jpeg.identifier as CFString, 1, nil) else { return nil }
+        CGImageDestinationAddImage(dest, cgImage, [kCGImageDestinationLossyCompressionQuality: quality] as CFDictionary)
+        guard CGImageDestinationFinalize(dest) else { return nil }
+        return out as Data
+    }
+
+    /// 压缩参考图后转 base64 data URI
+    private func compressedImageDataURI(_ url: URL, maxDimension: Int = 1536, quality: CGFloat = 0.85) -> String? {
+        guard let data = compressedImageData(url, maxDimension: maxDimension, quality: quality) else {
+            return imageToBase64DataURI(url)
+        }
+        return "data:image/jpeg;base64,\(data.base64EncodedString())"
     }
 
     private func fileToBase64DataURI(_ url: URL, mime: String) -> String? {

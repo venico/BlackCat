@@ -8,27 +8,28 @@ struct AIChatPanel: View {
     @ObservedObject private var settings = AppSettings.shared
     @State private var inputText = ""
     @State private var showHistory = false
-    @State private var referenceContents: [RefContent] = []
-    @State private var firstFrameImage: (url: URL, image: NSImage)? = nil
-    @State private var lastFrameImage: (url: URL, image: NSImage)? = nil
-    @State private var imageMode: ImageInputMode = .reference
+    @State private var swapHovering = false
 
-    private enum RefContentType { case image, video, audio }
-    private struct RefContent: Identifiable {
-        let id = UUID()
-        let url: URL
-        let type: RefContentType
-        let thumbnail: NSImage
+    // 输入区状态存在 service 上，切 tab 重建 View 时不丢失
+    private typealias RefContentType = AIVideoService.RefContentType
+    private typealias RefContent = AIVideoService.RefContent
+    private typealias ImageInputMode = AIVideoService.ImageInputMode
+
+    private var referenceContents: [RefContent] {
+        get { service.referenceContents }
+        nonmutating set { service.referenceContents = newValue }
     }
-
-    private enum ImageInputMode: String {
-        case reference, frames
-        var label: String {
-            switch self {
-            case .reference: return "参考内容"
-            case .frames: return "首尾帧"
-            }
-        }
+    private var firstFrameImage: (url: URL, image: NSImage)? {
+        get { service.firstFrameImage }
+        nonmutating set { service.firstFrameImage = newValue }
+    }
+    private var lastFrameImage: (url: URL, image: NSImage)? {
+        get { service.lastFrameImage }
+        nonmutating set { service.lastFrameImage = newValue }
+    }
+    private var imageMode: ImageInputMode {
+        get { service.imageMode }
+        nonmutating set { service.imageMode = newValue }
     }
 
     private let durations = ["4", "5", "6", "7", "8", "9", "10"]
@@ -42,6 +43,30 @@ struct AIChatPanel: View {
             messageList
             inputArea
         }
+        .onChange(of: service.selectedProvider) { _ in
+            pruneInputsForProvider()
+        }
+    }
+
+    /// 切换模型后，裁掉新模型不支持的参考内容，避免带着旧模型的数据发出去被静默丢弃
+    private func pruneInputsForProvider() {
+        let provider = service.selectedProvider
+        if !provider.supportsLastFrame { lastFrameImage = nil }
+        if !provider.supportsFirstFrame { firstFrameImage = nil }
+
+        var kept: [RefContent] = []
+        var imgCount = 0, vidCount = 0, audCount = 0
+        for item in referenceContents {
+            guard kept.count < provider.maxReferenceTotal else { break }
+            switch item.type {
+            case .image where imgCount < provider.maxReferenceImages: imgCount += 1
+            case .video where vidCount < provider.maxReferenceVideos: vidCount += 1
+            case .audio where audCount < provider.maxReferenceAudios: audCount += 1
+            default: continue
+            }
+            kept.append(item)
+        }
+        if kept.count != referenceContents.count { referenceContents = kept }
     }
 
     // MARK: - 标题栏
@@ -136,7 +161,8 @@ struct AIChatPanel: View {
         .buttonStyle(.plain)
         .contextMenu {
             Button(role: .destructive) { service.deleteConversation(conv.id) } label: {
-                Label("删除", systemImage: "trash")
+                Image(nsImage: TimelineSVGIcon.load("delete", size: 14))
+                Text("删除")
             }
         }
     }
@@ -165,6 +191,8 @@ struct AIChatPanel: View {
                         ForEach(service.messages) { msg in
                             MessageBubble(message: msg, onInsertToTimeline: { url in
                                 insertMediaToTimeline(url)
+                            }, onRestoreAttachment: { att in
+                                restoreAttachment(att)
                             })
                             .id(msg.id)
                         }
@@ -246,11 +274,11 @@ struct AIChatPanel: View {
 
                 HStack(spacing: 4) {
                     if service.selectedProvider.category == .video {
-                        capsuleMenu(label: imageMode.label) {
+                        capsuleMenu(label: imageMode == .reference ? refSlotLabel : imageMode.label) {
                             Button {
                                 firstFrameImage = nil; lastFrameImage = nil
                                 imageMode = .reference
-                            } label: { Text("参考内容") }
+                            } label: { Text(refSlotLabel) }
                             Button {
                                 referenceContents.removeAll()
                                 imageMode = .frames
@@ -271,9 +299,11 @@ struct AIChatPanel: View {
                                 Button(r) { settings.aiResolution = r }
                             }
                         }
-                    } else if service.selectedProvider.maxReferenceImages > 0 {
-                        capsuleMenu(label: "参考图") {
-                            Text("最多 \(service.selectedProvider.maxReferenceImages) 张")
+                    } else if service.selectedProvider.category == .image {
+                        capsuleMenu(label: settings.aiImageRatio) {
+                            ForEach(ratios, id: \.self) { r in
+                                Button(r) { settings.aiImageRatio = r }
+                            }
                         }
                     }
 
@@ -327,6 +357,7 @@ struct AIChatPanel: View {
             .background(Color.white.opacity(0.06))
             .clipShape(RoundedRectangle(cornerRadius: 10))
             .padding(.horizontal, 8)
+            .padding(.top, 8)
             .padding(.bottom, 8)
         }
     }
@@ -357,20 +388,49 @@ struct AIChatPanel: View {
                 frameSlot(image: firstFrameImage, label: "首帧") {
                     pickSingleImage { u, i in firstFrameImage = (u, i) }
                 }
-                Image(systemName: "arrow.left.arrow.right")
-                    .font(.system(size: 10))
-                    .foregroundColor(Color.labelSecondary.opacity(0.4))
-                frameSlot(image: lastFrameImage, label: "尾帧") {
-                    pickSingleImage { u, i in lastFrameImage = (u, i) }
+                // 只有支持尾帧的模型才显示尾帧槽，否则用户设了会被 API 静默丢弃
+                if service.selectedProvider.supportsLastFrame {
+                    swapFramesButton
+                    frameSlot(image: lastFrameImage, label: "尾帧") {
+                        pickSingleImage { u, i in lastFrameImage = (u, i) }
+                    }
                 }
             }
         }
     }
 
+    /// 首尾帧互换：两个槽位都空时不可点
+    private var swapFramesButton: some View {
+        let enabled = firstFrameImage != nil || lastFrameImage != nil
+        return Button {
+            withAnimation(.easeInOut(duration: 0.18)) {
+                let tmp = firstFrameImage
+                firstFrameImage = lastFrameImage
+                lastFrameImage = tmp
+            }
+        } label: {
+            Image(systemName: "arrow.left.arrow.right")
+                .font(.system(size: 10))
+                .foregroundColor(Color.labelSecondary.opacity(enabled ? (swapHovering ? 0.9 : 0.55) : 0.25))
+                .frame(width: 20, height: 20)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(!enabled)
+        .help(enabled ? "交换首帧和尾帧" : "先添加首帧或尾帧")
+        .onHover { swapHovering = $0 && enabled }
+    }
+
+    /// 只收图片的模型显示「参考图」，能收视频/音频的才叫「参考内容」
+    private var refSlotLabel: String {
+        let p = service.selectedProvider
+        return (p.maxReferenceVideos == 0 && p.maxReferenceAudios == 0) ? "参考图" : "参考内容"
+    }
+
     private var refContentSlot: some View {
         Group {
             if referenceContents.isEmpty {
-                placeholderSlot(label: "参考内容", icon: "photo.badge.plus") { pickRefContents() }
+                placeholderSlot(label: refSlotLabel, icon: "photo.badge.plus") { pickRefContents() }
             } else {
                 ZStack {
                     fanThumbnails
@@ -388,13 +448,7 @@ struct AIChatPanel: View {
                     }
                 }
                 .overlay(alignment: .topTrailing) {
-                    Button { referenceContents.removeAll() } label: {
-                        Image(systemName: "xmark.circle.fill")
-                            .font(.system(size: 12))
-                            .foregroundColor(.white.opacity(0.7))
-                    }
-                    .buttonStyle(.plain)
-                    .offset(x: 2, y: -3)
+                    deleteBadge { referenceContents.removeAll() }
                 }
                 .onTapGesture { pickRefContents() }
             }
@@ -452,21 +506,31 @@ struct AIChatPanel: View {
                     .frame(width: 48, height: 48)
                     .clipShape(RoundedRectangle(cornerRadius: 6))
                     .overlay(alignment: .topTrailing) {
-                        Button {
+                        deleteBadge {
                             if label == "首帧" { firstFrameImage = nil } else { lastFrameImage = nil }
-                        } label: {
-                            Image(systemName: "xmark.circle.fill")
-                                .font(.system(size: 12))
-                                .foregroundColor(.white.opacity(0.7))
                         }
-                        .buttonStyle(.plain)
-                        .offset(x: 2, y: -3)
                     }
                     .onTapGesture(perform: onPick)
             } else {
                 placeholderSlot(label: label, icon: "photo", action: onPick)
             }
         }
+    }
+
+    /// 统一的删除角标：白圈 + 深色叉，垫深色底保证压在浅色图片上时观感一致
+    private func deleteBadge(action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: "xmark.circle.fill")
+                .font(.system(size: 12))
+                .foregroundColor(.white.opacity(0.7))
+                .background {
+                    Circle()
+                        .fill(Color(red: 0.13, green: 0.13, blue: 0.14))
+                        .frame(width: 10, height: 10)
+                }
+        }
+        .buttonStyle(.plain)
+        .offset(x: 2, y: -3)
     }
 
     private func placeholderSlot(label: String, icon: String = "photo", action: @escaping () -> Void) -> some View {
@@ -490,19 +554,36 @@ struct AIChatPanel: View {
 
     // MARK: - 参考内容选择
 
-    private static let imageExts: Set<String> = ["jpg","jpeg","png","gif","bmp","tiff","webp","heic"]
-    private static let videoExts: Set<String> = ["mp4","mov","m4v","avi","mkv","webm"]
-    private static let audioExts: Set<String> = ["mp3","wav","m4a","aac","flac","ogg"]
+    private static let imageExts = AIVideoService.imageExts
+    private static let videoExts = AIVideoService.videoExts
+    private static let audioExts = AIVideoService.audioExts
 
     private func pickRefContents() {
-        let totalLimit = 12
+        let provider = service.selectedProvider
+        let maxImg = provider.maxReferenceImages
+        let maxVid = provider.maxReferenceVideos
+        let maxAud = provider.maxReferenceAudios
+        let totalLimit = provider.maxReferenceTotal
         let remaining = totalLimit - referenceContents.count
         guard remaining > 0 else { return }
+
+        var types: [UTType] = []
+        if maxImg > 0 { types.append(.image) }
+        if maxVid > 0 { types.append(.movie) }
+        if maxAud > 0 { types.append(.audio) }
+        guard !types.isEmpty else { return }
+
         let panel = NSOpenPanel()
-        panel.allowedContentTypes = [.image, .movie, .audio]
-        panel.allowsMultipleSelection = true
+        panel.allowedContentTypes = types
+        panel.allowsMultipleSelection = totalLimit > 1
         panel.canChooseDirectories = false
-        panel.message = "选择参考内容（图片≤9 视频≤3 音频≤3 总数≤12）"
+        var limitParts: [String] = []
+        if maxImg > 0 { limitParts.append("图片≤\(maxImg)") }
+        if maxVid > 0 { limitParts.append("视频≤\(maxVid)") }
+        if maxAud > 0 { limitParts.append("音频≤\(maxAud)") }
+        panel.message = limitParts.count == 1
+            ? "选择\(refSlotLabel)（最多 \(maxImg) 张）"
+            : "选择\(refSlotLabel)（\(limitParts.joined(separator: " ")) 总数≤\(totalLimit)）"
         panel.begin { [self] response in
             guard response == .OK else { return }
             let urls = Array(panel.urls.prefix(remaining))
@@ -512,16 +593,16 @@ struct AIChatPanel: View {
             var newItems: [RefContent] = []
             for u in urls {
                 let ext = u.pathExtension.lowercased()
-                if Self.imageExts.contains(ext), imgCount < 9 {
+                if Self.imageExts.contains(ext), imgCount < maxImg {
                     if let img = NSImage(contentsOf: u) {
                         newItems.append(RefContent(url: u, type: .image, thumbnail: img.thumbnailImage(maxSize: 200)))
                         imgCount += 1
                     }
-                } else if Self.videoExts.contains(ext), vidCount < 3 {
+                } else if Self.videoExts.contains(ext), vidCount < maxVid {
                     let thumb = Self.videoThumbnail(url: u)
                     newItems.append(RefContent(url: u, type: .video, thumbnail: thumb))
                     vidCount += 1
-                } else if Self.audioExts.contains(ext), audCount < 3 {
+                } else if Self.audioExts.contains(ext), audCount < maxAud {
                     let thumb = Self.audioThumbnail()
                     newItems.append(RefContent(url: u, type: .audio, thumbnail: thumb))
                     audCount += 1
@@ -532,38 +613,25 @@ struct AIChatPanel: View {
         }
     }
 
-    private static func videoThumbnail(url: URL) -> NSImage {
-        let asset = AVAsset(url: url)
-        let gen = AVAssetImageGenerator(asset: asset)
-        gen.appliesPreferredTrackTransform = true
-        gen.maximumSize = CGSize(width: 200, height: 200)
-        if let cg = try? gen.copyCGImage(at: .zero, actualTime: nil) {
-            return NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
+    /// 点击历史消息里的附件缩略图回填输入区。
+    /// 去向只看当前处于哪个模式，不切模式；首尾帧按点击先后决定角色。
+    private func restoreAttachment(_ att: AIVideoService.Attachment) {
+        guard let url = att.resolvedURL() else {
+            project.showSuccessToast(icon: "exclamationmark.triangle", iconColor: .orange, title: "文件已不存在", subtitle: att.url.lastPathComponent)
+            return
         }
-        let img = NSImage(size: NSSize(width: 48, height: 48))
-        img.lockFocus()
-        NSColor.darkGray.setFill()
-        NSBezierPath.fill(NSRect(origin: .zero, size: img.size))
-        img.unlockFocus()
-        return img
+        switch service.addToReference(url: url) {
+        case .added, .duplicate:
+            break
+        case .unsupportedType:
+            project.showSuccessToast(icon: "exclamationmark.triangle", iconColor: .orange, title: "不支持当前素材类型", subtitle: "当前占位不接受该类型素材")
+        case .limitReached(let msg):
+            project.showSuccessToast(icon: "exclamationmark.triangle", iconColor: .orange, title: "无法添加", subtitle: msg)
+        }
     }
 
-    private static func audioThumbnail() -> NSImage {
-        let size = NSSize(width: 48, height: 48)
-        let img = NSImage(size: size)
-        img.lockFocus()
-        NSColor(white: 0.2, alpha: 1).setFill()
-        NSBezierPath(roundedRect: NSRect(origin: .zero, size: size), xRadius: 6, yRadius: 6).fill()
-        let symbol = NSImage(systemSymbolName: "waveform", accessibilityDescription: nil)
-        if let s = symbol {
-            let config = NSImage.SymbolConfiguration(pointSize: 20, weight: .light)
-            let configured = s.withSymbolConfiguration(config) ?? s
-            let r = NSRect(x: (48 - 28) / 2, y: (48 - 28) / 2, width: 28, height: 28)
-            configured.draw(in: r)
-        }
-        img.unlockFocus()
-        return img
-    }
+    private static func videoThumbnail(url: URL) -> NSImage { AIVideoService.videoFrameThumbnail(url: url) }
+    private static func audioThumbnail() -> NSImage { AIVideoService.audioPlaceholderThumbnail() }
 
     private func pickSingleImage(completion: @escaping (URL, NSImage) -> Void) {
         let panel = NSOpenPanel()
@@ -664,7 +732,7 @@ struct AIChatPanel: View {
         let refAudioURLs = referenceContents.filter { $0.type == .audio }.map(\.url)
         let firstURL = firstFrameImage?.url
         let lastURL = lastFrameImage?.url
-        service.sendPrompt(text, duration: settings.aiDuration, aspectRatio: settings.aiRatio, resolution: settings.aiResolution, referenceImages: refImageURLs, referenceVideos: refVideoURLs, referenceAudios: refAudioURLs, firstFrame: firstURL, lastFrame: lastURL)
+        service.sendPrompt(text, duration: settings.aiDuration, aspectRatio: settings.aiRatio, resolution: settings.aiResolution, imageRatio: settings.aiImageRatio, referenceImages: refImageURLs, referenceVideos: refVideoURLs, referenceAudios: refAudioURLs, firstFrame: firstURL, lastFrame: lastURL)
         referenceContents.removeAll()
         firstFrameImage = nil
         lastFrameImage = nil
@@ -701,6 +769,7 @@ struct AIChatPanel: View {
 private struct MessageBubble: View {
     let message: AIVideoService.ChatMessage
     var onInsertToTimeline: (URL) -> Void
+    var onRestoreAttachment: (AIVideoService.Attachment) -> Void = { _ in }
 
     var body: some View {
         HStack(alignment: .top, spacing: 8) {
@@ -715,14 +784,29 @@ private struct MessageBubble: View {
     }
 
     private var userBubble: some View {
-        Text(message.content)
-            .font(.system(size: 12))
-            .foregroundColor(.black)
-            .textSelection(.enabled)
-            .padding(.horizontal, 10)
-            .padding(.vertical, 7)
-            .background(Color.accent)
-            .clipShape(RoundedRectangle(cornerRadius: 10))
+        VStack(alignment: .trailing, spacing: 5) {
+            Text(message.content)
+                .font(.system(size: 12))
+                .foregroundColor(.black)
+                .textSelection(.enabled)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 7)
+                .background(Color.accent)
+                .clipShape(RoundedRectangle(cornerRadius: 10))
+
+            if !message.attachments.isEmpty {
+                attachmentRow
+            }
+        }
+    }
+
+    /// 气泡底部的参考内容/首尾帧缩略图，点击回填输入区
+    private var attachmentRow: some View {
+        HStack(spacing: 4) {
+            ForEach(message.attachments) { att in
+                AttachmentThumb(attachment: att) { onRestoreAttachment(att) }
+            }
+        }
     }
 
     @ViewBuilder
@@ -769,6 +853,7 @@ private struct MessageBubble: View {
                             NSWorkspace.shared.activateFileViewerSelecting([message.resolvedVideoURL() ?? url])
                         }
                     }
+                    .frame(width: AIMediaThumbSize.width)
                 }
 
             case .completedImage(let url):
@@ -779,20 +864,21 @@ private struct MessageBubble: View {
                         Image(systemName: "checkmark.circle.fill")
                             .foregroundColor(.green)
                             .font(.system(size: 12))
-                        Text("图片已生成")
+                        Text("已生成")
                             .font(.system(size: 12))
                             .foregroundColor(Color.labelPrimary)
                             .lineLimit(1)
 
                         Spacer()
 
-                        HoverIconButton(icon: "photo.on.rectangle", tip: "插入图片轨道") {
+                        HoverIconButton(icon: "photo.on.rectangle", svgName: "addToImageTrack", tip: "插入图片轨道") {
                             onInsertToTimeline(message.resolvedImageURL() ?? url)
                         }
                         HoverIconButton(icon: "folder", svgName: "folder", tip: "在 Finder 中显示") {
                             NSWorkspace.shared.activateFileViewerSelecting([message.resolvedImageURL() ?? url])
                         }
                     }
+                    .frame(width: AIMediaThumbSize.width)
                 }
 
             case .completedAudio(let url):
@@ -810,7 +896,7 @@ private struct MessageBubble: View {
 
                         Spacer()
 
-                        HoverIconButton(icon: "waveform", tip: "插入音频轨道") {
+                        HoverIconButton(icon: "waveform", svgName: "addToAudioTrack", tip: "插入音频轨道") {
                             onInsertToTimeline(message.resolvedAudioURL() ?? url)
                         }
                         HoverIconButton(icon: "folder", svgName: "folder", tip: "在 Finder 中显示") {
@@ -842,10 +928,115 @@ private struct MessageBubble: View {
 
 // MARK: - 视频封面
 
+// MARK: - 消息附件缩略图
+
+private struct AttachmentThumb: View {
+    let attachment: AIVideoService.Attachment
+    var onTap: () -> Void
+
+    @State private var thumbnail: NSImage?
+    @State private var missing = false
+    @State private var hovering = false
+
+    /// 只标内容类型，不标首/尾角色 —— 角色由点击顺序决定
+    private var badge: (icon: String?, text: String?)? {
+        switch attachment.kind {
+        case .video: return ("video.fill", nil)
+        case .audio: return ("waveform", nil)
+        case .image, .firstFrame, .lastFrame: return nil
+        }
+    }
+
+    private var tip: String {
+        switch attachment.kind {
+        case .video: return "视频 · 点击添加"
+        case .audio: return "音频 · 点击添加"
+        case .image, .firstFrame, .lastFrame: return "图片 · 点击添加"
+        }
+    }
+
+    var body: some View {
+        Button(action: onTap) {
+            ZStack {
+                if let thumb = thumbnail {
+                    Image(nsImage: thumb)
+                        .resizable()
+                        .aspectRatio(contentMode: .fill)
+                        .frame(width: 32, height: 32)
+                } else {
+                    Rectangle()
+                        .fill(Color.white.opacity(0.08))
+                        .frame(width: 32, height: 32)
+                        .overlay {
+                            Image(systemName: missing ? "questionmark" : "photo")
+                                .font(.system(size: 10, weight: .light))
+                                .foregroundColor(Color.labelSecondary.opacity(0.5))
+                        }
+                }
+            }
+            .frame(width: 32, height: 32)
+            .clipShape(RoundedRectangle(cornerRadius: 5))
+            .overlay(RoundedRectangle(cornerRadius: 5).stroke(Color.white.opacity(hovering ? 0.5 : 0.15), lineWidth: 0.5))
+            .overlay(alignment: .bottomTrailing) {
+                if let b = badge {
+                    Group {
+                        if let t = b.text {
+                            Text(t).font(.system(size: 7, weight: .bold))
+                        } else if let icon = b.icon {
+                            Image(systemName: icon).font(.system(size: 6))
+                        }
+                    }
+                    .foregroundColor(.white)
+                    .padding(.horizontal, 2)
+                    .padding(.vertical, 1)
+                    .background(.black.opacity(0.65))
+                    .clipShape(RoundedRectangle(cornerRadius: 2))
+                    .padding(1.5)
+                }
+            }
+            .opacity(missing ? 0.4 : 1)
+        }
+        .buttonStyle(.plain)
+        .help(missing ? "文件已不存在" : tip)
+        .onHover { hovering = $0 }
+        .task { await load() }
+    }
+
+    private func load() async {
+        guard let url = attachment.resolvedURL() else {
+            await MainActor.run { missing = true }
+            return
+        }
+        switch attachment.kind {
+        case .audio:
+            return  // 用占位图标即可
+        case .video:
+            let asset = AVURLAsset(url: url)
+            let gen = AVAssetImageGenerator(asset: asset)
+            gen.appliesPreferredTrackTransform = true
+            gen.maximumSize = CGSize(width: 120, height: 120)
+            if let cg = try? gen.copyCGImage(at: .zero, actualTime: nil) {
+                let ns = NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
+                await MainActor.run { thumbnail = ns }
+            }
+        case .image, .firstFrame, .lastFrame:
+            if let img = NSImage(contentsOf: url) {
+                let thumb = img.thumbnailImage(maxSize: 120)
+                await MainActor.run { thumbnail = thumb }
+            }
+        }
+    }
+}
+
 private struct VideoThumbnailView: View {
     let url: URL
     @State private var thumbnail: NSImage?
     @State private var duration: String = ""
+
+    /// 固定宽度，不再随聊天区宽度伸缩
+    private var displaySize: CGSize {
+        AIMediaThumbSize.fit(thumbnail?.size)
+    }
 
     var body: some View {
         ZStack(alignment: .bottomTrailing) {
@@ -853,14 +1044,16 @@ private struct VideoThumbnailView: View {
                 if let thumb = thumbnail {
                     Image(nsImage: thumb)
                         .resizable()
-                        .aspectRatio(contentMode: .fit)
+                        .aspectRatio(contentMode: .fill)
+                        .frame(width: displaySize.width, height: displaySize.height)
                 } else {
                     Rectangle()
                         .fill(Color.white.opacity(0.04))
-                        .frame(height: 100)
+                        .frame(width: AIMediaThumbSize.width, height: 90)
                         .overlay(ProgressView().controlSize(.small))
                 }
             }
+            .clipped()
             .clipShape(RoundedRectangle(cornerRadius: 8))
 
             if !duration.isEmpty {
@@ -898,23 +1091,42 @@ private struct VideoThumbnailView: View {
 
 // MARK: - 图片缩略图
 
+/// AI 生成结果缩略图的固定尺寸。宽度写死，高度按素材比例算。
+/// 宽度必须始终等于 width，否则竖图会比下方状态行窄，右边留出空档
+enum AIMediaThumbSize {
+    static let width: CGFloat = 140
+
+    static func fit(_ source: CGSize?) -> CGSize {
+        guard let s = source, s.width > 0, s.height > 0 else {
+            return CGSize(width: width, height: 90)
+        }
+        return CGSize(width: width, height: width * s.height / s.width)
+    }
+}
+
 private struct ImageThumbnailView: View {
     let url: URL
     @State private var image: NSImage?
+
+    private var displaySize: CGSize {
+        AIMediaThumbSize.fit(image?.size)
+    }
 
     var body: some View {
         Group {
             if let img = image {
                 Image(nsImage: img)
                     .resizable()
-                    .aspectRatio(contentMode: .fit)
+                    .aspectRatio(contentMode: .fill)
+                    .frame(width: displaySize.width, height: displaySize.height)
             } else {
                 Rectangle()
                     .fill(Color.white.opacity(0.04))
-                    .frame(height: 100)
+                    .frame(width: AIMediaThumbSize.width, height: 90)
                     .overlay(ProgressView().controlSize(.small))
             }
         }
+        .clipped()
         .clipShape(RoundedRectangle(cornerRadius: 8))
         .task {
             if let img = NSImage(contentsOf: url) {
@@ -1170,18 +1382,6 @@ private struct HoverIconButton: View {
     }
 }
 
-// MARK: - NSImage Thumbnail
-
 private extension NSImage {
-    func thumbnailImage(maxSize: CGFloat) -> NSImage {
-        let s = self.size
-        guard s.width > 0, s.height > 0 else { return self }
-        let scale = min(maxSize / s.width, maxSize / s.height, 1)
-        let newSize = NSSize(width: s.width * scale, height: s.height * scale)
-        let img = NSImage(size: newSize)
-        img.lockFocus()
-        self.draw(in: NSRect(origin: .zero, size: newSize), from: .zero, operation: .copy, fraction: 1)
-        img.unlockFocus()
-        return img
-    }
+    func thumbnailImage(maxSize: CGFloat) -> NSImage { aiThumbnail(maxSize: maxSize) }
 }

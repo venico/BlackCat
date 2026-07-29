@@ -113,6 +113,11 @@ extension ProjectState {
         overlayTrackOrder = doc.overlayTrackOrder ?? []
         exportSettings = doc.exportSettings
         previewResolution = doc.previewResolution
+        previewAspectRatio = doc.previewAspectRatio ?? "原始"
+        customOutputWidth  = doc.customOutputWidth  ?? 1920
+        customOutputHeight = doc.customOutputHeight ?? 1080
+        projectFPS         = doc.projectFPS         ?? 30
+        projectBitrate     = doc.projectBitrate     ?? 5000
 
         // 恢复媒体资源（以项目文件为准，完全替换）
         mediaAssets.removeAll()
@@ -193,6 +198,11 @@ extension ProjectState {
             mediaAssets: mediaAssets,
             exportSettings: exportSettings,
             previewResolution: previewResolution,
+            previewAspectRatio: previewAspectRatio,
+            customOutputWidth: customOutputWidth,
+            customOutputHeight: customOutputHeight,
+            projectFPS: projectFPS,
+            projectBitrate: projectBitrate,
             subtitleBottomMargin: subtitleBottomMargin,
             subtitleLineSpacing: subtitleLineSpacing,
             overlayTrackOrder: overlayTrackOrder.isEmpty ? nil : overlayTrackOrder

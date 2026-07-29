@@ -40,10 +40,30 @@ extension ProjectState {
         }
     }
 
+    /// 撤销/重做只回滚数据，磁盘文件名不会跟着变，素材会变成「丢失」。
+    /// 这里比对快照前后的 URL：目标不存在而原位置还在，就把文件改回去
+    private func reconcileAssetFiles(from previous: [MediaAsset]) {
+        let fm = FileManager.default
+        for asset in mediaAssets {
+            guard let prev = previous.first(where: { $0.id == asset.id }),
+                  prev.url != asset.url,
+                  !fm.fileExists(atPath: asset.url.path),
+                  fm.fileExists(atPath: prev.url.path) else { continue }
+            do {
+                try fm.moveItem(at: prev.url, to: asset.url)
+            } catch {
+                NSLog("[Rename] 撤销回滚文件失败: %@", error.localizedDescription)
+            }
+        }
+    }
+
     func undo() {
         guard let s = undoStack.popLast() else { return }
-        redoStack.append(currentSnapshot())
+        // 带上素材：否则重做时还原不了素材名，磁盘文件也校准不回来
+        redoStack.append(currentSnapshot(includeAssets: true))
+        let before = mediaAssets
         applySnapshot(s)
+        reconcileAssetFiles(from: before)
         undoCount = undoStack.count
         redoCount = redoStack.count
         isSaved = false
@@ -52,8 +72,10 @@ extension ProjectState {
 
     func redo() {
         guard let s = redoStack.popLast() else { return }
-        undoStack.append(currentSnapshot())
+        undoStack.append(currentSnapshot(includeAssets: true))
+        let before = mediaAssets
         applySnapshot(s)
+        reconcileAssetFiles(from: before)
         undoCount = undoStack.count
         redoCount = redoStack.count
         isSaved = false

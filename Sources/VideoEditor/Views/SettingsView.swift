@@ -12,7 +12,8 @@ struct SettingsView: View {
     }
 
     @State private var sceneDetectState: ModelState = .notDownloaded
-    private let tabs = ["保存位置", "语音识别", "字幕翻译", "视频分析", "AI 生成"]
+    @State private var demucsState: ModelState = .notDownloaded
+    private let tabs = ["通用", "视频", "音频", "字幕", "AI 生成"]
 
     var body: some View {
         VStack(spacing: 0) {
@@ -63,9 +64,9 @@ struct SettingsView: View {
                 VStack(alignment: .leading, spacing: 12) {
                     switch selectedTab {
                     case 0: saveTab
-                    case 1: whisperTab
-                    case 2: translateTab
-                    case 3: sceneDetectTab
+                    case 1: sceneDetectTab
+                    case 2: audioTab
+                    case 3: subtitleTab
                     case 4: aiVideoTab
                     default: EmptyView()
                     }
@@ -76,7 +77,14 @@ struct SettingsView: View {
         }
         .frame(width: 540, height: 520)
         .background(Color(red: 0.13, green: 0.13, blue: 0.14))
-        .onAppear { refreshModelStates(); refreshSceneDetectState() }
+        .onAppear { refreshModelStates(); refreshSceneDetectState(); refreshDemucsState() }
+    }
+
+    /// 标签页内的一级标题，用来分块
+    private func sectionTitle(_ text: String) -> some View {
+        Text(text)
+            .font(.system(size: 13, weight: .semibold))
+            .foregroundColor(Color.labelPrimary)
     }
 
     // MARK: - 保存位置
@@ -115,9 +123,174 @@ struct SettingsView: View {
         }
     }
 
-    // MARK: - 语音识别
+    // MARK: - 音频
 
-    private var whisperTab: some View {
+    private var audioTab: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            sectionTitle("分离音轨")
+
+            pathRow(label: "模型存储位置", path: AudioSeparator.supportDir,
+                    placeholder: "", defaultDir: AudioSeparator.supportDir) { _ in }
+
+            Text("分离模型")
+                .font(.system(size: 11, weight: .medium))
+                .foregroundColor(Color.labelSecondary)
+
+            HStack(spacing: 10) {
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("Demucs v4 (6 轨)")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundColor(Color.labelPrimary)
+                    Text("分离人声/鼓/贝斯/吉他/钢琴/其他，约 55 MB")
+                        .font(.system(size: 10))
+                        .foregroundColor(Color.labelSecondary)
+                }
+
+                Spacer()
+
+                switch demucsState {
+                case .downloaded:
+                    Text("已下载")
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundColor(.green.opacity(0.8))
+                        .padding(.horizontal, 8).frame(height: 24)
+                        .background(Color.green.opacity(0.1))
+                        .cornerRadius(4)
+                case .notDownloaded:
+                    Button { downloadDemucsModel() } label: {
+                        Text("下载")
+                            .font(.system(size: 10, weight: .medium))
+                            .foregroundColor(Color.accent)
+                            .padding(.horizontal, 10).frame(height: 24)
+                            .background(Color.accent.opacity(0.15))
+                            .cornerRadius(4)
+                    }
+                    .buttonStyle(.plain)
+                case .downloading(let pct):
+                    HStack(spacing: 6) {
+                        ProgressView(value: pct)
+                            .frame(width: 50)
+                            .tint(Color.accent)
+                        Text("\(Int(pct * 100))%")
+                            .font(.system(size: 10).monospacedDigit())
+                            .foregroundColor(Color.labelSecondary)
+                            .frame(width: 28)
+                    }
+                case .failed(let msg):
+                    HStack(spacing: 6) {
+                        Text(msg)
+                            .font(.system(size: 9))
+                            .foregroundColor(.red.opacity(0.8))
+                            .lineLimit(1)
+                            .frame(maxWidth: 80)
+                        Button { downloadDemucsModel() } label: {
+                            Text("重试")
+                                .font(.system(size: 10, weight: .medium))
+                                .foregroundColor(Color.accent)
+                                .padding(.horizontal, 8).frame(height: 24)
+                                .background(Color.accent.opacity(0.15))
+                                .cornerRadius(4)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 8)
+            .background(Color.white.opacity(0.04))
+            .cornerRadius(7)
+
+            if !AudioSeparator.demucsReady {
+                Text("未检测到分离组件 demucs.cpp.main，功能暂不可用。")
+                    .font(.system(size: 10))
+                    .foregroundColor(.orange.opacity(0.8))
+            }
+
+            Text("生成哪些音轨")
+                .font(.system(size: 11, weight: .medium))
+                .foregroundColor(Color.labelSecondary)
+
+            VStack(spacing: 4) {
+                ForEach(AudioSeparator.Stem.allCases, id: \.rawValue) { stem in
+                    stemRow(stem)
+                }
+            }
+
+            Text("本地推理耗时约为素材时长的 3 倍，处理长片段请预留时间。")
+                .font(.system(size: 10))
+                .foregroundColor(Color.labelSecondary)
+        }
+    }
+
+    private func stemRow(_ stem: AudioSeparator.Stem) -> some View {
+        let isOn = settings.separateKeepStems.contains(stem.rawValue)
+        return Button {
+            var keep = settings.separateKeepStems
+            if let idx = keep.firstIndex(of: stem.rawValue) {
+                // 至少保留一轨，否则输出会是全静音
+                if keep.count > 1 { keep.remove(at: idx) }
+            } else {
+                keep.append(stem.rawValue)
+            }
+            settings.separateKeepStems = keep
+        } label: {
+            HStack(spacing: 10) {
+                Image(systemName: isOn ? "checkmark.square.fill" : "square")
+                    .font(.system(size: 13))
+                    .foregroundColor(isOn ? Color.accent : Color.labelSecondary.opacity(0.5))
+
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(stem.displayName)
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundColor(Color.labelPrimary)
+                    Text(stem.hint)
+                        .font(.system(size: 10))
+                        .foregroundColor(Color.labelSecondary)
+                        .lineLimit(1)
+                }
+                Spacer()
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 7)
+            .background(Color.white.opacity(isOn ? 0.06 : 0.02))
+            .cornerRadius(7)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func refreshDemucsState() {
+        if case .downloading = demucsState { return }
+        demucsState = AudioSeparator.modelReady ? .downloaded : .notDownloaded
+    }
+
+    private func downloadDemucsModel() {
+        demucsState = .downloading(0)
+        Task {
+            do {
+                try await AudioSeparator.downloadModel { pct in
+                    DispatchQueue.main.async { demucsState = .downloading(pct) }
+                }
+                await MainActor.run { demucsState = .downloaded }
+            } catch {
+                await MainActor.run { demucsState = .failed(error.localizedDescription) }
+            }
+        }
+    }
+
+    // MARK: - 字幕
+
+    private var subtitleTab: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            translateSection
+
+            sectionTitle("语音识别字幕")
+
+            whisperSection
+        }
+    }
+
+    private var whisperSection: some View {
         let displayDir = settings.whisperModelDir ?? WhisperTranscriber.supportDir
         return VStack(alignment: .leading, spacing: 12) {
             pathRow(label: "模型存储位置", path: displayDir, placeholder: "", defaultDir: WhisperTranscriber.supportDir) { url in
@@ -137,10 +310,10 @@ struct SettingsView: View {
         }
     }
 
-    // MARK: - 字幕翻译
-
-    private var translateTab: some View {
+    private var translateSection: some View {
         VStack(alignment: .leading, spacing: 12) {
+            sectionTitle("字幕翻译")
+
             SSection(title: "翻译引擎") {
                 IPicker(selection: Binding(
                     get: { settings.translateProvider.displayName },
@@ -188,13 +361,15 @@ struct SettingsView: View {
         }
     }
 
-    // MARK: - 视频分析
+    // MARK: - 视频
 
     private var sceneDetectTab: some View {
         VStack(alignment: .leading, spacing: 12) {
+            sectionTitle("智能分割")
+
             pathRow(label: "组件存储位置", path: SceneDetector.supportDir, placeholder: "", defaultDir: SceneDetector.supportDir) { _ in }
 
-            Text("智能分割")
+            Text("检测组件")
                 .font(.system(size: 11, weight: .medium))
                 .foregroundColor(Color.labelSecondary)
 
@@ -266,9 +441,9 @@ struct SettingsView: View {
                 .font(.system(size: 10))
                 .foregroundColor(Color.labelSecondary)
 
-            Divider().padding(.vertical, 4)
+            sectionTitle("AI 剪辑")
 
-            SSection(title: "AI 剪辑") {
+            SSection(title: "") {
                 IPicker(selection: Binding(
                     get: { settings.llmProvider.displayName },
                     set: { name in
@@ -317,7 +492,9 @@ struct SettingsView: View {
 
     private var aiVideoTab: some View {
         VStack(alignment: .leading, spacing: 12) {
-            SSection(title: "生成模型") {
+            sectionTitle("生成模型")
+
+            SSection(title: "") {
                 AIProviderPicker(selection: Binding(
                     get: { settings.aiProvider },
                     set: { settings.aiProvider = $0 }
@@ -325,7 +502,21 @@ struct SettingsView: View {
             }
 
             if let provider = AIVideoService.Provider(rawValue: settings.aiProvider) {
-                if provider == .seedance || provider == .seedance15 {
+                if provider == .seedream {
+                    apiKeyField(
+                        label: "API Key",
+                        placeholder: "输入火山方舟 API Key",
+                        text: Binding(get: { settings.seedanceApiKey }, set: { settings.seedanceApiKey = $0 })
+                    )
+                    endpointField(
+                        label: "接入点 ID / 模型名",
+                        placeholder: "ep-xxxxx 或 doubao-seedream-...",
+                        text: Binding(get: { settings.seedreamEndpoint }, set: { settings.seedreamEndpoint = $0 })
+                    )
+                    Text("与 Seedance 共用火山方舟 API Key；接入点 ID 在「接入点管理」中创建")
+                        .font(.system(size: 10))
+                        .foregroundColor(Color.labelSecondary.opacity(0.6))
+                } else if provider == .seedance || provider == .seedance15 {
                     apiKeyField(
                         label: "API Key",
                         placeholder: "输入火山方舟 API Key",
@@ -381,7 +572,9 @@ struct SettingsView: View {
                 }
             }
 
-            SSection(title: "联网搜索") {
+            sectionTitle("联网搜索引擎")
+
+            SSection(title: "") {
                 SearchEnginePicker(selection: Binding(
                     get: { settings.searchEngine },
                     set: { settings.searchEngine = $0 }

@@ -19,33 +19,30 @@ struct InspectorView: View {
         VStack(spacing: 0) {
             header
             ScrollView(showsIndicators: false) {
-                if let transID = project.selectedTransitionClipID {
-                    TransitionInspector(clipID: transID)
-                } else if let clip = project.selectedTextClip {
-                    TextInspector(clip: clip).id(clip.id)
-                } else if let clip = project.selectedShapeClip {
-                    ShapeInspector(clip: clip).id(clip.id)
-                } else if let clip = project.selectedSubtitleClip {
-                    SubtitleInspector(clip: clip).id(clip.id)
-                } else if let clip = project.selectedImageClip {
-                    ImageInspector(clip: clip).id(clip.id)
-                } else if let clip = project.selectedVideoClip {
-                    VideoInspector(clip: clip).id(clip.id)
-                } else if let clip = project.selectedAudioClip {
-                    AudioInspector(clip: clip).id(clip.id)
-                } else if let clip = project.selectedCompoundClip {
-                    CompoundInspector(clip: clip).id(clip.id)
-                } else if let clip = defaultClip {
-                    // 未选择时，默认显示第一个视频片段；无视频则显示第一个片段
-                    switch clip {
-                    case .video(let c):    VideoInspector(clip: c).id(c.id)
-                    case .image(let c):    ImageInspector(clip: c).id(c.id)
-                    case .audio(let c):    AudioInspector(clip: c).id(c.id)
-                    case .subtitle(let c): SubtitleInspector(clip: c).id(c.id)
+                // 统一给所有属性面板留出底部间距，各 Inspector 不必各自处理
+                Group {
+                    if let transID = project.selectedTransitionClipID {
+                        TransitionInspector(clipID: transID)
+                    } else if let clip = project.selectedTextClip {
+                        TextInspector(clip: clip).id(clip.id)
+                    } else if let clip = project.selectedShapeClip {
+                        ShapeInspector(clip: clip).id(clip.id)
+                    } else if let clip = project.selectedSubtitleClip {
+                        SubtitleInspector(clip: clip).id(clip.id)
+                    } else if let clip = project.selectedImageClip {
+                        ImageInspector(clip: clip).id(clip.id)
+                    } else if let clip = project.selectedVideoClip {
+                        VideoInspector(clip: clip).id(clip.id)
+                    } else if let clip = project.selectedAudioClip {
+                        AudioInspector(clip: clip).id(clip.id)
+                    } else if let clip = project.selectedCompoundClip {
+                        CompoundInspector(clip: clip).id(clip.id)
+                    } else {
+                        // 未选中任何片段时显示整个项目的设置
+                        ProjectInspector()
                     }
-                } else {
-                    EmptyInspector()
                 }
+                .padding(.bottom, 16)
             }
         }
     }
@@ -94,16 +91,7 @@ struct InspectorView: View {
         if project.selectedVideoClipID      != nil { return "视频片段" }
         if project.selectedAudioClipID      != nil { return "音频片段" }
         if project.selectedCompoundClipID   != nil { return "复合片段" }
-        // 默认片段的标签
-        if let clip = defaultClip {
-            switch clip {
-            case .video:    return "视频片段"
-            case .image:    return "图片片段"
-            case .audio:    return "音频片段"
-            case .subtitle: return "字幕片段"
-            }
-        }
-        return ""
+        return "项目设置"
     }
 }
 

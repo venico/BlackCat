@@ -50,6 +50,9 @@ extension ProjectState {
         hasher.combine(cTracks.flatMap(\.clips).map { "\($0.id)\($0.startTime)\($0.endTime)\($0.internalStart)" }.joined())
         hasher.combine(cTracks.map { "\($0.isVisible)\($0.isMuted)" }.joined())
         hasher.combine(vSectionOrder.map { "\($0.trackID)" }.joined())
+        // 画布尺寸是合成的 renderSize，不入指纹的话切分辨率/比例会被当成「无变化」跳过重建
+        let rs = previewRenderSize
+        hasher.combine("\(rs.width)x\(rs.height)")
         let fp = hasher.finalize()
         if seekTo == nil && fp == lastRebuildFingerprint { return }
         lastRebuildFingerprint = fp

@@ -25,9 +25,12 @@ final class AppSettings: ObservableObject {
         static let aiDuration = "settings.ai.duration"
         static let aiRatio = "settings.ai.ratio"
         static let aiResolution = "settings.ai.resolution"
+        static let aiImageRatio = "settings.ai.imageRatio"
+        static let separateKeepStems = "settings.audio.separateKeepStems"
         static let seedanceApiKey = "settings.ai.seedance.apiKey"
         static let seedanceEndpoint = "settings.ai.seedance.endpoint"
         static let seedance15Endpoint = "settings.ai.seedance15.endpoint"
+        static let seedreamEndpoint = "settings.ai.seedream.endpoint"
         static let llmProvider = "settings.llm.provider"
         static let llmAPIKey = "settings.llm.apiKey"
         static let searchEngine = "settings.ai.searchEngine"
@@ -236,6 +239,16 @@ final class AppSettings: ObservableObject {
     @Published var aiResolution: String {
         didSet { ud.set(aiResolution, forKey: K.aiResolution) }
     }
+    /// 图片生成比例，与视频比例独立存储，避免切模型时互相覆盖
+    @Published var aiImageRatio: String {
+        didSet { ud.set(aiImageRatio, forKey: K.aiImageRatio) }
+    }
+    /// 去背景音乐时保留哪些分离轨（存 Stem 的 rawValue）。
+    /// 默认 人声 + 其他 + 鼓：打击类音效（脚步/关门/撞击）会被模型归到 drums，
+    /// 不保留 drums 的话这些音效会跟着音乐一起消失。
+    @Published var separateKeepStems: [Int] {
+        didSet { ud.set(separateKeepStems, forKey: K.separateKeepStems) }
+    }
     @Published var seedanceApiKey: String {
         didSet { ud.set(seedanceApiKey, forKey: K.seedanceApiKey) }
     }
@@ -244,6 +257,9 @@ final class AppSettings: ObservableObject {
     }
     @Published var seedance15Endpoint: String {
         didSet { ud.set(seedance15Endpoint, forKey: K.seedance15Endpoint) }
+    }
+    @Published var seedreamEndpoint: String {
+        didSet { ud.set(seedreamEndpoint, forKey: K.seedreamEndpoint) }
     }
 
     // MARK: - 联网搜索
@@ -316,9 +332,12 @@ final class AppSettings: ObservableObject {
         aiDuration = ud.string(forKey: K.aiDuration) ?? "5"
         aiRatio = ud.string(forKey: K.aiRatio) ?? "16:9"
         aiResolution = ud.string(forKey: K.aiResolution) ?? "720P"
+        aiImageRatio = ud.string(forKey: K.aiImageRatio) ?? "1:1"
+        separateKeepStems = (ud.array(forKey: K.separateKeepStems) as? [Int]) ?? [3, 2, 0]
         seedanceApiKey = ud.string(forKey: K.seedanceApiKey) ?? ""
         seedanceEndpoint = ud.string(forKey: K.seedanceEndpoint) ?? ""
         seedance15Endpoint = ud.string(forKey: K.seedance15Endpoint) ?? ""
+        seedreamEndpoint = ud.string(forKey: K.seedreamEndpoint) ?? ""
 
         if let raw = ud.string(forKey: K.llmProvider),
            let prov = LLMProvider(rawValue: raw) {

@@ -198,6 +198,10 @@ struct ContentView: View {
                     TranscribeOverlay()
                         .environmentObject(project)
                 }
+                if project.isSeparatingAudio {
+                    SeparateOverlay()
+                        .environmentObject(project)
+                }
                 if project.isReversingVideo {
                     ReverseVideoBubble()
                         .transition(.asymmetric(
