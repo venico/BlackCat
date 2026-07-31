@@ -304,7 +304,17 @@ struct ImageClip: Identifiable, Equatable, Codable {
     var rotation: Int = 0
     // 色调调节
     var colorAdjust: ColorAdjust = .identity
+    // 描边。用可选类型是为了兼容旧 .bcj —— 自动合成的 Codable 遇到缺失的非可选字段会直接解码失败
+    var strokeColorHex: String? = nil
+    var strokeWidth: Double? = nil
+    var strokeSoftness: Double? = nil
     var markers: [Marker]? = nil
+
+    var strokeColor: Color { Color(hex: strokeColorHex ?? "#FFFFFF") }
+    /// 描边宽度（px），0 = 不描边
+    var strokeW: Double { strokeWidth ?? 0 }
+    /// 描边柔和度，0 = 硬边
+    var strokeSoft: Double { strokeSoftness ?? 0 }
 }
 
 // MARK: - Text Template (文字样式模板)
@@ -1115,5 +1125,57 @@ enum ShapeGeometry {
         }
         path.closeSubpath()
         return path
+    }
+}
+
+// MARK: - 通知卡片文件名显示
+
+extension String {
+    /// 通知卡片 subtitle 用的文件名截断：按视觉宽度（CJK 算 2），头部 + ... + 尾 6 字符 + 后缀。
+    /// 卡片文本区实测约 152pt，10pt 字体下约 27 个视觉宽度单位，超了会被系统硬截在末尾、看不到后缀
+    func truncatedFileName(maxVisualWidth: Int = 26) -> String {
+        func w(_ c: Character) -> Int {
+            guard let s = c.unicodeScalars.first else { return 1 }
+            let v = s.value
+            let cjk = (0x4E00...0x9FFF).contains(v)   // CJK 统一汉字
+                || (0x3400...0x4DBF).contains(v)      // 扩展 A
+                || (0x3000...0x303F).contains(v)      // CJK 标点
+                || (0xFF00...0xFFEF).contains(v)      // 全角
+                || (0x3040...0x309F).contains(v)      // 平假名
+                || (0x30A0...0x30FF).contains(v)      // 片假名
+                || (0xAC00...0xD7AF).contains(v)      // 韩文
+            return cjk ? 2 : 1
+        }
+        func vw(_ s: String) -> Int { s.reduce(0) { $0 + w($1) } }
+        guard vw(self) > maxVisualWidth else { return self }
+
+        let ext: String, base: String
+        if let dot = lastIndex(of: ".") {
+            ext = String(self[dot...]); base = String(self[..<dot])
+        } else {
+            ext = ""; base = self
+        }
+
+        // 尾段固定 6 字符在全中文名（每字算 2）或窄预算下会把额度吃光，逐步缩短
+        var tailLen = min(6, base.count)
+        var tail = String(base.suffix(tailLen))
+        var budget = maxVisualWidth - 3 - vw(tail) - vw(ext)
+        while budget <= 0 && tailLen > 1 {
+            tailLen -= 1
+            tail = String(base.suffix(tailLen))
+            budget = maxVisualWidth - 3 - vw(tail) - vw(ext)
+        }
+        guard budget > 0 else { return "...\(tail)\(ext)" }
+
+        var head = ""
+        var used = 0
+        for ch in base {
+            let cw = w(ch)
+            if used + cw > budget { break }
+            head.append(ch)
+            used += cw
+        }
+        guard !head.isEmpty else { return "...\(tail)\(ext)" }
+        return "\(head)...\(tail)\(ext)"
     }
 }

@@ -1337,6 +1337,10 @@ private struct ImageInspector: View {
     @State private var contrast:   Double = 0
     @State private var saturation: Double = 0
     @State private var hue:        Double = 0
+    // 描边
+    @State private var strokeColor: Color = .white
+    @State private var strokeWidth: Double = 0
+    @State private var strokeSoftness: Double = 0
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -1454,6 +1458,39 @@ private struct ImageInspector: View {
                 ICapsuleSlider(label: "色相", value: $hue,        range: -180.0...180.0,
                                decimals: 0, unit: "°", labelWidth: 28, onChange: { _ in applyColorAdjust() })
             }
+
+            ISection(title: nil) {
+                imgSectionHeader("描边") {
+                    Button { strokeWidth = 0; applyStroke() } label: {
+                        Text("重置")
+                            .font(.system(size: 9, weight: .medium))
+                            .foregroundColor(strokeWidth > 0.01 ? .black : Color.labelSecondary)
+                            .padding(.horizontal, 6).padding(.vertical, 2)
+                            .background(strokeWidth > 0.01 ? Color(hex: "#E8A54B") : Color.white.opacity(0.08))
+                            .clipShape(RoundedRectangle(cornerRadius: 4))
+                    }.buttonStyle(.plain).disabled(strokeWidth <= 0.01)
+                }
+                HStack(spacing: 12) {
+                    Text("颜色")
+                        .font(.system(size: 11))
+                        .foregroundColor(Color.labelSecondary)
+                        .frame(width: 28, alignment: .leading)
+                    ColorPicker("", selection: $strokeColor)
+                        .labelsHidden()
+                        .onChange(of: strokeColor) { _ in applyStroke() }
+                    Spacer()
+                }
+                ICapsuleSlider(label: "宽度", value: $strokeWidth, range: 0...20,
+                               decimals: 1, unit: "px", labelWidth: 28,
+                               onChange: { _ in applyStroke() })
+                ICapsuleSlider(label: "柔和", value: $strokeSoftness, range: 0...1,
+                               decimals: 2, labelWidth: 28,
+                               onChange: { _ in applyStroke() })
+                // 去背图片会沿主体轮廓描边，未去背的矩形图片则沿画面边缘
+                Text("描边沿图片不透明区域的轮廓生成，柔和 0 为硬边")
+                    .font(.system(size: 9))
+                    .foregroundColor(Color.labelSecondary.opacity(0.6))
+            }
         }
         .onAppear { syncFromClip() }
         .onChange(of: clip.id) { _ in syncFromClip() }
@@ -1504,11 +1541,27 @@ private struct ImageInspector: View {
         contrast   = clip.colorAdjust.contrast
         saturation = clip.colorAdjust.saturation
         hue        = clip.colorAdjust.hue
+        strokeColor = clip.strokeColor
+        strokeWidth = clip.strokeW
+        strokeSoftness = clip.strokeSoft
         hasPushedUndo = false
     }
 
     private func syncLock() {
         project.updateImageClip(id: clip.id) { $0.lockAspect = lockAspect }
+    }
+
+    private func applyStroke() {
+        if !hasPushedUndo {
+            project.pushUndo()
+            hasPushedUndo = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { hasPushedUndo = false }
+        }
+        project.updateImageClip(id: clip.id) {
+            $0.strokeColorHex = strokeColor.toHex()
+            $0.strokeWidth = strokeWidth
+            $0.strokeSoftness = strokeSoftness
+        }
     }
 
     private func applyTransform() {

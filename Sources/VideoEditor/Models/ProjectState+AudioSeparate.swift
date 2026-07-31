@@ -41,7 +41,7 @@ extension ProjectState {
     /// 分离产物再分离没意义（人声轨里已无音乐），按输出目录判断
     private func isSeparatedOutput(_ url: URL?) -> Bool {
         guard let url else { return false }
-        let outDir = AudioSeparator.supportDir.appendingPathComponent("separated").standardizedFileURL.path
+        let outDir = AudioSeparator.separatedDir.standardizedFileURL.path
         return url.standardizedFileURL.deletingLastPathComponent().path == outDir
     }
 
@@ -120,6 +120,10 @@ extension ProjectState {
                                      autoCountdown: false, revealURL: stems.first?.url)
                 }
             } catch is CancellationError {
+                separateState = .idle
+                separateTask = nil
+            } catch AudioSeparator.SeparateError.cancelled {
+                // 取消的提示统一由 cancelSeparate() 弹，这里再弹会出现两张卡片
                 separateState = .idle
                 separateTask = nil
             } catch {

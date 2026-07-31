@@ -202,6 +202,14 @@ struct ContentView: View {
                     SeparateOverlay()
                         .environmentObject(project)
                 }
+                if project.isRemovingBackground {
+                    RemoveBackgroundOverlay()
+                        .environmentObject(project)
+                }
+                if project.isGeneratingSpeech {
+                    SpeechOverlay()
+                        .environmentObject(project)
+                }
                 if project.isReversingVideo {
                     ReverseVideoBubble()
                         .transition(.asymmetric(
@@ -246,16 +254,6 @@ struct ContentView: View {
             .animation(.spring(response: 0.35, dampingFraction: 0.8), value: project.successToasts.count)
             .padding(.trailing, 16)
             .padding(.bottom, 16)
-        }
-        .overlay(alignment: .bottomTrailing) {
-            if project.importToastMessage != nil {
-                ImportToastBubble()
-                    .environmentObject(project)
-                    .padding(.trailing, 16)
-                    .padding(.bottom, 48)
-                    .transition(.move(edge: .trailing).combined(with: .opacity))
-                    .animation(.easeInOut(duration: 0.25), value: project.importToastMessage)
-            }
         }
         .environmentObject(project)
         .environmentObject(project.clock)
@@ -316,10 +314,10 @@ struct ContentView: View {
         .onAppear {
             setupEscMonitor()
             exportManager.onSuccess = { [weak project] filename, url in
-                project?.showSuccessToast(icon: "checkmark", title: filename, subtitle: "导出完成", revealURL: url)
+                project?.showSuccessToast(icon: "checkmark", title: filename.truncatedFileName(maxVisualWidth: 24), subtitle: "导出完成", revealURL: url)
             }
             exportManager.onCancel = { [weak project] filename in
-                project?.showSuccessToast(icon: "stop.fill", iconColor: .yellow, title: filename, subtitle: "已停止", autoCountdown: false)
+                project?.showSuccessToast(icon: "stop.fill", iconColor: .yellow, title: filename.truncatedFileName(maxVisualWidth: 24), subtitle: "已停止", autoCountdown: false)
             }
         }
         .onReceive(NotificationCenter.default.publisher(for: .menuImportFiles)) { note in
@@ -352,11 +350,16 @@ struct ContentView: View {
                 project.openProject(url: url)
             }
         }
-        .alert("清空素材库", isPresented: $project.showClearLibraryConfirm) {
-            Button("清空", role: .destructive) { project.clearMediaLibrary() }
+        .alert("清空\(project.currentLibraryAssetType?.label ?? "")素材", isPresented: $project.showClearLibraryConfirm) {
+            Button("清空", role: .destructive) {
+                if let type = project.currentLibraryAssetType {
+                    project.clearMediaLibrary(type: type)
+                }
+            }
             Button("取消", role: .cancel) {}
         } message: {
-            Text("将移除所有素材，并同时删除时间轴上的所有片段，此操作可撤销。")
+            let label = project.currentLibraryAssetType?.label ?? ""
+            Text("将移除全部\(label)素材，并同时删除时间轴上引用它们的片段，此操作可撤销。")
         }
         .alert("确认移除素材", isPresented: $project.showAssetDeleteConfirm) {
             Button("移除", role: .destructive) {
@@ -464,30 +467,6 @@ struct FocusTextField: View {
 
 extension Comparable {
     func clamped(to r: ClosedRange<Self>) -> Self { min(max(self, r.lowerBound), r.upperBound) }
-}
-
-// MARK: - Import Toast Bubble
-
-private struct ImportToastBubble: View {
-    @EnvironmentObject private var project: ProjectState
-
-    var body: some View {
-        if let msg = project.importToastMessage {
-            HStack(spacing: 6) {
-                Image(systemName: "exclamationmark.circle.fill")
-                    .font(.system(size: 12))
-                    .foregroundColor(.orange)
-                Text(msg)
-                    .font(.system(size: 12, weight: .medium))
-                    .foregroundColor(.white)
-            }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 8)
-            .background(Color(white: 0.15).opacity(0.95))
-            .clipShape(RoundedRectangle(cornerRadius: 8))
-            .shadow(color: .black.opacity(0.3), radius: 4, y: 2)
-        }
-    }
 }
 
 // MARK: - Success Toast Bubble (右下角，带倒计时)

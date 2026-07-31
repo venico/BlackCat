@@ -60,8 +60,13 @@ struct MediaLibraryView: View {
                     .foregroundColor(Color.labelSecondary)
                     .textCase(.uppercase)
                 Spacer()
-                MediaToolBtn(svgName: "clear", enabled: !project.mediaAssets.isEmpty, help: "清空素材库") {
-                    project.showClearLibraryConfirm = true
+                // 转场/文字/图形面板没有素材可清，不显示按钮
+                if let type = project.currentLibraryAssetType {
+                    MediaToolBtn(svgName: "clear",
+                                 enabled: project.mediaAssets.contains { $0.type == type },
+                                 help: "清空\(type.label)素材") {
+                        project.showClearLibraryConfirm = true
+                    }
                 }
                 MediaToolBtn(svgName: "refresh", help: "刷新素材库") {
                     project.refreshMediaLibrary()
@@ -586,9 +591,9 @@ private struct AssetRow: View {
         switch service.addToReference(url: asset.url) {
         case .added:
             let target = (service.selectedProvider.category == .video && service.imageMode == .frames) ? "首尾帧" : "参考内容"
-            project.showSuccessToast(icon: "sparkles", iconColor: .purple, title: "已添加到 AI \(target)", subtitle: asset.name)
+            project.showSuccessToast(icon: "sparkles", iconColor: .purple, title: "已添加到 AI \(target)", subtitle: asset.name.truncatedFileName())
         case .duplicate:
-            project.showSuccessToast(icon: "exclamationmark.triangle", iconColor: .orange, title: "已经添加过了", subtitle: asset.name)
+            project.showSuccessToast(icon: "exclamationmark.triangle", iconColor: .orange, title: "已经添加过了", subtitle: asset.name.truncatedFileName())
         case .unsupportedType:
             project.showSuccessToast(icon: "exclamationmark.triangle", iconColor: .orange, title: "不支持当前素材类型", subtitle: "当前占位不接受该类型素材")
         case .limitReached(let msg):
@@ -766,6 +771,169 @@ struct SeparateOverlay: View {
             }
         }
         .animation(.spring(response: 0.35, dampingFraction: 0.8), value: project.separateState)
+    }
+}
+
+struct SpeechOverlay: View {
+    @EnvironmentObject private var project: ProjectState
+
+    var body: some View {
+        VStack(alignment: .trailing, spacing: 8) {
+            if project.isGeneratingSpeech {
+                SpeechBubble(done: project.speechDone, total: project.speechTotal,
+                             onCancel: { project.cancelSpeechGeneration() })
+                    .transition(.asymmetric(
+                        insertion: .move(edge: .trailing).combined(with: .opacity),
+                        removal: .opacity))
+            }
+        }
+        .animation(.spring(response: 0.35, dampingFraction: 0.8), value: project.speechDone)
+    }
+}
+
+private struct SpeechBubble: View {
+    let done: Int
+    let total: Int
+    let onCancel: () -> Void
+    @State private var xHovering = false
+
+    private var progress: Double {
+        total > 0 ? Double(done) / Double(total) : 0
+    }
+
+    var body: some View {
+        HStack(spacing: 10) {
+            ZStack {
+                Circle().fill(Color.accent.opacity(0.2)).frame(width: 28, height: 28)
+                Image(systemName: "waveform.circle")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundColor(Color.accent)
+            }
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text("转换成语音")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundColor(Color.labelPrimary)
+                    .lineLimit(1)
+
+                GeometryReader { geo in
+                    HStack(spacing: 6) {
+                        ProgressView(value: progress)
+                            .progressViewStyle(.linear)
+                            .tint(Color.accent)
+                        Text("\(done)/\(total)")
+                            .font(.system(size: 10).monospacedDigit())
+                            .foregroundColor(Color.labelSecondary)
+                            .fixedSize()
+                    }
+                    .frame(width: geo.size.width)
+                }
+                .frame(height: 14)
+            }
+
+            Button(action: onCancel) {
+                Image(systemName: "xmark")
+                    .font(.system(size: 9, weight: .bold))
+                    .foregroundColor(xHovering ? Color.labelPrimary : Color.labelSecondary)
+                    .frame(width: 18, height: 18)
+                    .background(Color.white.opacity(xHovering ? 0.15 : 0.08))
+                    .clipShape(Circle())
+            }
+            .buttonStyle(.plain)
+            .onHover { xHovering = $0 }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .frame(maxWidth: 280)
+        .background(
+            RoundedRectangle(cornerRadius: 10)
+                .fill(Color(red: 0.16, green: 0.16, blue: 0.17))
+                .shadow(color: .black.opacity(0.5), radius: 8, y: 4)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 10)
+                .stroke(Color.white.opacity(0.12), lineWidth: 0.5)
+        )
+    }
+}
+
+struct RemoveBackgroundOverlay: View {
+    @EnvironmentObject private var project: ProjectState
+
+    var body: some View {
+        VStack(alignment: .trailing, spacing: 8) {
+            if project.isRemovingBackground {
+                RemoveBackgroundBubble(state: project.removeBackgroundState,
+                                       onCancel: { project.cancelRemoveBackground() })
+                    .transition(.asymmetric(
+                        insertion: .move(edge: .trailing).combined(with: .opacity),
+                        removal: .opacity))
+            }
+        }
+        .animation(.spring(response: 0.35, dampingFraction: 0.8), value: project.removeBackgroundState)
+    }
+}
+
+private struct RemoveBackgroundBubble: View {
+    let state: ProjectState.RemoveBackgroundState
+    let onCancel: () -> Void
+    @State private var xHovering = false
+
+    var body: some View {
+        HStack(spacing: 10) {
+            ZStack {
+                Circle().fill(Color.accent.opacity(0.2)).frame(width: 28, height: 28)
+                Image(systemName: "scissors")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundColor(Color.accent)
+            }
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text("去除背景中")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundColor(Color.labelPrimary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                GeometryReader { geo in
+                    HStack(spacing: 6) {
+                        ProgressView(value: state.progress)
+                            .progressViewStyle(.linear)
+                            .tint(Color.accent)
+                        Text("\(Int(state.progress * 100))%")
+                            .font(.system(size: 10).monospacedDigit())
+                            .foregroundColor(Color.labelSecondary)
+                            .fixedSize()
+                    }
+                    .frame(width: geo.size.width)
+                }
+                .frame(height: 14)
+            }
+
+            Button(action: onCancel) {
+                Image(systemName: "xmark")
+                    .font(.system(size: 9, weight: .bold))
+                    .foregroundColor(xHovering ? Color.labelPrimary : Color.labelSecondary)
+                    .frame(width: 18, height: 18)
+                    .background(Color.white.opacity(xHovering ? 0.15 : 0.08))
+                    .clipShape(Circle())
+            }
+            .buttonStyle(.plain)
+            .onHover { xHovering = $0 }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .frame(maxWidth: 280)
+        .background(
+            RoundedRectangle(cornerRadius: 10)
+                .fill(Color(red: 0.16, green: 0.16, blue: 0.17))
+                .shadow(color: .black.opacity(0.5), radius: 8, y: 4)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 10)
+                .stroke(Color.white.opacity(0.12), lineWidth: 0.5)
+        )
     }
 }
 
@@ -1740,7 +1908,7 @@ enum SidebarSVGIcon {
         <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path fill-rule="evenodd" d="M7.00005981,9.00169332 C7,13.4176111 10.5806408,16.9989187 14.9979993,16.9999998 C14.9902126,18.1649053 14.943429,18.8312631 14.6730196,19.3619715 C14.3853994,19.9264578 13.9264578,20.3853994 13.3619715,20.6730196 C12.7202363,21 11.8801575,21 10.2,21 L7.8,21 C6.11984248,21 5.27976372,21 4.6380285,20.6730196 C4.07354222,20.3853994 3.61460055,19.9264578 3.32698043,19.3619715 C3,18.7202363 3,17.8801575 3,16.2 L3,13.8 C3,12.1198425 3,11.2797637 3.32698043,10.6380285 C3.61460055,10.0735422 4.07354222,9.61460055 4.6380285,9.32698043 C5.16873687,9.05657101 5.83509473,9.00978737 7.00005981,9.00169332 Z M15,3 C18.3137085,3 21,5.6862915 21,9 C21,12.3137085 18.3137085,15 15,15 C11.6862915,15 9,12.3137085 9,9 C9,5.6862915 11.6862915,3 15,3 Z" fill="black"/></svg>
         """,
         "ai": """
-        <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path fill-rule="evenodd" d="M14.0806426,6.80241402 C14.4524511,8.62734144 16.0659248,10 18,10 C18.3042511,10 18.6005683,9.96603121 18.8853661,9.90167928 C19.4558722,9.77276965 19.9999996,10.2060169 20,10.7909058 C20,10.7939344 20,10.7969659 20,10.8 L20,14.2 C20,15.8801575 20,16.7202363 19.6730196,17.3619715 C19.3853994,17.9264578 18.9264578,18.3853994 18.3619715,18.6730196 C17.7202363,19 16.8801575,19 15.2,19 L4.6,19 C4.03994749,19 3.75992124,19 3.5460095,18.8910065 C3.35784741,18.7951331 3.20486685,18.6421526 3.10899348,18.4539905 C3,18.2400788 3,17.9600525 3,17.4 L3,10.8 C3,9.11984248 3,8.27976372 3.32698043,7.6380285 C3.61460055,7.07354222 4.07354222,6.61460055 4.6380285,6.32698043 C5.27976372,6 6.11984248,6 7.8,6 L13.100879,5.99914149 C13.5772426,5.99906434 13.9855426,6.33563967 14.0806426,6.80241402 Z M7.5,12 C6.67157288,12 6,12.6715729 6,13.5 C6,14.3284271 6.67157288,15 7.5,15 C8.32842712,15 9,14.3284271 9,13.5 C9,12.6715729 8.32842712,12 7.5,12 Z M15.5,12 C14.6715729,12 14,12.6715729 14,13.5 C14,14.3284271 14.6715729,15 15.5,15 C16.3284271,15 17,14.3284271 17,13.5 C17,12.6715729 16.3284271,12 15.5,12 Z M18.6447444,3.38562184 L19.1104888,4.74949431 C19.1605162,4.89599282 19.2755801,5.01105672 19.4220786,5.06108403 L20.785951,5.52682845 C21.2371753,5.68091556 21.2371753,6.31908444 20.785951,6.47317155 L19.4220786,6.93891597 C19.2755801,6.98894328 19.1605162,7.10400718 19.1104888,7.25050569 L18.6447444,8.61437816 C18.4906573,9.06560239 17.8524884,9.06560239 17.6984013,8.61437816 L17.2326569,7.25050569 C17.1826296,7.10400718 17.0675657,6.98894328 16.9210672,6.93891597 L15.5571947,6.47317155 C15.1059705,6.31908444 15.1059705,5.68091556 15.5571947,5.52682845 L16.9210672,5.06108403 C17.0675657,5.01105672 17.1826296,4.89599282 17.2326569,4.74949431 L17.6984013,3.38562184 C17.8524884,2.93439761 18.4906573,2.93439761 18.6447444,3.38562184 Z" fill="black"/></svg>
+        <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path d="M14.0694088,5.8342558 C14.4668191,8.19893129 16.5230785,10 19,10 C19.8516234,10 20.6535185,9.78708758 21.3553593,9.41158873 C21.6467631,9.25568185 22,9.46610091 22,9.79659015 C22,9.79772638 22,9.798863 22,9.8 L22,16.2 C22,17.8801575 22,18.7202363 21.6730196,19.3619715 C21.3853994,19.9264578 20.9264578,20.3853994 20.3619715,20.6730196 C19.7202363,21 18.8801575,21 17.2,21 L3.6,21 C3.03994749,21 2.75992124,21 2.5460095,20.8910065 C2.35784741,20.7951331 2.20486685,20.6421526 2.10899348,20.4539905 C2,20.2400788 2,19.9600525 2,19.4 L2,9.8 C2,8.11984248 2,7.27976372 2.32698043,6.6380285 C2.61460055,6.07354222 3.07354222,5.61460055 3.6380285,5.32698043 C4.27976372,5 5.11984248,5 6.8,5 L13.082422,4.99912341 C13.5713818,4.99905519 13.9883701,5.35205826 14.0694088,5.8342558 Z M8,11 C6.8954305,11 6,11.8954305 6,13 C6,14.1045695 6.8954305,15 8,15 C9.1045695,15 10,14.1045695 10,13 C10,11.8954305 9.1045695,11 8,11 Z M16,11 C14.8954305,11 14,11.8954305 14,13 C14,14.1045695 14.8954305,15 16,15 C17.1045695,15 18,14.1045695 18,13 C18,11.8954305 17.1045695,11 16,11 Z M19.6447444,2.38562184 L20.1104888,3.74949431 C20.1605162,3.89599282 20.2755801,4.01105672 20.4220786,4.06108403 L21.785951,4.52682845 C22.2371753,4.68091556 22.2371753,5.31908444 21.785951,5.47317155 L20.4220786,5.93891597 C20.2755801,5.98894328 20.1605162,6.10400718 20.1104888,6.25050569 L19.6447444,7.61437816 C19.4906573,8.06560239 18.8524884,8.06560239 18.6984013,7.61437816 L18.2326569,6.25050569 C18.1826296,6.10400718 18.0675657,5.98894328 17.9210672,5.93891597 L16.5571947,5.47317155 C16.1059705,5.31908444 16.1059705,4.68091556 16.5571947,4.52682845 L17.9210672,4.06108403 C18.0675657,4.01105672 18.1826296,3.89599282 18.2326569,3.74949431 L18.6984013,2.38562184 C18.8524884,1.93439761 19.4906573,1.93439761 19.6447444,2.38562184 Z" fill="black" fill-rule="evenodd"/></svg>
         """,
         "importExport": """
         <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path fill-rule="evenodd" d="M20.3619715,4.32698043 C20.9264578,4.61460055 21.3853994,5.07354222 21.6730196,5.6380285 C22,6.27976372 22,7.11984248 22,8.8 L22,15.2 C22,16.8801575 22,17.7202363 21.6730196,18.3619715 C21.3853994,18.9264578 20.9264578,19.3853994 20.3619715,19.6730196 C19.7202363,20 18.8801575,20 17.2,20 L6.8,20 C5.11984248,20 4.27976372,20 3.6380285,19.6730196 C3.07354222,19.3853994 2.61460055,18.9264578 2.32698043,18.3619715 C2,17.7202363 2,16.8801575 2,15.2 L2,8.8 C2,7.11984248 2,6.27976372 2.32698043,5.6380285 C2.61460055,5.07354222 3.07354222,4.61460055 3.6380285,4.32698043 C4.27976372,4 5.11984248,4 6.8,4 L17.2,4 C18.8801575,4 19.7202363,4 20.3619715,4.32698043 Z M17,13 L7,13 C6.16149379,13 5.69532051,13.9699317 6.21913119,14.624695 L8.21913119,17.124695 C8.56414074,17.555957 9.19343311,17.6258784 9.62469505,17.2808688 C10.055957,16.9358593 10.1258784,16.3065669 9.78086881,15.875305 L9.08062486,15 L17,15 C17.5522847,15 18,14.5522847 18,14 C18,13.4477153 17.5522847,13 17,13 Z M15.7808688,6.87530495 C15.4358593,6.44404302 14.8065669,6.37412164 14.375305,6.71913119 C13.944043,7.06414074 13.8741216,7.69343311 14.2191312,8.12469505 L14.9193752,9 L7,9 C6.44771525,9 6,9.44771525 6,10 C6,10.5522847 6.44771525,11 7,11 L17,11 C17.8385062,11 18.3046795,10.0300683 17.7808688,9.37530495 Z" fill="black"/></svg>

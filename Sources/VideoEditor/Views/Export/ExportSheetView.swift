@@ -1990,6 +1990,12 @@ actor TimelineExporter {
             ciImg = ColorAdjust.apply(ciImg, adj)
         }
 
+        // 描边放在色调之后，颜色才不会被色调调节带跑。strokeW 是画布像素单位，与预览同尺度
+        ciImg = ImageStroke.apply(to: ciImg,
+                                  width: CGFloat(clip.strokeW),
+                                  color: clip.strokeColor,
+                                  softness: clip.strokeSoft)
+
         // 裁剪到画布范围
         ciImg = ciImg.cropped(to: CGRect(origin: .zero, size: renderSize))
 

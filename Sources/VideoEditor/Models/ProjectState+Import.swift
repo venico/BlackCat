@@ -58,7 +58,9 @@ extension ProjectState {
         }
 
         guard !mediaAssets.contains(where: { $0.url == url }) else {
-            showImportToast("「\(url.lastPathComponent)」已在素材库中，已跳过")
+            showSuccessToast(icon: "exclamationmark.circle.fill", iconColor: .orange,
+                             title: "已跳过重复素材",
+                             subtitle: url.lastPathComponent.truncatedFileName())
             return
         }
         let ext = url.pathExtension.lowercased()
@@ -72,7 +74,9 @@ extension ProjectState {
                 .appendingPathComponent("BlackCatTranscode", isDirectory: true)
                 .appendingPathComponent("\(fileName)_\(shortHash).m4a")
             if mediaAssets.contains(where: { $0.url == outputURL }) {
-                showImportToast("「\(url.lastPathComponent)」已在素材库中，已跳过")
+                showSuccessToast(icon: "exclamationmark.circle.fill", iconColor: .orange,
+                             title: "已跳过重复素材",
+                             subtitle: url.lastPathComponent.truncatedFileName())
                 return
             }
             transcodeAudioAndImport(url: url, outputURL: outputURL, displayName: url.lastPathComponent)
@@ -87,7 +91,9 @@ extension ProjectState {
                 .appendingPathComponent("BlackCatTranscode", isDirectory: true)
                 .appendingPathComponent("\(fileName).mp4")
             if mediaAssets.contains(where: { $0.url == outputURL }) {
-                showImportToast("「\(url.lastPathComponent)」已在素材库中，已跳过")
+                showSuccessToast(icon: "exclamationmark.circle.fill", iconColor: .orange,
+                             title: "已跳过重复素材",
+                             subtitle: url.lastPathComponent.truncatedFileName())
                 return
             }
             transcodeAndImport(url: url)
@@ -156,7 +162,9 @@ extension ProjectState {
             task.process?.terminate()
             task.process = nil
             try? FileManager.default.removeItem(at: task.outputURL)
-            showSuccessToast(icon: "stop.fill", iconColor: .yellow, title: task.displayName, subtitle: "已停止", autoCountdown: false)
+            showSuccessToast(icon: "stop.fill", iconColor: .yellow,
+                             title: task.displayName.truncatedFileName(maxVisualWidth: 24),
+                             subtitle: "已停止", autoCountdown: false)
         }
         activeTasks.removeAll { $0.id == taskID }
         pendingTasks.removeAll { $0.id == taskID }
@@ -223,7 +231,9 @@ extension ProjectState {
 
     func runAudioTranscode(_ task: TranscodeTask) {
         guard let ffmpeg = Self.findFFmpeg() else {
-            showImportToast("未找到 FFmpeg，无法转码 \(task.displayName)")
+            showSuccessToast(icon: "exclamationmark.triangle.fill", iconColor: .orange,
+                             title: "未找到 FFmpeg，无法转码",
+                             subtitle: task.displayName.truncatedFileName())
             finishTranscodeTask(task.id)
             return
         }
@@ -241,7 +251,9 @@ extension ProjectState {
                 if ok {
                     self?.importFileDirectly(url: task.outputURL, type: .audio, displayName: task.displayName)
                 } else {
-                    self?.showImportToast("「\(task.displayName)」转码失败")
+                    self?.showSuccessToast(icon: "xmark.circle.fill", iconColor: .red,
+                                           title: "转码失败",
+                                           subtitle: task.displayName.truncatedFileName())
                 }
                 self?.finishTranscodeTask(task.id)
             }
@@ -250,7 +262,9 @@ extension ProjectState {
 
     func runVideoTranscode(_ task: TranscodeTask) {
         guard let ffmpeg = Self.findFFmpeg() else {
-            showImportToast("未找到 FFmpeg，无法转码 \(task.displayName)")
+            showSuccessToast(icon: "exclamationmark.triangle.fill", iconColor: .orange,
+                             title: "未找到 FFmpeg，无法转码",
+                             subtitle: task.displayName.truncatedFileName())
             finishTranscodeTask(task.id)
             return
         }
@@ -294,7 +308,9 @@ extension ProjectState {
 
             do { try process.run() } catch {
                 await MainActor.run {
-                    self?.showImportToast("转码失败")
+                    self?.showSuccessToast(icon: "xmark.circle.fill", iconColor: .red,
+                                           title: "转码失败",
+                                           subtitle: task.displayName.truncatedFileName())
                     self?.finishTranscodeTask(task.id)
                 }
                 return
@@ -331,7 +347,9 @@ extension ProjectState {
                 if process.terminationStatus == 0 {
                     self?.importFileDirectly(url: task.outputURL, type: .video)
                 } else {
-                    self?.showImportToast("转码失败")
+                    self?.showSuccessToast(icon: "xmark.circle.fill", iconColor: .red,
+                                           title: "转码失败",
+                                           subtitle: task.displayName.truncatedFileName())
                 }
                 self?.finishTranscodeTask(task.id)
             }
@@ -345,7 +363,9 @@ extension ProjectState {
             if !mediaAssets.contains(where: { $0.url == outputURL }) {
                 importFileDirectly(url: outputURL, type: .audio, displayName: name)
             } else {
-                showImportToast("「\(name)」已在素材库中，已跳过")
+                showSuccessToast(icon: "exclamationmark.circle.fill", iconColor: .orange,
+                                 title: "已跳过重复素材",
+                                 subtitle: name.truncatedFileName())
             }
             return
         }
@@ -365,7 +385,9 @@ extension ProjectState {
             if !mediaAssets.contains(where: { $0.url == outputURL }) {
                 importFileDirectly(url: outputURL, type: .video)
             } else {
-                showImportToast("「\(url.lastPathComponent)」已在素材库中，已跳过")
+                showSuccessToast(icon: "exclamationmark.circle.fill", iconColor: .orange,
+                             title: "已跳过重复素材",
+                             subtitle: url.lastPathComponent.truncatedFileName())
             }
             return
         }

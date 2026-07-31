@@ -216,7 +216,9 @@ extension ProjectState {
         } catch {
             isSaved = false
             if silent {
-                showImportToast("自动保存失败：\(error.localizedDescription)")
+                showSuccessToast(icon: "xmark.circle.fill", iconColor: .red,
+                                 title: "自动保存失败",
+                                 subtitle: error.localizedDescription)
             } else {
                 let alert = NSAlert()
                 alert.alertStyle = .critical
@@ -228,16 +230,9 @@ extension ProjectState {
             return
         }
         guard !silent else { return }
-        showSuccessToast(icon: "checkmark", title: "已保存", subtitle: fileURL.lastPathComponent, revealURL: fileURL)
-    }
-
-    /// Show a brief import feedback toast (auto-dismiss after 3 seconds)
-    func showImportToast(_ message: String) {
-        importToastMessage = message
-        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
-            if self?.importToastMessage == message {
-                self?.importToastMessage = nil
-            }
-        }
+        // 带 revealURL 时 subtitle 后面还要接「 · 点击查看」，名字预算相应收窄
+        showSuccessToast(icon: "checkmark", title: "已保存",
+                         subtitle: fileURL.lastPathComponent.truncatedFileName(maxVisualWidth: 15),
+                         revealURL: fileURL)
     }
 }

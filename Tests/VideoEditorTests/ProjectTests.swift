@@ -113,10 +113,12 @@ final class ProjectManagementTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: dir) }
 
         p.createNewProject(name: "ToastTest", directory: dir)
+        // 保存提示已并入右下角统一卡片（successToasts），saveToasts 不再有写入方
         p.saveProject()
-        XCTAssertEqual(p.saveToasts.count, 1, "手动保存应产生toast")
+        XCTAssertEqual(p.successToasts.count, 1, "手动保存应产生toast")
+        XCTAssertEqual(p.successToasts.first?.title, "已保存")
         p.saveProject()
-        XCTAssertEqual(p.saveToasts.count, 2, "连续保存应叠加toast")
+        XCTAssertEqual(p.successToasts.count, 2, "连续保存应叠加toast")
     }
 
     // TC-PM-010: Finder 双击 .bcj 文件打开项目
@@ -144,6 +146,9 @@ final class ProjectManagementTests: XCTestCase {
         let sub = SubtitleClip(text: "Hello", startTime: 1, endTime: 3)
         let img = ImageClip(assetID: UUID(), name: "i1", startTime: 0, endTime: 5)
 
+        // audioTracks / subtitleTracks 默认为空，得先建轨道
+        p.audioTracks.append(Track(label: "音频"))
+        p.subtitleTracks.append(Track(label: "字幕"))
         p.videoTracks[0].clips.append(vid)
         p.audioTracks[0].clips.append(aud)
         p.subtitleTracks[0].clips.append(sub)
@@ -227,8 +232,9 @@ final class MediaLibraryTests: XCTestCase {
         p.importFile(url)
         // Should still have 1 asset (not 2)
         XCTAssertEqual(p.mediaAssets.count, 1, "重复导入不应增加素材")
-        // importToastMessage should be set
-        XCTAssertNotNil(p.importToastMessage, "重复导入应显示 toast 提示")
+        // 重复导入的提示已并入右下角统一卡片（successToasts）
+        XCTAssertFalse(p.successToasts.isEmpty, "重复导入应显示 toast 提示")
+        XCTAssertEqual(p.successToasts.first?.title, "已跳过重复素材")
     }
 
     // TC-ML-007: 双击素材添加到时间轴
@@ -308,7 +314,7 @@ final class MediaLibraryTests: XCTestCase {
         p.mediaAssets.append(MediaAsset(id: aid, url: URL(fileURLWithPath: "/tmp/x.mp4"), name: "x", type: .video))
         p.videoTracks[0].clips.append(VideoClip(assetID: aid, startTime: 0, endTime: 5))
 
-        p.clearMediaLibrary()
+        p.clearMediaLibrary(type: .video)
         XCTAssertEqual(p.mediaAssets.count, 0, "清空后素材应为0")
         XCTAssertEqual(p.videoTracks[0].clips.count, 0, "清空后片段应为0")
         XCTAssertTrue(p.undoCount > 0, "清空应支持撤销")
@@ -322,6 +328,12 @@ final class TimelineEditorTests: XCTestCase {
     private func makeProject() -> ProjectState {
         let p = ProjectState()
         p.showWelcome = false
+        // 只有 videoTracks 默认带一条，音频/字幕/图片都是空数组。
+        // 下面的用例普遍直接用 [0]，在这里统一补齐，省得每个用例各写一遍
+        p.audioTracks.append(Track(label: "音频"))
+        p.subtitleTracks.append(Track(label: "字幕"))
+        p.imageTracks.append(Track(label: "图片"))
+        p.syncOverlayOrder()
         return p
     }
 
@@ -586,6 +598,8 @@ final class InspectorTests: XCTestCase {
     // TC-IN-003: 修改字幕文字
     func testIN003_ModifySubtitleText() {
         let p = ProjectState()
+        // subtitleTracks 默认为空，得先建一条轨道再放片段
+        p.subtitleTracks.append(Track(label: "字幕"))
         let sub = SubtitleClip(text: "原始", startTime: 0, endTime: 3)
         p.subtitleTracks[0].clips = [sub]
         p.updateSubtitleText(id: sub.id, text: "修改后")
@@ -646,6 +660,8 @@ final class InspectorTests: XCTestCase {
     // TC-IN-011: 音频淡入淡出
     func testIN011_AudioFade() {
         let p = ProjectState()
+        // audioTracks 默认为空，得先建一条轨道再放片段
+        p.audioTracks.append(Track(label: "音频"))
         let aid = UUID()
         let clip = AudioClip(assetID: aid, name: "a", startTime: 0, endTime: 10)
         p.audioTracks[0].clips = [clip]
@@ -743,6 +759,8 @@ final class UndoRedoTests: XCTestCase {
     // TC-UR-004: 撤销字幕编辑（节流）
     func testUR004_UndoThrottled() {
         let p = ProjectState()
+        // subtitleTracks 默认为空，得先建一条轨道
+        p.subtitleTracks.append(Track(label: "字幕"))
         let sub = SubtitleClip(text: "orig", startTime: 0, endTime: 3)
         p.subtitleTracks[0].clips = [sub]
 
@@ -851,7 +869,7 @@ final class UndoRedoTests: XCTestCase {
         p.mediaAssets.append(MediaAsset(id: aid, url: URL(fileURLWithPath: "/tmp/x.mp4"), name: "x", type: .video))
         p.videoTracks[0].clips.append(VideoClip(assetID: aid, startTime: 0, endTime: 5))
 
-        p.clearMediaLibrary()
+        p.clearMediaLibrary(type: .video)
         XCTAssertEqual(p.mediaAssets.count, 0)
 
         p.undo()
@@ -970,8 +988,8 @@ final class TranslationTests: XCTestCase {
         let p = ProjectState()
         // No subtitle selected
         XCTAssertNil(p.selectedSubtitleClip, "无选中字幕时翻译当前字幕应不可用")
-        // With empty tracks
-        XCTAssertTrue(p.subtitleTracks[0].clips.isEmpty)
+        // 新项目没有任何字幕片段（字幕轨道本身默认就不存在，所以不按下标取）
+        XCTAssertTrue(p.subtitleTracks.flatMap(\.clips).isEmpty)
     }
 }
 
@@ -1037,17 +1055,20 @@ final class ExportTests: XCTestCase {
 
     // TC-EX-005: 导出分辨率
     func testEX005_ExportResolutions() {
+        // v4.2.0 起分辨率只定短边，具体尺寸由「分辨率 × 画面比例」算出，标签不再带固定像素
         let resolutions = ExportSettings.resolutions
-        XCTAssertTrue(resolutions.contains("1080p  1920×1080"))
-        XCTAssertTrue(resolutions.contains("4K  3840×2160"))
-        XCTAssertTrue(resolutions.contains("720p  1280×720"))
+        XCTAssertTrue(resolutions.contains("原始"))
+        XCTAssertTrue(resolutions.contains("4K"))
+        XCTAssertTrue(resolutions.contains("1080p"))
+        XCTAssertTrue(resolutions.contains("720p"))
+        XCTAssertTrue(resolutions.contains("480p"))
     }
 
     // TC-EX-008: 导出设置
     func testEX008_ExportSettings() {
         var settings = ExportSettings()
         XCTAssertEqual(settings.fps, 30)
-        XCTAssertEqual(settings.bitrate, 8000)
+        XCTAssertEqual(settings.bitrate, 5000, "默认码率 5000kbps（1080p 标准画质）")
         settings.fps = 60
         settings.bitrate = 12000
         XCTAssertEqual(settings.fps, 60)
@@ -1066,6 +1087,8 @@ final class LayoutTests: XCTestCase {
         p.videoTracks[0].clips = [VideoClip(assetID: aid, startTime: 0, endTime: 20)]
         XCTAssertEqual(p.contentEndTime, 20, accuracy: 0.01)
 
+        // audioTracks 默认为空，得先建一条轨道
+        p.audioTracks.append(Track(label: "音频"))
         p.audioTracks[0].clips = [AudioClip(assetID: aid, startTime: 0, endTime: 30)]
         XCTAssertEqual(p.contentEndTime, 30, accuracy: 0.01, "应取所有轨道最大结束时间")
     }
@@ -1108,7 +1131,8 @@ final class PlayerModelTests: XCTestCase {
     // TC-PV-005: 预览分辨率
     func testPV005_PreviewResolution() {
         let p = ProjectState()
-        XCTAssertEqual(p.previewResolution, "1080p  1920×1080")
+        // v4.2.0 起分辨率标签只标短边，实际尺寸由「分辨率 × 画面比例」算出
+        XCTAssertEqual(p.previewResolution, "1080p")
         let size = p.previewRenderSize
         XCTAssertEqual(size.width, 1920)
         XCTAssertEqual(size.height, 1080)

@@ -46,6 +46,11 @@ struct AIChatPanel: View {
         .onChange(of: service.selectedProvider) { _ in
             pruneInputsForProvider()
         }
+        // 试听播放器是单例，view 销毁不会带走它 —— 切会话和关面板都得手动停，否则声音继续响
+        .onChange(of: service.currentConversationId) { _ in
+            AIInlinePlayer.shared.stop()
+        }
+        .onDisappear { AIInlinePlayer.shared.stop() }
     }
 
     /// 切换模型后，裁掉新模型不支持的参考内容，避免带着旧模型的数据发出去被静默丢弃
@@ -617,7 +622,7 @@ struct AIChatPanel: View {
     /// 去向只看当前处于哪个模式，不切模式；首尾帧按点击先后决定角色。
     private func restoreAttachment(_ att: AIVideoService.Attachment) {
         guard let url = att.resolvedURL() else {
-            project.showSuccessToast(icon: "exclamationmark.triangle", iconColor: .orange, title: "文件已不存在", subtitle: att.url.lastPathComponent)
+            project.showSuccessToast(icon: "exclamationmark.triangle", iconColor: .orange, title: "文件已不存在", subtitle: att.url.lastPathComponent.truncatedFileName())
             return
         }
         switch service.addToReference(url: url) {
@@ -889,7 +894,7 @@ private struct MessageBubble: View {
                         Image(systemName: "checkmark.circle.fill")
                             .foregroundColor(.green)
                             .font(.system(size: 12))
-                        Text("音频已生成")
+                        Text("已生成")
                             .font(.system(size: 12))
                             .foregroundColor(Color.labelPrimary)
                             .lineLimit(1)
@@ -1032,6 +1037,7 @@ private struct VideoThumbnailView: View {
     let url: URL
     @State private var thumbnail: NSImage?
     @State private var duration: String = ""
+    @ObservedObject private var inline = AIInlinePlayer.shared
 
     /// 固定宽度，不再随聊天区宽度伸缩
     private var displaySize: CGSize {
@@ -1046,6 +1052,13 @@ private struct VideoThumbnailView: View {
                         .resizable()
                         .aspectRatio(contentMode: .fill)
                         .frame(width: displaySize.width, height: displaySize.height)
+                        // 播放时画面盖在缩略图上，停了自动露回缩略图
+                        .overlay {
+                            if inline.isPlaying(url), let p = inline.player {
+                                InlinePlayerLayer(player: p)
+                                    .frame(width: displaySize.width, height: displaySize.height)
+                            }
+                        }
                 } else {
                     Rectangle()
                         .fill(Color.white.opacity(0.04))
@@ -1055,6 +1068,7 @@ private struct VideoThumbnailView: View {
             }
             .clipped()
             .clipShape(RoundedRectangle(cornerRadius: 8))
+            .overlay { if thumbnail != nil { InlinePlayButton(url: url) } }
 
             if !duration.isEmpty {
                 Text(duration)
@@ -1136,6 +1150,90 @@ private struct ImageThumbnailView: View {
     }
 }
 
+// MARK: - 行内试听
+
+/// AI 面板里缩略图上的试听播放器。全局单例，同一时刻只播一条，
+/// 点第二条会自动停掉上一条，避免多条一起响
+@MainActor
+final class AIInlinePlayer: ObservableObject {
+    static let shared = AIInlinePlayer()
+
+    @Published private(set) var playingURL: URL?
+    @Published private(set) var player: AVPlayer?
+    private var endObserver: NSObjectProtocol?
+
+    private init() {}
+
+    func isPlaying(_ url: URL) -> Bool { playingURL == url }
+
+    func toggle(_ url: URL) {
+        if playingURL == url { stop(); return }
+        stop()
+        let p = AVPlayer(url: url)
+        // 播完自动复位成播放态图标
+        endObserver = NotificationCenter.default.addObserver(
+            forName: AVPlayerItem.didPlayToEndTimeNotification,
+            object: p.currentItem,
+            queue: .main
+        ) { _ in
+            Task { @MainActor in AIInlinePlayer.shared.stop() }
+        }
+        player = p
+        playingURL = url
+        p.play()
+    }
+
+    func stop() {
+        player?.pause()
+        if let o = endObserver {
+            NotificationCenter.default.removeObserver(o)
+            endObserver = nil
+        }
+        player = nil
+        playingURL = nil
+    }
+}
+
+/// 缩略图上的播放/暂停按钮：半透明黑底圆形 + 白色图标
+private struct InlinePlayButton: View {
+    let url: URL
+    var size: CGFloat = 28
+    @ObservedObject private var inline = AIInlinePlayer.shared
+
+    var body: some View {
+        Button { inline.toggle(url) } label: {
+            Image(nsImage: TimelineSVGIcon.load(inline.isPlaying(url) ? "pause" : "play"))
+                .renderingMode(.template)
+                .resizable()
+                .aspectRatio(contentMode: .fit)
+                .frame(width: size * 0.43, height: size * 0.43)
+                .foregroundColor(.white)
+                .frame(width: size, height: size)
+                .background(Color.black.opacity(0.5))
+                .clipShape(Circle())
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+/// 播放视频时盖在缩略图上的画面层
+private struct InlinePlayerLayer: NSViewRepresentable {
+    let player: AVPlayer
+
+    func makeNSView(context: Context) -> NSView {
+        let v = NSView()
+        v.wantsLayer = true
+        let layer = AVPlayerLayer(player: player)
+        layer.videoGravity = .resizeAspectFill
+        v.layer = layer
+        return v
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        (nsView.layer as? AVPlayerLayer)?.player = player
+    }
+}
+
 // MARK: - 音频波形
 
 private struct AudioWaveformView: View {
@@ -1163,6 +1261,7 @@ private struct AudioWaveformView: View {
             .frame(height: 40)
             .background(Color.white.opacity(0.04))
             .clipShape(RoundedRectangle(cornerRadius: 6))
+            .overlay { InlinePlayButton(url: url, size: 24) }
 
             if !duration.isEmpty {
                 Text(duration)

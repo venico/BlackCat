@@ -37,6 +37,22 @@ final class AppSettings: ObservableObject {
         static let bingSearchKey = "settings.ai.bing.searchKey"
         static let googleSearchKey = "settings.ai.google.searchKey"
         static let googleSearchCX = "settings.ai.google.searchCX"
+        static let fishVoices = "settings.ai.fish.voices"
+        static let fishSelectedVoice = "settings.ai.fish.selectedVoice"
+        static let bgRemovalEngine = "settings.image.bgRemovalEngine"
+        static let ttsProvider = "settings.subtitle.ttsProvider"
+        static let ttsSpeed = "settings.subtitle.ttsSpeed"
+        static let ttsAutoFit = "settings.subtitle.ttsAutoFit"
+        static let biRefNetModel = "settings.image.biRefNetModel"
+    }
+
+    // MARK: - Fish Audio 音色模型
+
+    /// 用户在 Fish Audio 自建/收藏的音色。modelID 就是接口的 reference_id，note 是自己标的名字
+    struct FishVoice: Codable, Identifiable, Equatable {
+        var id = UUID()
+        var modelID: String = ""
+        var note: String = ""
     }
 
     // MARK: - 文件保存位置
@@ -282,6 +298,53 @@ final class AppSettings: ObservableObject {
         didSet { ud.set(googleSearchCX, forKey: K.googleSearchCX) }
     }
 
+    @Published var fishVoices: [FishVoice] {
+        didSet { ud.set((try? JSONEncoder().encode(fishVoices)) ?? Data(), forKey: K.fishVoices) }
+    }
+
+    /// 选中音色的 UUID 字符串。空串或找不到对应项时走服务端默认音色
+    @Published var fishSelectedVoice: String {
+        didSet { ud.set(fishSelectedVoice, forKey: K.fishSelectedVoice) }
+    }
+
+    /// 字幕转语音用的模型。跟 AI 面板的 aiProvider 分开存 ——
+    /// 那个多半选的是视频模型，混用会互相打架
+    @Published var ttsProvider: AIVideoService.Provider {
+        didSet { ud.set(ttsProvider.rawValue, forKey: K.ttsProvider) }
+    }
+
+    /// 语速倍率。三家 TTS 都支持，只是参数路径不同：
+    /// Fish Audio 是 prosody.speed，OpenAI 是 speed，ElevenLabs 是 voice_settings.speed
+    @Published var ttsSpeed: Double {
+        didSet { ud.set(ttsSpeed, forKey: K.ttsSpeed) }
+    }
+
+    /// 生成后是否自动变速对齐字幕时长
+    @Published var ttsAutoFit: Bool {
+        didSet { ud.set(ttsAutoFit, forKey: K.ttsAutoFit) }
+    }
+
+    /// 可选的语音模型
+    static var ttsProviders: [AIVideoService.Provider] {
+        AIVideoService.Provider.allCases.filter { $0.category == .audio }
+    }
+
+    /// 图片去背使用的模型
+    @Published var bgRemovalEngine: BackgroundRemover.Engine {
+        didSet { ud.set(bgRemovalEngine.rawValue, forKey: K.bgRemovalEngine) }
+    }
+
+    /// 选用 BiRefNet 时具体用哪个权重
+    @Published var biRefNetModel: BiRefNetModel {
+        didSet { ud.set(biRefNetModel.rawValue, forKey: K.biRefNetModel) }
+    }
+
+    /// 生成时实际要传的 reference_id。空串表示不传该字段
+    var fishActiveModelID: String {
+        guard let v = fishVoices.first(where: { $0.id.uuidString == fishSelectedVoice }) else { return "" }
+        return v.modelID.trimmingCharacters(in: .whitespaces)
+    }
+
     func providerAPIKey(for provider: String) -> String {
         ud.string(forKey: "settings.ai.providerKey.\(provider)") ?? ""
     }
@@ -319,6 +382,21 @@ final class AppSettings: ObservableObject {
         } else {
             translateProvider = .google
         }
+
+        if let d = ud.data(forKey: K.fishVoices),
+           let list = try? JSONDecoder().decode([FishVoice].self, from: d) {
+            fishVoices = list
+        } else {
+            fishVoices = []
+        }
+        fishSelectedVoice = ud.string(forKey: K.fishSelectedVoice) ?? ""
+        bgRemovalEngine = BackgroundRemover.Engine(rawValue: ud.string(forKey: K.bgRemovalEngine) ?? "") ?? .system
+        ttsProvider = AIVideoService.Provider(rawValue: ud.string(forKey: K.ttsProvider) ?? "")
+            .flatMap { $0.category == .audio ? $0 : nil } ?? .fishAudio
+        let savedSpeed = ud.double(forKey: K.ttsSpeed)
+        ttsSpeed = savedSpeed > 0 ? savedSpeed : 1.0
+        ttsAutoFit = ud.object(forKey: K.ttsAutoFit) as? Bool ?? true
+        biRefNetModel = BiRefNetModel(rawValue: ud.string(forKey: K.biRefNetModel) ?? "") ?? .lite
 
         deeplAPIKey = ud.string(forKey: K.deeplAPIKey) ?? ""
         youdaoAppKey = ud.string(forKey: K.youdaoAppKey) ?? ""

@@ -83,6 +83,43 @@ enum AudioSeparator {
         return dir
     }
 
+    /// 分离产物输出目录。只增不删，靠设置页的清理入口回收
+    static var separatedDir: URL {
+        supportDir.appendingPathComponent("separated", isDirectory: true)
+    }
+
+    /// 目录下的全部产物文件（含早期「替换片段音频」方案遗留的 mp4）
+    static func separatedFiles() -> [URL] {
+        guard let items = try? FileManager.default.contentsOfDirectory(
+            at: separatedDir,
+            includingPropertiesForKeys: [.fileSizeKey, .isRegularFileKey],
+            options: [.skipsHiddenFiles]
+        ) else { return [] }
+        return items.filter {
+            (try? $0.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true
+        }
+    }
+
+    static func totalSize(of urls: [URL]) -> Int64 {
+        urls.reduce(0) { $0 + Int64((try? $1.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0) }
+    }
+
+    /// 走废纸篓而不是直接删：判断失误时用户还能自己捡回来
+    @discardableResult
+    static func trashFiles(_ urls: [URL]) -> (moved: Int, failed: Int) {
+        var moved = 0, failed = 0
+        for u in urls {
+            do {
+                try FileManager.default.trashItem(at: u, resultingItemURL: nil)
+                moved += 1
+            } catch {
+                NSLog("[Demucs] 清理失败 %@: %@", u.lastPathComponent, error.localizedDescription)
+                failed += 1
+            }
+        }
+        return (moved, failed)
+    }
+
     /// 6 轨模型，比 4 轨多切走 guitar / piano 两类音乐成分
     static let modelFileName = "ggml-model-htdemucs-6s-f16.bin"
     static let modelMinFileSize = 40_000_000
@@ -249,7 +286,7 @@ enum AudioSeparator {
         onProgress?(0.85, "导出音轨…")
 
         // 3. 每条勾选的轨各自转成 m4a（85% ~ 100%）
-        let outDir = supportDir.appendingPathComponent("separated", isDirectory: true)
+        let outDir = separatedDir
         try? FileManager.default.createDirectory(at: outDir, withIntermediateDirectories: true)
         let baseName = mediaURL.deletingPathExtension().lastPathComponent
 

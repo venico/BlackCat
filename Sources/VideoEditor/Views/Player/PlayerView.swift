@@ -606,6 +606,30 @@ fileprivate final class PreviewImageCache {
     }
 }
 
+private extension View {
+    /// 图片描边：八向阴影堆叠近似轮廓。四向在斜边上会露口子，所以补到八向。
+    /// shadow 的 radius 天生是模糊的，硬边靠把 radius 压到极小、纯靠偏移堆出来；
+    /// softness 才把 radius 放开，跟导出侧 ImageStroke 的高斯模糊对应
+    @ViewBuilder
+    func imageStroke(width: CGFloat, color: Color, softness: Double) -> some View {
+        if width > 0.01 {
+            let r = max(0.35, width * softness)
+            let k = width * 0.707   // 斜向分量
+            self
+                .shadow(color: color, radius: r, x:  width, y:  0)
+                .shadow(color: color, radius: r, x: -width, y:  0)
+                .shadow(color: color, radius: r, x:  0, y:  width)
+                .shadow(color: color, radius: r, x:  0, y: -width)
+                .shadow(color: color, radius: r, x:  k, y:  k)
+                .shadow(color: color, radius: r, x: -k, y:  k)
+                .shadow(color: color, radius: r, x:  k, y: -k)
+                .shadow(color: color, radius: r, x: -k, y: -k)
+        } else {
+            self
+        }
+    }
+}
+
 private struct ImageLayerView: View {
     let clip: ImageClip
     let viewSize: CGSize      // GeometryReader 给的整个预览区域尺寸
@@ -655,6 +679,9 @@ private struct ImageLayerView: View {
                 }
                 .frame(width: cropW * vs, height: cropH * vs, alignment: .topLeading)
                 .clipped()
+                // 描边必须加在 clipped 之后，否则会连同描边一起被裁掉。
+                // shadow 基于 alpha，所以去背图沿主体轮廓描边，不透明图沿裁剪框描边
+                .imageStroke(width: clip.strokeW * vs, color: clip.strokeColor, softness: clip.strokeSoft)
                 .scaleEffect(x: clip.mirrorH ? -1 : 1, y: clip.mirrorV ? -1 : 1)
                 .rotationEffect(.degrees(Double(clip.rotation)))
                 .position(x: originX + (cropX + cropW / 2) * vs,

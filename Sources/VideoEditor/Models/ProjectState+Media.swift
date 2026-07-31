@@ -171,7 +171,10 @@ extension ProjectState {
 
     /// Generate timeline thumbnail strip for a video asset (evenly spaced frames).
     func loadTimelineThumbnails(assetID: UUID, url: URL) {
-        guard assetThumbnails[assetID] == nil else { return }
+        // 空数组是"上次没生成出来"，不能当成已有缓存 —— 否则那条片段的缩略图
+        // 会一直空着且永不重试，只有重启 app 清掉内存缓存才恢复
+        if let cached = assetThumbnails[assetID], !cached.isEmpty { return }
+        guard !thumbnailsGenerating.contains(assetID) else { return }
         generateThumbnails(assetID: assetID, url: url)
     }
 
@@ -185,11 +188,18 @@ extension ProjectState {
         if !isReload { assetThumbnails[assetID] = [] }
         let id = assetID
         let pps = pixelsPerSecond
+        thumbnailsGenerating.insert(id)
         Task {
             let av = AVURLAsset(url: url)
             let dur = (try? await av.load(.duration))?.seconds ?? 0
             guard dur > 0.1 else {
-                await MainActor.run { self.thumbnailsReloading.remove(id) }
+                // 时长读不出来（文件临时不可读、资源紧张等）。必须把占位的空数组撤掉，
+                // 留着它会让 loadTimelineThumbnails 以为已有缓存，从此不再重试
+                await MainActor.run {
+                    self.assetThumbnails.removeValue(forKey: id)
+                    self.thumbnailsReloading.remove(id)
+                    self.thumbnailsGenerating.remove(id)
+                }
                 return
             }
             let gen = AVAssetImageGenerator(asset: av)
@@ -223,8 +233,14 @@ extension ProjectState {
             await Task.detached(priority: .utility) { semaphore.wait() }.value
             let sorted = frames.sorted(by: { $0.time < $1.time })
             await MainActor.run {
-                self.assetThumbnails[id] = sorted
+                // 一帧都没出来也按失败处理，同样别留空数组挡住重试
+                if sorted.isEmpty {
+                    self.assetThumbnails.removeValue(forKey: id)
+                } else {
+                    self.assetThumbnails[id] = sorted
+                }
                 self.thumbnailsReloading.remove(id)
+                self.thumbnailsGenerating.remove(id)
             }
         }
     }
@@ -336,16 +352,24 @@ extension ProjectState {
         scheduleAutoSave()
     }
 
-    /// 清空素材库及时间轴上所有关联片段
-    func clearMediaLibrary() {
+    /// 清空指定类型的素材，及时间轴上引用这些素材的片段
+    /// 片段按 assetID 匹配删除，不按轨道类型 —— 视频素材也可能被拖进音频轨
+    func clearMediaLibrary(type: AssetType) {
+        let ids = Set(mediaAssets.filter { $0.type == type }.map(\.id))
+        guard !ids.isEmpty else { return }
         pushUndoSavingAssets()
-        mediaAssets.removeAll()
-        mediaThumbnails.removeAll()
-        waveformCache.removeAll()
-        for i in videoTracks.indices    { videoTracks[i].clips.removeAll() }
-        for i in audioTracks.indices    { audioTracks[i].clips.removeAll() }
-        for i in imageTracks.indices    { imageTracks[i].clips.removeAll() }
-        for i in subtitleTracks.indices { subtitleTracks[i].clips.removeAll() }
+        mediaAssets.removeAll { ids.contains($0.id) }
+        for i in videoTracks.indices    { videoTracks[i].clips.removeAll { ids.contains($0.assetID) } }
+        for i in audioTracks.indices    { audioTracks[i].clips.removeAll { ids.contains($0.assetID) } }
+        for i in imageTracks.indices    { imageTracks[i].clips.removeAll { ids.contains($0.assetID) } }
+        // 字幕片段的 assetID 可选：手动新建的字幕没有来源素材，不该被清掉
+        for i in subtitleTracks.indices {
+            subtitleTracks[i].clips.removeAll { $0.assetID.map(ids.contains) ?? false }
+        }
+        for id in ids {
+            mediaThumbnails.removeValue(forKey: id)
+            waveformCache.removeValue(forKey: id)
+        }
         rebuildTimelinePreview()
         scheduleAutoSave()
     }

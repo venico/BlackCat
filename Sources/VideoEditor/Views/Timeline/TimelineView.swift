@@ -944,6 +944,35 @@ struct TimelineView: View {
                             }
                             .disabled(!project.canRemoveBackgroundMusic)
                         }
+                        if !project.selectedSubtitleClipsForTTS.isEmpty {
+                            Divider()
+                            Button { project.convertSelectedSubtitlesToSpeech() } label: {
+                                Label("转换成语音", systemImage: "waveform.circle")
+                            }
+                            .disabled(!project.canConvertSubtitleToSpeech)
+                        }
+                        if project.selectedImageClipID != nil {
+                            Divider()
+                            // BiRefNet 一个模型全包，不用分方式；系统内置才需要在语义分割和色键之间选
+                            if AppSettings.shared.bgRemovalEngine == .biRefNet {
+                                Button { project.removeBackgroundForSelection(mode: .subject) } label: {
+                                    Label("去除背景", systemImage: "scissors")
+                                }
+                                .disabled(!project.canRemoveImageBackground)
+                            } else {
+                                Menu {
+                                    Button { project.removeBackgroundForSelection(mode: .subject) } label: {
+                                        Text("智能识别主体")
+                                    }
+                                    Button { project.removeBackgroundForSelection(mode: .solid) } label: {
+                                        Text("纯色背景")
+                                    }
+                                } label: {
+                                    Label("去除背景", systemImage: "scissors")
+                                }
+                                .disabled(!project.canRemoveImageBackground)
+                            }
+                        }
                         if selID != nil {
                             Divider()
                             Button { project.createCompoundFromSelected() } label: {

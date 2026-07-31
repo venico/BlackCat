@@ -478,6 +478,42 @@ final class ProjectState: ObservableObject {
         showSuccessToast(icon: "stop.fill", iconColor: .yellow, title: "分离音轨", subtitle: "已停止", autoCountdown: false)
     }
 
+    // 图片去背状态。BiRefNet 首次要加载几百 MB 模型，得让用户看见在干什么
+    enum RemoveBackgroundState: Equatable {
+        case idle
+        case loadingModel     // 首次加载 CoreML 模型，最慢的一段
+        case processing       // 推理 / 色键
+        case composing        // 写文件 + 建轨道
+
+        /// 没有细粒度进度可报，按阶段给个近似值，让进度条别停着不动
+        var progress: Double {
+            switch self {
+            case .idle:         return 0
+            case .loadingModel: return 0.25
+            case .processing:   return 0.65
+            case .composing:    return 0.92
+            }
+        }
+    }
+
+    // 字幕转语音进度
+    @Published var speechTotal: Int = 0
+    @Published var speechDone: Int = 0
+    var speechTask: Task<Void, Never>? = nil
+    var isGeneratingSpeech: Bool { speechTotal > 0 }
+
+    @Published var removeBackgroundState: RemoveBackgroundState = .idle
+    var removeBackgroundTask: Task<Void, Never>? = nil
+    var isRemovingBackground: Bool { removeBackgroundState != .idle }
+
+    func cancelRemoveBackground() {
+        removeBackgroundTask?.cancel()
+        removeBackgroundTask = nil
+        removeBackgroundState = .idle
+        showSuccessToast(icon: "stop.fill", iconColor: .yellow,
+                         title: "去除背景", subtitle: "已停止", autoCountdown: false)
+    }
+
     // MARK: - 场景检测 / 大模型分析
     @Published var isReversingVideo: Bool = false
     @Published var isDetectingScenes: Bool = false
@@ -507,6 +543,18 @@ final class ProjectState: ObservableObject {
     }
 
     @Published var mediaLibraryTab: String = "video"      // 素材库当前标签（提升到 ProjectState，转场图标点击可切换）
+
+    /// 当前标签对应的素材类型。转场/文字/图形/AI 是预置面板，没有素材概念，返回 nil
+    var currentLibraryAssetType: AssetType? {
+        switch mediaLibraryTab {
+        case "video":    return .video
+        case "audio":    return .audio
+        case "image":    return .image
+        case "subtitle": return .subtitle
+        default:         return nil
+        }
+    }
+
     enum MediaSortOrder: String, CaseIterable {
         case name = "名称"
         case duration = "时长"
@@ -544,8 +592,6 @@ final class ProjectState: ObservableObject {
         let path: String
     }
     @Published var saveToasts: [SaveToast] = []
-    /// Toast message for import feedback (e.g. duplicate file skipped)
-    @Published var importToastMessage: String? = nil
 
     // 右上角成功提示（5s 倒计时自动消失）
     struct SuccessToastItem: Identifiable {
@@ -737,6 +783,8 @@ final class ProjectState: ObservableObject {
     @Published var mediaThumbnails: [UUID: NSImage] = [:]          // asset ID → single thumbnail (media library)
     @Published var assetThumbnails: [UUID: [ThumbnailFrame]] = [:] // asset ID → timeline thumbnail strip
     @Published var thumbnailsReloading: Set<UUID> = []              // 正在重建缩略图的 asset IDs
+    /// 正在生成缩略图的 asset IDs。不用 @Published —— 只是防重入，不需要驱动 UI
+    var thumbnailsGenerating: Set<UUID> = []
     @Published var waveformCache: [UUID: WaveformData] = [:]       // asset ID → waveform peaks
     var imageVideoCache: [UUID: URL] = [:]                         // asset ID → generated video file
     var avAssetCache: [URL: AVURLAsset] = [:]             // URL → cached AVURLAsset（避免重复创建）

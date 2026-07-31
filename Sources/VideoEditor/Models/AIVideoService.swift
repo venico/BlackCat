@@ -1463,6 +1463,19 @@ final class AIVideoService: ObservableObject {
 
     // MARK: - 音频生成
 
+    /// 字幕转语音用：直接把一段文本合成成音频文件。
+    /// 跟 AI 面板那条生成链路分开 —— 这里不碰会话历史，也不动面板状态
+    func synthesizeSpeech(text: String, provider: Provider) async throws -> URL {
+        guard provider.category == .audio else {
+            throw AIError.apiError("\(provider.displayName) 不是语音模型")
+        }
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            throw AIError.apiError("字幕内容为空")
+        }
+        return try await generateAudio(provider: provider, prompt: trimmed)
+    }
+
     private func generateAudio(provider: Provider, prompt: String) async throws -> URL {
         let apiKey = settings.providerAPIKey(for: provider.rawValue)
         guard !apiKey.isEmpty else {
@@ -1489,13 +1502,20 @@ final class AIVideoService: ObservableObject {
         let url = URL(string: "https://api.elevenlabs.io/v1/text-to-speech/\(voiceId)")!
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
+        // TTS 默认 60s 超时，长文本容易踩线；批量转换里一条挂住会拖慢整批
+        request.timeoutInterval = 120
         request.setValue(apiKey, forHTTPHeaderField: "xi-api-key")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
 
+        // 语速：ElevenLabs 塞在 voice_settings.speed 里，接口范围 0.25~4.0
+        var voiceSettings: [String: Any] = ["stability": 0.5, "similarity_boost": 0.75]
+        if abs(settings.ttsSpeed - 1.0) > 0.01 {
+            voiceSettings["speed"] = min(4.0, max(0.25, settings.ttsSpeed))
+        }
         let body: [String: Any] = [
             "text": prompt,
             "model_id": "eleven_multilingual_v2",
-            "voice_settings": ["stability": 0.5, "similarity_boost": 0.75]
+            "voice_settings": voiceSettings
         ]
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
@@ -1519,10 +1539,16 @@ final class AIVideoService: ObservableObject {
         let url = URL(string: "https://api.openai.com/v1/audio/speech")!
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
+        // TTS 默认 60s 超时，长文本容易踩线；批量转换里一条挂住会拖慢整批
+        request.timeoutInterval = 120
         request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
 
-        let body: [String: Any] = ["model": "tts-1-hd", "input": prompt, "voice": "alloy", "response_format": "mp3"]
+        var body: [String: Any] = ["model": "tts-1-hd", "input": prompt, "voice": "alloy", "response_format": "mp3"]
+        // 语速：OpenAI 是顶层 speed，接口范围 0.25~4.0
+        if abs(settings.ttsSpeed - 1.0) > 0.01 {
+            body["speed"] = min(4.0, max(0.25, settings.ttsSpeed))
+        }
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
         await MainActor.run { updateAssistantStatus(.generating(progress: "生成音频中…")) }
@@ -1545,17 +1571,33 @@ final class AIVideoService: ObservableObject {
         let url = URL(string: "https://api.fish.audio/v1/tts")!
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
+        // TTS 默认 60s 超时，长文本容易踩线；批量转换里一条挂住会拖慢整批
+        request.timeoutInterval = 120
         request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        // model 是必填 header，缺了直接被拒。s2.1-pro-free 对应免费开发者层
+        request.setValue("s2.1-pro-free", forHTTPHeaderField: "model")
 
-        let body: [String: Any] = ["text": prompt, "reference_id": "default", "format": "mp3"]
+        // reference_id 只接受真实音色模型 ID，没选音色就不传，走服务端默认
+        var body: [String: Any] = ["text": prompt, "format": "mp3"]
+        // 语速：Fish Audio 走 prosody.speed，接口范围 0.5~2.0
+        let speed = settings.ttsSpeed
+        if abs(speed - 1.0) > 0.01 {
+            body["prosody"] = ["speed": min(2.0, max(0.5, speed))]
+        }
+        let voiceID = await MainActor.run { AppSettings.shared.fishActiveModelID }
+        if !voiceID.isEmpty { body["reference_id"] = voiceID }
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
         await MainActor.run { updateAssistantStatus(.generating(progress: "生成音频中…")) }
 
         let (data, resp) = try await URLSession.shared.data(for: request)
         guard let http = resp as? HTTPURLResponse, http.statusCode == 200 else {
-            throw AIError.apiError("Fish Audio 请求失败")
+            let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+            let detail = String(data: data, encoding: .utf8) ?? ""
+            NSLog("[FishAudio] HTTP %d: %@", code, detail)
+            throw AIError.apiError("Fish Audio 请求失败 (\(code))"
+                                   + (detail.isEmpty ? "" : "：\(detail.prefix(300))"))
         }
 
         let saveDir = AppSettings.shared.effectiveProjectDir.appendingPathComponent("AI生成")
@@ -1571,6 +1613,8 @@ final class AIVideoService: ObservableObject {
         let url = URL(string: "https://studio-api.suno.ai/api/external/generate/")!
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
+        // TTS 默认 60s 超时，长文本容易踩线；批量转换里一条挂住会拖慢整批
+        request.timeoutInterval = 120
         request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
 
