@@ -148,9 +148,11 @@ f4: shape=(3, 3, 12, 12)    b4: shape=(12,)    alpha4: shape=(12,)
 f5: shape=(3, 3, 12, 12)    b5: shape=(12,)    alpha5: shape=(12,)
 f6: shape=(3, 3, 12, 12)    b6: shape=(12,)    alpha6: shape=(12,)
 f7: shape=(1, 1, 12, 56)    b7: shape=(56,)    alpha7: shape=(56,)
-f8: shape=(1, 1, 56, 16)    b8: shape=(16,)
+f8: shape=(1, 1, 56, 16)    b8: shape=(1,)
 ```
 `f1` 的输入通道是 1（不是 3）——**FSRCNN 只处理 YCbCr 的 Y 亮度通道**，这是这个方案跟 Real-ESRGAN（直接处理 RGB）的关键差异，Task 2/6 都要考虑这一点。`f8` 输出 16 = 4²（scale² for x4；x2 的话 f8 应该是 4=2²），配合图里的 `DepthToSpace` 节点做 sub-pixel 上采样（等价于 PyTorch 的 `nn.PixelShuffle`）。
+
+**`b8` 的 shape 是 `(1,)`，不是 `(16,)`**——它不是 `f8` 这层卷积的常规 per-channel bias，而是加在 `DepthToSpace`（PixelShuffle）**之后**的最终单通道输出上的一个标量（这是实际执行 Task 1 时深入排查图节点连接关系才发现的，diagnostic 脚本里 `t.size > 1` 的过滤条件会把它漏掉，需要专门确认）。Task 2 的 PyTorch 架构定义已经按这个结论处理（`out_conv` 用 `bias=False`，另外单独用一个 `output_bias` 参数在 `PixelShuffle` 之后相加）。
 
 **如果节点名/shape 跟这里列的不一致**：说明这个 `.pb` 文件版本或配置跟已验证过的不同，需要按实际输出调整后续的 PyTorch 架构定义，不要硬套这里给的形状。
 
@@ -256,8 +258,13 @@ class FSRCNN(nn.Module):
         self.act6 = nn.PReLU(12)
         self.expand = nn.Conv2d(12, 56, kernel_size=1)
         self.act7 = nn.PReLU(56)
-        self.out_conv = nn.Conv2d(56, scale_factor * scale_factor, kernel_size=1)
+        # bias=False：Task 1 排查确认，官方权重的 b8 不是这层卷积的 per-channel
+        # bias（那样 shape 应该是 scale²，比如 x4 是 16），而是加在 PixelShuffle
+        # 之后的最终单通道输出上的一个标量——两种写法数值等价，但 PyTorch 的
+        # nn.Conv2d.bias 长度必须等于 out_channels，装不下这个标量，必须分开处理
+        self.out_conv = nn.Conv2d(56, scale_factor * scale_factor, kernel_size=1, bias=False)
         self.pixel_shuffle = nn.PixelShuffle(scale_factor)
+        self.output_bias = nn.Parameter(torch.zeros(1))
 
     def forward(self, x):
         x = self.act1(self.feature(x))
@@ -269,6 +276,7 @@ class FSRCNN(nn.Module):
         x = self.act7(self.expand(x))
         x = self.out_conv(x)
         x = self.pixel_shuffle(x)
+        x = x + self.output_bias
         return x
 ```
 
@@ -300,11 +308,14 @@ def load_from_npz(model: FSRCNN, npz_path: str):
             conv.weight.copy_(torch.from_numpy(w[f_key].transpose(3, 2, 0, 1).copy()))
             conv.bias.copy_(torch.from_numpy(w[b_key].copy()))
             act.weight.copy_(torch.from_numpy(w[alpha_key].copy()))
-        # 最后一层没有 PReLU
+        # 最后一层没有 PReLU；out_conv 是 bias=False（见 fsrcnn_arch.py 里的说明），
+        # b8 是加在 PixelShuffle 之后的标量，赋给 output_bias 而不是 out_conv.bias
         model.out_conv.weight.copy_(torch.from_numpy(w["f8"].transpose(3, 2, 0, 1).copy()))
-        model.out_conv.bias.copy_(torch.from_numpy(w["b8"].copy()))
+        model.output_bias.copy_(torch.from_numpy(w["b8"].copy()))
     return model
 ```
+
+**这个 `b8` 的处理方式是 Task 1 实际执行时才发现的（原计划这里假设 `b8` 是 `out_conv` 的常规 16/4 维 bias，实测发现不对——Task 1 深入排查了 TF 图的节点连接关系，确认 `b8` 是标量、加在 `DepthToSpace` 之后）**，上面的代码已经按 Task 1 报告的正确结论写好，不需要再重新排查这一点，但 Step 2 的数值验证（下面）仍然要认真做——这类"形状凑巧对上了但语义错了"的 bug 光看 shape 断言是发现不了的，必须靠 PSNR 数值比对才能验证。
 
 ```python
 # 追加到同一个文件或新建 verify_pytorch.py，跟 OpenCV 基准数值比对
