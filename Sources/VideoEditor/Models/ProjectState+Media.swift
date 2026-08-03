@@ -162,11 +162,89 @@ extension ProjectState {
             let gen = AVAssetImageGenerator(asset: av)
             gen.appliesPreferredTrackTransform = true
             gen.maximumSize = CGSize(width: 400, height: 400)
-            if let cg = try? gen.copyCGImage(at: .zero, actualTime: nil) {
+            do {
+                let cg = try gen.copyCGImage(at: .zero, actualTime: nil)
                 let img = NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
                 await MainActor.run { self.mediaThumbnails[id] = img }
+            } catch {
+                // 部分机器上 AVFoundation 会对本进程整体拒绝解码（-11821 Cannot Decode，
+                // 连普通 H.264 都失败），此时改用自带 ffmpeg 抽帧 —— 它是静态编译、
+                // 解码器内置，不依赖系统解码服务
+                NSLog("[缩略图] 素材库封面 AVFoundation 失败 %@ 错误=%@，改用 ffmpeg",
+                      url.lastPathComponent, error.localizedDescription)
+                let fallback = await Task.detached(priority: .utility) {
+                    Self.ffmpegSingleFrame(url: url, maxSize: 400)
+                }.value
+                if let img = fallback {
+                    await MainActor.run { self.mediaThumbnails[id] = img }
+                } else {
+                    let exists = FileManager.default.fileExists(atPath: url.path)
+                    let readable = FileManager.default.isReadableFile(atPath: url.path)
+                    let tracks = (try? await av.loadTracks(withMediaType: .video))?.count ?? -1
+                    NSLog("[缩略图] ffmpeg 兜底也失败 %@ 存在=%@ 可读=%@ 视频轨=%d",
+                          url.lastPathComponent, exists ? "是" : "否", readable ? "是" : "否", tracks)
+                }
             }
         }
+    }
+
+    // MARK: - FFmpeg 兜底抽帧
+
+    /// 用内置 ffmpeg 抽单帧（素材库封面用）。同步执行，须在后台线程调用。
+    nonisolated static func ffmpegSingleFrame(url: URL, maxSize: Int) -> NSImage? {
+        guard let ff = findFFmpeg() else { return nil }
+        let out = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ffcover_\(UUID().uuidString).png")
+        defer { try? FileManager.default.removeItem(at: out) }
+        let p = Process()
+        p.executableURL = ff
+        p.arguments = ["-hide_banner", "-loglevel", "error", "-nostdin",
+                       "-ss", "0", "-i", url.path,
+                       "-frames:v", "1",
+                       "-vf", "scale=w=\(maxSize):h=\(maxSize):force_original_aspect_ratio=decrease",
+                       "-y", out.path]
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = FileHandle.nullDevice
+        do { try p.run() } catch { return nil }
+        p.waitUntilExit()
+        guard p.terminationStatus == 0 else { return nil }
+        return NSImage(contentsOf: out)
+    }
+
+    /// 用内置 ffmpeg 按固定间隔抽帧（时间轴缩略图条用）。同步执行，须在后台线程调用。
+    /// fps 滤镜一次解码流式出全部帧，比逐帧 seek 快得多。
+    nonisolated static func ffmpegFrameStrip(url: URL, interval: Double) -> [ThumbnailFrame] {
+        guard interval > 0, let ff = findFFmpeg() else { return [] }
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ffstrip_\(UUID().uuidString)")
+        do {
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        } catch { return [] }
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let p = Process()
+        p.executableURL = ff
+        p.arguments = ["-hide_banner", "-loglevel", "error", "-nostdin",
+                       "-i", url.path,
+                       "-vf", "fps=\(1.0 / interval),scale=w=160:h=104:force_original_aspect_ratio=decrease",
+                       "-fps_mode", "vfr",
+                       dir.appendingPathComponent("f_%05d.png").path]
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = FileHandle.nullDevice
+        do { try p.run() } catch { return [] }
+        p.waitUntilExit()
+        guard p.terminationStatus == 0 else { return [] }
+
+        let files = ((try? FileManager.default.contentsOfDirectory(atPath: dir.path)) ?? [])
+            .filter { $0.hasSuffix(".png") }
+            .sorted()
+        var frames: [ThumbnailFrame] = []
+        for (i, name) in files.enumerated() {
+            if let img = NSImage(contentsOf: dir.appendingPathComponent(name)) {
+                // fps 滤镜第 i 帧（0 起）对应时间 i*interval，与请求的时间点一致
+                frames.append(ThumbnailFrame(time: Double(i) * interval, image: img))
+            }
+        }
+        return frames
     }
 
     /// Generate timeline thumbnail strip for a video asset (evenly spaced frames).
@@ -191,10 +269,21 @@ extension ProjectState {
         thumbnailsGenerating.insert(id)
         Task {
             let av = AVURLAsset(url: url)
-            let dur = (try? await av.load(.duration))?.seconds ?? 0
+            var loadError: String? = nil
+            var dur: Double = 0
+            do {
+                dur = try await av.load(.duration).seconds
+            } catch {
+                loadError = error.localizedDescription
+            }
             guard dur > 0.1 else {
-                // 时长读不出来（文件临时不可读、资源紧张等）。必须把占位的空数组撤掉，
+                // 时长读不出来（文件临时不可读、权限被拒、资源紧张等）。必须把占位的空数组撤掉，
                 // 留着它会让 loadTimelineThumbnails 以为已有缓存，从此不再重试
+                let exists = FileManager.default.fileExists(atPath: url.path)
+                let readable = FileManager.default.isReadableFile(atPath: url.path)
+                NSLog("[缩略图] 读不出时长 %@ 存在=%@ 可读=%@ 时长=%.2f 错误=%@",
+                      url.lastPathComponent, exists ? "是" : "否", readable ? "是" : "否",
+                      dur, loadError ?? "无")
                 await MainActor.run {
                     self.assetThumbnails.removeValue(forKey: id)
                     self.thumbnailsReloading.remove(id)
@@ -220,21 +309,33 @@ extension ProjectState {
             }
 
             var frames: [ThumbnailFrame] = []
+            var firstError: String? = nil
             let semaphore = DispatchSemaphore(value: 0)
             var remaining = times.count
             gen.generateCGImagesAsynchronously(forTimes: times) { requested, cgImage, actual, result, error in
                 if result == .succeeded, let cg = cgImage {
                     let img = NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
                     frames.append(ThumbnailFrame(time: requested.seconds, image: img))
+                } else if firstError == nil {
+                    firstError = error?.localizedDescription ?? "result=\(result.rawValue)"
                 }
                 remaining -= 1
                 if remaining == 0 { semaphore.signal() }
             }
             await Task.detached(priority: .utility) { semaphore.wait() }.value
-            let sorted = frames.sorted(by: { $0.time < $1.time })
+            var sorted = frames.sorted(by: { $0.time < $1.time })
+            // AVFoundation 一帧都没出来（-11821 Cannot Decode 等）→ 改用 ffmpeg 整条重抽
+            if sorted.isEmpty {
+                NSLog("[缩略图] %@ AVFoundation %d 帧全部失败（首个错误：%@），改用 ffmpeg",
+                      url.lastPathComponent, times.count, firstError ?? "无")
+                sorted = await Task.detached(priority: .utility) {
+                    Self.ffmpegFrameStrip(url: url, interval: interval)
+                }.value
+            }
             await MainActor.run {
-                // 一帧都没出来也按失败处理，同样别留空数组挡住重试
+                // 两条路都没出帧才算失败，别留空数组挡住重试
                 if sorted.isEmpty {
+                    NSLog("[缩略图] %@ ffmpeg 兜底也没出帧", url.lastPathComponent)
                     self.assetThumbnails.removeValue(forKey: id)
                 } else {
                     self.assetThumbnails[id] = sorted
