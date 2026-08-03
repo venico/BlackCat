@@ -794,11 +794,6 @@ enum ClarityEnhancer {
     }
 
     private static func runOneTile(_ tile: CGImage, mlModel: MLModel) throws -> CGImage {
-        guard let nsImage = NSImage(cgImage: tile, size: NSSize(width: tile.width, height: tile.height))
-            .cgImage(forProposedRect: nil, context: nil, hints: nil) else {
-            throw EnhanceError.inferenceFailed("输入转换失败")
-        }
-        _ = nsImage
         let inputName = mlModel.modelDescription.inputDescriptionsByName.keys.first ?? "input"
         let ciImage = CIImage(cgImage: tile)
         guard let pixelBuffer = pixelBuffer(from: ciImage, width: tile.width, height: tile.height) else {
@@ -981,6 +976,9 @@ enum ClarityEnhanceState: Equatable {
 }
 @Published var clarityEnhanceState: ClarityEnhanceState = .idle
 var clarityEnhanceTask: Task<Void, Never>? = nil
+/// 处理流水线整体跑在专属线程上（不受 Swift Task 协作式取消管辖，
+/// 详见 Task 9 的设计说明），取消要靠这个跨线程共享标志
+var clarityCancelFlag: ClarityCancelFlag? = nil
 var isEnhancingClarity: Bool {
     switch clarityEnhanceState {
     case .idle, .failed: return false
@@ -988,10 +986,24 @@ var isEnhancingClarity: Bool {
     }
 }
 func cancelClarityEnhance() {
+    clarityCancelFlag?.cancel()
+    ClarityFrameIO.killCurrentProcess()
     clarityEnhanceTask?.cancel()
     clarityEnhanceTask = nil
+    clarityCancelFlag = nil
     clarityEnhanceState = .idle
     showSuccessToast(icon: "stop.fill", iconColor: .yellow, title: "清晰度提升", subtitle: "已停止", autoCountdown: false)
+}
+```
+
+`ClarityCancelFlag` 是一个简单的跨线程取消信号，**定义在这次编辑的 `Project.swift` 里**（跟上面的状态机放在一起，同一个改动范围）——跟 `AudioSeparator.killCurrentProcess()` 一样的思路：专属线程里的重计算循环不受 `Task.isCancelled` 管辖，需要一个锁保护的标志位：
+
+```swift
+final class ClarityCancelFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _cancelled = false
+    func cancel() { lock.lock(); _cancelled = true; lock.unlock() }
+    var isCancelled: Bool { lock.lock(); defer { lock.unlock() }; return _cancelled }
 }
 ```
 
@@ -1091,6 +1103,7 @@ enum ClarityFrameIO {
         case extractFailed(String)
         case encodeFailed(String)
         case noFramesExtracted
+        case cancelled
 
         var errorDescription: String? {
             switch self {
@@ -1098,8 +1111,21 @@ enum ClarityFrameIO {
             case .extractFailed(let d): return "抽帧失败：\(d)"
             case .encodeFailed(let d):  return "编码失败：\(d)"
             case .noFramesExtracted:    return "没有抽出任何帧"
+            case .cancelled:            return "已取消"
             }
         }
+    }
+
+    /// 当前运行的 ffmpeg 进程，供取消时 terminate（同 AudioSeparator.currentProcess 的模式）
+    private static let processLock = NSLock()
+    private static var _currentProcess: Process?
+    static var currentProcess: Process? {
+        get { processLock.withLock { _currentProcess } }
+        set { processLock.withLock { _currentProcess = newValue } }
+    }
+    static func killCurrentProcess() {
+        if let p = currentProcess, p.isRunning { p.terminate() }
+        currentProcess = nil
     }
 
     /// 把片段裁剪范围解码成 PNG 序列，按帧率抽满。文件名 frame_00001.png 起
@@ -1119,12 +1145,15 @@ enum ClarityFrameIO {
         let errPipe = Pipe()
         p.standardOutput = FileHandle.nullDevice
         p.standardError = errPipe
+        currentProcess = p
+        defer { currentProcess = nil }
         do { try p.run() } catch {
             throw FrameIOError.extractFailed(error.localizedDescription)
         }
         let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
         p.waitUntilExit()
         guard p.terminationStatus == 0 else {
+            if p.terminationReason == .uncaughtSignal { throw FrameIOError.cancelled }
             let msg = String(data: errData, encoding: .utf8)?
                 .trimmingCharacters(in: .whitespacesAndNewlines).prefix(500) ?? ""
             throw FrameIOError.extractFailed("ffmpeg 退出码 \(p.terminationStatus) \(msg)")
@@ -1157,12 +1186,15 @@ enum ClarityFrameIO {
         let errPipe = Pipe()
         p.standardOutput = FileHandle.nullDevice
         p.standardError = errPipe
+        currentProcess = p
+        defer { currentProcess = nil }
         do { try p.run() } catch {
             throw FrameIOError.encodeFailed(error.localizedDescription)
         }
         let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
         p.waitUntilExit()
         guard p.terminationStatus == 0 else {
+            if p.terminationReason == .uncaughtSignal { throw FrameIOError.cancelled }
             let msg = String(data: errData, encoding: .utf8)?
                 .trimmingCharacters(in: .whitespacesAndNewlines).prefix(500) ?? ""
             throw FrameIOError.encodeFailed("ffmpeg 退出码 \(p.terminationStatus) \(msg)")
@@ -1170,6 +1202,8 @@ enum ClarityFrameIO {
     }
 }
 ```
+
+`currentProcess`/`killCurrentProcess()` 是照抄 `AudioSeparator.swift` 里已经验证过的取消模式（第 327-335 行附近）——取消时不依赖 Swift Task 的协作式取消（这条流水线整体跑在专属线程上，不受 `Task.isCancelled` 管辖），直接 `terminate()` 掉正在跑的 ffmpeg 子进程。
 
 `-map 1:a:0?` 里的 `?` 是 ffmpeg 语法，表示"这个流不存在也不报错"——覆盖原片段没有音轨的情况（比如静音素材）。
 
@@ -1362,6 +1396,9 @@ extension ProjectState {
                 .appendingPathComponent("clarity_\(UUID().uuidString)")
             defer { try? FileManager.default.removeItem(at: workDir) }
 
+            let cancelFlag = ClarityCancelFlag()
+            clarityCancelFlag = cancelFlag
+
             do {
                 if !model.isDownloaded {
                     clarityEnhanceState = .downloadingModel(0)
@@ -1371,47 +1408,30 @@ extension ProjectState {
                     try Task.checkCancellation()
                 }
 
-                clarityEnhanceState = .extractingFrames(0)
-                let frameRate = 30.0  // 固定输出帧率，跟原素材帧率解耦，简化实现
-                let inputFrameDir = workDir.appendingPathComponent("in")
-                let frames = try await Task.detached(priority: .userInitiated) {
-                    try ClarityFrameIO.extractFrames(url: url, trimStart: trimStart, duration: duration,
-                                                     frameRate: frameRate, outputDir: inputFrameDir)
-                }.value
-                try Task.checkCancellation()
-
-                clarityEnhanceState = .inferring(0)
-                let outputFrameDir = workDir.appendingPathComponent("out")
-                try FileManager.default.createDirectory(at: outputFrameDir, withIntermediateDirectories: true)
-                for (index, frameURL) in frames.enumerated() {
-                    try Task.checkCancellation()
-                    try await Task.detached(priority: .userInitiated) {
-                        guard let src = CGImageSourceCreateWithURL(frameURL as CFURL, nil),
-                              let cg = CGImageSourceCreateImageAtIndex(src, 0, nil) else {
-                            throw ClarityEnhancer.EnhanceError.badOutput
-                        }
-                        let enhanced = try ClarityEnhancer.enhance(cgImage: cg, model: model)
-                        let outURL = outputFrameDir.appendingPathComponent(frameURL.lastPathComponent)
-                        let rep = NSBitmapImageRep(cgImage: enhanced)
-                        guard let data = rep.representation(using: .png, properties: [:]) else {
-                            throw ClarityEnhancer.EnhanceError.badOutput
-                        }
-                        try data.write(to: outURL)
-                    }.value
-                    let pct = Double(index + 1) / Double(frames.count)
-                    clarityEnhanceState = .inferring(pct)
-                }
-                try Task.checkCancellation()
-
-                clarityEnhanceState = .encoding
                 let outDir = Self.clarityOutputDir
                 let outName = "\(sourceName)_清晰x\(scale.rawValue)_\(UUID().uuidString.prefix(8)).mp4"
                 let outURL = outDir.appendingPathComponent(outName)
-                try await Task.detached(priority: .userInitiated) {
-                    try ClarityFrameIO.encodeFrames(frameDir: outputFrameDir, frameRate: frameRate,
-                                                    audioSourceURL: url, audioTrimStart: trimStart,
-                                                    audioDuration: duration, outputURL: outURL)
-                }.value
+
+                // 抽帧 → 逐帧推理 → 编码整段在专属线程上跑，详见 runClarityEnhancePipeline 的注释：
+                // 这几步都是同步阻塞操作，不能用 Task.detached 反复占用 Swift 协作池
+                try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+                    Thread.detachNewThread {
+                        do {
+                            _ = try Self.runClarityEnhancePipeline(
+                                sourceURL: url, trimStart: trimStart, duration: duration,
+                                scale: scale, model: model, workDir: workDir, outputURL: outURL,
+                                cancelFlag: cancelFlag,
+                                onStateChange: { state in
+                                    DispatchQueue.main.async { self.clarityEnhanceState = state }
+                                }
+                            )
+                            cont.resume(returning: ())
+                        } catch {
+                            cont.resume(throwing: error)
+                        }
+                    }
+                }
+                try Task.checkCancellation()
 
                 pushUndoSavingAssets()
                 var asset = MediaAsset(url: outURL, name: outName, type: .video)
@@ -1441,20 +1461,81 @@ extension ProjectState {
 
                 clarityEnhanceState = .idle
                 clarityEnhanceTask = nil
+                clarityCancelFlag = nil
                 showSuccessToast(icon: "sparkles", iconColor: .green,
                                  title: "清晰度提升", subtitle: "已生成 \(scale.rawValue)x 高清版本",
                                  revealURL: outURL)
             } catch is CancellationError {
                 clarityEnhanceState = .idle
                 clarityEnhanceTask = nil
+                clarityCancelFlag = nil
+            } catch ClarityFrameIO.FrameIOError.cancelled {
+                // 用户点了取消：cancelClarityEnhance() 已经弹过"已停止"提示，这里不再重复弹
+                clarityEnhanceState = .idle
+                clarityEnhanceTask = nil
+                clarityCancelFlag = nil
             } catch {
                 clarityEnhanceState = .idle
                 clarityEnhanceTask = nil
+                clarityCancelFlag = nil
                 showSuccessToast(icon: "xmark.circle.fill", iconColor: .red,
                                  title: "清晰度提升", subtitle: error.localizedDescription,
                                  autoCountdown: false)
             }
         }
+    }
+
+    /// 抽帧 → 逐帧 CoreML 超分 → 编码，整段同步执行。**调用方必须在专属线程
+    /// （`Thread.detachNewThread`）上调用，绝不能直接包在 `Task`/`Task.detached` 里跑**——
+    /// 这几步都是同步阻塞操作（ffmpeg 子进程 `waitUntilExit()`、CoreML `MLModel.prediction`
+    /// 同步调用），`Task.detached` 不代表脱离协作池，只是不继承调用者的 actor/优先级，依然会
+    /// 被派发到 Swift 全局协作线程池执行。逐帧循环几百次反复占用/归还协作池线程，跟本次会话
+    /// 验证过的"协作池被同步阻塞调用拖垮"是同一类风险（详见 home_machine_decode_issue.md
+    /// 里 `loadWaveform` 从 `Task {}` 改为 `Thread.detachNewThread` 的教训）——虽然这里
+    /// 阻塞的是 ffmpeg/CoreML 而不是挂死的 AVFoundation，不会永久卡住，但协作池本来就不该被
+    /// 这类长耗时同步任务反复占用。`onStateChange` 在这条专属线程上被调用，内部自己切回主线程。
+    nonisolated static func runClarityEnhancePipeline(
+        sourceURL: URL, trimStart: Double, duration: Double,
+        scale: ClarityScale, model: ClarityModel, workDir: URL, outputURL: URL,
+        cancelFlag: ClarityCancelFlag,
+        onStateChange: @escaping (ClarityEnhanceState) -> Void
+    ) throws -> URL {
+        func checkCancelled() throws {
+            if cancelFlag.isCancelled { throw ClarityFrameIO.FrameIOError.cancelled }
+        }
+
+        onStateChange(.extractingFrames(0))
+        let frameRate = 30.0  // 固定输出帧率，跟原素材帧率解耦，简化实现
+        let inputFrameDir = workDir.appendingPathComponent("in")
+        let frames = try ClarityFrameIO.extractFrames(url: sourceURL, trimStart: trimStart, duration: duration,
+                                                       frameRate: frameRate, outputDir: inputFrameDir)
+        try checkCancelled()
+
+        onStateChange(.inferring(0))
+        let outputFrameDir = workDir.appendingPathComponent("out")
+        try FileManager.default.createDirectory(at: outputFrameDir, withIntermediateDirectories: true)
+        for (index, frameURL) in frames.enumerated() {
+            try checkCancelled()
+            guard let src = CGImageSourceCreateWithURL(frameURL as CFURL, nil),
+                  let cg = CGImageSourceCreateImageAtIndex(src, 0, nil) else {
+                throw ClarityEnhancer.EnhanceError.badOutput
+            }
+            let enhanced = try ClarityEnhancer.enhance(cgImage: cg, model: model)
+            let outFrameURL = outputFrameDir.appendingPathComponent(frameURL.lastPathComponent)
+            let rep = NSBitmapImageRep(cgImage: enhanced)
+            guard let data = rep.representation(using: .png, properties: [:]) else {
+                throw ClarityEnhancer.EnhanceError.badOutput
+            }
+            try data.write(to: outFrameURL)
+            onStateChange(.inferring(Double(index + 1) / Double(frames.count)))
+        }
+        try checkCancelled()
+
+        onStateChange(.encoding)
+        try ClarityFrameIO.encodeFrames(frameDir: outputFrameDir, frameRate: frameRate,
+                                        audioSourceURL: sourceURL, audioTrimStart: trimStart,
+                                        audioDuration: duration, outputURL: outputURL)
+        return outputURL
     }
 
     static var clarityOutputDir: URL {
@@ -1468,7 +1549,40 @@ extension ProjectState {
 
 **这一步用到的具体类型/属性（`VideoClip`、`Track<T>`、`videoSectionOrder`、`OverlayTrackRef`/`.video(trackID:)` 的确切签名）需要在实现时对照 `DataTypes.swift` 和 `Project.swift` 里的真实定义核对**——这个任务描述里写的字段名（`duration`、`trimStart`、`startTime`）是根据本次会话前面读到的其他代码（demucs/预览重建）里反复出现的字段名推断的，实现者动手前应该先读一遍 `VideoClip` 的真实结构体定义，字段名如果对不上就以实际代码为准，不要盲目照抄这里的代码。这是本计划里**唯一**需要在写代码前额外核对一遍现有类型定义的地方，因为 `VideoClip` 的具体字段集这份计划的准备过程中没有逐字段确认过。
 
-- [ ] **Step 2: 编译，处理字段名不匹配的报错**
+**取消行为的分工**：`cancelClarityEnhance()`（Task 7）里 `ClarityFrameIO.killCurrentProcess()` 会立即打断正在跑的 ffmpeg 子进程（抽帧/编码阶段能立即响应取消）；`cancelFlag.isCancelled` 在推理循环的每一帧之间检查（推理阶段的取消会有"最多等完当前这一帧"的延迟，可接受，单帧耗时是可控的）。
+
+- [ ] **Step 2: 追加 `canEnhanceClarity` 的单元测试**
+
+流程整体依赖真实视频+真实 CoreML 模型，不适合写自动化单测（Step 4 用手动集成测试覆盖）；但 `canEnhanceClarity` 是纯逻辑判断，可以脱离真实处理流程单独测：
+
+```swift
+// 追加到 Tests/VideoEditorTests/ClarityEnhanceProgressTests.swift
+
+extension ClarityEnhanceProgressTests {
+
+    @MainActor
+    func testCanEnhanceClarityRequiresSelection() {
+        let p = ProjectState()
+        XCTAssertFalse(p.canEnhanceClarity, "没有选中片段时不应该可用")
+    }
+
+    @MainActor
+    func testCanEnhanceClarityDisabledWhileRunning() {
+        let p = ProjectState()
+        p.clarityEnhanceState = .inferring(0.5)
+        XCTAssertFalse(p.canEnhanceClarity, "任务进行中不应该可以再次触发")
+    }
+}
+```
+
+```bash
+cd /Users/Venico/claude/VideoEditor
+swift test --filter ClarityEnhanceProgressTests 2>&1 | tail -20
+```
+
+Expected: 新增的两个测试 PASS（连同 Task 7 已有的三个测试，这个文件现在共 5 个测试）。
+
+- [ ] **Step 3: 编译，处理字段名不匹配的报错**
 
 ```bash
 cd /Users/Venico/claude/VideoEditor
@@ -1477,7 +1591,7 @@ swift build 2>&1 | grep -E "error:"
 
 Expected: 第一次编译大概率会报若干字段名/类型不匹配的错误（`VideoClip` 的真实初始化参数、`Track` 的真实初始化方式、`videoSectionOrder` 元素类型的真实 case 名）。逐个对照 `Sources/VideoEditor/Models/DataTypes.swift` 里 `VideoClip`/`Track` 的定义和 `Project.swift` 里 `OverlayTrackRef`/`videoSectionOrder` 的真实定义修正，直到 `swift build` 无 error。
 
-- [ ] **Step 3: 手动集成测试（这一步涉及真实 ffmpeg+CoreML 端到端流程，不适合写成纯 XCTest，用真实素材跑一遍）**
+- [ ] **Step 4: 手动集成测试（这一步涉及真实 ffmpeg+CoreML 端到端流程，不适合写成纯 XCTest，用真实素材跑一遍）**
 
 ```bash
 # 部署到测试用的 app（走项目固定的双路径部署流程）
@@ -1494,11 +1608,11 @@ open /Users/Venico/claude/黑猫剪辑.app
 
 **这一步先跳过手动 UI 触发，等 Task 10-12 做完 UI 后再做端到端验证**——Task 9 本身先只保证 `swift build` 通过、类型对得上。
 
-- [ ] **Step 4: Commit**
+- [ ] **Step 5: Commit**
 
 ```bash
 cd /Users/Venico/claude/VideoEditor
-git add Sources/VideoEditor/Models/ProjectState+ClarityEnhance.swift
+git add Sources/VideoEditor/Models/ProjectState+ClarityEnhance.swift Tests/VideoEditorTests/ClarityEnhanceProgressTests.swift
 git commit -m "feat: 清晰度提升 — 主流程整合（抽帧+推理+编码+建轨道）"
 ```
 
@@ -1801,10 +1915,14 @@ git commit -m "feat: 清晰度提升 — 右键菜单集成"
 - 进度气泡 → Task 10
 - 磁盘空间检查、耗时提示、分辨率上限保护 → Task 9 已实现（`enhanceClaritySelection` 开头三段边界检查）。**其中耗时估算用的 `estimatedMsPerFrame = 3000`（每帧 3 秒）是占位系数**——Task 3 实测出 `per_tile_ms` 和 `tiles_per_frame` 之后，应该回来把这个系数换成 `per_tile_ms × tiles_per_frame`（Task 3 脚本本身已经打印出这个换算结果，直接抄过来即可，不需要重新推导）。这是本计划里唯一一处"先用合理默认值让逻辑跑起来、待有实测数据后回填精确值"的地方，跟"完全不写这块逻辑"是两回事
 - 处理中原片段被删除/撤销 → Task 9 已实现（`stillClip` 判断）
-- 取消 → Task 7（状态复位）+ Task 9（`Task.checkCancellation()`）
+- 取消 → Task 7（`ClarityCancelFlag` + `ClarityFrameIO.killCurrentProcess()`）+ Task 9（`runClarityEnhancePipeline` 里的 `checkCancelled()` 检查点）
 
 **占位符扫描**：无 TBD/TODO。Task 9 和 Task 10 里各有一段明确标注"这里的具体数值/字段名是推断的，实现时需要对照真实代码核对替换"——这不是偷懒占位，是诚实标注计划撰写阶段确实没有逐字段验证过的两个点，且给出了核对方法。
 
 **类型一致性检查**：`ClarityScale`（Task 7 定义）在 Task 9/Task 12 里的用法一致（`.x2`/`.x4`，`rawValue` 是 Int 2/4）。`ClarityModel`（Task 5）跟 `ClarityScale` 是两个独立类型，Task 9 里有一行 `let model: ClarityModel = scale == .x2 ? .x2 : .x4` 做转换——这个双轨设计（一个管下载/模型文件，一个管 UI 选项）初看有点冗余，但保留是因为 `ClarityModel` 需要是 `CaseIterable`+`Identifiable` 才能在 Task 11 的 `ForEach` 里用，`ClarityScale` 需要是简单的 `Int rawValue` 枚举才能被状态机和右键菜单直接消费，两者职责不同，不合并。
+
+**Pre-Flight Plan Review 阶段修正的架构问题（执行前发现，不是执行中才暴露）**：
+1. Task 9 初稿里，抽帧/逐帧推理/编码这三步分别用 `Task.detached(priority: .userInitiated) { ... }.value` 包裹——这个模式跟本次会话（`home_machine_decode_issue.md`）验证过的错误模式是同一类：`Task.detached` 不脱离 Swift 协作池，只是不继承调用者的 actor/优先级；把同步阻塞的重计算（ffmpeg `waitUntilExit`、CoreML 同步推理）反复丢给它执行，是协作池的错误用法。已重写为整段在 `Thread.detachNewThread` 专属线程上跑（`runClarityEnhancePipeline`），配合 `withCheckedThrowingContinuation` 桥接成 async，取消机制也相应从 `Task.checkCancellation()` 改为跨线程共享的 `ClarityCancelFlag`（专属线程不受 Swift Task 取消管辖）+ `ClarityFrameIO.killCurrentProcess()`（立即终止正在跑的 ffmpeg 子进程，模式抄自 `AudioSeparator.killCurrentProcess()`）。
+2. Task 6 的 `runOneTile` 里有一段死代码（构造 `NSImage`→`CGImage` 后完全没用上，实际用的是原始 `tile` 参数）——已删除。
 
 **已知缺口（Out of Scope 延续自 spec）**：批量处理、云端引擎、动漫模型变体——均不在本计划内，与 spec 一致。
