@@ -514,6 +514,49 @@ final class ProjectState: ObservableObject {
                          title: "去除背景", subtitle: "已停止", autoCountdown: false)
     }
 
+    // 清晰度提升状态（FSRCNN）
+    enum ClarityScale: Int, Equatable { case x2 = 2, x4 = 4 }
+
+    enum ClarityEnhanceState: Equatable {
+        case idle
+        case downloadingModel(Double)
+        case extractingFrames(Double)
+        case inferring(Double)
+        case encoding
+        case failed(String)
+
+        /// 没有细粒度进度可报的阶段，按阶段给个近似值，让进度条别停着不动
+        var approximateProgress: Double {
+            switch self {
+            case .idle:                    return 0
+            case .downloadingModel(let p): return p * 0.1
+            case .extractingFrames(let p): return 0.1 + p * 0.1
+            case .inferring(let p):        return 0.2 + p * 0.7
+            case .encoding:                return 0.95
+            case .failed:                  return 0
+            }
+        }
+    }
+    @Published var clarityEnhanceState: ClarityEnhanceState = .idle
+    var clarityEnhanceTask: Task<Void, Never>? = nil
+    /// 处理流水线整体跑在专属线程上（不受 Swift Task 协作式取消管辖，
+    /// 详见 Task 9 的设计说明），取消要靠这个跨线程共享标志
+    var clarityCancelFlag: ClarityCancelFlag? = nil
+    var isEnhancingClarity: Bool {
+        switch clarityEnhanceState {
+        case .idle, .failed: return false
+        default: return true
+        }
+    }
+    func cancelClarityEnhance() {
+        clarityCancelFlag?.cancel()
+        clarityEnhanceTask?.cancel()
+        clarityEnhanceTask = nil
+        clarityCancelFlag = nil
+        clarityEnhanceState = .idle
+        showSuccessToast(icon: "stop.fill", iconColor: .yellow, title: "清晰度提升", subtitle: "已停止", autoCountdown: false)
+    }
+
     // MARK: - 场景检测 / 大模型分析
     @Published var isReversingVideo: Bool = false
     @Published var isDetectingScenes: Bool = false
@@ -1015,4 +1058,13 @@ final class ProjectState: ObservableObject {
     func findMarker(id: UUID) -> MarkerAbsolute? {
         allMarkersAbsolute.first { $0.id == id }
     }
+}
+
+// MARK: - 清晰度提升（跨线程取消标志）
+
+final class ClarityCancelFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _cancelled = false
+    func cancel() { lock.lock(); _cancelled = true; lock.unlock() }
+    var isCancelled: Bool { lock.lock(); defer { lock.unlock() }; return _cancelled }
 }
