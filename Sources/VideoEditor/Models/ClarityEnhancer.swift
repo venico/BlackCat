@@ -170,12 +170,40 @@ enum ClarityEnhancer {
         if h <= tileSize { tilesY = 1 }
         let totalTiles = tilesX * tilesY
 
+        // tile 序号 -> 原图坐标系裁剪起点。提取成函数（而不是在循环体里内联算），
+        // 是因为下面算贡献区间右/下边界时，需要查询"下一个 tile"实际会用的起点——
+        // 如果各自独立算，当图片尺寸不能被 stride 整除、下一个 tile 的起点被
+        // clamp 到比"整齐排列"时更靠前的位置时，当前 tile 的贡献区间终点不会
+        // 跟着变，会跟下一个 tile 的贡献区间起点重叠（冗余双写：不产生 gap 或
+        // 可见接缝，但违背"精确裁剪、不重叠"的设计意图，且这个隐藏依赖容易被
+        // 后来者踩坑）。srcXFor/srcYFor 对 tx/ty 是非递减的（clamp 只会让它提前
+        // 变平，不会倒退），这保证了下面依赖它算出的贡献区间前后能精确衔接。
+        func srcXFor(_ tx: Int) -> Int { min(tx * stride, max(0, w - tileSize)) }
+        func srcYFor(_ ty: Int) -> Int { min(ty * stride, max(0, h - tileSize)) }
+
+        // tile tx/ty 的贡献区间左/上边界（原图坐标系）。tx==0（或 ty==0）时不裁剪
+        // ——没有前一个 tile 接管这一侧；否则裁掉靠前一侧的 overlap，只留中心可信
+        // 部分。用 min(...) 兜底：cropW/cropH 比 tileOverlap 还小时（极端小图），
+        // 避免算出的边界超出这个 tile 自己实际裁到的范围。
+        func contribX0For(_ tx: Int) -> Int {
+            let sx = srcXFor(tx)
+            guard tx > 0 else { return sx }
+            let cw = min(tileSize, w - sx)
+            return min(sx + tileOverlap, sx + cw)
+        }
+        func contribY0For(_ ty: Int) -> Int {
+            let sy = srcYFor(ty)
+            guard ty > 0 else { return sy }
+            let ch = min(tileSize, h - sy)
+            return min(sy + tileOverlap, sy + ch)
+        }
+
         var output = [Float](repeating: 0, count: w * scale * h * scale)
         var done = 0
         for ty in 0..<tilesY {
             for tx in 0..<tilesX {
-                let srcX = min(tx * stride, max(0, w - tileSize))
-                let srcY = min(ty * stride, max(0, h - tileSize))
+                let srcX = srcXFor(tx)
+                let srcY = srcYFor(ty)
                 let cropW = min(tileSize, w - srcX)
                 let cropH = min(tileSize, h - srcY)
 
@@ -188,11 +216,16 @@ enum ClarityEnhancer {
                 // 只取中心可信部分——两侧都留给相邻 tile 的中心部分去覆盖，避免
                 // 每块边缘因为缺乏完整上下文导致的输出劣化被拼接进最终图像形成
                 // 可见接缝。首/尾 tile 因为没有相邻 tile 接管边界，对应那一侧不裁剪。
-                // 用 max(...) 兜底防止 cropW/cropH 很小时贡献区间算出负宽度。
-                let contribX0 = tx == 0 ? srcX : min(srcX + tileOverlap, srcX + cropW)
-                let contribX1 = tx == tilesX - 1 ? srcX + cropW : max(contribX0, srcX + cropW - tileOverlap)
-                let contribY0 = ty == 0 ? srcY : min(srcY + tileOverlap, srcY + cropH)
-                let contribY1 = ty == tilesY - 1 ? srcY + cropH : max(contribY0, srcY + cropH - tileOverlap)
+                // 关键点：非末个 tile 时，contribX1/contribY1 直接复用下一个 tile
+                // 的 contribX0For/contribY0For 算出来的值，而不是从自己的
+                // srcX+cropW-overlap 独立算——这样 contribX1(tx) 恒等于
+                // contribX0(tx+1)，无论下一个 tile 的 srcX 有没有被 clamp，两个
+                // 相邻 tile 的贡献区间永远精确衔接：不重叠、不留缝，不依赖"stride
+                // 刚好整除图片宽高"这种巧合。
+                let contribX0 = contribX0For(tx)
+                let contribX1 = tx == tilesX - 1 ? srcX + cropW : contribX0For(tx + 1)
+                let contribY0 = contribY0For(ty)
+                let contribY1 = ty == tilesY - 1 ? srcY + cropH : contribY0For(ty + 1)
 
                 for oy in (contribY0 * scale)..<(contribY1 * scale) {
                     let localRow = oy - srcY * scale
