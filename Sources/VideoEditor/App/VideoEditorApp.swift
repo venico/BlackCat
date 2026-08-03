@@ -10,6 +10,8 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate 
     public static var pendingOpenURL: URL?
 
     public func applicationDidFinishLaunching(_ notification: Notification) {
+        // 启动即写一条，保证诊断日志文件必然存在（版本/构建时间在 header 里）
+        DiagLog.log("[启动] app 启动完成")
         setupMenuBar()
         createWindow()
 

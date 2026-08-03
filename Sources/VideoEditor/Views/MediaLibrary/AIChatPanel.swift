@@ -1281,48 +1281,31 @@ private struct AudioWaveformView: View {
         }
     }
 
+    /// 家用机实证：坏掉的音频读取服务会让 copyNextSampleBuffer 永久挂死并占满 Swift 协作池
+    /// （详见 ProjectState.loadWaveform）。这里复用同一套专属线程+超时+ffmpeg 兜底的静态方法，
+    /// 不直接在 Task 里做同步 AVAssetReader 调用。
     private func loadWaveform() async {
-        let asset = AVURLAsset(url: url)
-        if let dur = try? await asset.load(.duration) {
-            let s = Int(dur.seconds)
-            let m = s / 60; let sec = s % 60
-            await MainActor.run { duration = String(format: "%d:%02d", m, sec) }
-        }
-        guard let track = try? await asset.loadTracks(withMediaType: .audio).first else {
-            await MainActor.run { samples = Array(repeating: 0.3, count: 60) }
-            return
-        }
-        guard let reader = try? AVAssetReader(asset: asset) else { return }
-        let outputSettings: [String: Any] = [
-            AVFormatIDKey: kAudioFormatLinearPCM,
-            AVLinearPCMBitDepthKey: 16,
-            AVLinearPCMIsBigEndianKey: false,
-            AVLinearPCMIsFloatKey: false,
-            AVLinearPCMIsNonInterleaved: false
-        ]
-        let output = AVAssetReaderTrackOutput(track: track, outputSettings: outputSettings)
-        reader.add(output)
-        reader.startReading()
-
-        var allSamples: [Float] = []
-        let downsample = 512
-        while let buf = output.copyNextSampleBuffer(), let blockBuf = CMSampleBufferGetDataBuffer(buf) {
-            let len = CMBlockBufferGetDataLength(blockBuf)
-            var data = Data(count: len)
-            data.withUnsafeMutableBytes { ptr in
-                CMBlockBufferCopyDataBytes(blockBuf, atOffset: 0, dataLength: len, destination: ptr.baseAddress!)
-            }
-            let int16s = data.withUnsafeBytes { Array($0.bindMemory(to: Int16.self)) }
-            var i = 0
-            while i < int16s.count {
-                let end = min(i + downsample, int16s.count)
-                let chunk = int16s[i..<end]
-                let maxVal = chunk.map { abs(Int32($0)) }.max() ?? 0
-                allSamples.append(Float(maxVal) / 32768.0)
-                i += downsample
+        let u = url
+        let (durText, wfSamples): (String?, [Float]) = await withCheckedContinuation { cont in
+            Thread.detachNewThread {
+                var durText: String? = nil
+                if case .success(let d) = ProjectState.durationSyncWithTimeout(url: u, seconds: 10) {
+                    let s = Int(d)
+                    durText = String(format: "%d:%02d", s / 60, s % 60)
+                }
+                var wf = Array(repeating: Float(0.3), count: 60)
+                if let data = ProjectState.waveformSyncWithTimeout(url: u, timeout: 15) {
+                    wf = data.samples
+                } else if let data = ProjectState.ffmpegWaveform(url: u) {
+                    wf = data.samples
+                }
+                cont.resume(returning: (durText, wf))
             }
         }
-        await MainActor.run { samples = allSamples }
+        await MainActor.run {
+            if let durText { duration = durText }
+            samples = wfSamples
+        }
     }
 }
 

@@ -785,6 +785,10 @@ final class ProjectState: ObservableObject {
     @Published var thumbnailsReloading: Set<UUID> = []              // 正在重建缩略图的 asset IDs
     /// 正在生成缩略图的 asset IDs。不用 @Published —— 只是防重入，不需要驱动 UI
     var thumbnailsGenerating: Set<UUID> = []
+    /// 封面生成中的素材（防重复起线程：挂起机器上 UI 刷新会反复触发 loadMediaThumbnail）
+    var coverGenerating: Set<UUID> = []
+    /// 波形生成中的素材（防重复起线程，同上）
+    var waveformGenerating: Set<UUID> = []
     @Published var waveformCache: [UUID: WaveformData] = [:]       // asset ID → waveform peaks
     var imageVideoCache: [UUID: URL] = [:]                         // asset ID → generated video file
     var avAssetCache: [URL: AVURLAsset] = [:]             // URL → cached AVURLAsset（避免重复创建）

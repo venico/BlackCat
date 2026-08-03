@@ -123,16 +123,7 @@ extension ProjectState {
             loadImageThumbnail(assetID: aid, url: url)
         }
         if type != .subtitle && type != .image {
-            Task {
-                let av = AVURLAsset(url: url)
-                if let d = try? await av.load(.duration) {
-                    await MainActor.run {
-                        if let i = self.mediaAssets.firstIndex(where:{ $0.id == aid }) {
-                            self.mediaAssets[i].duration = d.seconds
-                        }
-                    }
-                }
-            }
+            updateAssetDuration(assetID: aid, url: url)
         }
     }
 

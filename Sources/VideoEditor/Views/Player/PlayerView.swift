@@ -2951,7 +2951,7 @@ final class PlayerController: ObservableObject {
             var obs: NSKeyValueObservation?
             obs = item.observe(\.status, options: [.new]) { it, _ in
                 if it.status == .failed {
-                    NSLog("[Player] AVPlayerItem FAILED: %@", it.error?.localizedDescription ?? "unknown")
+                    DiagLog.log("[预览] AVPlayerItem 失败：\(it.error?.localizedDescription ?? "未知")（\((it.error as NSError?)?.code ?? 0)）")
                 }
                 if it.status != .unknown { obs?.invalidate(); obs = nil }
             }

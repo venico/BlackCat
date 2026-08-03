@@ -201,12 +201,14 @@ final class ColorCompositor: NSObject, AVVideoCompositing {
                                       colorSpace: CGColorSpaceCreateDeviceRGB())
                 req.finish(withComposedVideoFrame: outBuf)
             } else {
+                DiagLog.log("[预览] 合成器透传失败（无数据且拿不到 source frame）t=\(String(format: "%.2f", req.compositionTime.seconds))")
                 req.finish(with: NSError(domain: "ColorCompositor", code: 1, userInfo: nil))
             }
             return
         }
 
         guard let outBuf = req.renderContext.newPixelBuffer() else {
+            DiagLog.log("[预览] 合成器拿不到输出 pixelBuffer")
             req.finish(with: NSError(domain: "ColorCompositor", code: 2, userInfo: nil))
             return
         }

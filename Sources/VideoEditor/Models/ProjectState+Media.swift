@@ -91,8 +91,14 @@ extension ProjectState {
             guard let url = try? URL(resolvingBookmarkData: data,
                                       options: .withSecurityScope,
                                       relativeTo: nil,
-                                      bookmarkDataIsStale: &isStale) else { continue }
-            guard url.startAccessingSecurityScopedResource() else { continue }
+                                      bookmarkDataIsStale: &isStale) else {
+                DiagLog.log("[素材恢复] bookmark 解析失败，跳过一条")
+                continue
+            }
+            guard url.startAccessingSecurityScopedResource() else {
+                DiagLog.log("[素材恢复] security-scoped 访问被拒 \(url.lastPathComponent)")
+                continue
+            }
             accessedURLs.append(url)
             importFileFromRestore(url)
         }
@@ -107,6 +113,8 @@ extension ProjectState {
         mediaAssets.append(asset)
         if asset.fileExists {
             loadMediaResources(asset)
+        } else {
+            DiagLog.log("[素材恢复] 文件不存在，不生成缩略图 \(url.lastPathComponent)")
         }
     }
 
@@ -125,74 +133,247 @@ extension ProjectState {
         case .video:
             loadMediaThumbnail(assetID: aid, url: url)
             loadTimelineThumbnails(assetID: aid, url: url)
-            Task {
-                if let d = try? await AVURLAsset(url: url).load(.duration) {
-                    await MainActor.run {
-                        if let i = self.mediaAssets.firstIndex(where: { $0.id == aid }) {
-                            self.mediaAssets[i].duration = d.seconds
-                        }
-                    }
-                }
-            }
+            updateAssetDuration(assetID: aid, url: url)
         case .audio:
             loadWaveform(assetID: aid, url: url)
-            Task {
-                if let d = try? await AVURLAsset(url: url).load(.duration) {
-                    await MainActor.run {
-                        if let i = self.mediaAssets.firstIndex(where: { $0.id == aid }) {
-                            self.mediaAssets[i].duration = d.seconds
-                        }
-                    }
-                }
-            }
+            updateAssetDuration(assetID: aid, url: url)
         case .image:
             loadImageThumbnail(assetID: aid, url: url)
         case .subtitle: break
         }
     }
 
-    // MARK: - Thumbnail & Waveform Generation
-
-    /// Generate a single thumbnail for the media library (video assets only).
-    func loadMediaThumbnail(assetID: UUID, url: URL) {
-        guard mediaThumbnails[assetID] == nil else { return }
-        let id = assetID
-        Task {
-            let av = AVURLAsset(url: url)
-            let gen = AVAssetImageGenerator(asset: av)
-            gen.appliesPreferredTrackTransform = true
-            gen.maximumSize = CGSize(width: 400, height: 400)
-            do {
-                let cg = try gen.copyCGImage(at: .zero, actualTime: nil)
-                let img = NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
-                await MainActor.run { self.mediaThumbnails[id] = img }
-            } catch {
-                // 部分机器上 AVFoundation 会对本进程整体拒绝解码（-11821 Cannot Decode，
-                // 连普通 H.264 都失败），此时改用自带 ffmpeg 抽帧 —— 它是静态编译、
-                // 解码器内置，不依赖系统解码服务
-                NSLog("[缩略图] 素材库封面 AVFoundation 失败 %@ 错误=%@，改用 ffmpeg",
-                      url.lastPathComponent, error.localizedDescription)
-                let fallback = await Task.detached(priority: .utility) {
-                    Self.ffmpegSingleFrame(url: url, maxSize: 400)
-                }.value
-                if let img = fallback {
-                    await MainActor.run { self.mediaThumbnails[id] = img }
-                } else {
-                    let exists = FileManager.default.fileExists(atPath: url.path)
-                    let readable = FileManager.default.isReadableFile(atPath: url.path)
-                    let tracks = (try? await av.loadTracks(withMediaType: .video))?.count ?? -1
-                    NSLog("[缩略图] ffmpeg 兜底也失败 %@ 存在=%@ 可读=%@ 视频轨=%d",
-                          url.lastPathComponent, exists ? "是" : "否", readable ? "是" : "否", tracks)
+    /// 素材时长更新（专属 pthread + 超时，挂起机器上安全）
+    func updateAssetDuration(assetID: UUID, url: URL) {
+        Thread.detachNewThread {
+            if case .success(let d) = Self.durationSyncWithTimeout(url: url, seconds: 10) {
+                DispatchQueue.main.async {
+                    if let i = self.mediaAssets.firstIndex(where: { $0.id == assetID }) {
+                        self.mediaAssets[i].duration = d
+                    }
                 }
             }
         }
     }
 
+    // MARK: - Thumbnail & Waveform Generation
+
+    /// Generate a single thumbnail for the media library (video assets only).
+    ///
+    /// 线程模型（家用机 -11821 实证倒逼，勿改回 Task/GCD）：
+    /// 解码服务会让本进程的 AVFoundation 调用**同步挂死**（AVURLAsset init 都可能卡住），
+    /// 挂死会占满 Swift 协作池和 GCD 全局池 —— 排进这两个池的任务（包括超时定时器）永不执行。
+    /// 因此整条链路用专属 pthread（Thread.detachNewThread，无池限制）+ 信号量超时，
+    /// 结果经 DispatchQueue.main（RunLoop 驱动，不依赖线程池）回写 @Published。
+    func loadMediaThumbnail(assetID: UUID, url: URL) {
+        guard mediaThumbnails[assetID] == nil else { return }
+        guard !coverGenerating.contains(assetID) else { return }
+        coverGenerating.insert(assetID)
+        let id = assetID
+        Thread.detachNewThread {
+            let outcome = Self.avSingleFrameSync(url: url, maxSize: 400, timeout: 10)
+            var cover: NSImage? = nil
+            switch outcome {
+            case .success(let cg):
+                cover = NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
+            case .failure(let msg):
+                DiagLog.log("[缩略图] 素材库封面 AVFoundation 失败 \(url.lastPathComponent) 错误=\(msg)，改用 ffmpeg")
+            case .timedOut:
+                DiagLog.log("[缩略图] 素材库封面 AVFoundation 超时(10s)无响应 \(url.lastPathComponent)，改用 ffmpeg")
+            }
+            if cover == nil {
+                cover = Self.ffmpegSingleFrame(url: url, maxSize: 400)
+                if cover != nil {
+                    DiagLog.log("[缩略图] 素材库封面 ffmpeg 兜底成功 \(url.lastPathComponent)")
+                } else {
+                    let exists = FileManager.default.fileExists(atPath: url.path)
+                    let readable = FileManager.default.isReadableFile(atPath: url.path)
+                    DiagLog.log("[缩略图] 素材库封面 ffmpeg 兜底也失败 \(url.lastPathComponent) 存在=\(exists ? "是" : "否") 可读=\(readable ? "是" : "否")")
+                }
+            }
+            let result = cover
+            DispatchQueue.main.async {
+                if let img = result { self.mediaThumbnails[id] = img }
+                self.coverGenerating.remove(id)
+            }
+        }
+    }
+
+    enum AVFrameOutcome {
+        case success(CGImage)
+        case failure(String)
+        case timedOut
+    }
+
+    /// 带超时的 AVFoundation 单帧抽取（同步版，须在专属 pthread 上调用）。
+    /// AVFoundation 交互放在再开的一条 pthread 里：挂死只废弃那条线程；
+    /// 超时用信号量 wait(timeout:)，不依赖 GCD 定时器（全局池可能已被挂死任务占满）
+    nonisolated static func avSingleFrameSync(url: URL, maxSize: CGFloat, timeout: Double) -> AVFrameOutcome {
+        let sem = DispatchSemaphore(value: 0)
+        let lock = NSLock()
+        var outcome: AVFrameOutcome? = nil
+        func finish(_ r: AVFrameOutcome) {
+            lock.lock(); defer { lock.unlock() }
+            guard outcome == nil else { return }
+            outcome = r
+            sem.signal()
+        }
+        Thread.detachNewThread {
+            let av = AVURLAsset(url: url)
+            let gen = AVAssetImageGenerator(asset: av)
+            gen.appliesPreferredTrackTransform = true
+            gen.maximumSize = CGSize(width: maxSize, height: maxSize)
+            gen.generateCGImagesAsynchronously(forTimes: [NSValue(time: .zero)]) { _, cg, _, result, error in
+                if result == .succeeded, let cg = cg {
+                    finish(.success(cg))
+                } else {
+                    finish(.failure(error?.localizedDescription ?? "result=\(result.rawValue)"))
+                }
+            }
+        }
+        if sem.wait(timeout: .now() + timeout) == .timedOut {
+            finish(.timedOut)
+        }
+        lock.lock(); defer { lock.unlock() }
+        return outcome ?? .timedOut
+    }
+
+    enum DurationOutcome {
+        case success(Double)
+        case failure(String)
+        case timedOut
+    }
+
+    /// 带超时的时长读取（同步版，须在专属 pthread 上调用）。
+    /// 用回调式 loadValuesAsynchronously（不需要 async 上下文，避开协作池）
+    nonisolated static func durationSyncWithTimeout(url: URL, seconds: Double) -> DurationOutcome {
+        let sem = DispatchSemaphore(value: 0)
+        let lock = NSLock()
+        var outcome: DurationOutcome? = nil
+        func finish(_ r: DurationOutcome) {
+            lock.lock(); defer { lock.unlock() }
+            guard outcome == nil else { return }
+            outcome = r
+            sem.signal()
+        }
+        Thread.detachNewThread {
+            let av = AVURLAsset(url: url)
+            av.loadValuesAsynchronously(forKeys: ["duration"]) {
+                var err: NSError? = nil
+                let status = av.statusOfValue(forKey: "duration", error: &err)
+                if status == .loaded {
+                    finish(.success(av.duration.seconds))
+                } else {
+                    finish(.failure(err?.localizedDescription ?? "status=\(status.rawValue)"))
+                }
+            }
+        }
+        if sem.wait(timeout: .now() + seconds) == .timedOut {
+            finish(.timedOut)
+        }
+        lock.lock(); defer { lock.unlock() }
+        return outcome ?? .timedOut
+    }
+
+    /// 时间轴条批量抽帧结果
+    enum AVStripOutcome {
+        case frames([ThumbnailFrame], firstError: String?)
+        case timedOut(partial: [ThumbnailFrame])
+    }
+
+    private final class StripState: @unchecked Sendable {
+        let lock = NSLock()
+        var frames: [ThumbnailFrame] = []
+        var firstError: String? = nil
+        var abandoned = false
+        var remaining: Int
+        init(remaining: Int) { self.remaining = remaining }
+        func snapshot() -> [ThumbnailFrame] {
+            lock.lock(); defer { lock.unlock() }
+            return frames
+        }
+    }
+
+    /// 带超时的 AVFoundation 批量抽帧（同步版，须在专属 pthread 上调用）。
+    /// 线程模型同 avSingleFrameSync；信号量超时兜"同步挂死"和"回调不齐"两种情况
+    nonisolated static func avFrameStripSync(url: URL, times: [NSValue], maxSize: CGSize,
+                                             tolerance: CMTime, timeout: Double) -> AVStripOutcome {
+        let sem = DispatchSemaphore(value: 0)
+        let state = StripState(remaining: times.count)
+        var genRef: AVAssetImageGenerator? = nil
+        let genLock = NSLock()
+        Thread.detachNewThread {
+            let av = AVURLAsset(url: url)
+            let gen = AVAssetImageGenerator(asset: av)
+            gen.appliesPreferredTrackTransform = true
+            gen.maximumSize = maxSize
+            gen.requestedTimeToleranceBefore = tolerance
+            gen.requestedTimeToleranceAfter  = tolerance
+            genLock.lock(); genRef = gen; genLock.unlock()
+            gen.generateCGImagesAsynchronously(forTimes: times) { requested, cgImage, _, result, error in
+                state.lock.lock()
+                defer { state.lock.unlock() }
+                guard !state.abandoned else { return }
+                if result == .succeeded, let cg = cgImage {
+                    let img = NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
+                    state.frames.append(ThumbnailFrame(time: requested.seconds, image: img))
+                } else if state.firstError == nil {
+                    state.firstError = error?.localizedDescription ?? "result=\(result.rawValue)"
+                }
+                state.remaining -= 1
+                if state.remaining == 0 { sem.signal() }
+            }
+        }
+        if sem.wait(timeout: .now() + timeout) == .timedOut {
+            state.lock.lock(); state.abandoned = true; state.lock.unlock()
+            genLock.lock(); genRef?.cancelAllCGImageGeneration(); genLock.unlock()
+            return .timedOut(partial: state.snapshot())
+        }
+        state.lock.lock()
+        let fs = state.frames
+        let err = state.firstError
+        state.lock.unlock()
+        return .frames(fs, firstError: err)
+    }
+
     // MARK: - FFmpeg 兜底抽帧
+
+    /// 用 ffprobe 读视频时长（AVFoundation load(.duration) 失败时的兜底）。同步执行，须在后台线程调用。
+    nonisolated static func ffprobeDuration(url: URL) -> Double? {
+        guard let ff = findFFmpeg() else { return nil }
+        let probe = ff.deletingLastPathComponent().appendingPathComponent("ffprobe")
+        guard FileManager.default.isExecutableFile(atPath: probe.path) else {
+            DiagLog.log("[缩略图] ffprobe 不存在（\(probe.path)），时长兜底放弃")
+            return nil
+        }
+        let p = Process()
+        p.executableURL = probe
+        p.arguments = ["-v", "error",
+                       "-show_entries", "format=duration",
+                       "-of", "default=noprint_wrappers=1:nokey=1",
+                       url.path]
+        let outPipe = Pipe()
+        p.standardOutput = outPipe
+        p.standardError = FileHandle.nullDevice
+        do { try p.run() } catch {
+            DiagLog.log("[缩略图] ffprobe 进程启动失败：\(error.localizedDescription)")
+            return nil
+        }
+        let data = outPipe.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        guard p.terminationStatus == 0,
+              let text = String(data: data, encoding: .utf8)?
+                  .trimmingCharacters(in: .whitespacesAndNewlines),
+              let dur = Double(text), dur > 0 else { return nil }
+        return dur
+    }
 
     /// 用内置 ffmpeg 抽单帧（素材库封面用）。同步执行，须在后台线程调用。
     nonisolated static func ffmpegSingleFrame(url: URL, maxSize: Int) -> NSImage? {
-        guard let ff = findFFmpeg() else { return nil }
+        guard let ff = findFFmpeg() else {
+            DiagLog.log("[缩略图] 找不到 ffmpeg（bundle 与系统路径均无），封面兜底放弃 \(url.lastPathComponent)")
+            return nil
+        }
         let out = FileManager.default.temporaryDirectory
             .appendingPathComponent("ffcover_\(UUID().uuidString).png")
         defer { try? FileManager.default.removeItem(at: out) }
@@ -203,23 +384,44 @@ extension ProjectState {
                        "-frames:v", "1",
                        "-vf", "scale=w=\(maxSize):h=\(maxSize):force_original_aspect_ratio=decrease",
                        "-y", out.path]
+        let errPipe = Pipe()
         p.standardOutput = FileHandle.nullDevice
-        p.standardError = FileHandle.nullDevice
-        do { try p.run() } catch { return nil }
+        p.standardError = errPipe
+        do { try p.run() } catch {
+            DiagLog.log("[缩略图] ffmpeg 进程启动失败（\(ff.path)）：\(error.localizedDescription)")
+            return nil
+        }
+        let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
         p.waitUntilExit()
-        guard p.terminationStatus == 0 else { return nil }
-        return NSImage(contentsOf: out)
+        guard p.terminationStatus == 0 else {
+            let msg = String(data: errData, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines).prefix(500) ?? ""
+            DiagLog.log("[缩略图] ffmpeg 抽帧退出码 \(p.terminationStatus) \(url.lastPathComponent) stderr=\(msg)")
+            return nil
+        }
+        guard let img = NSImage(contentsOf: out) else {
+            DiagLog.log("[缩略图] ffmpeg 抽帧成功但 PNG 读不出 \(url.lastPathComponent)")
+            return nil
+        }
+        return img
     }
 
     /// 用内置 ffmpeg 按固定间隔抽帧（时间轴缩略图条用）。同步执行，须在后台线程调用。
     /// fps 滤镜一次解码流式出全部帧，比逐帧 seek 快得多。
     nonisolated static func ffmpegFrameStrip(url: URL, interval: Double) -> [ThumbnailFrame] {
-        guard interval > 0, let ff = findFFmpeg() else { return [] }
+        guard interval > 0 else { return [] }
+        guard let ff = findFFmpeg() else {
+            DiagLog.log("[缩略图] 找不到 ffmpeg（bundle 与系统路径均无），时间轴条兜底放弃 \(url.lastPathComponent)")
+            return []
+        }
         let dir = FileManager.default.temporaryDirectory
             .appendingPathComponent("ffstrip_\(UUID().uuidString)")
         do {
             try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        } catch { return [] }
+        } catch {
+            DiagLog.log("[缩略图] 临时目录创建失败：\(error.localizedDescription)")
+            return []
+        }
         defer { try? FileManager.default.removeItem(at: dir) }
         let p = Process()
         p.executableURL = ff
@@ -228,11 +430,21 @@ extension ProjectState {
                        "-vf", "fps=\(1.0 / interval),scale=w=160:h=104:force_original_aspect_ratio=decrease",
                        "-fps_mode", "vfr",
                        dir.appendingPathComponent("f_%05d.png").path]
+        let errPipe = Pipe()
         p.standardOutput = FileHandle.nullDevice
-        p.standardError = FileHandle.nullDevice
-        do { try p.run() } catch { return [] }
+        p.standardError = errPipe
+        do { try p.run() } catch {
+            DiagLog.log("[缩略图] ffmpeg 进程启动失败（\(ff.path)）：\(error.localizedDescription)")
+            return []
+        }
+        let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
         p.waitUntilExit()
-        guard p.terminationStatus == 0 else { return [] }
+        guard p.terminationStatus == 0 else {
+            let msg = String(data: errData, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines).prefix(500) ?? ""
+            DiagLog.log("[缩略图] ffmpeg 整条抽帧退出码 \(p.terminationStatus) \(url.lastPathComponent) stderr=\(msg)")
+            return []
+        }
 
         let files = ((try? FileManager.default.contentsOfDirectory(atPath: dir.path)) ?? [])
             .filter { $0.hasSuffix(".png") }
@@ -267,78 +479,85 @@ extension ProjectState {
         let id = assetID
         let pps = pixelsPerSecond
         thumbnailsGenerating.insert(id)
-        Task {
-            let av = AVURLAsset(url: url)
+        // 线程模型说明见 loadMediaThumbnail：专属 pthread + 信号量超时，不碰协作池/GCD 全局池
+        Thread.detachNewThread {
             var loadError: String? = nil
             var dur: Double = 0
-            do {
-                dur = try await av.load(.duration).seconds
-            } catch {
-                loadError = error.localizedDescription
+            var avDurationOK = false
+            switch Self.durationSyncWithTimeout(url: url, seconds: 10) {
+            case .success(let d): dur = d; avDurationOK = true
+            case .failure(let msg): loadError = msg
+            case .timedOut: loadError = "超时(10s)无响应"
             }
-            guard dur > 0.1 else {
-                // 时长读不出来（文件临时不可读、权限被拒、资源紧张等）。必须把占位的空数组撤掉，
-                // 留着它会让 loadTimelineThumbnails 以为已有缓存，从此不再重试
+            if dur <= 0.1 {
+                // AVFoundation 读不出时长（-11821 机器上可能连元数据都拒）→ ffprobe 兜底再试一次
                 let exists = FileManager.default.fileExists(atPath: url.path)
                 let readable = FileManager.default.isReadableFile(atPath: url.path)
-                NSLog("[缩略图] 读不出时长 %@ 存在=%@ 可读=%@ 时长=%.2f 错误=%@",
-                      url.lastPathComponent, exists ? "是" : "否", readable ? "是" : "否",
-                      dur, loadError ?? "无")
-                await MainActor.run {
+                DiagLog.log("[缩略图] AVFoundation 读不出时长 \(url.lastPathComponent) 存在=\(exists ? "是" : "否") 可读=\(readable ? "是" : "否") 时长=\(String(format: "%.2f", dur)) 错误=\(loadError ?? "无")，改用 ffprobe")
+                if let d = Self.ffprobeDuration(url: url) {
+                    DiagLog.log("[缩略图] ffprobe 读出时长 \(String(format: "%.2f", d)) \(url.lastPathComponent)")
+                    dur = d
+                }
+            }
+            guard dur > 0.1 else {
+                // 两条路都读不出时长。必须把占位的空数组撤掉，
+                // 留着它会让 loadTimelineThumbnails 以为已有缓存，从此不再重试
+                DiagLog.log("[缩略图] ffprobe 也读不出时长，放弃 \(url.lastPathComponent)")
+                DispatchQueue.main.async {
                     self.assetThumbnails.removeValue(forKey: id)
                     self.thumbnailsReloading.remove(id)
                     self.thumbnailsGenerating.remove(id)
                 }
                 return
             }
-            let gen = AVAssetImageGenerator(asset: av)
-            gen.appliesPreferredTrackTransform = true
-            gen.maximumSize = CGSize(width: 160, height: 104)
-            gen.requestedTimeToleranceBefore = CMTime(seconds: 0.3, preferredTimescale: 600)
-            gen.requestedTimeToleranceAfter  = CMTime(seconds: 0.3, preferredTimescale: 600)
-
             let thumbWidth = 48.0
             let neededFrames = Int(dur * pps / thumbWidth)
             let frameCount = max(10, min(200, neededFrames))
             let interval = dur / Double(frameCount)
-            var times: [NSValue] = []
-            var t = 0.0
-            while t < dur {
-                times.append(NSValue(time: CMTime(seconds: t, preferredTimescale: 600)))
-                t += interval
-            }
 
-            var frames: [ThumbnailFrame] = []
-            var firstError: String? = nil
-            let semaphore = DispatchSemaphore(value: 0)
-            var remaining = times.count
-            gen.generateCGImagesAsynchronously(forTimes: times) { requested, cgImage, actual, result, error in
-                if result == .succeeded, let cg = cgImage {
-                    let img = NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
-                    frames.append(ThumbnailFrame(time: requested.seconds, image: img))
-                } else if firstError == nil {
-                    firstError = error?.localizedDescription ?? "result=\(result.rawValue)"
+            var sorted: [ThumbnailFrame] = []
+            var timedOut = false
+            if avDurationOK {
+                var times: [NSValue] = []
+                var t = 0.0
+                while t < dur {
+                    times.append(NSValue(time: CMTime(seconds: t, preferredTimescale: 600)))
+                    t += interval
                 }
-                remaining -= 1
-                if remaining == 0 { semaphore.signal() }
+                let tol = CMTime(seconds: 0.3, preferredTimescale: 600)
+                switch Self.avFrameStripSync(url: url, times: times,
+                                             maxSize: CGSize(width: 160, height: 104),
+                                             tolerance: tol, timeout: 60) {
+                case .frames(let fs, let firstError):
+                    sorted = fs.sorted(by: { $0.time < $1.time })
+                    if sorted.isEmpty {
+                        DiagLog.log("[缩略图] \(url.lastPathComponent) AVFoundation \(times.count) 帧全部失败（首个错误：\(firstError ?? "无")），改用 ffmpeg")
+                    }
+                case .timedOut(let partial):
+                    timedOut = true
+                    sorted = partial.sorted(by: { $0.time < $1.time })
+                    DiagLog.log("[缩略图] \(url.lastPathComponent) AVFoundation 60s 超时（完成 \(sorted.count)/\(frameCount) 帧），改用 ffmpeg")
+                }
+            } else {
+                // 时长是 ffprobe 读出来的 = AVFoundation 已证明挂起/失败，别再碰它
+                DiagLog.log("[缩略图] \(url.lastPathComponent) AVFoundation 时长不可用，直接 ffmpeg 抽条")
             }
-            await Task.detached(priority: .utility) { semaphore.wait() }.value
-            var sorted = frames.sorted(by: { $0.time < $1.time })
-            // AVFoundation 一帧都没出来（-11821 Cannot Decode 等）→ 改用 ffmpeg 整条重抽
-            if sorted.isEmpty {
-                NSLog("[缩略图] %@ AVFoundation %d 帧全部失败（首个错误：%@），改用 ffmpeg",
-                      url.lastPathComponent, times.count, firstError ?? "无")
-                sorted = await Task.detached(priority: .utility) {
-                    Self.ffmpegFrameStrip(url: url, interval: interval)
-                }.value
+            // 超时或全失败 → ffmpeg 整条重抽；ffmpeg 也没出帧时保留超时前的部分帧
+            if timedOut || sorted.isEmpty {
+                let ffFrames = Self.ffmpegFrameStrip(url: url, interval: interval)
+                if !ffFrames.isEmpty {
+                    DiagLog.log("[缩略图] \(url.lastPathComponent) ffmpeg 兜底成功，出帧 \(ffFrames.count) 张")
+                    sorted = ffFrames
+                }
             }
-            await MainActor.run {
+            let finalFrames = sorted
+            DispatchQueue.main.async {
                 // 两条路都没出帧才算失败，别留空数组挡住重试
-                if sorted.isEmpty {
-                    NSLog("[缩略图] %@ ffmpeg 兜底也没出帧", url.lastPathComponent)
+                if finalFrames.isEmpty {
+                    DiagLog.log("[缩略图] \(url.lastPathComponent) ffmpeg 兜底也没出帧")
                     self.assetThumbnails.removeValue(forKey: id)
                 } else {
-                    self.assetThumbnails[id] = sorted
+                    self.assetThumbnails[id] = finalFrames
                 }
                 self.thumbnailsReloading.remove(id)
                 self.thumbnailsGenerating.remove(id)
@@ -358,15 +577,54 @@ extension ProjectState {
     }
 
     /// Generate waveform peak data for an audio asset.
+    ///
+    /// 线程模型见 loadMediaThumbnail。家用机 sample 实证：坏掉的音频读取服务会让
+    /// copyNextSampleBuffer 永久挂死，曾一次占满 11 条协作池线程（user-initiated 层），
+    /// 饿死预览重建 Task 导致播放黑屏。专属 pthread + 超时遗弃 + ffmpeg 兜底。
     func loadWaveform(assetID: UUID, url: URL) {
         guard waveformCache[assetID] == nil else { return }
+        guard !waveformGenerating.contains(assetID) else { return }
+        waveformGenerating.insert(assetID)
         let id = assetID
-        Task {
+        Thread.detachNewThread {
+            var result = Self.waveformSyncWithTimeout(url: url, timeout: 30)
+            if result == nil {
+                DiagLog.log("[波形] AVAssetReader 失败/超时(30s) \(url.lastPathComponent)，改用 ffmpeg")
+                result = Self.ffmpegWaveform(url: url)
+                DiagLog.log(result != nil ? "[波形] ffmpeg 兜底成功 \(url.lastPathComponent)"
+                                          : "[波形] ffmpeg 兜底也失败 \(url.lastPathComponent)")
+            }
+            let data = result
+            DispatchQueue.main.async {
+                if let d = data { self.waveformCache[id] = d }
+                self.waveformGenerating.remove(id)
+            }
+        }
+    }
+
+    /// AVAssetReader 波形读取（内层专属 pthread；外层信号量超时，挂死即遗弃该线程）
+    nonisolated static func waveformSyncWithTimeout(url: URL, timeout: Double) -> WaveformData? {
+        let sem = DispatchSemaphore(value: 0)
+        let lock = NSLock()
+        var result: WaveformData? = nil
+        var abandoned = false
+        Thread.detachNewThread {
+            var dur: Double = 0
+            if case .success(let d) = durationSyncWithTimeout(url: url, seconds: min(10, timeout)) {
+                dur = d
+            }
+            guard dur > 0 else {
+                lock.lock(); defer { lock.unlock() }
+                if !abandoned { sem.signal() }
+                return
+            }
             let av = AVURLAsset(url: url)
-            let dur = (try? await av.load(.duration))?.seconds ?? 0
-            guard dur > 0 else { return }
-            guard let track = try? await av.loadTracks(withMediaType: .audio).first else { return }
-            guard let reader = try? AVAssetReader(asset: av) else { return }
+            guard let track = av.tracks(withMediaType: .audio).first,
+                  let reader = try? AVAssetReader(asset: av) else {
+                lock.lock(); defer { lock.unlock() }
+                if !abandoned { sem.signal() }
+                return
+            }
             let settings: [String: Any] = [
                 AVFormatIDKey: kAudioFormatLinearPCM,
                 AVLinearPCMBitDepthKey: 16,
@@ -405,15 +663,66 @@ extension ProjectState {
                         samplesInChunk = 0
                     }
                 }
+                // 超时后外层已放弃，尽早停止读取
+                lock.lock()
+                let stop = abandoned
+                lock.unlock()
+                if stop { reader.cancelReading(); return }
             }
             if samplesInChunk > 0 {
                 allPeaks.append(Float(runningPeak) / Float(Int16.max))
             }
+            lock.lock(); defer { lock.unlock() }
+            guard !abandoned else { return }
+            result = WaveformData(totalDuration: dur, samples: allPeaks)
+            sem.signal()
+        }
+        if sem.wait(timeout: .now() + timeout) == .timedOut {
+            lock.lock(); abandoned = true; lock.unlock()
+            return nil
+        }
+        lock.lock(); defer { lock.unlock() }
+        return result
+    }
 
-            await MainActor.run {
-                self.waveformCache[id] = WaveformData(totalDuration: dur, samples: allPeaks)
+    /// ffmpeg 波形兜底：提 8kHz 单声道 PCM 算峰值（音频读取服务坏掉的机器用）
+    nonisolated static func ffmpegWaveform(url: URL) -> WaveformData? {
+        guard let ff = findFFmpeg() else { return nil }
+        guard let dur = ffprobeDuration(url: url), dur > 0 else { return nil }
+        let p = Process()
+        p.executableURL = ff
+        p.arguments = ["-hide_banner", "-loglevel", "error", "-nostdin",
+                       "-i", url.path, "-vn",
+                       "-f", "s16le", "-ac", "1", "-ar", "8000", "-"]
+        let outPipe = Pipe()
+        p.standardOutput = outPipe
+        p.standardError = FileHandle.nullDevice
+        do { try p.run() } catch { return nil }
+        let data = outPipe.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        guard p.terminationStatus == 0, !data.isEmpty else { return nil }
+        var peaks: [Float] = []
+        data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+            let samples = raw.bindMemory(to: Int16.self)
+            // 8kHz 下每 360 样本 ≈ 45ms/峰，与原 44.1kHz/2000 样本的密度对齐
+            let chunkTarget = 360
+            var runningPeak: Int16 = 0
+            var samplesInChunk = 0
+            for sample in samples {
+                let absSample = sample == Int16.min ? Int16.max : abs(sample)
+                if absSample > runningPeak { runningPeak = absSample }
+                samplesInChunk += 1
+                if samplesInChunk >= chunkTarget {
+                    peaks.append(Float(runningPeak) / Float(Int16.max))
+                    runningPeak = 0
+                    samplesInChunk = 0
+                }
+            }
+            if samplesInChunk > 0 {
+                peaks.append(Float(runningPeak) / Float(Int16.max))
             }
         }
+        return WaveformData(totalDuration: dur, samples: peaks)
     }
 
     /// Load an image file as thumbnail for the media library.

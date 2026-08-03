@@ -1888,14 +1888,24 @@ actor TimelineExporter {
             if let audioOutput = audioOutput, let audioInput = audioInput {
                 group.addTask {
                     await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+                        var audioTimedOut = false
                         audioInput.requestMediaDataWhenReady(on: audioQueue) {
                             while audioInput.isReadyForMoreMediaData {
-                                guard let sb = audioOutput.copyNextSampleBuffer() else {
+                                switch Self.copyNextAudioSample(audioOutput, timeout: 15) {
+                                case .sample(let sb):
+                                    audioInput.append(sb)
+                                case .ended:
+                                    audioInput.markAsFinished()
+                                    cont.resume()
+                                    return
+                                case .timedOut:
+                                    guard !audioTimedOut else { return }
+                                    audioTimedOut = true
+                                    DiagLog.log("[导出] 音频读取超时(15s)，放弃音频轨（仅导出画面）")
                                     audioInput.markAsFinished()
                                     cont.resume()
                                     return
                                 }
-                                audioInput.append(sb)
                             }
                         }
                     }
@@ -1914,6 +1924,39 @@ actor TimelineExporter {
             throw writer.error ?? NSError(domain: "Export", code: 12,
                 userInfo: [NSLocalizedDescriptionKey: "写入失败 (\(writer.status.rawValue))"])
         }
+    }
+
+    private enum AudioSampleOutcome {
+        case sample(CMSampleBuffer)
+        case ended
+        case timedOut
+    }
+
+    /// 带超时的 copyNextSampleBuffer（导出音频用）。
+    /// 家用机实证：坏掉的音频读取服务会让此调用永久挂死（详见 ProjectState.loadWaveform 的同类修复）。
+    /// 用独立 GCD 队列执行，超时后放弃音频轨，只影响 export.audio 这一条自建串行队列，不碰协作池。
+    private nonisolated static func copyNextAudioSample(
+        _ output: AVAssetReaderAudioMixOutput, timeout: Double
+    ) -> AudioSampleOutcome {
+        let sem = DispatchSemaphore(value: 0)
+        let lock = NSLock()
+        var result: AudioSampleOutcome = .ended
+        var done = false
+        DispatchQueue.global(qos: .userInitiated).async {
+            let sb = output.copyNextSampleBuffer()
+            lock.lock()
+            defer { lock.unlock() }
+            guard !done else { return }
+            done = true
+            result = sb.map { .sample($0) } ?? .ended
+            sem.signal()
+        }
+        if sem.wait(timeout: .now() + timeout) == .timedOut {
+            lock.lock()
+            if !done { done = true; result = .timedOut }
+            lock.unlock()
+        }
+        return result
     }
 
     // MARK: - GPU overlay 渲染（CIImage 管线）
