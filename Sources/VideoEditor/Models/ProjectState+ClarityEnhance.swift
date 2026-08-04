@@ -75,11 +75,42 @@ extension ProjectState {
     /// videoWidth 未知时（新建 clip 没探测过尺寸，值为 0）按 1 倍处理，不去猜；
     /// 下限 clamp 到 1，避免源分辨率比 640x480 还小时把预计耗时估得比基准更短
     /// （基准本身已经是所有实测里最快的档位，没必要再往下算）。
+    /// 逐帧处理的并发度。**估算耗时和真正跑流水线必须用同一套算法**，否则用户看到的
+    /// "预计几分钟"跟实际差一个并发倍数——这个函数就是为了让两处只有一个真相来源。
+    ///
+    /// 并发 N 帧就是 N 份单帧峰值内存，所以按输出分辨率反推：单帧峰值实测约
+    /// 48 bytes/输出像素，预算取物理内存 1/8、上限 2GB，再夹在 [1, min(4, 核数)]。
+    /// 640x480 素材吃满 4 并发；1080p x4（输出 7680x4320）单帧就要 1.6GB，
+    /// 自动退回串行——慢，但不会 OOM，这个取舍方向不能反。
+    nonisolated static func clarityConcurrency(outputWidth: Double, outputHeight: Double) -> Int {
+        let hardCap = max(1, min(4, ProcessInfo.processInfo.activeProcessorCount))
+        guard outputWidth > 0.001, outputHeight > 0.001 else { return hardCap }
+        let perFrameBytes = outputWidth * outputHeight * 48
+        let budget = min(2_000_000_000.0, Double(ProcessInfo.processInfo.physicalMemory) / 8)
+        return max(1, min(hardCap, Int(budget / max(perFrameBytes, 1))))
+    }
+
     private static func estimatedMsPerFrame(scale: ClarityScale, videoWidth: Double, videoHeight: Double) -> Double {
-        let base = scale == .x4 ? 940.0 : 333.0
-        guard videoWidth > 0.001, videoHeight > 0.001 else { return base }
-        let areaRatio = (videoWidth * videoHeight) / (640.0 * 480.0)
-        return base * max(1.0, areaRatio)
+        // 基准是**串行**单帧耗时（640x480、向量化之后、多帧并行之前实测）
+        let serialBase = scale == .x4 ? 940.0 : 333.0
+        guard videoWidth > 0.001, videoHeight > 0.001 else { return serialBase }
+
+        let areaRatio = max(1.0, (videoWidth * videoHeight) / (640.0 * 480.0))
+        let serialPerFrame = serialBase * areaRatio
+
+        // 再除以这次实际会用的并发度。漏掉这一步就是上一版的 bug：多帧并行让
+        // 小素材快了 2.4 倍，估算却还按串行算，对话框把 7 分钟 720p 素材报成
+        // 203 分钟（实际约 51 分钟）。而且并发度本身随分辨率变（大素材会退回
+        // 串行），不能简单地全局除以一个固定倍数，必须调用跟流水线同一个函数。
+        let s = Double(scale.rawValue)
+        let concurrency = Double(clarityConcurrency(outputWidth: videoWidth * s,
+                                                    outputHeight: videoHeight * s))
+
+        // 除完并发度之后再乘 1.3：并行不是完美线性（内存带宽争用），而且 ffmpeg
+        // 解码/编码这两头是串行的固定开销，不随并发摊薄。实测 960x720 x4、并发 3
+        // 是 965ms/帧，纯公式算出来 705ms，偏低 27%。这个提示是给用户预判等待时间
+        // 用的，说少了比说多了难受，所以宁可保守。
+        return serialPerFrame / max(1.0, concurrency) * 1.3
     }
     /// 耗时预计超过这个秒数就弹确认框。FSRCNN 实测速度下，绝大多数正常长度（几秒
     /// 以上）的片段都会触发这个提示——这不是异常片段的兜底，是当前实现下的常态，
@@ -345,12 +376,7 @@ extension ProjectState {
         // 48 bytes/输出像素，预算取物理内存 1/8、上限 2GB。640x480 素材吃满 4 并发；
         // 1080p x4（输出 7680x4320）单帧就要 1.6GB，自动退回串行——慢，但不会 OOM，
         // 这个取舍方向不能反。
-        let concurrency: Int = {
-            let hardCap = max(1, min(4, ProcessInfo.processInfo.activeProcessorCount))
-            let perFrameBytes = Double(dstW) * Double(dstH) * 48
-            let budget = min(2_000_000_000.0, Double(ProcessInfo.processInfo.physicalMemory) / 8)
-            return max(1, min(hardCap, Int(budget / max(perFrameBytes, 1))))
-        }()
+        let concurrency = clarityConcurrency(outputWidth: Double(dstW), outputHeight: Double(dstH))
 
         let shared = ClarityParallelState(total: estimatedTotal)
         // 结果槽位也必须放引用类型里：并发闭包直接改外层局部 var 会触发 Swift 的
