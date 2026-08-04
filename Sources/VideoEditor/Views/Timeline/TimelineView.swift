@@ -3233,7 +3233,17 @@ private struct VideoClipView: View {
     @ViewBuilder
     private func thumbnailStrip(frames: [ThumbnailFrame], clipWidth: CGFloat) -> some View {
         let thumbH = h - 4
-        let ratio: CGFloat = frames.first.map { CGFloat($0.image.size.width) / max(CGFloat($0.image.size.height), 1) } ?? 1.0
+        // 格子宽高比优先用片段自己的原始尺寸算——它是固定值，不会因为缩略图重建
+        // 而变。原本取自 frames.first 的图片尺寸：缩略图一重建，如果新帧来自
+        // ffmpeg 兜底而不是 AVFoundation（两者输出尺寸不同），ratio 就变了，
+        // 连带 thumbW / count 全变，整条缩略图重新排布，看着就是片段在抖。
+        // 只有拿不到原始尺寸时（新建 clip 还没探测出来，值为 0）才退回用首帧。
+        let ratio: CGFloat = {
+            if clip.videoWidth > 0.001, clip.videoHeight > 0.001 {
+                return CGFloat(clip.videoWidth / clip.videoHeight)
+            }
+            return frames.first.map { CGFloat($0.image.size.width) / max(CGFloat($0.image.size.height), 1) } ?? 1.0
+        }()
         let thumbW = max(thumbH * ratio, 1)
         let count = max(1, Int(ceil(clipWidth / thumbW)))
         // 只渲染可视范围内的缩略图
@@ -3263,7 +3273,12 @@ private struct VideoClipView: View {
                 Color.clear.frame(width: max(0, clipWidth - thumbW * CGFloat(endIdx)), height: thumbH)
             }
         }
-        .frame(width: clipWidth, height: thumbH)
+        // alignment 必须显式给 .leading。默认是 .center，一旦 HStack 内容的实际
+        // 总宽跟 clipWidth 差一点（几百个 Image frame 的亚像素舍入会累积，缩放
+        // 倍数越大格数越多、误差越大），居中就会把这点误差平摊到左右两边——
+        // 表现出来就是整条缩略图相对片段左右晃。左对齐后，内容永远从片段左边缘
+        // 开始画，宽度误差只会落在右端被 clipShape 裁掉，看不出来。
+        .frame(width: clipWidth, height: thumbH, alignment: .leading)
         .clipShape(RoundedRectangle(cornerRadius: 6))
     }
 

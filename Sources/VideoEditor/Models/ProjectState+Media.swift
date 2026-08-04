@@ -474,13 +474,25 @@ extension ProjectState {
         generateThumbnails(assetID: assetID, url: url, isReload: true)
     }
 
+    /// 同时最多几条缩略图生成线程真正在跑。
+    ///
+    /// 时间轴缩放超过 1.8 倍会触发 refreshAllThumbnails，它对**每个**素材都
+    /// 起一条线程；时间轴上十来个素材就是十几条 AVAssetImageGenerator 同时解码，
+    /// 跟 AVPlayer 抢同一套解码资源，表现出来就是缩放之后按播放键要卡一下才出声
+    /// （TTS 生成的语音尤其明显——那些音频文件是新写出来的，没有任何系统级缓存）。
+    /// 限流到 2 条，再配合下面把线程 QoS 降到 .utility，让播放始终优先。
+    private static let thumbnailGenSlots = DispatchSemaphore(value: 2)
+
     func generateThumbnails(assetID: UUID, url: URL, isReload: Bool = false) {
         if !isReload { assetThumbnails[assetID] = [] }
         let id = assetID
         let pps = pixelsPerSecond
         thumbnailsGenerating.insert(id)
         // 线程模型说明见 loadMediaThumbnail：专属 pthread + 信号量超时，不碰协作池/GCD 全局池
-        Thread.detachNewThread {
+        let worker = Thread {
+            // 排队等一个名额再开工。wait 必须在这条新线程里做，不能在调用方（主线程）等
+            Self.thumbnailGenSlots.wait()
+            defer { Self.thumbnailGenSlots.signal() }
             var loadError: String? = nil
             var dur: Double = 0
             var avDurationOK = false
@@ -563,6 +575,9 @@ extension ProjectState {
                 self.thumbnailsGenerating.remove(id)
             }
         }
+        // 缩略图是后台锦上添花的活，不该跟播放/交互抢 CPU 和解码资源
+        worker.qualityOfService = .utility
+        worker.start()
     }
 
     func refreshAllThumbnails() {
