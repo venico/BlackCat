@@ -1081,7 +1081,14 @@ struct TimelineView: View {
                             NSCursor.arrow.set()
                         }
                     case .ended:
-                        scrollBarHovered = false
+                        // 延迟一拍再收，别立刻置 false。指针从轨道区移到滚动条上时，
+                        // 这里会先收到 .ended（滚动条把事件挡住了），而滚动条自己的
+                        // onHover 要等它仍然可 hit test 才能触发——立刻置 false 会让
+                        // show 瞬间变假、allowsHitTesting 关掉，接管就再也发生不了，
+                        // 直接卡死在隐藏。留 0.2s 的交接窗口
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                            scrollBarHovered = false
+                        }
                         hoveredMarkerID = nil
                         NSCursor.arrow.set()
                     }
@@ -5083,6 +5090,14 @@ private struct TimelineScrollBar: View {
 
     @State private var isDragging = false
     @State private var dragStartFraction: Double = 0
+    /// 指针是否落在滚动条自己身上。
+    ///
+    /// 必须有这个，否则会来回闪：父视图靠 onContinuousHover 判断"指针在不在轨道区
+    /// 底部"来决定 isVisible，而滚动条一旦显示就开始接事件（allowsHitTesting），
+    /// 把 hover 事件挡住了——父视图收到 .ended 以为指针离开了，于是隐藏；隐藏后
+    /// 不再拦截，事件又落回父视图，再显示。指针明明没动，滚动条却在自己开关。
+    /// 让它自己也报一份 hover，跟 isVisible 取或，指针在它身上时就由它保证不消失。
+    @State private var selfHovered = false
 
     /// 滑块高度。滚动条本来就只在指针移到轨道区底部时才淡入，既然露面了就说明
     /// 用户要用它，直接给好点的尺寸，不再要求"精确悬停到滑块上"才加粗。
@@ -5104,7 +5119,7 @@ private struct TimelineScrollBar: View {
             let knobW = max(trackW * viewportFraction, 30)
             let maxOffset = max(trackW - knobW, 1)
             let knobX = 8 + fraction * maxOffset
-            let show = isVisible || isDragging
+            let show = isVisible || isDragging || selfHovered
 
             ZStack(alignment: .leading) {
                 RoundedRectangle(cornerRadius: 6)
@@ -5145,6 +5160,11 @@ private struct TimelineScrollBar: View {
                     )
             }
             .frame(height: hitH)
+            // 挂在整个条上而不是只挂滑块：指针在轨道背景上也算"在滚动条上"，
+            // 不然从滑块滑到旁边空白就会触发隐藏。这里只驱动 opacity /
+            // allowsHitTesting，不改任何布局尺寸——上一版把 onHover 接到
+            // .frame(height:) 上导致过自激抖动，别再犯
+            .onHover { selfHovered = $0 }
             .opacity(show ? 1 : 0)
             // opacity 0 的视图照样会接事件。命中区域从 6pt 放大到 22pt 之后，
             // 不加这句的话滚动条隐藏时底部那 22pt 会把框选的拖拽吃掉——
