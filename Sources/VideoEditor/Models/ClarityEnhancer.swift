@@ -60,20 +60,31 @@ enum ClarityEnhancer {
     /// 单张图片超分辨率放大。onTileProgress 在每个 tile 处理完后回调（0...1），交给上层显示进度
     static func enhance(cgImage: CGImage, model modelKind: ClarityModel,
                        onTileProgress: ((Double) -> Void)? = nil) throws -> CGImage {
+        let w = cgImage.width, h = cgImage.height
+        let scale = modelKind == .x2 ? 2 : 4
+        let rgba = try readRGBA(from: cgImage)
+        let out = try enhanceRGBA(rgba, width: w, height: h, model: modelKind,
+                                  onTileProgress: onTileProgress)
+        return try makeCGImage(rgba: out, width: w * scale, height: h * scale)
+    }
+
+    /// 跟 enhance(cgImage:) 同一条处理链路，但直接吃/吐紧密排列的 RGBA8888 字节
+    /// （每像素 4 字节、行间无 padding）。给管道式流水线用：ffmpeg 那头本来就是
+    /// rawvideo 裸字节，走这个接口可以完全不碰 CGImage / 图片编解码。
+    static func enhanceRGBA(_ rgba: [UInt8], width w: Int, height h: Int,
+                            model modelKind: ClarityModel,
+                            onTileProgress: ((Double) -> Void)? = nil) throws -> [UInt8] {
         guard modelKind.isDownloaded else { throw EnhanceError.modelMissing }
         let mlModel = try model(at: modelKind.localURL, modelKind: modelKind)
         let scale = modelKind == .x2 ? 2 : 4
 
-        let w = cgImage.width, h = cgImage.height
-        let (yPlane, cbPlane, crPlane) = try rgbToYCbCr(cgImage)
-
+        let (yPlane, cbPlane, crPlane) = rgbaToYCbCr(rgba, width: w, height: h)
         let enhancedY = try enhanceYPlane(yPlane, width: w, height: h, scale: scale,
                                          mlModel: mlModel, onTileProgress: onTileProgress)
         let enhancedCb = upsampleBilinear(cbPlane, width: w, height: h, scale: scale)
         let enhancedCr = upsampleBilinear(crPlane, width: w, height: h, scale: scale)
-
-        return try yCbCrToRGB(y: enhancedY, cb: enhancedCb, cr: enhancedCr,
-                              width: w * scale, height: h * scale)
+        return yCbCrToRGBA(y: enhancedY, cb: enhancedCb, cr: enhancedCr,
+                           width: w * scale, height: h * scale)
     }
 
     // MARK: - 色彩空间转换
@@ -82,7 +93,9 @@ enum ClarityEnhancer {
     /// 系数跟 OpenCV cv2.COLOR_BGR2YCrCb 一致（full-range BT.601），
     /// 这是 Task 2 Python 验证阶段用的同一套系数，Swift 这边必须保持一致，
     /// 否则色彩空间转换本身的误差会跟"模型推理是否正确"混在一起没法区分。
-    private static func rgbToYCbCr(_ cgImage: CGImage) throws -> (y: [Float], cb: [Float], cr: [Float]) {
+    /// 把 CGImage 画进紧密排列的 RGBA8888 缓冲区（行间无 padding），供下面两条
+    /// 路径共用：CGImage 入口先转成裸字节，管道入口本来就是裸字节
+    private static func readRGBA(from cgImage: CGImage) throws -> [UInt8] {
         let w = cgImage.width, h = cgImage.height
         var rgba = [UInt8](repeating: 0, count: w * h * 4)
         guard let ctx = CGContext(data: &rgba, width: w, height: h, bitsPerComponent: 8,
@@ -91,8 +104,13 @@ enum ClarityEnhancer {
             throw EnhanceError.inferenceFailed("RGB 读取上下文创建失败")
         }
         ctx.draw(cgImage, in: CGRect(x: 0, y: 0, width: w, height: h))
+        return rgba
+    }
 
-        // 下面整段是上面那个逐像素 for 循环的 vDSP 向量化版本，公式和系数逐字未变。
+    private static func rgbaToYCbCr(_ rgba: [UInt8], width w: Int, height h: Int)
+        -> (y: [Float], cb: [Float], cr: [Float]) {
+
+        // 下面整段是原先那个逐像素 for 循环的 vDSP 向量化版本，公式和系数逐字未变。
         // 换掉的理由：实测这个函数在 640x480 单帧要 43ms，而同一帧里真正的 CoreML
         // 推理只要 18ms——纯标量循环的色彩空间转换比模型本身还贵。
         let n = w * h
@@ -138,8 +156,8 @@ enum ClarityEnhancer {
         return (y, cb, cr)
     }
 
-    /// Y/Cb/Cr 平面（0...1 范围，已是目标尺寸）合并转回 RGB CGImage
-    private static func yCbCrToRGB(y: [Float], cb: [Float], cr: [Float], width: Int, height: Int) throws -> CGImage {
+    /// Y/Cb/Cr 平面（0...1 范围，已是目标尺寸）合并成紧密排列的 RGBA8888 字节
+    private static func yCbCrToRGBA(y: [Float], cb: [Float], cr: [Float], width: Int, height: Int) -> [UInt8] {
         // 同样是原逐像素循环的 vDSP 向量化版本，公式和系数未变（原实现见 git 历史）。
         // 唯一的数值差异来源：下面用乘倒数（* 1/0.713）代替原来的除法（/ 0.713），
         // 1/0.713 在 float32 里有约 1e-7 的相对误差，作用在最大 127 的色差分量上是
@@ -183,6 +201,12 @@ enum ClarityEnhancer {
             vDSP_vfixru8(g, 1, base + 1, 4, count)
             vDSP_vfixru8(b, 1, base + 2, 4, count)
         }
+        return rgba
+    }
+
+    /// 把紧密排列的 RGBA8888 字节包成 CGImage（只给 enhance(cgImage:) 这条入口用；
+    /// 管道路径全程不需要走这一步）
+    private static func makeCGImage(rgba: [UInt8], width: Int, height: Int) throws -> CGImage {
         guard let provider = CGDataProvider(data: Data(rgba) as CFData),
               let img = CGImage(width: width, height: height, bitsPerComponent: 8, bitsPerPixel: 32,
                                 bytesPerRow: width * 4, space: CGColorSpaceCreateDeviceRGB(),

@@ -299,111 +299,121 @@ extension ProjectState {
             if cancelFlag.isCancelled { throw ClarityFrameIO.FrameIOError.cancelled }
         }
 
+        // 管道式流水线：ffmpeg 解码进程把 rawvideo RGBA 裸字节从 stdout 吐出来，
+        // 我们在内存里逐帧超分，再把结果字节写进 ffmpeg 编码进程的 stdin。
+        // 相比原先的「解成 PNG 文件序列 → 逐个读写 → 再编码」，省掉了每帧一次
+        // PNG 编码（实测 2560x1920 要 29.5ms）+ 一次解码 + 两次磁盘 I/O，
+        // 临时磁盘占用也从「300 帧 1080p x4 约 3.7GB」直接降到 0。
+        //
+        // 死锁防线（这条流水线两端都在阻塞读写，任何一端卡住都是死锁）：
+        //  · 两个 ffmpeg 的 stderr 都设成 nullDevice——留给没人排空的管道，写满就卡死
+        //  · 读 stdout 用 readExactly 循环补齐：一帧几十 MB 必然被拆成多次 read
+        //  · 严格「读满一批 → 处理 → 写出一批」，不会出现两端同时等对方的局面
         onStateChange(.extractingFrames(0))
         let frameRate = 30.0  // 固定输出帧率，跟原素材帧率解耦，简化实现
-        let inputFrameDir = workDir.appendingPathComponent("in")
-        let frames = try ClarityFrameIO.extractFrames(url: sourceURL, trimStart: trimStart, duration: duration,
-                                                       frameRate: frameRate, outputDir: inputFrameDir)
+        let (srcW, srcH) = try ClarityFrameIO.probeVideoSize(sourceURL)
+        let scale = model == .x2 ? 2 : 4
+        let dstW = srcW * scale, dstH = srcH * scale
+        let inFrameBytes = srcW * srcH * 4
+        let outFrameBytes = dstW * dstH * 4
         try checkCancelled()
 
-        onStateChange(.inferring(0))
-        let outputFrameDir = workDir.appendingPathComponent("out")
-        try FileManager.default.createDirectory(at: outputFrameDir, withIntermediateDirectories: true)
-        // 每帧的 CGImage 解码 + PNG 编码都会产生大量 autorelease 对象（尤其
-        // NSBitmapImageRep 的 PNG 编码器），这段跑在 Thread.detachNewThread 的
-        // 专属线程上，没有 RunLoop/框架代码替它定期排空 autorelease pool——
-        // 不手动包一层的话这些临时对象会在整个循环期间一直堆着，实测
-        // 7680x4320/40 帧不加 autoreleasepool 会从 8.2MB 一路涨到 5GB+
-        // （jetsam 杀掉的量级），加了之后稳定在 400MB 左右。autoreleasepool
-        // 是 rethrows，直接包住 try 调用不需要额外处理错误
-        //
-        // 并发策略：把帧切成若干批，**批内并行、批间串行**。批大小就是并发上限，
-        // 所以峰值内存最多是「单帧峰值 × 并发数」，不会随总帧数增长——这是上面
-        // 那条 OOM 教训之后必须守住的约束，也是不直接用一个大 concurrentPerform
-        // （并发度由系统按核数决定，无法控内存）的原因。
-        //
-        // 用 DispatchQueue.concurrentPerform 而不是 TaskGroup：整条流水线跑在
-        // Thread.detachNewThread 的专属线程上，是同步阻塞的世界，不能中途切进
-        // Swift 并发的协作池（这正是本项目踩过的坑，见文件头注释）。
-        // concurrentPerform 本身是同步阻塞的，语义上正好对得上。
-        //
-        // MLModel.prediction 是线程安全的（Apple 官方保证），ClarityEnhancer 里
-        // 的模型缓存本来就有 NSLock 保护，每个 tile 的 MLMultiArray 都是各线程
-        // 自己新建的，不共享。
-        // 共享可变状态必须放在引用类型里，不能让并发闭包直接捕获并修改外层的局部
-        // var——即使自己上了锁，Swift 运行时的独占访问检查（exclusivity enforcement）
-        // 也不认识这把锁，会直接 SIGTRAP 崩掉。这跟 ClarityCancelFlag 是同一个模式。
-        let shared = ClarityParallelState(total: frames.count)
+        let (decodeProc, decodeOut) = try ClarityFrameIO.startRawDecode(
+            url: sourceURL, trimStart: trimStart, duration: duration, frameRate: frameRate)
+        let (encodeProc, encodeIn) = try ClarityFrameIO.startRawEncode(
+            width: dstW, height: dstH, frameRate: frameRate,
+            audioSourceURL: sourceURL, audioTrimStart: trimStart,
+            audioDuration: duration, outputURL: outputURL)
 
-        // 并发度必须按**输出分辨率**动态定，不能写死——并发 N 帧就是 N 份单帧峰值
-        // 内存，素材越大越危险，写死 4 等于把上面刚修掉的 OOM 换个形式放回来。
-        //
-        // 单帧峰值实测约 48 bytes/输出像素（40 帧 960x720 x4、并发 4 实测进程峰值
-        // 2110MB，单帧输出 3840x2880=1106万像素 → 527MB/帧）。这个系数涵盖了
-        // Y/Cb/Cr 三个 float 平面 + 输出 RGBA + CGImage/PNG 编码缓冲。
-        //
-        // 预算取「物理内存的 1/8，上限 2GB」：8GB 机器 1GB、16GB 及以上 2GB。
-        // 挂钩物理内存是因为写死的绝对值在小内存机器上偏激进、在大内存机器上又
-        // 白白浪费并发。按这个预算：640x480 素材（x2/x4）吃满 4 并发；1080p x2
-        // 也是 4；1080p x4（输出 7680x4320）单帧就要 1.6GB，自动退回串行——
-        // 慢，但不会崩，这个取舍方向不能反。
-        //
-        // 尺寸从抽出来的第一帧读（只读属性不解码，很轻量），比用 clip.videoWidth
-        // 可靠——后者在没探测过尺寸的新建 clip 上是 0。
+        // 无论正常结束还是抛错，两个进程都要收干净，不能留孤儿卡在管道上
+        var finished = false
+        defer {
+            if !finished {
+                try? encodeIn.close()
+                ClarityFrameIO.killCurrentProcess()
+            }
+            ClarityFrameIO.unregister(decodeProc)
+            ClarityFrameIO.unregister(encodeProc)
+        }
+
+        // 总帧数只能按时长×帧率估——管道没有"总数"这个信息。多估一点不影响正确性，
+        // 进度不会倒退，只会在最后一批读不满时直接收尾
+        let estimatedTotal = max(1, Int((duration * frameRate).rounded()))
+        onStateChange(.inferring(0))
+
+        // 并发度按输出分辨率定：并发 N 帧就是 N 份单帧峰值内存。单帧峰值实测约
+        // 48 bytes/输出像素，预算取物理内存 1/8、上限 2GB。640x480 素材吃满 4 并发；
+        // 1080p x4（输出 7680x4320）单帧就要 1.6GB，自动退回串行——慢，但不会 OOM，
+        // 这个取舍方向不能反。
         let concurrency: Int = {
             let hardCap = max(1, min(4, ProcessInfo.processInfo.activeProcessorCount))
-            guard let first = frames.first,
-                  let src = CGImageSourceCreateWithURL(first as CFURL, nil),
-                  let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any],
-                  let fw = props[kCGImagePropertyPixelWidth] as? Int,
-                  let fh = props[kCGImagePropertyPixelHeight] as? Int,
-                  fw > 0, fh > 0
-            else { return min(2, hardCap) }  // 读不出尺寸就取保守的中间值
-            let scale = model == .x2 ? 2 : 4
-            let outputPixels = Double(fw * scale) * Double(fh * scale)
-            let perFrameBytes = outputPixels * 48
+            let perFrameBytes = Double(dstW) * Double(dstH) * 48
             let budget = min(2_000_000_000.0, Double(ProcessInfo.processInfo.physicalMemory) / 8)
-            let byMemory = Int(budget / max(perFrameBytes, 1))
-            return max(1, min(hardCap, byMemory))
+            return max(1, min(hardCap, Int(budget / max(perFrameBytes, 1))))
         }()
 
-        for chunkStart in stride(from: 0, to: frames.count, by: concurrency) {
+        let shared = ClarityParallelState(total: estimatedTotal)
+        // 结果槽位也必须放引用类型里：并发闭包直接改外层局部 var 会触发 Swift 的
+        // 独占访问检查而 SIGTRAP，加锁也没用（详见 ClarityParallelState 的注释）
+        let slots = ClarityFrameSlots(capacity: concurrency)
+
+        while true {
             try checkCancelled()
             if let e = shared.firstError { throw e }
 
-            let chunkCount = min(concurrency, frames.count - chunkStart)
-            DispatchQueue.concurrentPerform(iterations: chunkCount) { offset in
-                // 同批里已经有帧失败、或用户已取消，就别再开工做无用功
-                if shared.firstError != nil || cancelFlag.isCancelled { return }
+            // 读一批（顺序读，管道本来就是顺序流）
+            var batch: [Data] = []
+            batch.reserveCapacity(concurrency)
+            for _ in 0..<concurrency {
+                guard let f = ClarityFrameIO.readExactly(decodeOut, count: inFrameBytes) else { break }
+                batch.append(f)
+            }
+            if batch.isEmpty { break }
 
+            // 批内并发处理
+            slots.reset(count: batch.count)
+            DispatchQueue.concurrentPerform(iterations: batch.count) { i in
+                if shared.firstError != nil || cancelFlag.isCancelled { return }
                 autoreleasepool {
                     do {
-                        let frameURL = frames[chunkStart + offset]
-                        guard let src = CGImageSourceCreateWithURL(frameURL as CFURL, nil),
-                              let cg = CGImageSourceCreateImageAtIndex(src, 0, nil) else {
-                            throw ClarityEnhancer.EnhanceError.badOutput
-                        }
-                        let enhanced = try ClarityEnhancer.enhance(cgImage: cg, model: model)
-                        let outFrameURL = outputFrameDir.appendingPathComponent(frameURL.lastPathComponent)
-                        let rep = NSBitmapImageRep(cgImage: enhanced)
-                        guard let data = rep.representation(using: .png, properties: [:]) else {
-                            throw ClarityEnhancer.EnhanceError.badOutput
-                        }
-                        try data.write(to: outFrameURL)
+                        let out = try ClarityEnhancer.enhanceRGBA([UInt8](batch[i]),
+                                                                  width: srcW, height: srcH,
+                                                                  model: model)
+                        slots.set(i, Data(out))
                         onStateChange(.inferring(shared.recordCompletedAndProgress()))
                     } catch {
                         shared.record(error)
                     }
                 }
             }
-        }
-        if let e = shared.firstError { throw e }
-        try checkCancelled()
+            if let e = shared.firstError { throw e }
+            try checkCancelled()
 
+            // 按原始顺序写出——批内并发但批间串行，天然保序，不需要乱序重排缓冲
+            for i in 0..<batch.count {
+                guard let out = slots.get(i), out.count == outFrameBytes else {
+                    throw ClarityEnhancer.EnhanceError.badOutput
+                }
+                try encodeIn.write(contentsOf: out)
+            }
+        }
+
+        // 让编码进程看到 EOF 才会收尾写完 moov box，漏掉这步产出的 mp4 是坏的
         onStateChange(.encoding)
-        try ClarityFrameIO.encodeFrames(frameDir: outputFrameDir, frameRate: frameRate,
-                                        audioSourceURL: sourceURL, audioTrimStart: trimStart,
-                                        audioDuration: duration, outputURL: outputURL)
+        try encodeIn.close()
+        decodeProc.waitUntilExit()
+        encodeProc.waitUntilExit()
+        finished = true
+        ClarityFrameIO.unregister(decodeProc)
+        ClarityFrameIO.unregister(encodeProc)
+
+        if cancelFlag.isCancelled { throw ClarityFrameIO.FrameIOError.cancelled }
+        guard encodeProc.terminationStatus == 0 else {
+            if encodeProc.terminationReason == .uncaughtSignal {
+                throw ClarityFrameIO.FrameIOError.cancelled
+            }
+            throw ClarityFrameIO.FrameIOError.encodeFailed("ffmpeg 退出码 \(encodeProc.terminationStatus)")
+        }
         return outputURL
     }
 
@@ -447,5 +457,31 @@ final class ClarityParallelState: @unchecked Sendable {
     var firstError: Error? {
         lock.lock(); defer { lock.unlock() }
         return _firstError
+    }
+}
+
+/// 批内并发处理的结果槽位。跟 ClarityParallelState 同理，必须是引用类型：
+/// 并发闭包往外层局部数组里写会触发 Swift 运行时的独占访问检查而 SIGTRAP，
+/// 哪怕各线程写的是互不相干的下标也一样——那套检查管的是"同一块内存有没有被
+/// 并发独占访问"，不认识"我们保证下标不冲突"这种约定。
+final class ClarityFrameSlots: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: [Data?]
+
+    init(capacity: Int) { storage = [Data?](repeating: nil, count: max(1, capacity)) }
+
+    func reset(count: Int) {
+        lock.lock(); defer { lock.unlock() }
+        storage = [Data?](repeating: nil, count: max(1, count))
+    }
+    func set(_ index: Int, _ data: Data) {
+        lock.lock(); defer { lock.unlock() }
+        guard index >= 0, index < storage.count else { return }
+        storage[index] = data
+    }
+    func get(_ index: Int) -> Data? {
+        lock.lock(); defer { lock.unlock() }
+        guard index >= 0, index < storage.count else { return nil }
+        return storage[index]
     }
 }
