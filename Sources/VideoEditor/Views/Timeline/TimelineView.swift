@@ -5083,8 +5083,12 @@ private struct TimelineScrollBar: View {
 
     @State private var isDragging = false
     @State private var dragStartFraction: Double = 0
+    @State private var knobHovered = false
 
     private let barH: CGFloat = 6
+    /// 指针移上来（或正在拖）时滑块加粗到这个高度：既是"可以拖了"的即时反馈，
+    /// 也让实际要瞄的目标变大。命中范围一直是 hitH(22pt)，加粗只是让它看得见
+    private let barHActive: CGFloat = 10
     /// 滑块的**命中**高度。视觉上仍是 barH(6pt) 的细条，但只有 6pt 可点实在太难瞄——
     /// 鼠标差几个像素就落空，事件穿到下面的轨道区变成框选（用户原话："放上去了
     /// 拖动结果是框选"）。这个值跟父视图 onContinuousHover 里
@@ -5118,11 +5122,14 @@ private struct TimelineScrollBar: View {
 
                 RoundedRectangle(cornerRadius: 6)
                     .fill(Color.white.opacity(isDragging ? 0.55 : 0.35))
-                    .frame(width: knobW, height: barH)
-                    // 外层撑到 hitH 再配 contentShape：视觉还是那条 6pt 细线（在
-                    // 22pt 里垂直居中），但上下各多出 8pt 的可点范围
+                    .frame(width: knobW, height: (knobHovered || isDragging) ? barHActive : barH)
+                    // 外层撑到 hitH 再配 contentShape：视觉是 6pt（指针移上来变 10pt）
+                    // 的细条在 22pt 里垂直居中，可点范围始终是这 22pt
                     .frame(width: knobW, height: hitH)
                     .contentShape(Rectangle())
+                    .onHover { knobHovered = $0 }
+                    .animation(.easeOut(duration: 0.12), value: knobHovered)
+                    .animation(.easeOut(duration: 0.12), value: isDragging)
                     .offset(x: knobX)
                     .gesture(
                         DragGesture(minimumDistance: 1)
