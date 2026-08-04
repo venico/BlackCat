@@ -53,6 +53,10 @@ struct TimelineView: View {
     @State private var scrollMonitor:  Any? = nil
     @State private var lastMagnifyValue: CGFloat = 1.0
     @State private var scrollBarHovered = false
+    /// 正在横向滚动。滚动时也把滚动条亮出来（细版，只报位置不请你点），
+    /// 停手 1.2s 后自动收——跟 macOS overlay scroller 一个路子
+    @State private var scrollBarScrolling = false
+    @State private var scrollIdleWork: DispatchWorkItem?
     @State private var scrollFraction: Double = 0
     @State private var scrollViewportFraction: Double = 1
     @State private var scrollOffsetX: CGFloat = 0
@@ -831,6 +835,12 @@ struct TimelineView: View {
                         scrollFraction = frac
                         scrollViewportFraction = vpFrac
                         scrollOffsetX = offX
+                        // 滚一下就亮，并把"停手收起"的倒计时往后推
+                        scrollBarScrolling = true
+                        scrollIdleWork?.cancel()
+                        let work = DispatchWorkItem { scrollBarScrolling = false }
+                        scrollIdleWork = work
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2, execute: work)
                     })
                     .frame(width: 1, height: 1)
                     .opacity(0)
@@ -1117,6 +1127,7 @@ struct TimelineView: View {
                     fraction: scrollFraction,
                     viewportFraction: scrollViewportFraction,
                     isVisible: scrollBarHovered,
+                    isScrolling: scrollBarScrolling,
                     onDrag: { newFrac in
                         guard let sv = project.timelineHScrollView, let doc = sv.documentView else { return }
                         let maxX = doc.frame.width - sv.contentView.bounds.width
@@ -5086,6 +5097,8 @@ private struct TimelineScrollBar: View {
     let fraction: Double
     let viewportFraction: Double
     let isVisible: Bool
+    /// 正在横向滚动。这时只是把位置报给用户看，不指望他去点，所以用细版
+    let isScrolling: Bool
     let onDrag: (Double) -> Void
 
     @State private var isDragging = false
@@ -5099,7 +5112,10 @@ private struct TimelineScrollBar: View {
     /// 让它自己也报一份 hover，跟 isVisible 取或，指针在它身上时就由它保证不消失。
     @State private var selfHovered = false
 
-    /// 滑块高度。滚动条本来就只在指针移到轨道区底部时才淡入，既然露面了就说明
+    /// 只因为「正在滚动」而露面时的高度：此刻用户在滑轨道、不是在瞄滑块，
+    /// 细一点不挡视线，也跟"现在还不能拖"这个状态对应上
+    private let barHThin: CGFloat = 6
+    /// 指针进到底部区域时的高度。滚动条本来就只在这时才淡入，既然露面了就说明
     /// 用户要用它，直接给好点的尺寸，不再要求"精确悬停到滑块上"才加粗。
     ///
     /// 试过做二级 hover（指到滑块上再从 6pt 变 10pt），结果是抖：用
@@ -5119,12 +5135,17 @@ private struct TimelineScrollBar: View {
             let knobW = max(trackW * viewportFraction, 30)
             let maxOffset = max(trackW - knobW, 1)
             let knobX = 8 + fraction * maxOffset
-            let show = isVisible || isDragging || selfHovered
+            // 能拖 = 指针在底部区域 / 在滚动条上 / 正在拖。单纯因为滚动而露面时
+            // 不算可交互，只报位置
+            let interactive = isVisible || isDragging || selfHovered
+            let show = interactive || isScrolling
+            let knobH = interactive ? barH : barHThin
 
             ZStack(alignment: .leading) {
                 RoundedRectangle(cornerRadius: 6)
                     .fill(Color.white.opacity(0.08))
-                    .frame(width: trackW, height: barH)
+                    .frame(width: trackW, height: knobH)
+                    .animation(.easeOut(duration: 0.12), value: knobH)
                     // 轨道背景也接事件：点空白处直接把滑块挪过去（标准滚动条行为），
                     // 不接的话点在滑块之外就穿透下去变成框选，跟点不中滑块是同一个毛病
                     .frame(width: trackW, height: hitH)
@@ -5140,9 +5161,10 @@ private struct TimelineScrollBar: View {
 
                 RoundedRectangle(cornerRadius: 6)
                     .fill(Color.white.opacity(isDragging ? 0.55 : 0.35))
-                    .frame(width: knobW, height: barH)
-                    // 外层撑到 hitH 再配 contentShape：视觉是 10pt 的条在 22pt 里
-                    // 垂直居中，可点范围始终是这 22pt（上下各多 6pt 容错）
+                    .frame(width: knobW, height: knobH)
+                    // 外层撑到 hitH 再配 contentShape：视觉是 10pt（滚动时 6pt）的条
+                    // 在 22pt 里垂直居中，可点范围始终是这 22pt
+                    .animation(.easeOut(duration: 0.12), value: knobH)
                     .frame(width: knobW, height: hitH)
                     .contentShape(Rectangle())
                     .offset(x: knobX)
@@ -5166,10 +5188,13 @@ private struct TimelineScrollBar: View {
             // .frame(height:) 上导致过自激抖动，别再犯
             .onHover { selfHovered = $0 }
             .opacity(show ? 1 : 0)
-            // opacity 0 的视图照样会接事件。命中区域从 6pt 放大到 22pt 之后，
-            // 不加这句的话滚动条隐藏时底部那 22pt 会把框选的拖拽吃掉——
-            // 修一个手感问题反而制造另一个
-            .allowsHitTesting(show)
+            // 只有「可交互」时才拦事件，不能用 show：
+            //  · opacity 0 的视图照样会接事件，命中区域又有 22pt，隐藏时不关掉的话
+            //    底部那条会把框选的拖拽吃掉
+            //  · 单纯因为滚动而露面的那 1.2s 同理——那时用户在滑轨道，不该顺手
+            //    把接下来的框选也吞了。指针真进到底部区域时 isVisible 会点亮
+            //    interactive，照样拖得动
+            .allowsHitTesting(interactive)
             .animation(.easeInOut(duration: show ? 0.15 : 0.4), value: show)
         }
         .frame(height: hitH)
