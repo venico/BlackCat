@@ -966,7 +966,6 @@ private struct ClarityEnhanceBubble: View {
         case .extractingFrames:     return "抽取帧序列…"
         case .inferring:            return "超分辨率推理中…"
         case .encoding:             return "编码输出中…"
-        case .failed(let msg):      return msg
         }
     }
 

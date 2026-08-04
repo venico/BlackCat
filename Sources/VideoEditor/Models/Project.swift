@@ -523,7 +523,10 @@ final class ProjectState: ObservableObject {
         case extractingFrames(Double)
         case inferring(Double)
         case encoding
-        case failed(String)
+        // 没有 .failed case：失败统一走 showSuccessToast 报错（跟本功能其它错误
+        // 路径一致），这个状态机不需要单独携带失败态，见 whole-branch review：
+        // 之前留着这个 case 是死代码，从没被赋值过，进度气泡里对应分支也永远
+        // 渲染不到
 
         /// 没有细粒度进度可报的阶段，按阶段给个近似值，让进度条别停着不动
         var approximateProgress: Double {
@@ -533,7 +536,6 @@ final class ProjectState: ObservableObject {
             case .extractingFrames(let p): return 0.1 + p * 0.1
             case .inferring(let p):        return 0.2 + p * 0.7
             case .encoding:                return 0.95
-            case .failed:                  return 0
             }
         }
     }
@@ -544,7 +546,7 @@ final class ProjectState: ObservableObject {
     var clarityCancelFlag: ClarityCancelFlag? = nil
     var isEnhancingClarity: Bool {
         switch clarityEnhanceState {
-        case .idle, .failed: return false
+        case .idle: return false
         default: return true
         }
     }

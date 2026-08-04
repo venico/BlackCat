@@ -14,8 +14,8 @@
 //
 // 测试素材参数（640x480、约 8 帧）比 brief 原本设想的"3~5 秒"小得多，这不是
 // 图省事：Task 12 验证过程中实测发现 ClarityEnhancer.enhance() 真实单帧耗时
-// 远超 Task 3 文档记录的数字（x2 ≈1.48s/帧、x4 ≈5.24s/帧，而不是文档里的
-// 1.55ms/1.58ms 单 tile），照 brief 建议的 3~5 秒（90~150 帧）跑一遍 x4 会
+// 远超 Task 3 文档记录的数字（640x480 基准 x2 ≈1.16s/帧、x4 ≈3.80s/帧，而不是
+// 文档里的 1.55ms/1.58ms 单 tile），照 brief 建议的 3~5 秒（90~150 帧）跑一遍 x4 会
 // 需要 8~13 分钟，对一个要反复跑、还要在 CI 里跑的集成测试不现实。8 帧已经
 // 足够触发这个测试真正要验证的东西（真实 ffmpeg 抽帧/编码、真实多 tile
 // CoreML 推理与拼接、真实素材/轨道/z-order 落地、真实取消清理），更长的素材
@@ -31,10 +31,13 @@ final class ClarityEnhanceSelectionIntegrationTests: XCTestCase {
 
     /// 测试素材固定用这个时长：Int(0.28 * 30) = 8 帧，远离取整边界（不用 0.3
     /// 这种可能因为浮点误差落在 8/9 帧边界两侧的数字）。按实测最新的
-    /// estimatedMsPerFrame（x2 1484ms/帧、x4 5244ms/帧）算，8 帧 x4 预计约
-    /// 42 秒、x2 约 12 秒，都在 60 秒确认框阈值以内，不会弹出没人能点的
-    /// NSAlert.runModal() 模态框
-    private static let testClipSeconds = 0.28
+    /// estimatedMsPerFrame 640x480 基准值（x2 1157ms/帧、x4 3797ms/帧）算，
+    /// 8 帧 x4 预计约 30 秒、x2 约 9 秒，都在 60 秒确认框阈值以内，不会弹出
+    /// 没人能点的 NSAlert.runModal() 模态框。这里的 VideoClip 没有设置
+    /// videoWidth/videoHeight（保持默认值 0），estimatedMsPerFrame 按分辨率
+    /// 缩放耗时估算时会因此回退到不缩放的 640x480 基准值，上面这两个数字就是
+    /// 实际生效的值，不用换算
+    private nonisolated static let testClipSeconds = 0.28
 
     // MARK: - 测试素材构造
 
@@ -228,9 +231,9 @@ final class ClarityEnhanceSelectionIntegrationTests: XCTestCase {
     func testCancelKillsProcessAndCleansWorkDir() async throws {
         try XCTSkipUnless(ClarityModel.x4.isDownloaded, "本机未下载 FSRCNN x4 模型，跳过取消测试")
 
-        // 选 x4（单帧耗时比 x2 更长，约 5.2 秒/帧），即使只有 8 帧，自然跑完也要
-        // ~40 秒，取消轮询在毫秒级就该命中，中途打断的窗口非常充裕，不会出现
-        // "轮询检测到已开始之前，流程已经跑完"这种测不出东西的情况
+        // 选 x4（单帧耗时比 x2 更长，640x480 基准约 3.8 秒/帧），即使只有 8 帧，
+        // 自然跑完也要 ~30 秒，取消轮询在毫秒级就该命中，中途打断的窗口非常
+        // 充裕，不会出现"轮询检测到已开始之前，流程已经跑完"这种测不出东西的情况
         let video = try makeLowResTestVideo(width: 640, height: 480, suffix: "cancel")
         defer { try? FileManager.default.removeItem(at: video) }
 

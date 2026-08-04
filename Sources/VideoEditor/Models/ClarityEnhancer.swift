@@ -8,6 +8,7 @@ import Foundation
 import CoreML
 import CoreImage
 import AppKit
+import Accelerate
 
 enum ClarityEnhancer {
 
@@ -37,7 +38,7 @@ enum ClarityEnhancer {
     /// （x4: 1.58ms vs .all 的 3.04ms；x2: 1.55ms vs .all 的 1.94ms）。
     /// 探索阶段曾用随机权重模型测出相反结论，但那个模型是 ImageType(RGB) 接口，
     /// 跟正式模型的 MultiArray(Y通道) 接口不是同一回事，数字不可比，已废弃。
-    private static func computeUnits(for modelKind: ClarityModel) -> MLComputeUnits {
+    private static func computeUnits() -> MLComputeUnits {
         .cpuAndGPU
     }
 
@@ -46,7 +47,7 @@ enum ClarityEnhancer {
         defer { cacheLock.unlock() }
         if let c = cached, c.path == url.path { return c.model }
         let config = MLModelConfiguration()
-        config.computeUnits = computeUnits(for: modelKind)
+        config.computeUnits = computeUnits()
         do {
             let m = try MLModel(contentsOf: url, configuration: config)
             cached = (url.path, m)
@@ -200,44 +201,51 @@ enum ClarityEnhancer {
 
         var output = [Float](repeating: 0, count: w * scale * h * scale)
         var done = 0
+        // 每个 tile 的 runOneTile 都会分配两个 MLMultiArray（输入+输出），1080p
+        // 一帧约 45 个 tile；跟逐帧循环那层的 autoreleasepool（见
+        // ProjectState+ClarityEnhance.swift runClarityEnhancePipeline）是同一个
+        // 问题的两层，这里按 tile 排空能降低单帧内的峰值，不用等到整帧处理完
+        // 才释放这一帧所有 tile 的临时对象
         for ty in 0..<tilesY {
             for tx in 0..<tilesX {
-                let srcX = srcXFor(tx)
-                let srcY = srcYFor(ty)
-                let cropW = min(tileSize, w - srcX)
-                let cropH = min(tileSize, h - srcY)
+                try autoreleasepool {
+                    let srcX = srcXFor(tx)
+                    let srcY = srcYFor(ty)
+                    let cropW = min(tileSize, w - srcX)
+                    let cropH = min(tileSize, h - srcY)
 
-                let padded = padTile(yPlane, srcX: srcX, srcY: srcY, cropW: cropW, cropH: cropH,
-                                     fullWidth: w, fullHeight: h)
-                let outTile = try runOneTile(padded, mlModel: mlModel)  // tileSize*scale 见方
+                    let padded = padTile(yPlane, srcX: srcX, srcY: srcY, cropW: cropW, cropH: cropH,
+                                         fullWidth: w, fullHeight: h)
+                    let outTile = try runOneTile(padded, mlModel: mlModel)  // tileSize*scale 见方
 
-                // 贴回输出平面：只贴这个 tile 的"贡献区间"（原图坐标系），非首个
-                // tile 丢弃靠前一侧的 overlap、非末个 tile 丢弃靠后一侧的 overlap，
-                // 只取中心可信部分——两侧都留给相邻 tile 的中心部分去覆盖，避免
-                // 每块边缘因为缺乏完整上下文导致的输出劣化被拼接进最终图像形成
-                // 可见接缝。首/尾 tile 因为没有相邻 tile 接管边界，对应那一侧不裁剪。
-                // 关键点：非末个 tile 时，contribX1/contribY1 直接复用下一个 tile
-                // 的 contribX0For/contribY0For 算出来的值，而不是从自己的
-                // srcX+cropW-overlap 独立算——这样 contribX1(tx) 恒等于
-                // contribX0(tx+1)，无论下一个 tile 的 srcX 有没有被 clamp，两个
-                // 相邻 tile 的贡献区间永远精确衔接：不重叠、不留缝，不依赖"stride
-                // 刚好整除图片宽高"这种巧合。
-                let contribX0 = contribX0For(tx)
-                let contribX1 = tx == tilesX - 1 ? srcX + cropW : contribX0For(tx + 1)
-                let contribY0 = contribY0For(ty)
-                let contribY1 = ty == tilesY - 1 ? srcY + cropH : contribY0For(ty + 1)
+                    // 贴回输出平面：只贴这个 tile 的"贡献区间"（原图坐标系），非首个
+                    // tile 丢弃靠前一侧的 overlap、非末个 tile 丢弃靠后一侧的 overlap，
+                    // 只取中心可信部分——两侧都留给相邻 tile 的中心部分去覆盖，避免
+                    // 每块边缘因为缺乏完整上下文导致的输出劣化被拼接进最终图像形成
+                    // 可见接缝。首/尾 tile 因为没有相邻 tile 接管边界，对应那一侧不裁剪。
+                    // 关键点：非末个 tile 时，contribX1/contribY1 直接复用下一个 tile
+                    // 的 contribX0For/contribY0For 算出来的值，而不是从自己的
+                    // srcX+cropW-overlap 独立算——这样 contribX1(tx) 恒等于
+                    // contribX0(tx+1)，无论下一个 tile 的 srcX 有没有被 clamp，两个
+                    // 相邻 tile 的贡献区间永远精确衔接：不重叠、不留缝，不依赖"stride
+                    // 刚好整除图片宽高"这种巧合。
+                    let contribX0 = contribX0For(tx)
+                    let contribX1 = tx == tilesX - 1 ? srcX + cropW : contribX0For(tx + 1)
+                    let contribY0 = contribY0For(ty)
+                    let contribY1 = ty == tilesY - 1 ? srcY + cropH : contribY0For(ty + 1)
 
-                for oy in (contribY0 * scale)..<(contribY1 * scale) {
-                    let localRow = oy - srcY * scale
-                    let destRowStart = oy * (w * scale)
-                    let srcRowStart = localRow * (tileSize * scale)
-                    for ox in (contribX0 * scale)..<(contribX1 * scale) {
-                        let localCol = ox - srcX * scale
-                        output[destRowStart + ox] = outTile[srcRowStart + localCol]
+                    for oy in (contribY0 * scale)..<(contribY1 * scale) {
+                        let localRow = oy - srcY * scale
+                        let destRowStart = oy * (w * scale)
+                        let srcRowStart = localRow * (tileSize * scale)
+                        for ox in (contribX0 * scale)..<(contribX1 * scale) {
+                            let localCol = ox - srcX * scale
+                            output[destRowStart + ox] = outTile[srcRowStart + localCol]
+                        }
                     }
+                    done += 1
+                    onTileProgress?(Double(done) / Double(totalTiles))
                 }
-                done += 1
-                onTileProgress?(Double(done) / Double(totalTiles))
             }
         }
         return output
@@ -297,18 +305,30 @@ enum ClarityEnhancer {
     }
 
     /// 把模型输出的 MLMultiArray 批量读成 [Float]，三个分支都走 dataPointer
-    /// 类型化指针（见 runOneTile 顶部注释）。
+    /// 类型化指针/批量转换（见 runOneTile 顶部注释），不逐元素 subscript 装箱。
     ///
     /// **float16 是 FSRCNN 的常态路径，不是兜底分支**：coremltools 转出的
     /// mlprogram 默认用 FP16 存权重和中间结果，输出的 MLMultiArray dataType
     /// 实测就是 `.float16`（rawValue 65552），哪怕 `ct.TensorType` 没有显式
-    /// 指定精度。Swift 的 `Float16` 跟它二进制布局一致，可以直接 bindMemory
-    /// 后原生转换，不需要先造一个 float32 的 MLMultiArray 中转。
+    /// 指定精度。这个二进制布局是 IEEE 754 半精度标准，可以直接用 vImage 批量
+    /// 转换到 Float32，不需要先造一个 float32 的 MLMultiArray 中转。
     ///
     /// 早先这里写的是"借 MLMultiArray(shape:dataType:) 转成 float32 再读"，
     /// 那条路径每个元素都要过一次 subscript 装箱，x2 单 tile 实测 122ms；
-    /// 换成下面的 bindMemory 后是 24ms（5 倍提速），两种读法的输出数值逐元素
-    /// 比对完全一致（最大差异 0），确认只是读取方式变快、不影响数值。
+    /// 换成 bindMemory 后是 24ms（5 倍提速），两种读法的输出数值逐元素比对
+    /// 完全一致（最大差异 0），确认只是读取方式变快、不影响数值。
+    ///
+    /// bindMemory 当时用的是 Swift 的 `Float16` 标量类型逐元素转换——这个类型
+    /// 在 x86_64 macOS 上不可用（`error: 'Float16' is unavailable in macOS`，
+    /// 只在 arm64 编译通过）。当前两个部署 bundle 都是 arm64，不影响出货，但
+    /// App Store 的 Xcode 工程用默认 ARCHS_STANDARD（含 x86_64 的 Universal
+    /// Binary），一旦这个文件被那边引用就是硬编译错误。改用下面的
+    /// vImageConvert_Planar16FtoPlanarF：跨架构可用，且是向量化的批量转换，不再
+    /// 是逐元素标量循环。half-precision 的二进制布局是标准的 IEEE 754（vImage
+    /// 头文件原话："identical to OpenEXR"），跟 Swift Float16 位布局完全一致，
+    /// 转换结果数值上没有差异——回归探针见
+    /// ClarityEnhancerTests.testEnhanceMatchesPythonReference，换成 vImage
+    /// 前后 PSNR/MAE 必须分毫不差。
     private static func readMultiArrayFast(_ array: MLMultiArray) throws -> [Float] {
         let count = array.count
         var out = [Float](repeating: 0, count: count)
@@ -320,8 +340,15 @@ enum ClarityEnhancer {
             let p = array.dataPointer.bindMemory(to: Double.self, capacity: count)
             for i in 0..<count { out[i] = Float(p[i]) }
         case .float16:
-            let p = array.dataPointer.bindMemory(to: Float16.self, capacity: count)
-            for i in 0..<count { out[i] = Float(p[i]) }
+            var src = vImage_Buffer(data: array.dataPointer, height: 1,
+                                    width: vImagePixelCount(count), rowBytes: count * 2)
+            var converted: vImage_Error = kvImageNoError
+            out.withUnsafeMutableBufferPointer { buf in
+                var dst = vImage_Buffer(data: UnsafeMutableRawPointer(buf.baseAddress!), height: 1,
+                                        width: vImagePixelCount(count), rowBytes: count * 4)
+                converted = vImageConvert_Planar16FtoPlanarF(&src, &dst, vImage_Flags(kvImageNoFlags))
+            }
+            guard converted == kvImageNoError else { throw EnhanceError.badOutput }
         default:
             throw EnhanceError.badOutput
         }

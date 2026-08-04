@@ -53,6 +53,6 @@ final class ClarityFrameIOTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: outURL.path))
         let size = (try? FileManager.default.attributesOfItem(atPath: outURL.path)[.size] as? Int) ?? 0
         print("[TEST] Output file size: \(size) bytes, Extracted frames: \(frames.count)")
-        XCTAssertGreaterThan(size ?? 0, 1000, "输出文件应该有实际内容，不是空文件")
+        XCTAssertGreaterThan(size, 1000, "输出文件应该有实际内容，不是空文件")
     }
 }

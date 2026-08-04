@@ -26,8 +26,6 @@ final class ClarityEnhanceProgressTests: XCTestCase {
         XCTAssertTrue(p.isEnhancingClarity)
         p.clarityEnhanceState = .idle
         XCTAssertFalse(p.isEnhancingClarity)
-        p.clarityEnhanceState = .failed("测试错误")
-        XCTAssertFalse(p.isEnhancingClarity, "失败态不应算作进行中")
     }
 
     @MainActor
@@ -109,7 +107,7 @@ extension ClarityEnhanceProgressTests {
         let start = Date()
         let result = try ProjectState.runClarityEnhancePipeline(
             sourceURL: video, trimStart: 0, duration: 2,
-            scale: .x2, model: .x2, workDir: workDir, outputURL: outputURL,
+            model: .x2, workDir: workDir, outputURL: outputURL,
             cancelFlag: cancelFlag,
             onStateChange: { state in observedStates.append(state) }
         )
@@ -119,8 +117,8 @@ extension ClarityEnhanceProgressTests {
         XCTAssertTrue(FileManager.default.fileExists(atPath: outputURL.path), "应该生成输出视频文件")
         let size = (try? FileManager.default.attributesOfItem(atPath: outputURL.path)[.size] as? Int) ?? 0
         print("[TEST] Clarity pipeline end-to-end: elapsed=\(String(format: "%.2f", elapsed))s, "
-              + "output size=\(size ?? 0) bytes, states=\(observedStates.count)")
-        XCTAssertGreaterThan(size ?? 0, 1000, "输出文件应该有实际内容，不是空文件或错误输出")
+              + "output size=\(size) bytes, states=\(observedStates.count)")
+        XCTAssertGreaterThan(size, 1000, "输出文件应该有实际内容，不是空文件或错误输出")
 
         // 阶段应该按 extractingFrames -> inferring -> encoding 的顺序推进（各阶段可能连续
         // 出现多次，尤其 inferring 每帧回调一次），不应该出现倒退
