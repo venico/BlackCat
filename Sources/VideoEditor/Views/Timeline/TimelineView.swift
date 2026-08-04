@@ -259,8 +259,12 @@ struct TimelineView: View {
                     addTrackMenu
 
                     ZStack(alignment: .topLeading) {
+                        // 刻度必须画到跟内容区一样远。原来只画到 max(duration,
+                        // contentEndTime)，而内容区还多带 300pt 余量——那截尾巴滚得
+                        // 过去却没有刻度，就是时间轴最右边空一块的原因
                         TimelineRuler(pps: project.pixelsPerSecond,
-                                      duration: max(clock.duration, project.contentEndTime),
+                                      duration: project.timelineContentWidth(viewportWidth: clipW)
+                                                / max(project.pixelsPerSecond, 0.001),
                                       scrollOffsetX: scrollOffsetX, vpWidth: clipW)
                             .frame(width: clipW, height: rulerH)
                         // 播放头三角 + 补一段竖线到顶条底部，与轨道区竖线无缝相接
@@ -825,7 +829,10 @@ struct TimelineView: View {
         GeometryReader { visibleGeo in
             let visibleW = visibleGeo.size.width
             let _ = updateVisibleWidth(visibleW)
-            let contentW = max(clock.duration, project.contentEndTime) * project.pixelsPerSecond + 300
+            // 末尾余量给足一屏（原来是固定 300pt）。两个作用：素材能往内容之后拖，
+            // 以及内容很短时滚动条不会长得几乎占满整条轨道——滚动条长度就是
+            // 「视口 / 内容宽」，余量太小它就短不下来
+            let contentW = project.timelineContentWidth(viewportWidth: visibleW)
             let totalW = max(contentW, max(visibleW, 800))
             let effectiveH = max(totalContentH(), viewportH)
             ZStack(alignment: .bottom) {
