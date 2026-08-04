@@ -316,23 +316,88 @@ extension ProjectState {
         // 7680x4320/40 帧不加 autoreleasepool 会从 8.2MB 一路涨到 5GB+
         // （jetsam 杀掉的量级），加了之后稳定在 400MB 左右。autoreleasepool
         // 是 rethrows，直接包住 try 调用不需要额外处理错误
-        for (index, frameURL) in frames.enumerated() {
-            try autoreleasepool {
-                try checkCancelled()
-                guard let src = CGImageSourceCreateWithURL(frameURL as CFURL, nil),
-                      let cg = CGImageSourceCreateImageAtIndex(src, 0, nil) else {
-                    throw ClarityEnhancer.EnhanceError.badOutput
+        //
+        // 并发策略：把帧切成若干批，**批内并行、批间串行**。批大小就是并发上限，
+        // 所以峰值内存最多是「单帧峰值 × 并发数」，不会随总帧数增长——这是上面
+        // 那条 OOM 教训之后必须守住的约束，也是不直接用一个大 concurrentPerform
+        // （并发度由系统按核数决定，无法控内存）的原因。
+        //
+        // 用 DispatchQueue.concurrentPerform 而不是 TaskGroup：整条流水线跑在
+        // Thread.detachNewThread 的专属线程上，是同步阻塞的世界，不能中途切进
+        // Swift 并发的协作池（这正是本项目踩过的坑，见文件头注释）。
+        // concurrentPerform 本身是同步阻塞的，语义上正好对得上。
+        //
+        // MLModel.prediction 是线程安全的（Apple 官方保证），ClarityEnhancer 里
+        // 的模型缓存本来就有 NSLock 保护，每个 tile 的 MLMultiArray 都是各线程
+        // 自己新建的，不共享。
+        // 共享可变状态必须放在引用类型里，不能让并发闭包直接捕获并修改外层的局部
+        // var——即使自己上了锁，Swift 运行时的独占访问检查（exclusivity enforcement）
+        // 也不认识这把锁，会直接 SIGTRAP 崩掉。这跟 ClarityCancelFlag 是同一个模式。
+        let shared = ClarityParallelState(total: frames.count)
+
+        // 并发度必须按**输出分辨率**动态定，不能写死——并发 N 帧就是 N 份单帧峰值
+        // 内存，素材越大越危险，写死 4 等于把上面刚修掉的 OOM 换个形式放回来。
+        //
+        // 单帧峰值实测约 48 bytes/输出像素（40 帧 960x720 x4、并发 4 实测进程峰值
+        // 2110MB，单帧输出 3840x2880=1106万像素 → 527MB/帧）。这个系数涵盖了
+        // Y/Cb/Cr 三个 float 平面 + 输出 RGBA + CGImage/PNG 编码缓冲。
+        //
+        // 预算取「物理内存的 1/8，上限 2GB」：8GB 机器 1GB、16GB 及以上 2GB。
+        // 挂钩物理内存是因为写死的绝对值在小内存机器上偏激进、在大内存机器上又
+        // 白白浪费并发。按这个预算：640x480 素材（x2/x4）吃满 4 并发；1080p x2
+        // 也是 4；1080p x4（输出 7680x4320）单帧就要 1.6GB，自动退回串行——
+        // 慢，但不会崩，这个取舍方向不能反。
+        //
+        // 尺寸从抽出来的第一帧读（只读属性不解码，很轻量），比用 clip.videoWidth
+        // 可靠——后者在没探测过尺寸的新建 clip 上是 0。
+        let concurrency: Int = {
+            let hardCap = max(1, min(4, ProcessInfo.processInfo.activeProcessorCount))
+            guard let first = frames.first,
+                  let src = CGImageSourceCreateWithURL(first as CFURL, nil),
+                  let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any],
+                  let fw = props[kCGImagePropertyPixelWidth] as? Int,
+                  let fh = props[kCGImagePropertyPixelHeight] as? Int,
+                  fw > 0, fh > 0
+            else { return min(2, hardCap) }  // 读不出尺寸就取保守的中间值
+            let scale = model == .x2 ? 2 : 4
+            let outputPixels = Double(fw * scale) * Double(fh * scale)
+            let perFrameBytes = outputPixels * 48
+            let budget = min(2_000_000_000.0, Double(ProcessInfo.processInfo.physicalMemory) / 8)
+            let byMemory = Int(budget / max(perFrameBytes, 1))
+            return max(1, min(hardCap, byMemory))
+        }()
+
+        for chunkStart in stride(from: 0, to: frames.count, by: concurrency) {
+            try checkCancelled()
+            if let e = shared.firstError { throw e }
+
+            let chunkCount = min(concurrency, frames.count - chunkStart)
+            DispatchQueue.concurrentPerform(iterations: chunkCount) { offset in
+                // 同批里已经有帧失败、或用户已取消，就别再开工做无用功
+                if shared.firstError != nil || cancelFlag.isCancelled { return }
+
+                autoreleasepool {
+                    do {
+                        let frameURL = frames[chunkStart + offset]
+                        guard let src = CGImageSourceCreateWithURL(frameURL as CFURL, nil),
+                              let cg = CGImageSourceCreateImageAtIndex(src, 0, nil) else {
+                            throw ClarityEnhancer.EnhanceError.badOutput
+                        }
+                        let enhanced = try ClarityEnhancer.enhance(cgImage: cg, model: model)
+                        let outFrameURL = outputFrameDir.appendingPathComponent(frameURL.lastPathComponent)
+                        let rep = NSBitmapImageRep(cgImage: enhanced)
+                        guard let data = rep.representation(using: .png, properties: [:]) else {
+                            throw ClarityEnhancer.EnhanceError.badOutput
+                        }
+                        try data.write(to: outFrameURL)
+                        onStateChange(.inferring(shared.recordCompletedAndProgress()))
+                    } catch {
+                        shared.record(error)
+                    }
                 }
-                let enhanced = try ClarityEnhancer.enhance(cgImage: cg, model: model)
-                let outFrameURL = outputFrameDir.appendingPathComponent(frameURL.lastPathComponent)
-                let rep = NSBitmapImageRep(cgImage: enhanced)
-                guard let data = rep.representation(using: .png, properties: [:]) else {
-                    throw ClarityEnhancer.EnhanceError.badOutput
-                }
-                try data.write(to: outFrameURL)
-                onStateChange(.inferring(Double(index + 1) / Double(frames.count)))
             }
         }
+        if let e = shared.firstError { throw e }
         try checkCancelled()
 
         onStateChange(.encoding)
@@ -347,5 +412,40 @@ extension ProjectState {
         let dir = base.appendingPathComponent("黑猫剪辑/clarity/output", isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir
+    }
+}
+
+/// 逐帧并发处理时的共享可变状态（完成计数 + 首个错误）。
+///
+/// 必须是 class：`DispatchQueue.concurrentPerform` 的闭包如果直接捕获并修改外层
+/// 函数里的局部 `var`，会触发 Swift 运行时的独占访问检查（exclusivity
+/// enforcement）而 SIGTRAP 崩溃——自己加 NSLock 也没用，那套检查不认识锁，它管的
+/// 是"同一块内存有没有被并发地独占访问"。把状态挪进引用类型、只通过方法读写，
+/// 闭包捕获的就只是一个不可变的引用，检查自然不再触发。锁的写法照抄同文件
+/// ClarityCancelFlag。
+final class ClarityParallelState: @unchecked Sendable {
+    private let lock = NSLock()
+    private var completed = 0
+    private var _firstError: Error?
+    private let total: Int
+
+    init(total: Int) { self.total = max(1, total) }
+
+    /// 记一帧完成，返回当前整体进度（0...1）
+    func recordCompletedAndProgress() -> Double {
+        lock.lock(); defer { lock.unlock() }
+        completed += 1
+        return Double(completed) / Double(total)
+    }
+
+    /// 只留第一个错误——后面的多半是同一个原因的连锁反应，报第一个更有诊断价值
+    func record(_ error: Error) {
+        lock.lock(); defer { lock.unlock() }
+        if _firstError == nil { _firstError = error }
+    }
+
+    var firstError: Error? {
+        lock.lock(); defer { lock.unlock() }
+        return _firstError
     }
 }
