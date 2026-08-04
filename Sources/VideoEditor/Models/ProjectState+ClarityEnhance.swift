@@ -16,14 +16,34 @@ extension ProjectState {
     /// 每帧输出 PNG 的估算体积（1080p 放大到 4K 级别，粗略上限），用于磁盘空间检查。
     /// 这个数字只取决于输出分辨率，跟具体用什么超分模型无关，不需要因为换了 FSRCNN 而调整
     private static let estimatedBytesPerFrame: Int64 = 4_000_000
-    /// 单帧推理耗时（毫秒），Task 3 实测数据（真实权重模型，两个 scale 均用
-    /// .cpuAndGPU，详见 ClarityEnhancer.computeUnits）：x4 单 tile 1.58ms，
-    /// x2 单 tile 1.55ms，1080p 每帧 40 个 tile
+    /// 单帧推理耗时（毫秒）。Task 12 端到端集成测试实测（真实权重模型，完整走一遍
+    /// ClarityEnhancer.enhance() 调用链路——不是只测 CoreML 推理本身，640x480 测试
+    /// 素材，模型已预热后的稳态耗时）：x2 ≈ 1484ms/帧，x4 ≈ 5244ms/帧。
+    ///
+    /// 这组数字取代了原先"x4 单 tile 1.58ms、x2 单 tile 1.55ms，1080p 每帧 40 个
+    /// tile"的估算公式（Task 3 数据）——那组数字被 Task 12 的端到端测试证伪：按原
+    /// 公式，90 帧 640x480 x2 测试素材应该只要约 5.6 秒，实测却跑了 113~138 秒，
+    /// 差了 20~25 倍。逐段计时定位到瓶颈在 mlModel.prediction(from:) 这一次同步
+    /// 调用本身（≈130ms/tile），试过 .cpuOnly/.all/.cpuAndGPU 三种 computeUnits
+    /// 耗时几乎一样，说明是这次同步调用本身的固定开销，不是算力选型能解决的；
+    /// 真要解决需要把多个 tile 合并成一次 batch 调用摊薄这个固定开销，这是比这里
+    /// 修耗时提示阈值更大的架构改动，超出 Task 12 范围，如实记录、留给后续评估，
+    /// 不假装问题不存在。（另外顺手修了 ClarityEnhancer.runOneTile 里逐元素
+    /// `MLMultiArray[i] = NSNumber(value:)`/`.floatValue` 装箱的性能坑——参照
+    /// BiRefNetSegmenter.maskImage 的先例改成 dataPointer 批量读写，这个坑真实
+    /// 存在且已修，但不是耗时的主要来源，主要来源是上面这条同步调用本身。）
+    ///
+    /// 注意：这里测的是 640x480（偏低）分辨率源素材，真实 1080p 素材每帧 tile
+    /// 数更多（约 40 个，640x480 只有 6 个）、色彩空间转换等非 tile 步骤也随
+    /// 分辨率增大而变慢，实际耗时只会比这个数字更高——这是刻意保守的下限估算，
+    /// 不是精确值，宁可提示阈值触发得更容易，也不要让用户在毫无预期的情况下
+    /// 干等几分钟。
     private static func estimatedMsPerFrame(scale: ClarityScale) -> Double {
-        scale == .x4 ? 1.58 * 40 : 1.55 * 40
+        scale == .x4 ? 5244.0 : 1484.0
     }
-    /// 耗时预计超过这个秒数就弹确认框。FSRCNN 实测速度下，绝大多数正常长度的片段
-    /// 都不会触发这个提示——这个提示是给异常长片段兜底的，不是常态
+    /// 耗时预计超过这个秒数就弹确认框。FSRCNN 实测速度下，绝大多数正常长度（几秒
+    /// 以上）的片段都会触发这个提示——这不是异常片段的兜底，是当前实现下的常态，
+    /// 提示阈值本身不需要因此调高：处理确实要花这么久，用户应该被提前告知
     private static let confirmThresholdSeconds: Double = 60
     /// 分辨率上限：短边达到这个像素数就提示"已经比较清晰"（x4 用更低阈值，x2 用更高阈值）
     private static func resolutionWarningThreshold(scale: ClarityScale) -> Double {

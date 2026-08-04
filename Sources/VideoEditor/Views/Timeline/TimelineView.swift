@@ -944,6 +944,29 @@ struct TimelineView: View {
                             }
                             .disabled(!project.canRemoveBackgroundMusic)
                         }
+                        // 清晰度提升只对视频有意义（音频没有清晰度概念），单独用
+                        // selectedVideoClipID 分支包裹，不复用上面分离音轨的 OR 条件——
+                        // 跟下面「去除背景」（仅图片，canRemoveImageBackground 同样是
+                        // `guard !isXxx else return false; return selectedImageClipID != nil`
+                        // 的形状）保持同一套模式：只对单一片段类型有意义的功能，用自己的
+                        // if 分支控制显隐，而不是挂在别的功能的 OR 分支下用 .disabled 兜底
+                        // ——否则右键音频片段时会看到一个永远灰着的「清晰度提升」，容易让人
+                        // 误以为是 bug。canEnhanceClarity 内部仍会检查 selectedVideoClipID，
+                        // .disabled 在这里只负责处理"任务进行中不能重复触发"这一种状态。
+                        if project.selectedVideoClipID != nil {
+                            Divider()
+                            Menu {
+                                Button { project.enhanceClaritySelection(scale: .x2) } label: {
+                                    Text("放大 2 倍")
+                                }
+                                Button { project.enhanceClaritySelection(scale: .x4) } label: {
+                                    Text("放大 4 倍")
+                                }
+                            } label: {
+                                Label("清晰度提升", systemImage: "sparkles")
+                            }
+                            .disabled(!project.canEnhanceClarity)
+                        }
                         if !project.selectedSubtitleClipsForTTS.isEmpty {
                             Divider()
                             Button { project.convertSelectedSubtitlesToSpeech() } label: {

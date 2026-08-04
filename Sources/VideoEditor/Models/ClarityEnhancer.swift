@@ -259,12 +259,22 @@ enum ClarityEnhancer {
 
     /// 单 tile 推理：输入 tileSize x tileSize 的 Float 数组（0...1），
     /// 输出 (tileSize*scale) x (tileSize*scale) 的 Float 数组（0...1，未裁剪 clamp）
+    ///
+    /// Task 12 端到端集成测试实测发现：640x480/3秒/x2 的测试素材（90帧 x 6 tile）
+    /// 跑了 113 秒——跟 Task 3 记录的 x2 单 tile 1.55ms 差了两个数量级，不是模型
+    /// 推理本身慢，是这个函数原本逐元素 `inputArray[i] = NSNumber(value:)` /
+    /// `outArray[i].floatValue` 读写 MLMultiArray：x2 单 tile 输出就有
+    /// 512x512=262144 个元素，每个都要装一次 NSNumber，这才是真正的耗时大头。
+    /// BiRefNetSegmenter.maskImage 早就踩过同一个坑（注释原话："逐个下标访问
+    /// MLMultiArray 在百万像素级别慢得离谱"），这里改成同一套解法：用
+    /// dataPointer 绑定成类型化指针直接读写，跳过 NSNumber 装箱/拆箱。
     private static func runOneTile(_ tile: [Float], mlModel: MLModel) throws -> [Float] {
         guard let inputArray = try? MLMultiArray(shape: [1, 1, NSNumber(value: tileSize), NSNumber(value: tileSize)],
                                                  dataType: .float32) else {
             throw EnhanceError.inferenceFailed("输入 MLMultiArray 创建失败")
         }
-        for i in 0..<tile.count { inputArray[i] = NSNumber(value: tile[i]) }
+        let inPtr = inputArray.dataPointer.bindMemory(to: Float32.self, capacity: tile.count)
+        for i in 0..<tile.count { inPtr[i] = tile[i] }
 
         let inputName = mlModel.modelDescription.inputDescriptionsByName.keys.first ?? "input_y"
         let provider: MLFeatureProvider
@@ -284,8 +294,35 @@ enum ClarityEnhancer {
               let outArray = result.featureValue(for: outName)?.multiArrayValue else {
             throw EnhanceError.badOutput
         }
-        var out = [Float](repeating: 0, count: outArray.count)
-        for i in 0..<outArray.count { out[i] = outArray[i].floatValue }
+        return try readMultiArrayFast(outArray)
+    }
+
+    /// 把模型输出的 MLMultiArray 批量读成 [Float]，用 dataPointer 走类型化指针
+    /// （见 runOneTile 顶部注释）。跟 BiRefNetSegmenter.maskImage 一样按
+    /// dataType 分支处理：float32/double 直接指针读，float16 没有原生可绑的
+    /// Swift 类型，借官方 MLMultiArray(shape:dataType:) 转成 float32 再读
+    /// （这条分支本身仍是逐元素装箱，但 FSRCNN 导出用的是 float32，预期不会
+    /// 走到这里，保留只是防御性兜底，不因为 dtype 意外而崩溃）。
+    private static func readMultiArrayFast(_ array: MLMultiArray) throws -> [Float] {
+        let count = array.count
+        var out = [Float](repeating: 0, count: count)
+        switch array.dataType {
+        case .float32:
+            let p = array.dataPointer.bindMemory(to: Float32.self, capacity: count)
+            for i in 0..<count { out[i] = p[i] }
+        case .double:
+            let p = array.dataPointer.bindMemory(to: Double.self, capacity: count)
+            for i in 0..<count { out[i] = Float(p[i]) }
+        case .float16:
+            guard let converted = try? MLMultiArray(shape: array.shape, dataType: .float32) else {
+                throw EnhanceError.badOutput
+            }
+            for i in 0..<count { converted[i] = array[i] }
+            let p = converted.dataPointer.bindMemory(to: Float32.self, capacity: count)
+            for i in 0..<count { out[i] = p[i] }
+        default:
+            throw EnhanceError.badOutput
+        }
         return out
     }
 }
