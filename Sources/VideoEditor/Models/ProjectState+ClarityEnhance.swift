@@ -165,7 +165,7 @@ extension ProjectState {
         let duration = clip.duration * clip.speed
         let sourceTrackID = track.id
         let sourceName = url.deletingPathExtension().lastPathComponent
-        let estimatedFrameCount = Int(duration * 30.0)  // 固定输出帧率 30fps，跟下面 extractFrames 用的一致
+        let estimatedFrameCount = Int(duration * 30.0)  // 固定输出帧率 30fps，跟下面流水线里的 frameRate 一致
 
         // 边界检查 1：分辨率已经较高，放大收益有限——提示但不阻止
         let shortSide = min(clip.videoWidth, clip.videoHeight)

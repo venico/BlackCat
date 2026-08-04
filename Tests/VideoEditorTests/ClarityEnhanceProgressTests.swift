@@ -60,9 +60,9 @@ extension ClarityEnhanceProgressTests {
 // MARK: - Task 9 补充: runClarityEnhancePipeline 端到端集成测试
 //
 // Task 5(模型下载)/Task 6(CoreML 推理)/Task 8(ffmpeg 抽帧编码) 各自都已经过独立验证，
-// 但它们串起来是否真的顺畅衔接（ClarityFrameIO.extractFrames 输出的文件名规则、
-// ClarityEnhancer.enhance 读取 CGImageSourceCreateWithURL 的方式、NSBitmapImageRep
-// 写出的 PNG 交给 ClarityFrameIO.encodeFrames 读取）是 Task 9 独有的集成风险，
+// 但它们串起来是否真的顺畅衔接（解码进程吐出的 rawvideo 帧字节 → ClarityEnhancer
+// 的超分 → 写回编码进程 stdin，三者对宽高/像素格式/字节数的约定必须完全一致）
+// 是这一层独有的集成风险，
 // 前面几个任务的单测都测不到，这里用 ffmpeg testsrc 生成的短视频跑一遍完整流程验证。
 
 extension ClarityEnhanceProgressTests {
