@@ -1055,7 +1055,10 @@ struct TimelineView: View {
                 .onContinuousHover { phase in
                     switch phase {
                     case .active(let loc):
-                        scrollBarHovered = loc.y > effectiveH - 24
+                        // 24 必须 ≤ TimelineScrollBar.hitH(22) 对应的实际可点范围，
+                        // 否则最下面那几 pt 是"看得见滚动条、却拖不动"的死区。
+                        // 这里取 22 跟它对齐
+                        scrollBarHovered = loc.y > effectiveH - 22
                         let hoverTime = loc.x / project.pixelsPerSecond
                         if loc.y >= rulerH, let hm = project.allMarkersAbsolute.first(where: {
                             abs($0.absoluteTime - hoverTime) * project.pixelsPerSecond < 6
@@ -5082,6 +5085,11 @@ private struct TimelineScrollBar: View {
     @State private var dragStartFraction: Double = 0
 
     private let barH: CGFloat = 6
+    /// 滑块的**命中**高度。视觉上仍是 barH(6pt) 的细条，但只有 6pt 可点实在太难瞄——
+    /// 鼠标差几个像素就落空，事件穿到下面的轨道区变成框选（用户原话："放上去了
+    /// 拖动结果是框选"）。这个值跟父视图 onContinuousHover 里
+    /// `loc.y > effectiveH - 24` 的 24pt 对齐：看得见滚动条的地方就一定拖得动。
+    private let hitH: CGFloat = 22
 
     var body: some View {
         GeometryReader { geo in
@@ -5095,11 +5103,26 @@ private struct TimelineScrollBar: View {
                 RoundedRectangle(cornerRadius: 6)
                     .fill(Color.white.opacity(0.08))
                     .frame(width: trackW, height: barH)
+                    // 轨道背景也接事件：点空白处直接把滑块挪过去（标准滚动条行为），
+                    // 不接的话点在滑块之外就穿透下去变成框选，跟点不中滑块是同一个毛病
+                    .frame(width: trackW, height: hitH)
+                    .contentShape(Rectangle())
                     .offset(x: 8)
+                    .gesture(
+                        DragGesture(minimumDistance: 0)
+                            .onChanged { v in
+                                // 让滑块中心落到指针处
+                                onDrag(((v.location.x - knobW / 2) / maxOffset).clamped(to: 0...1))
+                            }
+                    )
 
                 RoundedRectangle(cornerRadius: 6)
                     .fill(Color.white.opacity(isDragging ? 0.55 : 0.35))
                     .frame(width: knobW, height: barH)
+                    // 外层撑到 hitH 再配 contentShape：视觉还是那条 6pt 细线（在
+                    // 22pt 里垂直居中），但上下各多出 8pt 的可点范围
+                    .frame(width: knobW, height: hitH)
+                    .contentShape(Rectangle())
                     .offset(x: knobX)
                     .gesture(
                         DragGesture(minimumDistance: 1)
@@ -5114,10 +5137,14 @@ private struct TimelineScrollBar: View {
                             .onEnded { _ in isDragging = false }
                     )
             }
-            .frame(height: barH)
+            .frame(height: hitH)
             .opacity(show ? 1 : 0)
+            // opacity 0 的视图照样会接事件。命中区域从 6pt 放大到 22pt 之后，
+            // 不加这句的话滚动条隐藏时底部那 22pt 会把框选的拖拽吃掉——
+            // 修一个手感问题反而制造另一个
+            .allowsHitTesting(show)
             .animation(.easeInOut(duration: show ? 0.15 : 0.4), value: show)
         }
-        .frame(height: barH + 4)
+        .frame(height: hitH)
     }
 }
