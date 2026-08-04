@@ -15,6 +15,7 @@ struct SettingsView: View {
     @State private var sceneDetectState: ModelState = .notDownloaded
     @State private var demucsState: ModelState = .notDownloaded
     @State private var biRefNetStates: [BiRefNetModel: ModelState] = [:]
+    @State private var clarityModelStates: [ClarityModel: ModelState] = [:]
     // 分离产物占用，进设置页和每次清理后刷新
     @State private var separatedFiles: [URL] = []
     @State private var separatedBytes: Int64 = 0
@@ -84,7 +85,7 @@ struct SettingsView: View {
         }
         .frame(width: 540, height: 520)
         .background(Color(red: 0.13, green: 0.13, blue: 0.14))
-        .onAppear { refreshModelStates(); refreshSceneDetectState(); refreshDemucsState(); refreshSeparated(); refreshBiRefNetStates() }
+        .onAppear { refreshModelStates(); refreshSceneDetectState(); refreshDemucsState(); refreshSeparated(); refreshBiRefNetStates(); refreshClarityModelStates() }
     }
 
     /// 标签页内的一级标题，用来分块
@@ -781,6 +782,31 @@ struct SettingsView: View {
                 .font(.system(size: 10))
                 .foregroundColor(Color.labelSecondary)
 
+            sectionTitle("清晰度提升")
+
+            ForEach(ClarityModel.allCases) { model in
+                HStack(spacing: 10) {
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(model.displayName)
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundColor(Color.labelPrimary)
+                        Text(model.sizeDesc)
+                            .font(.system(size: 10))
+                            .foregroundColor(Color.labelSecondary)
+                    }
+                    Spacer()
+                    clarityModelStatusView(model)
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 8)
+                .background(Color.white.opacity(0.04))
+                .cornerRadius(7)
+            }
+
+            Text("安装后可在时间轴视频片段右键使用「清晰度提升」，把低清素材放大为高清版本，新建独立轨道，不影响原片段。")
+                .font(.system(size: 10))
+                .foregroundColor(Color.labelSecondary)
+
             sectionTitle("AI 剪辑")
 
             SSection(title: "") {
@@ -824,6 +850,78 @@ struct SettingsView: View {
                 await MainActor.run { sceneDetectState = .downloaded }
             } catch {
                 await MainActor.run { sceneDetectState = .failed(error.localizedDescription) }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func clarityModelStatusView(_ model: ClarityModel) -> some View {
+        let state = clarityModelStates[model] ?? .notDownloaded
+        switch state {
+        case .downloaded:
+            Text("已安装")
+                .font(.system(size: 10, weight: .medium))
+                .foregroundColor(.green.opacity(0.8))
+                .padding(.horizontal, 8).frame(height: 24)
+                .background(Color.green.opacity(0.1))
+                .cornerRadius(4)
+        case .notDownloaded:
+            Button { downloadClarityModel(model) } label: {
+                Text("下载")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundColor(Color.accent)
+                    .padding(.horizontal, 10).frame(height: 24)
+                    .background(Color.accent.opacity(0.15))
+                    .cornerRadius(4)
+            }
+            .buttonStyle(.plain)
+        case .downloading(let pct):
+            HStack(spacing: 6) {
+                ProgressView(value: pct)
+                    .frame(width: 50)
+                    .tint(Color.accent)
+                Text("\(Int(pct * 100))%")
+                    .font(.system(size: 10).monospacedDigit())
+                    .foregroundColor(Color.labelSecondary)
+                    .frame(width: 28)
+            }
+        case .failed(let msg):
+            HStack(spacing: 6) {
+                Text(msg)
+                    .font(.system(size: 9))
+                    .foregroundColor(.red.opacity(0.8))
+                    .lineLimit(1)
+                    .frame(maxWidth: 80)
+                Button { downloadClarityModel(model) } label: {
+                    Text("重试")
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundColor(Color.accent)
+                        .padding(.horizontal, 8).frame(height: 24)
+                        .background(Color.accent.opacity(0.15))
+                        .cornerRadius(4)
+                }
+                .buttonStyle(.plain)
+            }
+        }
+    }
+
+    private func refreshClarityModelStates() {
+        for model in ClarityModel.allCases {
+            if case .downloading = clarityModelStates[model] { continue }
+            clarityModelStates[model] = model.isDownloaded ? .downloaded : .notDownloaded
+        }
+    }
+
+    private func downloadClarityModel(_ model: ClarityModel) {
+        clarityModelStates[model] = .downloading(0)
+        Task {
+            do {
+                try await model.download { pct in
+                    DispatchQueue.main.async { clarityModelStates[model] = .downloading(pct) }
+                }
+                await MainActor.run { clarityModelStates[model] = .downloaded }
+            } catch {
+                await MainActor.run { clarityModelStates[model] = .failed(error.localizedDescription) }
             }
         }
     }
