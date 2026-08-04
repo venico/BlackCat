@@ -276,7 +276,26 @@ struct TimelineView: View {
                     .frame(width: clipW, height: rulerH)
                     .background(Color(red: 0.09, green: 0.09, blue: 0.10))
                     .clipped()
-                    .allowsHitTesting(false)
+                    // 顶条自己接管点击/拖拽定位播放头，不再靠 allowsHitTesting(false)
+                    // 把事件漏给下层的滚动内容去处理。
+                    //
+                    // 原来那套在竖滑之后必然失效：顶条是 overlay、盖在滚动区上面，
+                    // 漏下去之后由统一手势用 `loc.y < rulerH` 判断"是不是点在刻度尺"，
+                    // 而那个 loc 是**滚动内容**的坐标 = 屏幕坐标 + 竖滚量。轨道一多、
+                    // 竖滑超过 26pt，点顶条漏下去的 loc.y 就已经大于 rulerH，判断落空，
+                    // 事件被当成点轨道区，于是选中了刻度尺正下方那条片段、播放头不动。
+                    //
+                    // 顶条固定不滚，它的 local 坐标恒等于屏幕坐标，这里直接算时间即可。
+                    // x 要加回 scrollOffsetX 换算到内容坐标系——正是刻度尺画播放头三角
+                    // 那个公式（px = time*pps - scrollOffsetX）的逆运算。
+                    .contentShape(Rectangle())
+                    .gesture(
+                        DragGesture(minimumDistance: 0)
+                            .onChanged { v in
+                                let t = max(0, (v.location.x + scrollOffsetX) / project.pixelsPerSecond)
+                                project.requestSeek(to: t)
+                            }
+                    )
                 }
             }
             .frame(height: rulerH)
