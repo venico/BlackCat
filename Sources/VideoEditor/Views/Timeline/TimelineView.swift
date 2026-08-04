@@ -3271,25 +3271,36 @@ private struct VideoClipView: View {
         let visRight = scrollOffsetX + max(project.timelineVisibleWidth, 400) - clipStartX + thumbW
         let startIdx = max(0, Int(floor(visLeft / thumbW)))
         let endIdx = max(startIdx, min(count, Int(ceil(visRight / thumbW))))
-        HStack(spacing: 0) {
-            if startIdx > 0 {
-                Color.clear.frame(width: thumbW * CGFloat(startIdx), height: thumbH)
-            }
+        // 每张缩略图按索引**绝对定位**，不用 HStack 流式布局 + 空占位撑位置。
+        //
+        // 流式布局的问题只在多片段时才暴露：头部占位宽度是 thumbW * startIdx，
+        // 而 startIdx 由 (scrollOffsetX - clip.startTime * pps) 推出来。单条片段
+        // startTime 通常是 0，startIdx 基本恒为 0、根本走不到占位那条路；多条片段
+        // 每条的 startTime 都不同，缩放时 pps 和 scrollOffsetX 只要有一帧不同步，
+        // startIdx 就会跳一格，头部占位跟着跳一个 thumbW，整条图平移一格——
+        // 表现出来就是"多条片段缩放时晃，单条不晃"。
+        //
+        // 绝对定位后，每张图的 x 只由它自己的索引决定（thumbW * i），跟 startIdx、
+        // 跟渲染了多少张都无关。虚拟化窗口怎么抖，已渲染的图都待在原地不动。
+        ZStack(alignment: .topLeading) {
+            // 撑满整条，保证 ZStack 尺寸稳定、不随渲染出的图数量变化
+            Color.clear.frame(width: clipWidth, height: thumbH)
             ForEach(startIdx..<endIdx, id: \.self) { i in
-                let t = clip.trimStart + clip.duration * max(0.01, clip.speed) * Double(i) / Double(count)
+                // 采样时间按**位置比例**算，不用 i/count。count 是 ceil 出来的整数，
+                // 缩放时 clipWidth 连续变而 count 跳变，i/count 会突然跳一下，
+                // closestFrame 就选到另一帧、图片内容闪一下。用 (thumbW*i)/clipWidth
+                // 是连续量，缩放过程中采样点平滑移动，不会闪。
+                let posRatio = clipWidth > 0 ? Double(thumbW * CGFloat(i) / clipWidth) : 0
+                let t = clip.trimStart + clip.duration * max(0.01, clip.speed) * min(1, posRatio)
                 let frame = closestFrame(frames, at: t)
+                // 最后一格用余数宽度，避免最后一张越过片段右边缘
+                let wCell = i == count - 1 ? max(0, clipWidth - thumbW * CGFloat(count - 1)) : thumbW
                 Image(nsImage: frame.image)
                     .resizable()
                     .aspectRatio(contentMode: .fill)
-                    .frame(width: i == count - 1 ? clipWidth - thumbW * CGFloat(count - 1) : thumbW,
-                           height: thumbH)
+                    .frame(width: wCell, height: thumbH)
                     .clipped()
-            }
-            if endIdx < count {
-                // 尾部占位必须用「剩余真实宽度」，不能用 thumbW*格数：
-                // 最后一格是余数宽度，按整格算会让内容总宽 > clipWidth，
-                // HStack 居中后整条缩略图左右跳动
-                Color.clear.frame(width: max(0, clipWidth - thumbW * CGFloat(endIdx)), height: thumbH)
+                    .offset(x: thumbW * CGFloat(i))
             }
         }
         // alignment 必须显式给 .leading。默认是 .center，一旦 HStack 内容的实际
