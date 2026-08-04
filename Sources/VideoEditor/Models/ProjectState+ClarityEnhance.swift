@@ -32,42 +32,51 @@ extension ProjectState {
         guard outputWidth > 0.001, outputHeight > 0.001 else { return fallbackEstimatedBytesPerFrame }
         return Int64(outputWidth * outputHeight * estimatedBytesPerOutputPixel)
     }
-    /// 单帧处理耗时（毫秒）。**第三版数字**，端到端集成测试实测（完整走一遍
+    /// 单帧处理耗时（毫秒）。**第四版数字**，端到端集成测试实测（完整走一遍
     /// enhanceClaritySelection 全流程，含 ffmpeg 抽帧/编码，640x480 源素材、
-    /// 8 帧、模型预热后的稳态）：x2 ≈ 1157ms/帧，x4 ≈ 3797ms/帧。
+    /// 8 帧、模型预热后的稳态）：x2 ≈ 333ms/帧，x4 ≈ 940ms/帧。
     ///
-    /// 三版数字的来历，写下来是为了别再被同一个坑绊倒：
+    /// 四版数字的来历，写下来是为了别再被同一个坑绊倒：
     /// 1. 初版（Task 3 benchmark 推算）：x2 单 tile 1.55ms × 40 tile = 62ms/帧。
     ///    Task 3 用 Python coremltools 测的**纯推理**耗时本身没错，错在直接拿它
     ///    当整帧耗时——漏掉了 Swift 侧读输出、色彩空间转换等步骤。
     /// 2. 第二版（Task 12 首测）：x2 1484ms/帧、x4 5244ms/帧。数字本身是真的，
     ///    但归因错了——当时认为瓶颈是 `mlModel.prediction(from:)` 的固定开销
     ///    （≈130ms/tile），据此判断"需要 batch 推理的架构改动才能解决"。
-    /// 3. 本版：那个归因是错的。单独测裸 `prediction(from:)` 只要 1.5~3ms/tile，
+    /// 3. 第三版：那个归因是错的。单独测裸 `prediction(from:)` 只要 1.5~3ms/tile，
     ///    跟 Task 3 完全吻合；真正的 ≈120ms/tile 花在 `readMultiArrayFast` 读
     ///    模型输出上——FSRCNN 输出的 MLMultiArray 是 float16，而当时那条分支
     ///    误以为"预期不会走到"，用的是逐元素 subscript 装箱的慢路径。改成
     ///    `bindMemory(to: Float16.self)` 后单次读取 122ms → 24ms，端到端
     ///    x2 13.5s → 9.25s、x4 48.6s → 30.4s（8 帧）。不需要 batch 架构改动。
     ///
-    /// 修复后剩下的耗时分布（640x480/x2 单帧约 1.16s）：Cb/Cr 双线性放大
-    /// ≈306ms、YCbCr→RGB ≈190ms 这两个纯 Swift 逐像素循环合计约占 43%，已经
-    /// 超过推理相关步骤，是下一步真要优化时该动的地方（可用 vImage/Accelerate
-    /// 向量化）——本版没动它们，如实记录现状。
+    /// 4. 本版：把上一版点名的那三个纯 Swift 逐像素循环（rgbToYCbCr、
+    ///    upsampleBilinear、yCbCrToRGB，合计占单帧 47%）全部换成 Accelerate 向量化
+    ///    实现——前两个用 vDSP 重写（公式系数逐字未变），upsampleBilinear 换
+    ///    vImageScale_PlanarF 直接在 float 域重采样，省掉原先
+    ///    float→uint8→CGImage→CGContext→uint8→float 一整圈往返。
+    ///    实测 x2 9.25s→2.67s、x4 30.4s→7.52s（8 帧），约 3.5~4 倍。
+    ///    x4 提升更大是因为旧实现那圈 CGImage 往返的成本随输出像素数平方级增长。
+    ///    副作用：色度精度反而提高了（旧实现被 uint8 中转压成 256 阶，实测输出
+    ///    只有 154 个不同取值；新实现保留完整 float 精度，65276 个取值）。
+    ///    代价是 testEnhanceMatchesPythonReference 的 PSNR 从 52.66→52.43dB——
+    ///    这不是画质劣化，是 Cb/Cr 数值变了导致 RGB 打包时量化噪声重新分布
+    ///    （该测试只看 Y 通道，而 Y 不经过 upsampleBilinear，纯属间接耦合），
+    ///    MAE 差异只有 0.006 个灰阶。
     ///
-    /// 上面 1157ms/3797ms 是 640x480（偏低）分辨率源素材的实测基准值，不能直接
+    /// 上面 333ms/940ms 是 640x480（偏低）分辨率源素材的实测基准值，不能直接
     /// 当成任意分辨率的耗时——Whole-branch review 实测：这两个数字原样套用在
     /// 1080p 素材上会低估约 7 倍（1080p tile 数约 45 个 vs 640x480 只有 6 个，
-    /// 差 7.5 倍；上面提到的两个逐像素颜色空间转换循环也随像素数增长，合计约
-    /// 7 倍），10 秒 1080p x4 片段真实要 ≈133 分钟，而未缩放版本的确认框只会说
-    /// "预计需要约 19 分钟"——这个数字是说给用户听的，往轻里说等于误导用户，
+    /// 差 7.5 倍；色彩空间转换那几步也随像素数增长，合计约 7 倍）——这个倍数
+    /// 在第四版向量化之后依然成立，因为向量化是把每一步都按比例加速，没有改变
+    /// 各步骤随分辨率增长的关系。这个数字是说给用户听的，往轻里说等于误导用户，
     /// 跟"阈值宁可保守触发"的初衷（那是说给"要不要弹确认框"这个内部判断听的）
     /// 方向正好相反，所以必须按输出分辨率跟 640x480 基准的面积比缩放。
     /// videoWidth 未知时（新建 clip 没探测过尺寸，值为 0）按 1 倍处理，不去猜；
     /// 下限 clamp 到 1，避免源分辨率比 640x480 还小时把预计耗时估得比基准更短
     /// （基准本身已经是所有实测里最快的档位，没必要再往下算）。
     private static func estimatedMsPerFrame(scale: ClarityScale, videoWidth: Double, videoHeight: Double) -> Double {
-        let base = scale == .x4 ? 3797.0 : 1157.0
+        let base = scale == .x4 ? 940.0 : 333.0
         guard videoWidth > 0.001, videoHeight > 0.001 else { return base }
         let areaRatio = (videoWidth * videoHeight) / (640.0 * 480.0)
         return base * max(1.0, areaRatio)

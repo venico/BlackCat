@@ -31,7 +31,7 @@ final class ClarityEnhanceSelectionIntegrationTests: XCTestCase {
 
     /// 测试素材固定用这个时长：Int(0.28 * 30) = 8 帧，远离取整边界（不用 0.3
     /// 这种可能因为浮点误差落在 8/9 帧边界两侧的数字）。按实测最新的
-    /// estimatedMsPerFrame 640x480 基准值（x2 1157ms/帧、x4 3797ms/帧）算，
+    /// estimatedMsPerFrame 640x480 基准值（x2 333ms/帧、x4 940ms/帧）算，
     /// 8 帧 x4 预计约 30 秒、x2 约 9 秒，都在 60 秒确认框阈值以内，不会弹出
     /// 没人能点的 NSAlert.runModal() 模态框。这里的 VideoClip 没有设置
     /// videoWidth/videoHeight（保持默认值 0），estimatedMsPerFrame 按分辨率
