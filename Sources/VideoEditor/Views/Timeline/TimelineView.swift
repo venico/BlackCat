@@ -3113,6 +3113,12 @@ private struct VideoClipView: View {
         project.thumbnailsReloading.contains(clip.assetID)
     }
 
+    /// 生成中的空占位（目前来自「清晰度提升」：点完 x2/x4 立刻插一条空轨道，
+    /// 处理完再原地填成真实素材）。跟字幕翻译的占位共用 placeholderClipIDs
+    private var isPlaceholder: Bool {
+        project.placeholderClipIDs.contains(clip.id)
+    }
+
     @State private var editName: String = ""
     @State private var editing = false          // 本地编辑标志：置空 renamingClipID 后仍能提交
     @FocusState private var nameFieldFocused: Bool
@@ -3156,10 +3162,13 @@ private struct VideoClipView: View {
             } else {
                 RoundedRectangle(cornerRadius:6).fill(Color(hex:"#3DBFBA").opacity(0.82))
             }
-            // 重建缩略图时的呼吸遮罩
-            if isReloading {
+            // 重建缩略图 / 生成中占位的呼吸遮罩。占位没有任何画面，遮罩铺满整块，
+            // 呼吸幅度也拉大一些，让"这条还在生成"一眼可辨
+            if isReloading || isPlaceholder {
                 RoundedRectangle(cornerRadius:6)
-                    .fill(Color(hex:"#3DBFBA").opacity(thumbBreathing ? 0.35 : 0.15))
+                    .fill(Color(hex:"#3DBFBA").opacity(
+                        isPlaceholder ? (thumbBreathing ? 0.55 : 0.18)
+                                      : (thumbBreathing ? 0.35 : 0.15)))
             }
             // Selection border
             RoundedRectangle(cornerRadius:6)
@@ -3238,8 +3247,13 @@ private struct VideoClipView: View {
         .frame(width: w, height: h-4)
         .clipShape(RoundedRectangle(cornerRadius: 6))
         .opacity(isDragging ? 0 : (project.clipboardIsCut && project.clipboardSourceIDs.contains(clip.id) ? 0.35 : 1.0))
-        .animation(isReloading ? .easeInOut(duration: 0.8).repeatForever(autoreverses: true) : .default, value: thumbBreathing)
-        .onChange(of: isReloading) { loading in thumbBreathing = loading }
+        // 呼吸动画由 thumbBreathing 来回翻转驱动。两个来源都要接：重建缩略图、
+        // 生成中占位——只监听 isReloading 的话占位会是一块静止的色块，不会呼吸
+        .animation((isReloading || isPlaceholder) ? .easeInOut(duration: 0.8).repeatForever(autoreverses: true) : .default,
+                   value: thumbBreathing)
+        .onChange(of: isReloading) { loading in thumbBreathing = loading || isPlaceholder }
+        .onChange(of: isPlaceholder) { ph in thumbBreathing = ph || isReloading }
+        .onAppear { if isPlaceholder { thumbBreathing = true } }
         .offset(x: clip.startTime*pps + 1)
         .allowsHitTesting(isRenaming)
         .onAppear {

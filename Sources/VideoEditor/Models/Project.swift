@@ -556,6 +556,11 @@ final class ProjectState: ObservableObject {
     @Published var clarityETASeconds: Double? = nil
     /// 推理阶段真正开始的时刻，算实测速度用
     var clarityInferStartTime: Date? = nil
+    /// 开工时就插好的那条占位轨道/片段。存在这里是为了让 cancelClarityEnhance()
+    /// 能**立刻**把它撤掉——后台线程的取消检查点在每批开头，等它跑到再清理的话，
+    /// 用户点完取消还要眼看着占位继续呼吸一会儿
+    var clarityPlaceholderTrackID: UUID? = nil
+    var clarityPlaceholderClipID: UUID? = nil
     var clarityEnhanceTask: Task<Void, Never>? = nil
     /// 处理流水线整体跑在专属线程上（不受 Swift Task 协作式取消管辖，
     /// 详见 Task 9 的设计说明），取消要靠这个跨线程共享标志
@@ -575,6 +580,14 @@ final class ProjectState: ObservableObject {
         clarityEnhanceState = .idle
         clarityETASeconds = nil
         clarityInferStartTime = nil
+        // 占位轨道立刻撤掉，别让它在用户点完取消之后还继续呼吸
+        if let cid = clarityPlaceholderClipID { placeholderClipIDs.remove(cid) }
+        if let tid = clarityPlaceholderTrackID {
+            videoTracks.removeAll { $0.id == tid }
+            videoSectionOrder.removeAll { $0.trackID == tid }
+        }
+        clarityPlaceholderClipID = nil
+        clarityPlaceholderTrackID = nil
         showSuccessToast(icon: "stop.fill", iconColor: .yellow, title: "清晰度提升", subtitle: "已停止", autoCountdown: false)
     }
 

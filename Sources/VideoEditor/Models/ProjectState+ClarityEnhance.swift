@@ -203,6 +203,47 @@ extension ProjectState {
             return
         }
 
+        // 立刻在源轨道位置插一条空的占位轨道，让用户马上看到"这条正在生成"，
+        // 而不是干等十几分钟才突然冒出一条新轨道。做法跟字幕翻译一致：先放一个
+        // 进 placeholderClipIDs 的空片段（呼吸显示），出结果后原地换成真实素材。
+        //
+        // 占位片段刻意用一个全新的、没有任何素材对应的 assetID：assetThumbnails
+        // 里查不到它，VideoClipView 自然走"没有缩略图就铺纯色"那条分支，正好就是
+        // 我们要的空占位效果，不需要为此另加一套渲染分支。
+        pushUndo()
+        let placeholderClip: VideoClip = {
+            var c = VideoClip(assetID: UUID(), startTime: clip.startTime,
+                              endTime: clip.startTime + clip.duration)
+            c.trimStart = 0
+            c.speed = clip.speed
+            return c
+        }()
+        let placeholderTrack = Track<VideoClip>(clips: [placeholderClip], label: "清晰度提升")
+        placeholderClipIDs.insert(placeholderClip.id)
+        videoTracks.append(placeholderTrack)
+        // 插到源轨道原来的位置（源轨道后移一位）——理由见下面成功分支里的长注释：
+        // videoSectionOrder 越靠前越是上层，插在后面会被源轨道盖住看不见
+        if let idx = videoSectionOrder.firstIndex(where: { $0.trackID == sourceTrackID }) {
+            videoSectionOrder.insert(.video(placeholderTrack.id), at: idx)
+        } else {
+            videoSectionOrder.append(.video(placeholderTrack.id))
+        }
+        let placeholderTrackID = placeholderTrack.id
+        let placeholderClipID = placeholderClip.id
+        clarityPlaceholderTrackID = placeholderTrackID
+        clarityPlaceholderClipID = placeholderClipID
+
+        /// 收尾时清掉占位。成功时只摘掉呼吸标记（轨道和片段留着，已被换成真实素材），
+        /// 失败/取消时整条占位轨道一起撤掉，不留一条空轨道在时间轴上。
+        func dropPlaceholder(removeTrack: Bool) {
+            placeholderClipIDs.remove(placeholderClipID)
+            clarityPlaceholderTrackID = nil
+            clarityPlaceholderClipID = nil
+            guard removeTrack else { return }
+            videoTracks.removeAll { $0.id == placeholderTrackID }
+            videoSectionOrder.removeAll { $0.trackID == placeholderTrackID }
+        }
+
         clarityEnhanceTask = Task { @MainActor in
             let workDir = FileManager.default.temporaryDirectory
                 .appendingPathComponent("clarity_\(UUID().uuidString)")
@@ -276,30 +317,32 @@ extension ProjectState {
                 let assetID = asset.id
                 mediaAssets.append(asset)
 
-                // 原片段可能在处理这段时间里被用户删除/撤销了 —— 只有还在时才建新轨道插片段
-                if videoTracks.first(where: { $0.id == sourceTrackID }) != nil,
-                   let stillClip = videoTracks.flatMap(\.clips).first(where: { $0.id == id }) {
-                    var newClip = VideoClip(assetID: assetID, startTime: stillClip.startTime,
-                                            endTime: stillClip.startTime + stillClip.duration)
+                // 把结果填进开工时就插好的那条占位轨道——轨道和片段已经在时间轴上
+                // 呼吸了一路，这里只换 assetID / 对齐时间范围，用户看到的是同一条
+                // 轨道从"生成中"变成有画面，而不是占位消失、另一条轨道凭空出现。
+                //
+                // 源片段可能在这段时间里被用户删掉或撤销了。真出现这种情况就退回
+                // 用占位自己的时间范围（它建的时候就是照源片段拷的），至少产物还在，
+                // 不至于因为源片段没了就把辛苦跑出来的结果丢掉。
+                if let ti = videoTracks.firstIndex(where: { $0.id == placeholderTrackID }),
+                   let ci = videoTracks[ti].clips.firstIndex(where: { $0.id == placeholderClipID }) {
+                    let stillClip = videoTracks.flatMap(\.clips).first(where: { $0.id == id })
+                    let base = stillClip ?? videoTracks[ti].clips[ci]
+                    var newClip = VideoClip(assetID: assetID, startTime: base.startTime,
+                                            endTime: base.startTime + base.duration)
                     newClip.trimStart = 0
                     // 新文件是按 clip.duration * clip.speed 秒抽帧/编码出来的（未变速的原始时长），
                     // 新 clip 要占用跟原片段相同的时间轴时长，必须带上同样的 speed 才能让
                     // 播放消耗量（duration * speed）跟新文件的实际时长对上，否则要么截断
                     // （原速度>1 时只播出前半段）要么留空（原速度<1 时后半段没内容）
-                    newClip.speed = stillClip.speed
-                    let newTrack = Track<VideoClip>(clips: [newClip], label: "清晰度提升")
-                    videoTracks.append(newTrack)
-                    // 新轨道插到源轨道原来的位置（而不是它后面）：videoSectionOrder 的合成顺序是
-                    // 反向遍历、数组里排得靠前的盖在最上层（见 ProjectState+Preview.swift「反序添加
-                    // （底层先、顶层后覆盖）」以及 ColorCompositor 里 result = ci.composited(over:
-                    // result) 的叠加顺序，数组第 0 位最终显示在最上层）。插在源轨道后面会让新轨道
-                    // 排到更底层，被源轨道盖住、用户什么都看不到；插在原位置（源轨道被顶到往后
-                    // 一位）新轨道才会盖住源轨道、让用户立刻看到增强画面，源轨道仍保留供随时对比。
-                    if let idx = videoSectionOrder.firstIndex(where: { $0.trackID == sourceTrackID }) {
-                        videoSectionOrder.insert(.video(newTrack.id), at: idx)
-                    } else {
-                        videoSectionOrder.append(.video(newTrack.id))
-                    }
+                    newClip.speed = base.speed
+                    // 就地替换占位片段（保留占位片段自己的 id，避免外部还持有旧 id 的引用失效）
+                    var filled = newClip
+                    filled.id = placeholderClipID
+                    videoTracks[ti].clips[ci] = filled
+                    dropPlaceholder(removeTrack: false)   // 摘掉呼吸标记，轨道留下
+                    // 轨道在 videoSectionOrder 里的位置在开工插占位时就定好了（源轨道
+                    // 原位、源轨道后移一位），这里不用再动——顺序注释见占位创建处
                     rebuildTimelinePreviewDebounced()
                 }
 
@@ -311,17 +354,20 @@ extension ProjectState {
                                  revealURL: outURL)
             } catch is CancellationError {
                 guard isCurrent() else { return }
+                dropPlaceholder(removeTrack: true)   // 没产出，占位轨道整条撤掉
                 clarityEnhanceState = .idle
                 clarityEnhanceTask = nil
                 clarityCancelFlag = nil
             } catch ClarityFrameIO.FrameIOError.cancelled {
                 guard isCurrent() else { return }
                 // 用户点了取消：cancelClarityEnhance() 已经弹过"已停止"提示，这里不再重复弹
+                dropPlaceholder(removeTrack: true)
                 clarityEnhanceState = .idle
                 clarityEnhanceTask = nil
                 clarityCancelFlag = nil
             } catch {
                 guard isCurrent() else { return }
+                dropPlaceholder(removeTrack: true)
                 clarityEnhanceState = .idle
                 clarityEnhanceTask = nil
                 clarityCancelFlag = nil
