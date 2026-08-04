@@ -380,6 +380,21 @@ extension ProjectState {
                 }
             }
 
+            // composition audio track 复用池。
+            //
+            // 原本每个 clip 都 addMutableTrack 一条新的 composition track——时间轴上
+            // 一条轨道、50 个片段，composition 里就是 50 条 track，AVPlayer 播放前
+            // 要为每条各自准备解码器再混音，起播明显发卡。字幕转语音最容易踩到：
+            // TTS 那边本来已经把不重叠的配音合并进同一条 lane 了（见
+            // ProjectState+TextToSpeech 里的 lanes 分配），到这层又被拆散回 N 条。
+            //
+            // 复用条件严格限定在「音量/声道完全相同、无淡入淡出、正常速度、时间不
+            // 重叠」——这种片段在 audioMix 里只需要一次 setVolume(at: .zero) 覆盖
+            // 整条 track，多个片段共用一条 track 不需要动 audioMix 的任何逻辑。
+            // 带 fade / 变速 / 倒放的仍旧一段一条，行为完全不变。
+            // key 是参数签名，value 是「这条 track 目前排到哪个时间点了」。
+            var audioLanePool: [String: [(track: AVMutableCompositionTrack, endTime: Double)]] = [:]
+
             for track in aTracks {
                 guard track.isVisible && !track.isMuted else { continue }
                 for clip in track.clips {
@@ -417,13 +432,31 @@ extension ProjectState {
                     } else {
                         // 正常速度
                         guard let aAsset = try? await asset.loadTracks(withMediaType: .audio).first else { continue }
-                        if let at2 = composition.addMutableTrack(withMediaType: .audio,
+                        let effDur  = useDur.seconds
+                        let fadeIn  = clip.fadeInEnabled  ? min(max(0, clip.fadeInDuration),  effDur) : 0
+                        let fadeOut = clip.fadeOutEnabled ? min(max(0, clip.fadeOutDuration), max(0, effDur - fadeIn)) : 0
+                        let clipEnd = clip.startTime + effDur
+
+                        // 只有「无淡入淡出」才进复用池：有 fade 的要按各自时间段加
+                        // volume ramp，共用一条 track 会让 ramp 互相打架
+                        let poolKey = (fadeIn > 0 || fadeOut > 0) ? nil
+                            : "v\(clip.volume)-l\(clip.leftChannel)-r\(clip.rightChannel)"
+
+                        // 同签名里找一条已经排到本片段起点之前的，续在它后面
+                        if let key = poolKey,
+                           let slot = audioLanePool[key]?.firstIndex(where: { $0.endTime <= clip.startTime + 0.0001 }) {
+                            let lane = audioLanePool[key]![slot].track
+                            try? lane.insertTimeRange(CMTimeRange(start: trimSt, duration: useDur), of: aAsset, at: at)
+                            audioLanePool[key]![slot].endTime = clipEnd
+                            // 不再 append audioParams：这条 track 第一次建的时候已经登记过，
+                            // 而 setVolume(at: .zero) 本来就是覆盖整条 track 的
+                        } else if let at2 = composition.addMutableTrack(withMediaType: .audio,
                                                                   preferredTrackID: kCMPersistentTrackID_Invalid) {
                             try? at2.insertTimeRange(CMTimeRange(start: trimSt, duration: useDur), of: aAsset, at: at)
-                            let effDur  = useDur.seconds
-                            let fadeIn  = clip.fadeInEnabled  ? min(max(0, clip.fadeInDuration),  effDur) : 0
-                            let fadeOut = clip.fadeOutEnabled ? min(max(0, clip.fadeOutDuration), max(0, effDur - fadeIn)) : 0
                             audioParams.append((at2.trackID, clip.volume, clip.leftChannel, clip.rightChannel, clip.startTime, effDur, fadeIn, fadeOut))
+                            if let key = poolKey {
+                                audioLanePool[key, default: []].append((at2, clipEnd))
+                            }
                         }
                     }
                 }
