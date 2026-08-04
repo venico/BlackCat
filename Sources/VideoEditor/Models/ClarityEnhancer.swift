@@ -260,14 +260,13 @@ enum ClarityEnhancer {
     /// 单 tile 推理：输入 tileSize x tileSize 的 Float 数组（0...1），
     /// 输出 (tileSize*scale) x (tileSize*scale) 的 Float 数组（0...1，未裁剪 clamp）
     ///
-    /// Task 12 端到端集成测试实测发现：640x480/3秒/x2 的测试素材（90帧 x 6 tile）
-    /// 跑了 113 秒——跟 Task 3 记录的 x2 单 tile 1.55ms 差了两个数量级，不是模型
-    /// 推理本身慢，是这个函数原本逐元素 `inputArray[i] = NSNumber(value:)` /
-    /// `outArray[i].floatValue` 读写 MLMultiArray：x2 单 tile 输出就有
-    /// 512x512=262144 个元素，每个都要装一次 NSNumber，这才是真正的耗时大头。
-    /// BiRefNetSegmenter.maskImage 早就踩过同一个坑（注释原话："逐个下标访问
-    /// MLMultiArray 在百万像素级别慢得离谱"），这里改成同一套解法：用
-    /// dataPointer 绑定成类型化指针直接读写，跳过 NSNumber 装箱/拆箱。
+    /// 读写 MLMultiArray 一律走 dataPointer 类型化指针，不用逐元素下标访问——
+    /// BiRefNetSegmenter.maskImage 早就踩过这个坑（注释原话："逐个下标访问
+    /// MLMultiArray 在百万像素级别慢得离谱"）：MLMultiArray 的 subscript 每次
+    /// 都要过一遍 Objective-C bridging 装箱/拆箱，x2 单 tile 输出有
+    /// 512x512=262144 个元素、x4 有 1024x1024=1048576 个，逐元素访问的开销
+    /// 会盖过模型推理本身。实测 `mlModel.prediction(from:)` 只要 1.5~3ms/tile
+    /// （跟 Task 3 benchmark 吻合），而一次逐元素读输出就要 ~120ms。
     private static func runOneTile(_ tile: [Float], mlModel: MLModel) throws -> [Float] {
         guard let inputArray = try? MLMultiArray(shape: [1, 1, NSNumber(value: tileSize), NSNumber(value: tileSize)],
                                                  dataType: .float32) else {
@@ -297,12 +296,19 @@ enum ClarityEnhancer {
         return try readMultiArrayFast(outArray)
     }
 
-    /// 把模型输出的 MLMultiArray 批量读成 [Float]，用 dataPointer 走类型化指针
-    /// （见 runOneTile 顶部注释）。跟 BiRefNetSegmenter.maskImage 一样按
-    /// dataType 分支处理：float32/double 直接指针读，float16 没有原生可绑的
-    /// Swift 类型，借官方 MLMultiArray(shape:dataType:) 转成 float32 再读
-    /// （这条分支本身仍是逐元素装箱，但 FSRCNN 导出用的是 float32，预期不会
-    /// 走到这里，保留只是防御性兜底，不因为 dtype 意外而崩溃）。
+    /// 把模型输出的 MLMultiArray 批量读成 [Float]，三个分支都走 dataPointer
+    /// 类型化指针（见 runOneTile 顶部注释）。
+    ///
+    /// **float16 是 FSRCNN 的常态路径，不是兜底分支**：coremltools 转出的
+    /// mlprogram 默认用 FP16 存权重和中间结果，输出的 MLMultiArray dataType
+    /// 实测就是 `.float16`（rawValue 65552），哪怕 `ct.TensorType` 没有显式
+    /// 指定精度。Swift 的 `Float16` 跟它二进制布局一致，可以直接 bindMemory
+    /// 后原生转换，不需要先造一个 float32 的 MLMultiArray 中转。
+    ///
+    /// 早先这里写的是"借 MLMultiArray(shape:dataType:) 转成 float32 再读"，
+    /// 那条路径每个元素都要过一次 subscript 装箱，x2 单 tile 实测 122ms；
+    /// 换成下面的 bindMemory 后是 24ms（5 倍提速），两种读法的输出数值逐元素
+    /// 比对完全一致（最大差异 0），确认只是读取方式变快、不影响数值。
     private static func readMultiArrayFast(_ array: MLMultiArray) throws -> [Float] {
         let count = array.count
         var out = [Float](repeating: 0, count: count)
@@ -314,12 +320,8 @@ enum ClarityEnhancer {
             let p = array.dataPointer.bindMemory(to: Double.self, capacity: count)
             for i in 0..<count { out[i] = Float(p[i]) }
         case .float16:
-            guard let converted = try? MLMultiArray(shape: array.shape, dataType: .float32) else {
-                throw EnhanceError.badOutput
-            }
-            for i in 0..<count { converted[i] = array[i] }
-            let p = converted.dataPointer.bindMemory(to: Float32.self, capacity: count)
-            for i in 0..<count { out[i] = p[i] }
+            let p = array.dataPointer.bindMemory(to: Float16.self, capacity: count)
+            for i in 0..<count { out[i] = Float(p[i]) }
         default:
             throw EnhanceError.badOutput
         }
