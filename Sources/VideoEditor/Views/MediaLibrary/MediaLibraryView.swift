@@ -971,16 +971,6 @@ private struct ClarityEnhanceBubble: View {
     }
     @State private var xHovering = false
 
-    private var stageText: String {
-        switch state {
-        case .idle:                 return ""
-        case .downloadingModel:     return "下载模型中…"
-        case .extractingFrames:     return "抽取帧序列…"
-        case .inferring:            return "超分辨率推理中…"
-        case .encoding:             return "编码输出中…"
-        }
-    }
-
     var body: some View {
         HStack(spacing: 10) {
             ZStack {
@@ -992,7 +982,7 @@ private struct ClarityEnhanceBubble: View {
 
             VStack(alignment: .leading, spacing: 3) {
                 HStack(spacing: 6) {
-                    Text("清晰度提升 · \(stageText)")
+                    Text("清晰度提升中…")
                         .font(.system(size: 11, weight: .medium))
                         .foregroundColor(Color.labelPrimary)
                         .lineLimit(1)
