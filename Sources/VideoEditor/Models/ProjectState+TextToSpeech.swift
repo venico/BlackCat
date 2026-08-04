@@ -94,8 +94,10 @@ extension ProjectState {
 
             var parts = ["已生成 \(results.count) 条语音"]
             if failures > 0 { parts.append("\(failures) 条失败") }
-            // 语速由文本决定，生成时长跟字幕对不齐是常态，超了要讲出来让用户自己决定怎么调
-            if overlong > 0 { parts.append("\(overlong) 条比字幕长") }
+            // 语速由文本决定，生成时长对不齐是常态。这里数的是「连到下一条字幕
+            // 之前的空档都塞不下」的条数——这些会跟后一条重叠、被分到另一条音轨，
+            // 要讲出来让用户自己决定怎么调
+            if overlong > 0 { parts.append("\(overlong) 条超出可用空档") }
             showSuccessToast(icon: "waveform", iconColor: failures > 0 ? .orange : .green,
                              title: "转换成语音",
                              subtitle: parts.joined(separator: "，"),
@@ -190,7 +192,21 @@ extension ProjectState {
     /// 变速对齐的上限。压过头语速太快听不清，宁可保持原速让用户自己处理
     static let maxFitRatio = 1.6
 
-    /// 把超长的音频用 atempo 压到字幕时长。
+    /// 两条配音之间留出的呼吸间隙：语音正好顶到下一条起点会显得太赶，
+    /// 留一点空让听感自然，也避免浮点边界上刚好判成重叠
+    static let speechGap = 0.15
+
+    /// 把超长的音频用 atempo 压到**可用槽位**（不是字幕自己的时长）。
+    ///
+    /// 槽位 = 到下一条字幕起点的距离 − 一点呼吸间隙，最后一条不设限。字幕之间
+    /// 几乎总有停顿，只按字幕自身时长压是白白浪费那段空档：字幕 0~2s、下一条
+    /// 5s 才开始、语音 3s，按旧算法要压到 2s（1.5 倍语速），实际上 3s 完全放得下、
+    /// 根本不用压。这直接减少两件事——被迫压缩导致的语速偏快，以及压不动
+    /// （超过 maxFitRatio）时顶到下一条、被迫另开一条音轨。
+    ///
+    /// 槽位比字幕本身还短时（字幕互相重叠这种少见情况）取字幕时长兜底，
+    /// 保证这个改动在任何情况下都不会比旧行为压得更狠。
+    ///
     /// atempo 是变速不变调，1.0~1.5 倍听感自然；超过上限的原样留着，返回时报给用户。
     /// - Returns: (最终用的音频地址, 实际时长, 是否仍然超长)
     private nonisolated static func fitDurations(
@@ -201,10 +217,17 @@ extension ProjectState {
             return zip(items, durations).map { ($0.url, $1, $1 > $0.clip.duration + 0.05) }
         }
 
+        // items 调用方已按 startTime 排好序，直接取后一条起点即可
+        let slots: [Double] = items.indices.map { i in
+            guard i + 1 < items.count else { return .greatestFiniteMagnitude }
+            let gap = items[i + 1].clip.startTime - items[i].clip.startTime - speechGap
+            return max(items[i].clip.duration, gap)
+        }
+
         return await withTaskGroup(of: (Int, URL, Double, Bool).self) { group in
             for (i, item) in items.enumerated() {
                 let dur = durations[i]
-                let target = item.clip.duration
+                let target = slots[i]
                 group.addTask {
                     guard dur > target + 0.05, target > 0.05 else {
                         return (i, item.url, dur, false)
