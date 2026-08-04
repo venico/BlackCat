@@ -188,6 +188,9 @@ enum ClarityFrameIO {
         // stderr 必须丢弃而不是接管道：没人排空的话它写满就会把整个进程卡死，
         // 而这条流水线的两端都在阻塞式读写，卡住一端就是死锁
         p.standardError = FileHandle.nullDevice
+        // 子进程不继承调用线程的 QoS，得单独降——否则 Swift 侧退到后台了，
+        // ffmpeg 还在用默认优先级满负荷解码，照样跟交互抢核
+        p.qualityOfService = .utility
         register(p)
         do { try p.run() } catch {
             unregister(p)
@@ -219,6 +222,7 @@ enum ClarityFrameIO {
         p.standardInput = inPipe
         p.standardOutput = FileHandle.nullDevice
         p.standardError = FileHandle.nullDevice   // 同上，不能留给没人读的管道
+        p.qualityOfService = .utility             // 同 startRawDecode
         register(p)
         do { try p.run() } catch {
             unregister(p)

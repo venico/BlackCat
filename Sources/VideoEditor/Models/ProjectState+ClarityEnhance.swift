@@ -284,7 +284,13 @@ extension ProjectState {
                 // 抽帧 → 逐帧推理 → 编码整段在专属线程上跑，详见 runClarityEnhancePipeline 的注释：
                 // 这几步都是同步阻塞操作，不能用 Task.detached 反复占用 Swift 协作池
                 try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
-                    Thread.detachNewThread {
+                    // QoS 降到 .utility：整条流水线（含 concurrentPerform 派生出来的
+                    // 并发工作，它们继承发起线程的 QoS）都退到后台优先级。实测这段
+                    // 处理会吃掉 3~4 个核（12 核机器上峰值 388%），跑在默认优先级时
+                    // 跟 UI 交互平起平坐抢 CPU，整个 app 都发涩——而这个功能的前提
+                    // 一直是"处理期间可以继续编辑其他内容"。降级之后 CPU 空闲时照样
+                    // 跑满、不会变慢，只有在跟交互抢的时候才让路，正是想要的取舍。
+                    let worker = Thread {
                         do {
                             _ = try Self.runClarityEnhancePipeline(
                                 sourceURL: url, trimStart: trimStart, duration: duration,
@@ -303,6 +309,8 @@ extension ProjectState {
                             cont.resume(throwing: error)
                         }
                     }
+                    worker.qualityOfService = .utility
+                    worker.start()
                 }
                 try Task.checkCancellation()
                 // 已经被取代的旧任务（用户取消后又立刻重新触发）不该再往时间轴里插东西
