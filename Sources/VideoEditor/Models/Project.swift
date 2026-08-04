@@ -529,13 +529,23 @@ final class ProjectState: ObservableObject {
         // 渲染不到
 
         /// 没有细粒度进度可报的阶段，按阶段给个近似值，让进度条别停着不动
+        /// 各阶段在进度条上占的区间。这个分配必须反映**真实耗时占比**，不然进度条
+        /// 就是在骗人——最早那版按"下载10% + 抽帧10% + 推理70% + 编码5%"分，是照
+        /// 文件序列式那三个串行阶段设计的；改成管道式之后现实完全变了：
+        ///  · 模型只有 20KB，而且通常早就下载过（只有 !isDownloaded 才走那个分支）
+        ///  · 抽帧和推理在管道下是**同时**进行的，extractingFrames 只剩"探测尺寸 +
+        ///    启动两个 ffmpeg 进程"，一瞬间就过去
+        ///  · 编码同理，最后只剩 close stdin 之后的 flush + 写 moov box
+        ///  · 真实情况是 99% 的时间都在 inferring
+        /// 结果就是进度条一进来直接跳 20%，然后所有时间都在 20%~90% 之间爬。
+        /// 现在让 inferring 几乎占满整条，前后只留一点点给真实存在的头尾。
         var approximateProgress: Double {
             switch self {
             case .idle:                    return 0
-            case .downloadingModel(let p): return p * 0.1
-            case .extractingFrames(let p): return 0.1 + p * 0.1
-            case .inferring(let p):        return 0.2 + p * 0.7
-            case .encoding:                return 0.95
+            case .downloadingModel(let p): return p * 0.02
+            case .extractingFrames:        return 0.03
+            case .inferring(let p):        return 0.03 + p * 0.94
+            case .encoding:                return 0.99
             }
         }
     }

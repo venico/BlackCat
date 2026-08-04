@@ -488,11 +488,16 @@ final class ClarityParallelState: @unchecked Sendable {
 
     init(total: Int) { self.total = max(1, total) }
 
-    /// 记一帧完成，返回当前整体进度（0...1）
+    /// 记一帧完成，返回当前整体进度（0...1）。
+    ///
+    /// 分母是按「时长 × 帧率」估的——管道是流式的，事先没有"总共多少帧"这个信息。
+    /// ffmpeg 的 fps 滤镜在边界上可能比估算多出一两帧，那时候除出来会大于 1，
+    /// 进度条就溢出了，所以这里 clamp 住。真实帧数比估算少的情况则是进度停在
+    /// 九十几然后直接进收尾，可以接受。
     func recordCompletedAndProgress() -> Double {
         lock.lock(); defer { lock.unlock() }
         completed += 1
-        return Double(completed) / Double(total)
+        return min(1.0, Double(completed) / Double(total))
     }
 
     /// 只留第一个错误——后面的多半是同一个原因的连锁反应，报第一个更有诊断价值
