@@ -550,6 +550,7 @@ final class ProjectState: ObservableObject {
     }
     func cancelClarityEnhance() {
         clarityCancelFlag?.cancel()
+        ClarityFrameIO.killCurrentProcess()
         clarityEnhanceTask?.cancel()
         clarityEnhanceTask = nil
         clarityCancelFlag = nil
