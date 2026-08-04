@@ -233,14 +233,14 @@ final class ProjectState: ObservableObject {
 
     /// 时间轴内容区的总宽度（像素）：内容长度 + 末尾余量。
     ///
-    /// 余量给一屏而不是固定值，因为它同时决定两件事：能把素材拖到内容之后多远，
+    /// 余量给两屏而不是固定值，因为它同时决定两件事：能把素材拖到内容之后多远，
     /// 以及滚动条有多长（滚动条长度就是「视口 / 这个宽度」，余量太小时内容一短
     /// 滚动条就长得几乎占满整条轨道，看着不像能拖的东西）。
     ///
     /// 刻度尺和内容区必须用同一个值算，否则会出现「滚得过去但那截没有刻度」。
     func timelineContentWidth(viewportWidth: Double) -> Double {
         let contentSec = max(duration, contentEndTime)
-        return contentSec * pixelsPerSecond + max(300, viewportWidth)
+        return contentSec * pixelsPerSecond + max(300, viewportWidth * 2)
     }
 
     /// 缩放下限：确保缩到最小时能完整显示所有内容并有富余

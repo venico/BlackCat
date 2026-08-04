@@ -171,11 +171,52 @@ extension ProjectState {
             }
         }
 
+        // 每条轨道合成一个素材：素材库里只多一条「配音」，而不是几十个碎条目。
+        // 时间轴上仍然是一段一段独立的 clip，它们指向同一个文件、各自用 trimStart
+        // 偏移到自己那一段，逐句挪动/删改的能力不受影响。
         let existing = audioTracks.filter { $0.label.hasPrefix("配音") }.count
-        let newTracks = lanes.enumerated().map { i, clips -> Track<AudioClip> in
+        var mergedAssets: [MediaAsset] = []
+        var newTracks: [Track<AudioClip>] = []
+
+        for (i, clips) in lanes.enumerated() {
             let n = existing + i + 1
-            return Track(clips: clips, label: n == 1 ? "配音" : "配音\(n)")
+            let label = n == 1 ? "配音" : "配音\(n)"
+            let ordered = clips.sorted { $0.startTime < $1.startTime }
+            let laneStart = ordered.first?.startTime ?? 0
+            let segments = ordered.compactMap { c -> (url: URL, offset: Double, duration: Double)? in
+                guard let u = c.url else { return nil }
+                return (u, c.startTime - laneStart, c.duration)
+            }
+
+            if segments.count == clips.count,
+               let mergedURL = Self.mergeLaneAudio(segments) {
+                let laneEnd = ordered.last.map { $0.startTime + $0.duration } ?? laneStart
+                var asset = MediaAsset(url: mergedURL, name: uniqueSpeechName(base: label,
+                                                                             taken: mergedAssets.map(\.name)),
+                                       type: .audio)
+                asset.importDate = Date()
+                asset.duration = laneEnd - laneStart
+                asset.fileSize = (try? FileManager.default.attributesOfItem(atPath: mergedURL.path)[.size] as? Int64) ?? nil
+                mergedAssets.append(asset)
+
+                // 每段改指合并后的文件，trimStart 就是它在文件里的偏移
+                let rebound = ordered.map { c -> AudioClip in
+                    var nc = c
+                    nc.assetID = asset.id
+                    nc.url = mergedURL
+                    nc.trimStart = c.startTime - laneStart
+                    return nc
+                }
+                newTracks.append(Track(clips: rebound, label: label))
+            } else {
+                // 只有一段、或者合并失败（ffmpeg 出错）→ 退回原来的分散存法，
+                // 功能不受影响，只是素材库里多几条
+                mergedAssets.append(contentsOf: newAssets.filter { a in clips.contains { $0.assetID == a.id } })
+                newTracks.append(Track(clips: clips, label: label))
+            }
         }
+        // 素材库最终只登记合并后的（合并失败的 lane 会把它自己那几条原样带回来）
+        newAssets = mergedAssets
 
         // 到这里才动 @Published，全程只触发一次刷新
         mediaAssets.append(contentsOf: newAssets)
@@ -191,6 +232,52 @@ extension ProjectState {
 
     /// 变速对齐的上限。压过头语速太快听不清，宁可保持原速让用户自己处理
     static let maxFitRatio = 1.6
+
+    /// 把同一条轨道上的多段配音合成一个音频文件，各段按它在时间轴上的位置摆放、
+    /// 空隙用静音填。
+    ///
+    /// 为什么要合：不合的话每条字幕一个素材，几十条配音就在素材库里堆几十个碎条目，
+    /// 翻起来很难受。合成一条之后素材库只多一个「配音」，而时间轴上仍然是一段一段
+    /// 独立的 clip——它们指向同一个文件、各自用 trimStart 偏移到自己那一段，
+    /// 所以逐句挪动、删改的能力一点没丢。
+    ///
+    /// 文件从这条轨道的第一段开始（不是从时间轴 0 点），省掉前面可能很长的一段静音。
+    /// - Returns: 合并后的文件；只有一段或合并失败时返回 nil，调用方退回原来的分散存法
+    private nonisolated static func mergeLaneAudio(
+        _ segments: [(url: URL, offset: Double, duration: Double)]
+    ) -> URL? {
+        guard segments.count > 1, let ffmpeg = ProjectState.findFFmpeg() else { return nil }
+
+        let out = FileManager.default.temporaryDirectory
+            .appendingPathComponent("tts_lane_\(UUID().uuidString).m4a")
+        var args = ["-hide_banner", "-loglevel", "error", "-nostdin", "-y"]
+        for seg in segments { args += ["-i", seg.url.path] }
+
+        // 每段先 adelay 挪到自己的位置，再 amix 叠起来。段与段本来就不重叠，
+        // amix 只是把它们拼进同一条时间线；normalize=0 很关键，否则 amix 会把
+        // 音量按输入数量均分，段数越多声音越小
+        var chains: [String] = []
+        var labels = ""
+        for (i, seg) in segments.enumerated() {
+            let ms = Int((seg.offset * 1000).rounded())
+            chains.append("[\(i)]adelay=\(ms)|\(ms)[a\(i)]")
+            labels += "[a\(i)]"
+        }
+        let filter = chains.joined(separator: ";") + ";" + labels
+            + "amix=inputs=\(segments.count):normalize=0[out]"
+        args += ["-filter_complex", filter, "-map", "[out]", "-c:a", "aac", "-b:a", "192k", out.path]
+
+        let p = Process()
+        p.executableURL = ffmpeg
+        p.arguments = args
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = FileHandle.nullDevice
+        do { try p.run() } catch { return nil }
+        p.waitUntilExit()
+        guard p.terminationStatus == 0,
+              FileManager.default.fileExists(atPath: out.path) else { return nil }
+        return out
+    }
 
     /// 两条配音之间留出的呼吸间隙：语音正好顶到下一条起点会显得太赶，
     /// 留一点空让听感自然，也避免浮点边界上刚好判成重叠
