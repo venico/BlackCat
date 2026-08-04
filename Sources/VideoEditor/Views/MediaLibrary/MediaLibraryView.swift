@@ -980,7 +980,7 @@ private struct ClarityEnhanceBubble: View {
             }
 
             VStack(alignment: .leading, spacing: 3) {
-                Text("清晰度提升中")
+                Text("清晰度提升 · \(stageText)")
                     .font(.system(size: 11, weight: .medium))
                     .foregroundColor(Color.labelPrimary)
                     .lineLimit(1)
