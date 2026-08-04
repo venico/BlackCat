@@ -206,6 +206,10 @@ struct ContentView: View {
                     RemoveBackgroundOverlay()
                         .environmentObject(project)
                 }
+                if project.isEnhancingClarity {
+                    ClarityEnhanceOverlay()
+                        .environmentObject(project)
+                }
                 if project.isGeneratingSpeech {
                     SpeechOverlay()
                         .environmentObject(project)
