@@ -3108,6 +3108,7 @@ private struct VideoClipView: View {
     var scrollOffsetX: CGFloat = 0
     @EnvironmentObject var project: ProjectState
     @State private var thumbBreathing = false
+    @State private var placeholderBreathing = false
 
     private var isReloading: Bool {
         project.thumbnailsReloading.contains(clip.assetID)
@@ -3160,15 +3161,17 @@ private struct VideoClipView: View {
                let frames = project.assetThumbnails[clip.assetID], !frames.isEmpty {
                 thumbnailStrip(frames: frames, clipWidth: w)
             } else {
-                RoundedRectangle(cornerRadius:6).fill(Color(hex:"#3DBFBA").opacity(0.82))
-            }
-            // 重建缩略图 / 生成中占位的呼吸遮罩。占位没有任何画面，遮罩铺满整块，
-            // 呼吸幅度也拉大一些，让"这条还在生成"一眼可辨
-            if isReloading || isPlaceholder {
+                // 占位（还在生成、没有画面）用更淡的底色，跟有内容的片段区分开
                 RoundedRectangle(cornerRadius:6)
-                    .fill(Color(hex:"#3DBFBA").opacity(
-                        isPlaceholder ? (thumbBreathing ? 0.55 : 0.18)
-                                      : (thumbBreathing ? 0.35 : 0.15)))
+                    .fill(Color(hex:"#3DBFBA").opacity(isPlaceholder ? 0.35 : 0.82))
+            }
+            // 重建缩略图时的呼吸遮罩（这条是叠在已有画面上的，同色半透明能看出来）。
+            // 占位不走这里——占位底下是同色实块，再叠一层同色遮罩，0.18 和 0.55
+            // 混出来几乎一个样，动画在跑却看不见。占位改成让整块的 opacity 呼吸，
+            // 跟 SubtitleClipView 的占位一致，见本视图末尾的 .opacity / .onAppear
+            if isReloading && !isPlaceholder {
+                RoundedRectangle(cornerRadius:6)
+                    .fill(Color(hex:"#3DBFBA").opacity(thumbBreathing ? 0.35 : 0.15))
             }
             // Selection border
             RoundedRectangle(cornerRadius:6)
@@ -3247,13 +3250,31 @@ private struct VideoClipView: View {
         .frame(width: w, height: h-4)
         .clipShape(RoundedRectangle(cornerRadius: 6))
         .opacity(isDragging ? 0 : (project.clipboardIsCut && project.clipboardSourceIDs.contains(clip.id) ? 0.35 : 1.0))
-        // 呼吸动画由 thumbBreathing 来回翻转驱动。两个来源都要接：重建缩略图、
-        // 生成中占位——只监听 isReloading 的话占位会是一块静止的色块，不会呼吸
-        .animation((isReloading || isPlaceholder) ? .easeInOut(duration: 0.8).repeatForever(autoreverses: true) : .default,
+        // 占位：整块 opacity 在 1.0 ↔ 0.45 之间呼吸。必须作用在整块上而不是叠一层
+        // 同色遮罩——底下就是同色实块，叠加前后混出来一个样，看不出在动。
+        .opacity(isPlaceholder && placeholderBreathing ? 0.45 : 1.0)
+        .onAppear {
+            // 占位是插进来时就已经存在的，等不到 onChange，必须在 onAppear 起动
+            if isPlaceholder {
+                withAnimation(.easeInOut(duration: 0.8).repeatForever(autoreverses: true)) {
+                    placeholderBreathing = true
+                }
+            }
+        }
+        .onChange(of: isPlaceholder) { ph in
+            if ph {
+                withAnimation(.easeInOut(duration: 0.8).repeatForever(autoreverses: true)) {
+                    placeholderBreathing = true
+                }
+            } else {
+                // 填上真实素材后要停下来，否则整条轨道会一直忽明忽暗
+                withAnimation(.easeInOut(duration: 0.2)) { placeholderBreathing = false }
+            }
+        }
+        // 重建缩略图的遮罩呼吸（跟上面占位那套互不干扰）
+        .animation(isReloading ? .easeInOut(duration: 0.8).repeatForever(autoreverses: true) : .default,
                    value: thumbBreathing)
-        .onChange(of: isReloading) { loading in thumbBreathing = loading || isPlaceholder }
-        .onChange(of: isPlaceholder) { ph in thumbBreathing = ph || isReloading }
-        .onAppear { if isPlaceholder { thumbBreathing = true } }
+        .onChange(of: isReloading) { loading in thumbBreathing = loading }
         .offset(x: clip.startTime*pps + 1)
         .allowsHitTesting(isRenaming)
         .onAppear {
