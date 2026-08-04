@@ -75,6 +75,29 @@ extension ProjectState {
     /// videoWidth 未知时（新建 clip 没探测过尺寸，值为 0）按 1 倍处理，不去猜；
     /// 下限 clamp 到 1，避免源分辨率比 640x480 还小时把预计耗时估得比基准更短
     /// （基准本身已经是所有实测里最快的档位，没必要再往下算）。
+    /// 按已跑完的部分推算还需多久，更新卡片上的倒计时。
+    ///
+    /// 用实测速度而不是一直用开工前那个静态估算：静态估算依赖"这台机器跟我测基准
+    /// 时的机器差不多"这个假设，实测则是这台机器此刻的真实吞吐，还会随进度自我校正。
+    /// 前 3% 不换（样本太少，除出来的数会乱跳），之后每次进度回调都重算。
+    func updateClarityETA(for state: ClarityEnhanceState) {
+        switch state {
+        case .inferring(let progress):
+            if clarityInferStartTime == nil { clarityInferStartTime = Date() }
+            guard progress > 0.03, let start = clarityInferStartTime else { return }
+            let elapsed = Date().timeIntervalSince(start)
+            guard elapsed > 0.5 else { return }
+            clarityETASeconds = max(0, elapsed / progress * (1 - progress))
+        case .encoding:
+            clarityETASeconds = nil   // 收尾阶段很快，不值得再报数
+        case .idle:
+            clarityETASeconds = nil
+            clarityInferStartTime = nil
+        case .downloadingModel, .extractingFrames:
+            break                      // 保持开工前那个初值
+        }
+    }
+
     /// 逐帧处理的并发度。**估算耗时和真正跑流水线必须用同一套算法**，否则用户看到的
     /// "预计几分钟"跟实际差一个并发倍数——这个函数就是为了让两处只有一个真相来源。
     ///
@@ -156,19 +179,13 @@ extension ProjectState {
             guard alert.runModal() == .alertFirstButtonReturn else { return }
         }
 
-        // 边界检查 2：预计耗时较长——需要用户明确确认才继续
+        // 预计耗时不再弹确认框拦一道——耗时长是这个功能的常态而不是异常，每次都
+        // 弹一个"要等 N 分钟，确定吗"纯属打断。改成把预计时间显示在进度卡片上，
+        // 用户随时能看到还剩多久，也随时能点 X 停掉。
+        // 这里算的是开工前的静态预估，只用来给卡片一个初值，跑起来之后会被按
+        // 实际速度推算的值替换掉（见下面 onStateChange 里的 ETA 计算）。
         let estimatedSeconds = Double(estimatedFrameCount)
             * Self.estimatedMsPerFrame(scale: scale, videoWidth: clip.videoWidth, videoHeight: clip.videoHeight) / 1000.0
-        if estimatedSeconds >= Self.confirmThresholdSeconds {
-            let minutes = Int((estimatedSeconds / 60).rounded(.up))
-            let alert = NSAlert()
-            alert.alertStyle = .informational
-            alert.messageText = "预计需要约 \(minutes) 分钟"
-            alert.informativeText = "处理期间可以继续编辑其他内容，完成后会有通知。确认开始吗？"
-            alert.addButton(withTitle: "开始")
-            alert.addButton(withTitle: "取消")
-            guard alert.runModal() == .alertFirstButtonReturn else { return }
-        }
 
         // 边界检查 3：磁盘空间不足直接报错，不要写到一半才失败
         let outputWidth = clip.videoWidth * Double(scale.rawValue)
@@ -193,6 +210,9 @@ extension ProjectState {
 
             let cancelFlag = ClarityCancelFlag()
             clarityCancelFlag = cancelFlag
+            // 卡片一开始就得有个数，不能空着等第一次进度回调
+            clarityETASeconds = estimatedSeconds
+            clarityInferStartTime = nil
             // 本次运行的身份标记。取消检查点在后台线程循环顶部、状态回写在循环底部，
             // 两者之间有窗口：cancelClarityEnhance() 已经把状态设成 .idle 之后，
             // 后台线程可能还会再推一次滞后的 onStateChange，把状态又改回处理中，
@@ -233,6 +253,7 @@ extension ProjectState {
                                     DispatchQueue.main.async {
                                         guard isCurrent() else { return }
                                         self.clarityEnhanceState = state
+                                        self.updateClarityETA(for: state)
                                     }
                                 }
                             )

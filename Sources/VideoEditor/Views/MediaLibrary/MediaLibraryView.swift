@@ -881,6 +881,7 @@ struct ClarityEnhanceOverlay: View {
         VStack(alignment: .trailing, spacing: 8) {
             if project.isEnhancingClarity {
                 ClarityEnhanceBubble(state: project.clarityEnhanceState,
+                                     etaSeconds: project.clarityETASeconds,
                                      onCancel: { project.cancelClarityEnhance() })
                     .transition(.asymmetric(
                         insertion: .move(edge: .trailing).combined(with: .opacity),
@@ -956,7 +957,18 @@ private struct RemoveBackgroundBubble: View {
 
 private struct ClarityEnhanceBubble: View {
     let state: ProjectState.ClarityEnhanceState
+    let etaSeconds: Double?
     let onCancel: () -> Void
+
+    /// "还需约 X" —— 取整到分钟，不足一分钟就直说，免得看着秒数一跳一跳
+    private var etaText: String? {
+        guard let s = etaSeconds, s.isFinite, s > 0 else { return nil }
+        if s < 60 { return "还需不到 1 分钟" }
+        let totalMinutes = Int((s / 60).rounded())
+        if totalMinutes < 60 { return "还需约 \(totalMinutes) 分钟" }
+        let h = totalMinutes / 60, m = totalMinutes % 60
+        return m == 0 ? "还需约 \(h) 小时" : "还需约 \(h) 小时 \(m) 分"
+    }
     @State private var xHovering = false
 
     private var stageText: String {
@@ -979,12 +991,21 @@ private struct ClarityEnhanceBubble: View {
             }
 
             VStack(alignment: .leading, spacing: 3) {
-                Text("清晰度提升 · \(stageText)")
-                    .font(.system(size: 11, weight: .medium))
-                    .foregroundColor(Color.labelPrimary)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-                    .fixedSize(horizontal: false, vertical: true)
+                HStack(spacing: 6) {
+                    Text("清晰度提升 · \(stageText)")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundColor(Color.labelPrimary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                    if let eta = etaText {
+                        Text(eta)
+                            .font(.system(size: 10).monospacedDigit())
+                            .foregroundColor(Color.labelSecondary)
+                            .lineLimit(1)
+                            .fixedSize()
+                    }
+                }
+                .fixedSize(horizontal: false, vertical: true)
 
                 GeometryReader { geo in
                     HStack(spacing: 6) {

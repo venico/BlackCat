@@ -540,6 +540,12 @@ final class ProjectState: ObservableObject {
         }
     }
     @Published var clarityEnhanceState: ClarityEnhanceState = .idle
+    /// 进度卡片上显示的"预计还需多久"（秒）。开工前用 estimatedMsPerFrame 给个
+    /// 初值，跑起来之后换成按**实际速度**推算——实测速度比开工前的静态估算准得多，
+    /// 而且会自我校正，不用担心估算模型跟真实机器有出入
+    @Published var clarityETASeconds: Double? = nil
+    /// 推理阶段真正开始的时刻，算实测速度用
+    var clarityInferStartTime: Date? = nil
     var clarityEnhanceTask: Task<Void, Never>? = nil
     /// 处理流水线整体跑在专属线程上（不受 Swift Task 协作式取消管辖，
     /// 详见 Task 9 的设计说明），取消要靠这个跨线程共享标志
@@ -557,6 +563,8 @@ final class ProjectState: ObservableObject {
         clarityEnhanceTask = nil
         clarityCancelFlag = nil
         clarityEnhanceState = .idle
+        clarityETASeconds = nil
+        clarityInferStartTime = nil
         showSuccessToast(icon: "stop.fill", iconColor: .yellow, title: "清晰度提升", subtitle: "已停止", autoCountdown: false)
     }
 
