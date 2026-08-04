@@ -276,7 +276,26 @@ struct TimelineView: View {
                     .frame(width: clipW, height: rulerH)
                     .background(Color(red: 0.09, green: 0.09, blue: 0.10))
                     .clipped()
-                    .allowsHitTesting(false)
+                    // 顶条自己接管点击/拖拽定位播放头，不再靠 allowsHitTesting(false)
+                    // 把事件漏给下层的滚动内容去处理。
+                    //
+                    // 原来那套在竖滑之后必然失效：顶条是 overlay、盖在滚动区上面，
+                    // 漏下去之后由统一手势用 `loc.y < rulerH` 判断"是不是点在刻度尺"，
+                    // 而那个 loc 是**滚动内容**的坐标 = 屏幕坐标 + 竖滚量。轨道一多、
+                    // 竖滑超过 26pt，点顶条漏下去的 loc.y 就已经大于 rulerH，判断落空，
+                    // 事件被当成点轨道区，于是选中了刻度尺正下方那条片段、播放头不动。
+                    //
+                    // 顶条固定不滚，它的 local 坐标恒等于屏幕坐标，这里直接算时间即可。
+                    // x 要加回 scrollOffsetX 换算到内容坐标系——正是刻度尺画播放头三角
+                    // 那个公式（px = time*pps - scrollOffsetX）的逆运算。
+                    .contentShape(Rectangle())
+                    .gesture(
+                        DragGesture(minimumDistance: 0)
+                            .onChanged { v in
+                                let t = max(0, (v.location.x + scrollOffsetX) / project.pixelsPerSecond)
+                                project.requestSeek(to: t)
+                            }
+                    )
                 }
             }
             .frame(height: rulerH)
@@ -943,6 +962,29 @@ struct TimelineView: View {
                                 Label("分离音轨", systemImage: "waveform")
                             }
                             .disabled(!project.canRemoveBackgroundMusic)
+                        }
+                        // 清晰度提升只对视频有意义（音频没有清晰度概念），单独用
+                        // selectedVideoClipID 分支包裹，不复用上面分离音轨的 OR 条件——
+                        // 跟下面「去除背景」（仅图片，canRemoveImageBackground 同样是
+                        // `guard !isXxx else return false; return selectedImageClipID != nil`
+                        // 的形状）保持同一套模式：只对单一片段类型有意义的功能，用自己的
+                        // if 分支控制显隐，而不是挂在别的功能的 OR 分支下用 .disabled 兜底
+                        // ——否则右键音频片段时会看到一个永远灰着的「清晰度提升」，容易让人
+                        // 误以为是 bug。canEnhanceClarity 内部仍会检查 selectedVideoClipID，
+                        // .disabled 在这里只负责处理"任务进行中不能重复触发"这一种状态。
+                        if project.selectedVideoClipID != nil {
+                            Divider()
+                            Menu {
+                                Button { project.enhanceClaritySelection(scale: .x2) } label: {
+                                    Text("放大 2 倍")
+                                }
+                                Button { project.enhanceClaritySelection(scale: .x4) } label: {
+                                    Text("放大 4 倍")
+                                }
+                            } label: {
+                                Label("清晰度提升", systemImage: "sparkles")
+                            }
+                            .disabled(!project.canEnhanceClarity)
                         }
                         if !project.selectedSubtitleClipsForTTS.isEmpty {
                             Divider()
@@ -3066,9 +3108,16 @@ private struct VideoClipView: View {
     var scrollOffsetX: CGFloat = 0
     @EnvironmentObject var project: ProjectState
     @State private var thumbBreathing = false
+    @State private var placeholderBreathing = false
 
     private var isReloading: Bool {
         project.thumbnailsReloading.contains(clip.assetID)
+    }
+
+    /// 生成中的空占位（目前来自「清晰度提升」：点完 x2/x4 立刻插一条空轨道，
+    /// 处理完再原地填成真实素材）。跟字幕翻译的占位共用 placeholderClipIDs
+    private var isPlaceholder: Bool {
+        project.placeholderClipIDs.contains(clip.id)
     }
 
     @State private var editName: String = ""
@@ -3112,10 +3161,15 @@ private struct VideoClipView: View {
                let frames = project.assetThumbnails[clip.assetID], !frames.isEmpty {
                 thumbnailStrip(frames: frames, clipWidth: w)
             } else {
-                RoundedRectangle(cornerRadius:6).fill(Color(hex:"#3DBFBA").opacity(0.82))
+                // 占位（还在生成、没有画面）用更淡的底色，跟有内容的片段区分开
+                RoundedRectangle(cornerRadius:6)
+                    .fill(Color(hex:"#3DBFBA").opacity(isPlaceholder ? 0.35 : 0.82))
             }
-            // 重建缩略图时的呼吸遮罩
-            if isReloading {
+            // 重建缩略图时的呼吸遮罩（这条是叠在已有画面上的，同色半透明能看出来）。
+            // 占位不走这里——占位底下是同色实块，再叠一层同色遮罩，0.18 和 0.55
+            // 混出来几乎一个样，动画在跑却看不见。占位改成让整块的 opacity 呼吸，
+            // 跟 SubtitleClipView 的占位一致，见本视图末尾的 .opacity / .onAppear
+            if isReloading && !isPlaceholder {
                 RoundedRectangle(cornerRadius:6)
                     .fill(Color(hex:"#3DBFBA").opacity(thumbBreathing ? 0.35 : 0.15))
             }
@@ -3196,7 +3250,30 @@ private struct VideoClipView: View {
         .frame(width: w, height: h-4)
         .clipShape(RoundedRectangle(cornerRadius: 6))
         .opacity(isDragging ? 0 : (project.clipboardIsCut && project.clipboardSourceIDs.contains(clip.id) ? 0.35 : 1.0))
-        .animation(isReloading ? .easeInOut(duration: 0.8).repeatForever(autoreverses: true) : .default, value: thumbBreathing)
+        // 占位：整块 opacity 在 1.0 ↔ 0.45 之间呼吸。必须作用在整块上而不是叠一层
+        // 同色遮罩——底下就是同色实块，叠加前后混出来一个样，看不出在动。
+        .opacity(isPlaceholder && placeholderBreathing ? 0.45 : 1.0)
+        .onAppear {
+            // 占位是插进来时就已经存在的，等不到 onChange，必须在 onAppear 起动
+            if isPlaceholder {
+                withAnimation(.easeInOut(duration: 0.8).repeatForever(autoreverses: true)) {
+                    placeholderBreathing = true
+                }
+            }
+        }
+        .onChange(of: isPlaceholder) { ph in
+            if ph {
+                withAnimation(.easeInOut(duration: 0.8).repeatForever(autoreverses: true)) {
+                    placeholderBreathing = true
+                }
+            } else {
+                // 填上真实素材后要停下来，否则整条轨道会一直忽明忽暗
+                withAnimation(.easeInOut(duration: 0.2)) { placeholderBreathing = false }
+            }
+        }
+        // 重建缩略图的遮罩呼吸（跟上面占位那套互不干扰）
+        .animation(isReloading ? .easeInOut(duration: 0.8).repeatForever(autoreverses: true) : .default,
+                   value: thumbBreathing)
         .onChange(of: isReloading) { loading in thumbBreathing = loading }
         .offset(x: clip.startTime*pps + 1)
         .allowsHitTesting(isRenaming)
@@ -3210,7 +3287,17 @@ private struct VideoClipView: View {
     @ViewBuilder
     private func thumbnailStrip(frames: [ThumbnailFrame], clipWidth: CGFloat) -> some View {
         let thumbH = h - 4
-        let ratio: CGFloat = frames.first.map { CGFloat($0.image.size.width) / max(CGFloat($0.image.size.height), 1) } ?? 1.0
+        // 格子宽高比优先用片段自己的原始尺寸算——它是固定值，不会因为缩略图重建
+        // 而变。原本取自 frames.first 的图片尺寸：缩略图一重建，如果新帧来自
+        // ffmpeg 兜底而不是 AVFoundation（两者输出尺寸不同），ratio 就变了，
+        // 连带 thumbW / count 全变，整条缩略图重新排布，看着就是片段在抖。
+        // 只有拿不到原始尺寸时（新建 clip 还没探测出来，值为 0）才退回用首帧。
+        let ratio: CGFloat = {
+            if clip.videoWidth > 0.001, clip.videoHeight > 0.001 {
+                return CGFloat(clip.videoWidth / clip.videoHeight)
+            }
+            return frames.first.map { CGFloat($0.image.size.width) / max(CGFloat($0.image.size.height), 1) } ?? 1.0
+        }()
         let thumbW = max(thumbH * ratio, 1)
         let count = max(1, Int(ceil(clipWidth / thumbW)))
         // 只渲染可视范围内的缩略图
@@ -3219,28 +3306,44 @@ private struct VideoClipView: View {
         let visRight = scrollOffsetX + max(project.timelineVisibleWidth, 400) - clipStartX + thumbW
         let startIdx = max(0, Int(floor(visLeft / thumbW)))
         let endIdx = max(startIdx, min(count, Int(ceil(visRight / thumbW))))
-        HStack(spacing: 0) {
-            if startIdx > 0 {
-                Color.clear.frame(width: thumbW * CGFloat(startIdx), height: thumbH)
-            }
+        // 每张缩略图按索引**绝对定位**，不用 HStack 流式布局 + 空占位撑位置。
+        //
+        // 流式布局的问题只在多片段时才暴露：头部占位宽度是 thumbW * startIdx，
+        // 而 startIdx 由 (scrollOffsetX - clip.startTime * pps) 推出来。单条片段
+        // startTime 通常是 0，startIdx 基本恒为 0、根本走不到占位那条路；多条片段
+        // 每条的 startTime 都不同，缩放时 pps 和 scrollOffsetX 只要有一帧不同步，
+        // startIdx 就会跳一格，头部占位跟着跳一个 thumbW，整条图平移一格——
+        // 表现出来就是"多条片段缩放时晃，单条不晃"。
+        //
+        // 绝对定位后，每张图的 x 只由它自己的索引决定（thumbW * i），跟 startIdx、
+        // 跟渲染了多少张都无关。虚拟化窗口怎么抖，已渲染的图都待在原地不动。
+        ZStack(alignment: .topLeading) {
+            // 撑满整条，保证 ZStack 尺寸稳定、不随渲染出的图数量变化
+            Color.clear.frame(width: clipWidth, height: thumbH)
             ForEach(startIdx..<endIdx, id: \.self) { i in
-                let t = clip.trimStart + clip.duration * max(0.01, clip.speed) * Double(i) / Double(count)
+                // 采样时间按**位置比例**算，不用 i/count。count 是 ceil 出来的整数，
+                // 缩放时 clipWidth 连续变而 count 跳变，i/count 会突然跳一下，
+                // closestFrame 就选到另一帧、图片内容闪一下。用 (thumbW*i)/clipWidth
+                // 是连续量，缩放过程中采样点平滑移动，不会闪。
+                let posRatio = clipWidth > 0 ? Double(thumbW * CGFloat(i) / clipWidth) : 0
+                let t = clip.trimStart + clip.duration * max(0.01, clip.speed) * min(1, posRatio)
                 let frame = closestFrame(frames, at: t)
+                // 最后一格用余数宽度，避免最后一张越过片段右边缘
+                let wCell = i == count - 1 ? max(0, clipWidth - thumbW * CGFloat(count - 1)) : thumbW
                 Image(nsImage: frame.image)
                     .resizable()
                     .aspectRatio(contentMode: .fill)
-                    .frame(width: i == count - 1 ? clipWidth - thumbW * CGFloat(count - 1) : thumbW,
-                           height: thumbH)
+                    .frame(width: wCell, height: thumbH)
                     .clipped()
-            }
-            if endIdx < count {
-                // 尾部占位必须用「剩余真实宽度」，不能用 thumbW*格数：
-                // 最后一格是余数宽度，按整格算会让内容总宽 > clipWidth，
-                // HStack 居中后整条缩略图左右跳动
-                Color.clear.frame(width: max(0, clipWidth - thumbW * CGFloat(endIdx)), height: thumbH)
+                    .offset(x: thumbW * CGFloat(i))
             }
         }
-        .frame(width: clipWidth, height: thumbH)
+        // alignment 必须显式给 .leading。默认是 .center，一旦 HStack 内容的实际
+        // 总宽跟 clipWidth 差一点（几百个 Image frame 的亚像素舍入会累积，缩放
+        // 倍数越大格数越多、误差越大），居中就会把这点误差平摊到左右两边——
+        // 表现出来就是整条缩略图相对片段左右晃。左对齐后，内容永远从片段左边缘
+        // 开始画，宽度误差只会落在右端被 clipShape 裁掉，看不出来。
+        .frame(width: clipWidth, height: thumbH, alignment: .leading)
         .clipShape(RoundedRectangle(cornerRadius: 6))
     }
 

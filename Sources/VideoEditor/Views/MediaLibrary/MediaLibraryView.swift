@@ -874,6 +874,24 @@ struct RemoveBackgroundOverlay: View {
     }
 }
 
+struct ClarityEnhanceOverlay: View {
+    @EnvironmentObject private var project: ProjectState
+
+    var body: some View {
+        VStack(alignment: .trailing, spacing: 8) {
+            if project.isEnhancingClarity {
+                ClarityEnhanceBubble(state: project.clarityEnhanceState,
+                                     etaSeconds: project.clarityETASeconds,
+                                     onCancel: { project.cancelClarityEnhance() })
+                    .transition(.asymmetric(
+                        insertion: .move(edge: .trailing).combined(with: .opacity),
+                        removal: .opacity))
+            }
+        }
+        .animation(.spring(response: 0.35, dampingFraction: 0.8), value: project.clarityEnhanceState)
+    }
+}
+
 private struct RemoveBackgroundBubble: View {
     let state: ProjectState.RemoveBackgroundState
     let onCancel: () -> Void
@@ -902,6 +920,89 @@ private struct RemoveBackgroundBubble: View {
                             .progressViewStyle(.linear)
                             .tint(Color.accent)
                         Text("\(Int(state.progress * 100))%")
+                            .font(.system(size: 10).monospacedDigit())
+                            .foregroundColor(Color.labelSecondary)
+                            .fixedSize()
+                    }
+                    .frame(width: geo.size.width)
+                }
+                .frame(height: 14)
+            }
+
+            Button(action: onCancel) {
+                Image(systemName: "xmark")
+                    .font(.system(size: 9, weight: .bold))
+                    .foregroundColor(xHovering ? Color.labelPrimary : Color.labelSecondary)
+                    .frame(width: 18, height: 18)
+                    .background(Color.white.opacity(xHovering ? 0.15 : 0.08))
+                    .clipShape(Circle())
+            }
+            .buttonStyle(.plain)
+            .onHover { xHovering = $0 }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .frame(maxWidth: 280)
+        .background(
+            RoundedRectangle(cornerRadius: 10)
+                .fill(Color(red: 0.16, green: 0.16, blue: 0.17))
+                .shadow(color: .black.opacity(0.5), radius: 8, y: 4)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 10)
+                .stroke(Color.white.opacity(0.12), lineWidth: 0.5)
+        )
+    }
+}
+
+private struct ClarityEnhanceBubble: View {
+    let state: ProjectState.ClarityEnhanceState
+    let etaSeconds: Double?
+    let onCancel: () -> Void
+
+    /// "还需约 X" —— 取整到分钟，不足一分钟就直说，免得看着秒数一跳一跳
+    private var etaText: String? {
+        guard let s = etaSeconds, s.isFinite, s > 0 else { return nil }
+        if s < 60 { return "还需不到 1 分钟" }
+        let totalMinutes = Int((s / 60).rounded())
+        if totalMinutes < 60 { return "还需约 \(totalMinutes) 分钟" }
+        let h = totalMinutes / 60, m = totalMinutes % 60
+        return m == 0 ? "还需约 \(h) 小时" : "还需约 \(h) 小时 \(m) 分"
+    }
+    @State private var xHovering = false
+
+    var body: some View {
+        HStack(spacing: 10) {
+            ZStack {
+                Circle().fill(Color.accent.opacity(0.2)).frame(width: 28, height: 28)
+                Image(systemName: "sparkles")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundColor(Color.accent)
+            }
+
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 6) {
+                    Text("清晰度提升中…")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundColor(Color.labelPrimary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                    if let eta = etaText {
+                        Text(eta)
+                            .font(.system(size: 10).monospacedDigit())
+                            .foregroundColor(Color.labelSecondary)
+                            .lineLimit(1)
+                            .fixedSize()
+                    }
+                }
+                .fixedSize(horizontal: false, vertical: true)
+
+                GeometryReader { geo in
+                    HStack(spacing: 6) {
+                        ProgressView(value: state.approximateProgress)
+                            .progressViewStyle(.linear)
+                            .tint(Color.accent)
+                        Text("\(Int(state.approximateProgress * 100))%")
                             .font(.system(size: 10).monospacedDigit())
                             .foregroundColor(Color.labelSecondary)
                             .fixedSize()

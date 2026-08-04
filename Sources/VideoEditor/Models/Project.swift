@@ -514,6 +514,83 @@ final class ProjectState: ObservableObject {
                          title: "去除背景", subtitle: "已停止", autoCountdown: false)
     }
 
+    // 清晰度提升状态（FSRCNN）
+    enum ClarityScale: Int, Equatable { case x2 = 2, x4 = 4 }
+
+    enum ClarityEnhanceState: Equatable {
+        case idle
+        case downloadingModel(Double)
+        case extractingFrames(Double)
+        case inferring(Double)
+        case encoding
+        // 没有 .failed case：失败统一走 showSuccessToast 报错（跟本功能其它错误
+        // 路径一致），这个状态机不需要单独携带失败态，见 whole-branch review：
+        // 之前留着这个 case 是死代码，从没被赋值过，进度气泡里对应分支也永远
+        // 渲染不到
+
+        /// 没有细粒度进度可报的阶段，按阶段给个近似值，让进度条别停着不动
+        /// 各阶段在进度条上占的区间。这个分配必须反映**真实耗时占比**，不然进度条
+        /// 就是在骗人——最早那版按"下载10% + 抽帧10% + 推理70% + 编码5%"分，是照
+        /// 文件序列式那三个串行阶段设计的；改成管道式之后现实完全变了：
+        ///  · 模型只有 20KB，而且通常早就下载过（只有 !isDownloaded 才走那个分支）
+        ///  · 抽帧和推理在管道下是**同时**进行的，extractingFrames 只剩"探测尺寸 +
+        ///    启动两个 ffmpeg 进程"，一瞬间就过去
+        ///  · 编码同理，最后只剩 close stdin 之后的 flush + 写 moov box
+        ///  · 真实情况是 99% 的时间都在 inferring
+        /// 结果就是进度条一进来直接跳 20%，然后所有时间都在 20%~90% 之间爬。
+        /// 现在让 inferring 几乎占满整条，前后只留一点点给真实存在的头尾。
+        var approximateProgress: Double {
+            switch self {
+            case .idle:                    return 0
+            case .downloadingModel(let p): return p * 0.02
+            case .extractingFrames:        return 0.03
+            case .inferring(let p):        return 0.03 + p * 0.94
+            case .encoding:                return 0.99
+            }
+        }
+    }
+    @Published var clarityEnhanceState: ClarityEnhanceState = .idle
+    /// 进度卡片上显示的"预计还需多久"（秒）。开工前用 estimatedMsPerFrame 给个
+    /// 初值，跑起来之后换成按**实际速度**推算——实测速度比开工前的静态估算准得多，
+    /// 而且会自我校正，不用担心估算模型跟真实机器有出入
+    @Published var clarityETASeconds: Double? = nil
+    /// 推理阶段真正开始的时刻，算实测速度用
+    var clarityInferStartTime: Date? = nil
+    /// 开工时就插好的那条占位轨道/片段。存在这里是为了让 cancelClarityEnhance()
+    /// 能**立刻**把它撤掉——后台线程的取消检查点在每批开头，等它跑到再清理的话，
+    /// 用户点完取消还要眼看着占位继续呼吸一会儿
+    var clarityPlaceholderTrackID: UUID? = nil
+    var clarityPlaceholderClipID: UUID? = nil
+    var clarityEnhanceTask: Task<Void, Never>? = nil
+    /// 处理流水线整体跑在专属线程上（不受 Swift Task 协作式取消管辖，
+    /// 详见 Task 9 的设计说明），取消要靠这个跨线程共享标志
+    var clarityCancelFlag: ClarityCancelFlag? = nil
+    var isEnhancingClarity: Bool {
+        switch clarityEnhanceState {
+        case .idle: return false
+        default: return true
+        }
+    }
+    func cancelClarityEnhance() {
+        clarityCancelFlag?.cancel()
+        ClarityFrameIO.killCurrentProcess()
+        clarityEnhanceTask?.cancel()
+        clarityEnhanceTask = nil
+        clarityCancelFlag = nil
+        clarityEnhanceState = .idle
+        clarityETASeconds = nil
+        clarityInferStartTime = nil
+        // 占位轨道立刻撤掉，别让它在用户点完取消之后还继续呼吸
+        if let cid = clarityPlaceholderClipID { placeholderClipIDs.remove(cid) }
+        if let tid = clarityPlaceholderTrackID {
+            videoTracks.removeAll { $0.id == tid }
+            videoSectionOrder.removeAll { $0.trackID == tid }
+        }
+        clarityPlaceholderClipID = nil
+        clarityPlaceholderTrackID = nil
+        showSuccessToast(icon: "stop.fill", iconColor: .yellow, title: "清晰度提升", subtitle: "已停止", autoCountdown: false)
+    }
+
     // MARK: - 场景检测 / 大模型分析
     @Published var isReversingVideo: Bool = false
     @Published var isDetectingScenes: Bool = false
@@ -1015,4 +1092,13 @@ final class ProjectState: ObservableObject {
     func findMarker(id: UUID) -> MarkerAbsolute? {
         allMarkersAbsolute.first { $0.id == id }
     }
+}
+
+// MARK: - 清晰度提升（跨线程取消标志）
+
+final class ClarityCancelFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _cancelled = false
+    func cancel() { lock.lock(); _cancelled = true; lock.unlock() }
+    var isCancelled: Bool { lock.lock(); defer { lock.unlock() }; return _cancelled }
 }
