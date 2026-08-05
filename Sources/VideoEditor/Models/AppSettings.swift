@@ -350,7 +350,7 @@ final class AppSettings: ObservableObject {
         var hint: String {
             switch self {
             case .system:
-                return "系统自带模型，画质明显更好，且逐帧之间更稳定；只支持放大 4 倍，素材分辨率需在 1920×1080 以内，要求 macOS 26 及以上"
+                return "画质更好；只支持放大 4 倍，素材分辨率需在 1920×1080 以内，要求 macOS 26 及以上"
             case .builtIn:
                 return "随应用附带的轻量模型，速度快、任何系统都能用，但画质提升有限（接近高质量插值放大）"
             }
