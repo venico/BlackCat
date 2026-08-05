@@ -1056,6 +1056,11 @@ struct SettingsView: View {
                 .buttonStyle(.plain)
             }
 
+            // 「默认音色」作为一个显式选项排在最前。原来它是隐式的——不选任何一行
+            // 就等于用默认，得靠"再点一次取消选中"才能回到它，既不好发现也不像
+            // 单选该有的样子。现在它就是单选组里的一项，选中它 = 用服务端默认音色。
+            defaultVoiceRow
+
             ForEach($settings.fishVoices) { $voice in
                 fishVoiceRow($voice)
             }
@@ -1063,12 +1068,32 @@ struct SettingsView: View {
         }
     }
 
+    /// 单选组里的「默认音色」项：选中它就是把 fishSelectedVoice 清空
+    private var defaultVoiceRow: some View {
+        let isOn = settings.fishSelectedVoice.isEmpty
+        return HStack(spacing: 6) {
+            Image(systemName: isOn ? "largecircle.fill.circle" : "circle")
+                .font(.system(size: 12))
+                .foregroundColor(isOn ? Color.accent : Color.labelSecondary.opacity(0.5))
+            Text("默认音色")
+                .font(.system(size: 11))
+                .foregroundColor(Color.labelPrimary)
+            Spacer()
+        }
+        .padding(.horizontal, 6)
+        .frame(height: 24)
+        .contentShape(Rectangle())
+        .onTapGesture { settings.fishSelectedVoice = "" }
+    }
+
     private func fishVoiceRow(_ voice: Binding<AppSettings.FishVoice>) -> some View {
         let vid = voice.wrappedValue.id
         let isOn = settings.fishSelectedVoice == vid.uuidString
         return HStack(spacing: 6) {
+            // 单选互斥：点一下就是选中它，不再"点第二次取消"。要回默认音色就点
+            // 上面那行「默认音色」——取消选中这个动作在单选组里本来就没有位置
             Button {
-                settings.fishSelectedVoice = isOn ? "" : vid.uuidString
+                settings.fishSelectedVoice = vid.uuidString
             } label: {
                 Image(systemName: isOn ? "largecircle.fill.circle" : "circle")
                     .font(.system(size: 12))
