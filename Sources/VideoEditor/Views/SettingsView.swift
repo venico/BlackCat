@@ -89,6 +89,115 @@ struct SettingsView: View {
     }
 
     /// 标签页内的一级标题，用来分块
+    // MARK: - 统一的组件卡片
+    //
+    // 需要下载模型/组件的功能共用这一套。取向：**卡片上只出现功能名，不露组件名
+    // 和路径**——用户要判断的是"这个功能我要不要装"，不是"PySceneDetect 是什么"。
+    // 组件名和体积挪进标题后的 ⓘ 气泡，想深究的人 hover 就能看到；存储位置从可
+    // 编辑的路径框降级成一个文件夹按钮，点开直接进 Finder，不再让用户自定义。
+    //
+    // 右侧状态是一个按钮：已下载 → 悬停变「卸载」→ 卸载后变「下载」。
+    //
+    // - Parameters:
+    //   - title: 功能名，卡片上唯一的标题
+    //   - detail: 功能描述，说清干什么，不提实现
+    //   - infoText: ⓘ 气泡内容，组件名 + 体积
+    //   - selection: 传入时左侧多一个单选标记（去除背景那种要在几档里挑一个用的场景）
+    private func componentCard(title: String,
+                               detail: String,
+                               infoText: String,
+                               folder: URL,
+                               state: ModelState,
+                               selection: (isSelected: Bool, onSelect: () -> Void)? = nil,
+                               onDownload: @escaping () -> Void,
+                               onUninstall: @escaping () -> Void) -> some View {
+        HStack(spacing: 10) {
+            if let sel = selection {
+                Button {
+                    if case .downloaded = state { sel.onSelect() }   // 没装好的不让选
+                } label: {
+                    Image(systemName: sel.isSelected ? "checkmark.circle.fill" : "circle")
+                        .font(.system(size: 13))
+                        .foregroundColor(sel.isSelected ? Color.accent : Color.labelSecondary.opacity(0.4))
+                }
+                .buttonStyle(.plain)
+            }
+
+            VStack(alignment: .leading, spacing: 1) {
+                HStack(spacing: 4) {
+                    Text(title)
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundColor(Color.labelPrimary)
+                    Image(systemName: "info.circle")
+                        .font(.system(size: 10))
+                        .foregroundColor(Color.labelSecondary.opacity(0.7))
+                        .help(infoText)
+                }
+                Text(detail)
+                    .font(.system(size: 10))
+                    .foregroundColor(Color.labelSecondary)
+            }
+
+            Spacer()
+
+            switch state {
+            case .downloaded:
+                // 装好了才给开文件夹——没装时点进去是空目录
+                Button { NSWorkspace.shared.open(folder) } label: {
+                    Image(systemName: "folder")
+                        .font(.system(size: 11))
+                        .foregroundColor(Color.labelSecondary)
+                        .frame(width: 24, height: 24)
+                }
+                .buttonStyle(.plain)
+                .help("在访达中显示")
+
+                InstalledBadge(onUninstall: onUninstall)
+
+            case .notDownloaded:
+                Button(action: onDownload) {
+                    Text("下载")
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundColor(Color.accent)
+                        .padding(.horizontal, 10).frame(height: 24)
+                        .background(Color.accent.opacity(0.15))
+                        .cornerRadius(4)
+                }
+                .buttonStyle(.plain)
+
+            case .downloading(let pct):
+                HStack(spacing: 6) {
+                    ProgressView(value: pct).frame(width: 50).tint(Color.accent)
+                    Text("\(Int(pct * 100))%")
+                        .font(.system(size: 10).monospacedDigit())
+                        .foregroundColor(Color.labelSecondary)
+                        .frame(width: 28)
+                }
+
+            case .failed(let msg):
+                HStack(spacing: 6) {
+                    Text(msg)
+                        .font(.system(size: 9))
+                        .foregroundColor(.red.opacity(0.8))
+                        .lineLimit(1).frame(maxWidth: 80)
+                    Button(action: onDownload) {
+                        Text("重试")
+                            .font(.system(size: 10, weight: .medium))
+                            .foregroundColor(Color.accent)
+                            .padding(.horizontal, 8).frame(height: 24)
+                            .background(Color.accent.opacity(0.15))
+                            .cornerRadius(4)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .background(Color.white.opacity(0.04))
+        .cornerRadius(7)
+    }
+
     private func sectionTitle(_ text: String) -> some View {
         Text(text)
             .font(.system(size: 13, weight: .semibold))
@@ -1646,5 +1755,29 @@ private struct SearchEnginePicker: View {
         } else {
             menu.popUp(positioning: nil, at: .zero, in: view)
         }
+    }
+}
+
+
+/// 已下载徽章：静止显示「已下载」，指针移上去变「卸载」并转红。
+/// 独立成 View 是因为要有自己的 hover 状态——写在 componentCard 里的话
+/// 几张卡片会共用同一个 @State，悬停一张其余全跟着变。
+private struct InstalledBadge: View {
+    let onUninstall: () -> Void
+    @State private var hovering = false
+
+    var body: some View {
+        Button(action: onUninstall) {
+            Text(hovering ? "卸载" : "已下载")
+                .font(.system(size: 10, weight: .medium))
+                .foregroundColor(hovering ? .red.opacity(0.9) : .green.opacity(0.8))
+                .padding(.horizontal, 8)
+                .frame(width: 52, height: 24)   // 定宽，免得换词时按钮宽度跳
+                .background((hovering ? Color.red : Color.green).opacity(hovering ? 0.15 : 0.1))
+                .cornerRadius(4)
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering = $0 }
+        .help(hovering ? "点击卸载" : "")
     }
 }
