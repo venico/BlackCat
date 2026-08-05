@@ -805,98 +805,35 @@ struct SettingsView: View {
         VStack(alignment: .leading, spacing: 12) {
             sectionTitle("智能分割")
 
-            pathRow(label: "组件存储位置", path: SceneDetector.supportDir, placeholder: "", defaultDir: SceneDetector.supportDir) { _ in }
-
-            Text("检测组件")
-                .font(.system(size: 11, weight: .medium))
-                .foregroundColor(Color.labelSecondary)
-
-            HStack(spacing: 10) {
-                VStack(alignment: .leading, spacing: 1) {
-                    Text("PySceneDetect")
-                        .font(.system(size: 12, weight: .semibold))
-                        .foregroundColor(Color.labelPrimary)
-                    Text("基于内容分析的智能场景切割（含 Python 运行时），\(SceneDetector.componentSize)")
-                        .font(.system(size: 10))
-                        .foregroundColor(Color.labelSecondary)
+            componentCard(
+                title: "智能分割组件",
+                detail: "基于内容分析的智能场景切割",
+                infoText: "使用 PySceneDetect 组件（含 Python 运行时），\(SceneDetector.componentSize)",
+                folder: SceneDetector.supportDir,
+                state: sceneDetectState,
+                onDownload: { downloadSceneDetect() },
+                onUninstall: {
+                    try? SceneDetector.uninstall()
+                    refreshSceneDetectState()
                 }
-
-                Spacer()
-
-                switch sceneDetectState {
-                case .downloaded:
-                    Text("已安装")
-                        .font(.system(size: 10, weight: .medium))
-                        .foregroundColor(.green.opacity(0.8))
-                        .padding(.horizontal, 8).frame(height: 24)
-                        .background(Color.green.opacity(0.1))
-                        .cornerRadius(4)
-                case .notDownloaded:
-                    Button { downloadSceneDetect() } label: {
-                        Text("下载")
-                            .font(.system(size: 10, weight: .medium))
-                            .foregroundColor(Color.accent)
-                            .padding(.horizontal, 10).frame(height: 24)
-                            .background(Color.accent.opacity(0.15))
-                            .cornerRadius(4)
-                    }
-                    .buttonStyle(.plain)
-                case .downloading(let pct):
-                    HStack(spacing: 6) {
-                        ProgressView(value: pct)
-                            .frame(width: 50)
-                            .tint(Color.accent)
-                        Text("\(Int(pct * 100))%")
-                            .font(.system(size: 10).monospacedDigit())
-                            .foregroundColor(Color.labelSecondary)
-                            .frame(width: 28)
-                    }
-                case .failed(let msg):
-                    HStack(spacing: 6) {
-                        Text(msg)
-                            .font(.system(size: 9))
-                            .foregroundColor(.red.opacity(0.8))
-                            .lineLimit(1)
-                            .frame(maxWidth: 80)
-                        Button { downloadSceneDetect() } label: {
-                            Text("重试")
-                                .font(.system(size: 10, weight: .medium))
-                                .foregroundColor(Color.accent)
-                                .padding(.horizontal, 8).frame(height: 24)
-                                .background(Color.accent.opacity(0.15))
-                                .cornerRadius(4)
-                        }
-                        .buttonStyle(.plain)
-                    }
-                }
-            }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 8)
-            .background(Color.white.opacity(0.04))
-            .cornerRadius(7)
-
+            )
 
             sectionTitle("清晰度提升")
 
             ForEach(ClarityModel.allCases) { model in
-                HStack(spacing: 10) {
-                    VStack(alignment: .leading, spacing: 1) {
-                        Text(model.displayName)
-                            .font(.system(size: 12, weight: .semibold))
-                            .foregroundColor(Color.labelPrimary)
-                        Text(model.sizeDesc)
-                            .font(.system(size: 10))
-                            .foregroundColor(Color.labelSecondary)
+                componentCard(
+                    title: model == .x2 ? "2 倍提升" : "4 倍提升",
+                    detail: model == .x2 ? "把低清素材放大到 2 倍分辨率" : "把低清素材放大到 4 倍分辨率",
+                    infoText: "使用 FSRCNN 超分辨率模型，约 20 KB",
+                    folder: ClarityModel.supportDir,
+                    state: clarityModelStates[model] ?? .notDownloaded,
+                    onDownload: { downloadClarityModel(model) },
+                    onUninstall: {
+                        try? model.delete()
+                        refreshClarityModelStates()
                     }
-                    Spacer()
-                    clarityModelStatusView(model)
-                }
-                .padding(.horizontal, 10)
-                .padding(.vertical, 8)
-                .background(Color.white.opacity(0.04))
-                .cornerRadius(7)
+                )
             }
-
 
             sectionTitle("AI 剪辑")
 
