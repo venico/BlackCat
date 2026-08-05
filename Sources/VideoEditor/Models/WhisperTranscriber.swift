@@ -53,6 +53,40 @@ enum WhisperTranscriber {
             case .large:  return "1.6 GB · 最高精度，速度优化版"
             }
         }
+        /// 设置卡片上的功能名。不用 Tiny/Base/Small 这些模型规格名——用户要挑的是
+        /// "多快 vs 多准"，规格名对这个判断没帮助，收进 infoText 就好
+        var featureName: String {
+            switch self {
+            case .tiny:   return "极速识别"
+            case .base:   return "快速识别"
+            case .small:  return "均衡识别"
+            case .medium: return "高精度识别"
+            case .large:  return "最高精度识别"
+            }
+        }
+
+        /// 卡片副标题：只说取舍，不提规格和体积
+        var featureDetail: String {
+            switch self {
+            case .tiny:   return "最快，适合短句和简单内容"
+            case .base:   return "较快，日常够用"
+            case .small:  return "速度与准确度均衡，推荐大多数场景"
+            case .medium: return "更准，适合复杂或多语言内容"
+            case .large:  return "最准，速度优化版"
+            }
+        }
+
+        /// ⓘ 气泡：模型规格 + 体积
+        var infoText: String {
+            switch self {
+            case .tiny:   return "使用 Whisper Tiny 模型，约 75 MB"
+            case .base:   return "使用 Whisper Base 模型，约 142 MB"
+            case .small:  return "使用 Whisper Small 模型，约 466 MB"
+            case .medium: return "使用 Whisper Medium 模型，约 1.5 GB"
+            case .large:  return "使用 Whisper Large v3 Turbo 模型，约 1.6 GB"
+            }
+        }
+
         var minFileSize: Int {
             switch self {
             case .tiny: return 30_000_000

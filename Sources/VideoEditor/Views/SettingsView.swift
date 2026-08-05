@@ -246,7 +246,7 @@ struct SettingsView: View {
         VStack(alignment: .leading, spacing: 12) {
             sectionTitle("去除背景")
 
-            Text("抠图模型")
+            Text("抠图方式")
                 .font(.system(size: 11, weight: .medium))
                 .foregroundColor(Color.labelSecondary)
 
@@ -255,111 +255,25 @@ struct SettingsView: View {
                 set: { settings.bgRemovalEngine = $0 }
             ))
 
-
             if settings.bgRemovalEngine.needsDownload {
-                pathRow(label: "模型存储位置", path: BiRefNetModel.supportDir,
-                        placeholder: "", defaultDir: BiRefNetModel.supportDir) { _ in }
-
-                Text("可用模型")
-                    .font(.system(size: 11, weight: .medium))
-                    .foregroundColor(Color.labelSecondary)
-
                 VStack(spacing: 4) {
                     ForEach(BiRefNetModel.allCases) { model in
-                        biRefNetRow(model)
+                        componentCard(
+                            title: model.featureName,
+                            detail: model.featureDetail,
+                            infoText: model.infoText,
+                            folder: BiRefNetModel.supportDir,
+                            state: biRefNetStates[model] ?? .notDownloaded,
+                            selection: (isSelected: settings.biRefNetModel == model,
+                                        onSelect: { settings.biRefNetModel = model }),
+                            onDownload: { downloadBiRefNet(model) },
+                            onUninstall: { deleteBiRefNet(model) }
+                        )
                     }
                 }
             }
 
         }
-    }
-
-    private func biRefNetRow(_ model: BiRefNetModel) -> some View {
-        let isSelected = settings.biRefNetModel == model
-        let state = biRefNetStates[model] ?? .notDownloaded
-
-        return HStack(spacing: 10) {
-            Button {
-                if case .downloaded = state { settings.biRefNetModel = model }
-            } label: {
-                Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
-                    .font(.system(size: 14))
-                    .foregroundColor(isSelected ? Color.accent : Color.labelSecondary)
-            }
-            .buttonStyle(.plain)
-
-            VStack(alignment: .leading, spacing: 1) {
-                Text(model.displayName)
-                    .font(.system(size: 12, weight: isSelected ? .semibold : .regular))
-                    .foregroundColor(Color.labelPrimary)
-                Text(model.sizeDesc)
-                    .font(.system(size: 10))
-                    .foregroundColor(Color.labelSecondary)
-            }
-
-            Spacer()
-
-            switch state {
-            case .downloaded:
-                Button { deleteBiRefNet(model) } label: {
-                    Text("已下载")
-                        .font(.system(size: 10, weight: .medium))
-                        .foregroundColor(.green.opacity(0.8))
-                        .padding(.horizontal, 8).frame(height: 24)
-                        .background(Color.green.opacity(0.1))
-                        .cornerRadius(4)
-                }
-                .buttonStyle(.plain)
-                .help("点击删除该模型")
-            case .notDownloaded:
-                if model.isAvailableForDownload {
-                    Button { downloadBiRefNet(model) } label: {
-                        Text("下载")
-                            .font(.system(size: 10, weight: .medium))
-                            .foregroundColor(Color.accent)
-                            .padding(.horizontal, 10).frame(height: 24)
-                            .background(Color.accent.opacity(0.15))
-                            .cornerRadius(4)
-                    }
-                    .buttonStyle(.plain)
-                } else {
-                    Text("暂无下载源")
-                        .font(.system(size: 10, weight: .medium))
-                        .foregroundColor(Color.labelSecondary.opacity(0.6))
-                        .padding(.horizontal, 8).frame(height: 24)
-                        .background(Color.white.opacity(0.05))
-                        .cornerRadius(4)
-                }
-            case .downloading(let pct):
-                HStack(spacing: 6) {
-                    ProgressView(value: pct).frame(width: 50).tint(Color.accent)
-                    Text("\(Int(pct * 100))%")
-                        .font(.system(size: 10).monospacedDigit())
-                        .foregroundColor(Color.labelSecondary)
-                        .frame(width: 28)
-                }
-            case .failed(let msg):
-                HStack(spacing: 6) {
-                    Text(msg)
-                        .font(.system(size: 9))
-                        .foregroundColor(.red.opacity(0.8))
-                        .lineLimit(1).frame(maxWidth: 80)
-                    Button { downloadBiRefNet(model) } label: {
-                        Text("重试")
-                            .font(.system(size: 10, weight: .medium))
-                            .foregroundColor(Color.accent)
-                            .padding(.horizontal, 8).frame(height: 24)
-                            .background(Color.accent.opacity(0.15))
-                            .cornerRadius(4)
-                    }
-                    .buttonStyle(.plain)
-                }
-            }
-        }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 7)
-        .background(Color.white.opacity(isSelected ? 0.06 : 0.02))
-        .cornerRadius(7)
     }
 
     private func refreshBiRefNetStates() {
@@ -397,76 +311,18 @@ struct SettingsView: View {
         VStack(alignment: .leading, spacing: 12) {
             sectionTitle("分离音轨")
 
-            pathRow(label: "模型存储位置", path: AudioSeparator.supportDir,
-                    placeholder: "", defaultDir: AudioSeparator.supportDir) { _ in }
-
-            Text("分离模型")
-                .font(.system(size: 11, weight: .medium))
-                .foregroundColor(Color.labelSecondary)
-
-            HStack(spacing: 10) {
-                VStack(alignment: .leading, spacing: 1) {
-                    Text("Demucs v4 (6 轨)")
-                        .font(.system(size: 12, weight: .semibold))
-                        .foregroundColor(Color.labelPrimary)
-                    Text("分离人声/鼓/贝斯/吉他/钢琴/其他，约 55 MB")
-                        .font(.system(size: 10))
-                        .foregroundColor(Color.labelSecondary)
+            componentCard(
+                title: "音轨分离组件",
+                detail: "把混音拆成人声、鼓、贝斯、吉他、钢琴等独立音轨",
+                infoText: "使用 Demucs v4（6 轨），约 55 MB",
+                folder: AudioSeparator.supportDir,
+                state: demucsState,
+                onDownload: { downloadDemucsModel() },
+                onUninstall: {
+                    try? AudioSeparator.uninstallModel()
+                    refreshDemucsState()
                 }
-
-                Spacer()
-
-                switch demucsState {
-                case .downloaded:
-                    Text("已下载")
-                        .font(.system(size: 10, weight: .medium))
-                        .foregroundColor(.green.opacity(0.8))
-                        .padding(.horizontal, 8).frame(height: 24)
-                        .background(Color.green.opacity(0.1))
-                        .cornerRadius(4)
-                case .notDownloaded:
-                    Button { downloadDemucsModel() } label: {
-                        Text("下载")
-                            .font(.system(size: 10, weight: .medium))
-                            .foregroundColor(Color.accent)
-                            .padding(.horizontal, 10).frame(height: 24)
-                            .background(Color.accent.opacity(0.15))
-                            .cornerRadius(4)
-                    }
-                    .buttonStyle(.plain)
-                case .downloading(let pct):
-                    HStack(spacing: 6) {
-                        ProgressView(value: pct)
-                            .frame(width: 50)
-                            .tint(Color.accent)
-                        Text("\(Int(pct * 100))%")
-                            .font(.system(size: 10).monospacedDigit())
-                            .foregroundColor(Color.labelSecondary)
-                            .frame(width: 28)
-                    }
-                case .failed(let msg):
-                    HStack(spacing: 6) {
-                        Text(msg)
-                            .font(.system(size: 9))
-                            .foregroundColor(.red.opacity(0.8))
-                            .lineLimit(1)
-                            .frame(maxWidth: 80)
-                        Button { downloadDemucsModel() } label: {
-                            Text("重试")
-                                .font(.system(size: 10, weight: .medium))
-                                .foregroundColor(Color.accent)
-                                .padding(.horizontal, 8).frame(height: 24)
-                                .background(Color.accent.opacity(0.15))
-                                .cornerRadius(4)
-                        }
-                        .buttonStyle(.plain)
-                    }
-                }
-            }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 8)
-            .background(Color.white.opacity(0.04))
-            .cornerRadius(7)
+            )
 
             if !AudioSeparator.demucsReady {
                 Text("未检测到分离组件 demucs.cpp.main，功能暂不可用。")
@@ -731,18 +587,19 @@ struct SettingsView: View {
     private var whisperSection: some View {
         let displayDir = settings.whisperModelDir ?? WhisperTranscriber.supportDir
         return VStack(alignment: .leading, spacing: 12) {
-            pathRow(label: "模型存储位置", path: displayDir, placeholder: "", defaultDir: WhisperTranscriber.supportDir) { url in
-                settings.whisperModelDir = url
-                refreshModelStates()
-            }
-
-            Text("识别模型")
-                .font(.system(size: 11, weight: .medium))
-                .foregroundColor(Color.labelSecondary)
-
             VStack(spacing: 4) {
                 ForEach(WhisperTranscriber.ModelSize.allCases, id: \.rawValue) { model in
-                    modelRow(model)
+                    componentCard(
+                        title: model.featureName,
+                        detail: model.featureDetail,
+                        infoText: model.infoText,
+                        folder: displayDir,
+                        state: modelStates[model] ?? .notDownloaded,
+                        selection: (isSelected: settings.selectedWhisperModel == model,
+                                    onSelect: { settings.selectedWhisperModel = model }),
+                        onDownload: { downloadModel(model) },
+                        onUninstall: { deleteWhisperModel(model) }
+                    )
                 }
             }
         }
@@ -875,57 +732,6 @@ struct SettingsView: View {
                 await MainActor.run { sceneDetectState = .downloaded }
             } catch {
                 await MainActor.run { sceneDetectState = .failed(error.localizedDescription) }
-            }
-        }
-    }
-
-    @ViewBuilder
-    private func clarityModelStatusView(_ model: ClarityModel) -> some View {
-        let state = clarityModelStates[model] ?? .notDownloaded
-        switch state {
-        case .downloaded:
-            Text("已安装")
-                .font(.system(size: 10, weight: .medium))
-                .foregroundColor(.green.opacity(0.8))
-                .padding(.horizontal, 8).frame(height: 24)
-                .background(Color.green.opacity(0.1))
-                .cornerRadius(4)
-        case .notDownloaded:
-            Button { downloadClarityModel(model) } label: {
-                Text("下载")
-                    .font(.system(size: 10, weight: .medium))
-                    .foregroundColor(Color.accent)
-                    .padding(.horizontal, 10).frame(height: 24)
-                    .background(Color.accent.opacity(0.15))
-                    .cornerRadius(4)
-            }
-            .buttonStyle(.plain)
-        case .downloading(let pct):
-            HStack(spacing: 6) {
-                ProgressView(value: pct)
-                    .frame(width: 50)
-                    .tint(Color.accent)
-                Text("\(Int(pct * 100))%")
-                    .font(.system(size: 10).monospacedDigit())
-                    .foregroundColor(Color.labelSecondary)
-                    .frame(width: 28)
-            }
-        case .failed(let msg):
-            HStack(spacing: 6) {
-                Text(msg)
-                    .font(.system(size: 9))
-                    .foregroundColor(.red.opacity(0.8))
-                    .lineLimit(1)
-                    .frame(maxWidth: 80)
-                Button { downloadClarityModel(model) } label: {
-                    Text("重试")
-                        .font(.system(size: 10, weight: .medium))
-                        .foregroundColor(Color.accent)
-                        .padding(.horizontal, 8).frame(height: 24)
-                        .background(Color.accent.opacity(0.15))
-                        .cornerRadius(4)
-                }
-                .buttonStyle(.plain)
             }
         }
     }
@@ -1250,86 +1056,6 @@ struct SettingsView: View {
         }
     }
 
-    private func modelRow(_ model: WhisperTranscriber.ModelSize) -> some View {
-        let isSelected = settings.selectedWhisperModel == model
-        let state = modelStates[model] ?? .notDownloaded
-
-        return HStack(spacing: 10) {
-            Button {
-                if case .downloaded = state {
-                    settings.selectedWhisperModel = model
-                }
-            } label: {
-                Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
-                    .font(.system(size: 14))
-                    .foregroundColor(isSelected ? Color.accent : Color.labelSecondary)
-            }
-            .buttonStyle(.plain)
-
-            VStack(alignment: .leading, spacing: 1) {
-                Text(model.displayName)
-                    .font(.system(size: 12, weight: isSelected ? .semibold : .regular))
-                    .foregroundColor(Color.labelPrimary)
-                Text(model.sizeDesc)
-                    .font(.system(size: 10))
-                    .foregroundColor(Color.labelSecondary)
-            }
-
-            Spacer()
-
-            switch state {
-            case .downloaded:
-                Text("已下载")
-                    .font(.system(size: 10, weight: .medium))
-                    .foregroundColor(.green.opacity(0.8))
-                    .padding(.horizontal, 8).frame(height: 24)
-                    .background(Color.green.opacity(0.1))
-                    .cornerRadius(4)
-            case .notDownloaded:
-                Button { downloadModel(model) } label: {
-                    Text("下载")
-                        .font(.system(size: 10, weight: .medium))
-                        .foregroundColor(Color.accent)
-                        .padding(.horizontal, 10).frame(height: 24)
-                        .background(Color.accent.opacity(0.15))
-                        .cornerRadius(4)
-                }
-                .buttonStyle(.plain)
-            case .downloading(let pct):
-                HStack(spacing: 6) {
-                    ProgressView(value: pct)
-                        .frame(width: 50)
-                        .tint(Color.accent)
-                    Text("\(Int(pct * 100))%")
-                        .font(.system(size: 10).monospacedDigit())
-                        .foregroundColor(Color.labelSecondary)
-                        .frame(width: 28)
-                }
-            case .failed(let msg):
-                HStack(spacing: 6) {
-                    Text(msg)
-                        .font(.system(size: 9))
-                        .foregroundColor(.red.opacity(0.8))
-                        .lineLimit(1)
-                        .frame(maxWidth: 80)
-                    Button { downloadModel(model) } label: {
-                        Text("重试")
-                            .font(.system(size: 10, weight: .medium))
-                            .foregroundColor(Color.accent)
-                            .padding(.horizontal, 8).frame(height: 24)
-                            .background(Color.accent.opacity(0.15))
-                            .cornerRadius(4)
-                    }
-                    .buttonStyle(.plain)
-                }
-            }
-        }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 6)
-        .background(isSelected ? Color.white.opacity(0.06) : Color.clear)
-        .cornerRadius(7)
-    }
-
     private func refreshModelStates() {
         for model in WhisperTranscriber.ModelSize.allCases {
             let url = modelFileURL(model)
@@ -1347,6 +1073,12 @@ struct SettingsView: View {
     private func modelFileURL(_ model: WhisperTranscriber.ModelSize) -> URL {
         let dir = settings.whisperModelDir ?? WhisperTranscriber.supportDir
         return dir.appendingPathComponent(model.fileName)
+    }
+
+    /// 卸载识别模型。原本这几个模型只能装不能卸——统一卡片给了卸载入口，这里补上实现
+    private func deleteWhisperModel(_ model: WhisperTranscriber.ModelSize) {
+        try? FileManager.default.removeItem(at: modelFileURL(model))
+        refreshModelStates()
     }
 
     private func downloadModel(_ model: WhisperTranscriber.ModelSize) {
