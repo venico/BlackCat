@@ -40,6 +40,7 @@ final class AppSettings: ObservableObject {
         static let fishVoices = "settings.ai.fish.voices"
         static let fishSelectedVoice = "settings.ai.fish.selectedVoice"
         static let bgRemovalEngine = "settings.image.bgRemovalEngine"
+        static let clarityEngine = "settings.video.clarityEngine"
         static let ttsProvider = "settings.subtitle.ttsProvider"
         static let ttsSpeed = "settings.subtitle.ttsSpeed"
         static let ttsAutoFit = "settings.subtitle.ttsAutoFit"
@@ -334,6 +335,35 @@ final class AppSettings: ObservableObject {
         didSet { ud.set(bgRemovalEngine.rawValue, forKey: K.bgRemovalEngine) }
     }
 
+    /// 清晰度提升用哪个超分引擎
+    enum ClarityEngine: String, CaseIterable {
+        case system   // 系统自带（VTSuperResolutionScaler，macOS 26+）
+        case builtIn  // 随 app 走的 FSRCNN
+
+        var label: String {
+            switch self {
+            case .system:  return "系统超分"
+            case .builtIn: return "轻量超分"
+            }
+        }
+
+        var hint: String {
+            switch self {
+            case .system:
+                return "系统自带模型，画质明显更好，且逐帧之间更稳定；只支持放大 4 倍，素材分辨率需在 1920×1080 以内，要求 macOS 26 及以上"
+            case .builtIn:
+                return "随应用附带的轻量模型，速度快、任何系统都能用，但画质提升有限（接近高质量插值放大）"
+            }
+        }
+
+        /// 系统超分只有 4 倍这一档
+        var supportsX2: Bool { self == .builtIn }
+    }
+
+    @Published var clarityEngine: ClarityEngine {
+        didSet { ud.set(clarityEngine.rawValue, forKey: K.clarityEngine) }
+    }
+
     /// 选用 BiRefNet 时具体用哪个权重
     @Published var biRefNetModel: BiRefNetModel {
         didSet { ud.set(biRefNetModel.rawValue, forKey: K.biRefNetModel) }
@@ -391,6 +421,15 @@ final class AppSettings: ObservableObject {
         }
         fishSelectedVoice = ud.string(forKey: K.fishSelectedVoice) ?? ""
         bgRemovalEngine = BackgroundRemover.Engine(rawValue: ud.string(forKey: K.bgRemovalEngine) ?? "") ?? .system
+        // 没存过时按这台机器的能力挑默认：能跑系统超分就用它（画质差距明显），
+        // 否则回落到随包的轻量模型
+        if let saved = ClarityEngine(rawValue: ud.string(forKey: K.clarityEngine) ?? "") {
+            clarityEngine = saved
+        } else if #available(macOS 26.0, *), AppleSuperResolution.isSupported {
+            clarityEngine = .system
+        } else {
+            clarityEngine = .builtIn
+        }
         ttsProvider = AIVideoService.Provider(rawValue: ud.string(forKey: K.ttsProvider) ?? "")
             .flatMap { $0.category == .audio ? $0 : nil } ?? .fishAudio
         let savedSpeed = ud.double(forKey: K.ttsSpeed)

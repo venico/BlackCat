@@ -16,6 +16,8 @@ struct SettingsView: View {
     @State private var demucsState: ModelState = .notDownloaded
     @State private var biRefNetStates: [BiRefNetModel: ModelState] = [:]
     @State private var clarityModelStates: [ClarityModel: ModelState] = [:]
+    /// 系统超分模型的状态。它不归我们下载/存放，只能查状态和请求系统去下
+    @State private var appleSRState: ModelState = .notDownloaded
     // 分离产物占用，进设置页和每次清理后刷新
     @State private var separatedFiles: [URL] = []
     @State private var separatedBytes: Int64 = 0
@@ -682,19 +684,46 @@ struct SettingsView: View {
 
             sectionTitle("清晰度提升")
 
-            ForEach(ClarityModel.allCases) { model in
+            Text("超分引擎")
+                .font(.system(size: 11, weight: .medium))
+                .foregroundColor(Color.labelSecondary)
+
+            ClarityEnginePicker(selection: Binding(
+                get: { settings.clarityEngine },
+                set: { settings.clarityEngine = $0 }
+            ))
+
+            Text(settings.clarityEngine.hint)
+                .font(.system(size: 10))
+                .foregroundColor(Color.labelSecondary.opacity(0.7))
+                .fixedSize(horizontal: false, vertical: true)
+
+            if settings.clarityEngine == .system {
+                // 系统超分只有 4 倍这一档，模型也由系统管
                 componentCard(
-                    title: model == .x2 ? "2 倍提升" : "4 倍提升",
-                    detail: model == .x2 ? "把低清素材放大到 2 倍分辨率" : "把低清素材放大到 4 倍分辨率",
-                    infoText: "使用 FSRCNN 超分辨率模型，约 20 KB",
-                    folder: ClarityModel.supportDir,
-                    state: clarityModelStates[model] ?? .notDownloaded,
-                    onDownload: { downloadClarityModel(model) },
-                    onUninstall: {
-                        try? model.delete()
-                        refreshClarityModelStates()
-                    }
+                    title: "4 倍提升",
+                    detail: "把低清素材放大到 4 倍分辨率，画质更好、逐帧更稳",
+                    infoText: "使用系统自带的视频超分模型（VideoToolbox），由系统下载和更新",
+                    folder: FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0],
+                    state: appleSRState,
+                    onDownload: { downloadAppleSRModel() },
+                    onUninstall: { /* 系统模型由系统管理，应用侧不做卸载 */ }
                 )
+            } else {
+                ForEach(ClarityModel.allCases) { model in
+                    componentCard(
+                        title: model == .x2 ? "2 倍提升" : "4 倍提升",
+                        detail: model == .x2 ? "把低清素材放大到 2 倍分辨率" : "把低清素材放大到 4 倍分辨率",
+                        infoText: "使用 FSRCNN 超分辨率模型，约 20 KB",
+                        folder: ClarityModel.supportDir,
+                        state: clarityModelStates[model] ?? .notDownloaded,
+                        onDownload: { downloadClarityModel(model) },
+                        onUninstall: {
+                            try? model.delete()
+                            refreshClarityModelStates()
+                        }
+                    )
+                }
             }
 
             sectionTitle("AI 剪辑")
@@ -737,6 +766,31 @@ struct SettingsView: View {
                 await MainActor.run { sceneDetectState = .downloaded }
             } catch {
                 await MainActor.run { sceneDetectState = .failed(error.localizedDescription) }
+            }
+        }
+    }
+
+    private func refreshAppleSRState() {
+        if case .downloading = appleSRState { return }
+        if #available(macOS 26.0, *) {
+            appleSRState = AppleSuperResolution.modelReady() ? .downloaded : .notDownloaded
+        } else {
+            appleSRState = .notDownloaded
+        }
+    }
+
+    /// 请求系统下载超分模型。系统不给进度，只能等它回调，所以进度条固定在一个
+    /// 位置转——比停在 0% 让人以为卡死好
+    private func downloadAppleSRModel() {
+        guard #available(macOS 26.0, *) else { return }
+        appleSRState = .downloading(0.5)
+        AppleSuperResolution.downloadModel { err in
+            DispatchQueue.main.async {
+                if let e = err {
+                    appleSRState = .failed(e.localizedDescription)
+                } else {
+                    refreshAppleSRState()
+                }
             }
         }
     }
@@ -1359,6 +1413,77 @@ private struct BGEnginePicker: View {
                 title.append(NSAttributedString(string: "  ✓", attributes: [
                     .font: NSFont.systemFont(ofSize: 12, weight: .semibold),
                     .foregroundColor: NSColor.white
+                ]))
+            }
+            item.attributedTitle = title
+            menu.addItem(item)
+        }
+        guard let view = NSApp.keyWindow?.contentView else { return }
+        if let event = NSApp.currentEvent {
+            NSMenu.popUpContextMenu(menu, with: event, for: view)
+        } else {
+            menu.popUp(positioning: nil, at: .zero, in: view)
+        }
+    }
+}
+
+private struct ClarityEnginePicker: View {
+    @Binding var selection: AppSettings.ClarityEngine
+    @State private var hov = false
+
+    var body: some View {
+        Button(action: showMenu) {
+            HStack(spacing: 6) {
+                Text(selection.label)
+                    .font(.system(size: 12))
+                    .foregroundColor(Color.labelPrimary)
+                    .lineLimit(1)
+                Spacer(minLength: 4)
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundColor(Color.labelSecondary)
+            }
+            .padding(.horizontal, 10)
+            .frame(maxWidth: .infinity, minHeight: 32, maxHeight: 32)
+            .background(Color.white.opacity(hov ? 0.10 : 0.06))
+            .cornerRadius(7)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .onHover { hov = $0 }
+    }
+
+    private func showMenu() {
+        let menu = NSMenu()
+        menu.minimumWidth = 180
+        IPickerItemHandler.shared.actions.removeAll()
+        for (tag, eng) in AppSettings.ClarityEngine.allCases.enumerated() {
+            // 这台机器跑不了系统超分就置灰，别让用户选一个用不了的
+            var usable = true
+            if eng == .system {
+                if #available(macOS 26.0, *) { usable = AppleSuperResolution.isSupported }
+                else { usable = false }
+            }
+            let item = NSMenuItem(title: eng.label,
+                                  action: #selector(IPickerItemHandler.pick(_:)),
+                                  keyEquivalent: "")
+            item.target = IPickerItemHandler.shared
+            item.tag = tag
+            IPickerItemHandler.shared.actions[tag] = { [self] in selection = eng }
+            let title = NSMutableAttributedString(string: eng.label, attributes: [
+                .font: NSFont.systemFont(ofSize: 13)
+            ])
+            if eng == selection {
+                title.append(NSAttributedString(string: "  ✓", attributes: [
+                    .font: NSFont.systemFont(ofSize: 12, weight: .semibold),
+                    .foregroundColor: NSColor.white
+                ]))
+            }
+            item.isEnabled = usable
+            if !usable {
+                title.append(NSAttributedString(string: "（需 macOS 26+）", attributes: [
+                    .font: NSFont.systemFont(ofSize: 11),
+                    .foregroundColor: NSColor.secondaryLabelColor
                 ]))
             }
             item.attributedTitle = title

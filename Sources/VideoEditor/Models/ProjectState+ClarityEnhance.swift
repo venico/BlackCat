@@ -161,6 +161,19 @@ extension ProjectState {
         }
 
         let model: ClarityModel = scale == .x2 ? .x2 : .x4
+
+        // 这次用不用系统超分：设置里选了、系统版本够、且素材尺寸在它的上限内。
+        // 尺寸超了（比如 4K 素材）自动回落到随包模型——总比直接报错不能用强，
+        // 到时候画质差一些但功能是通的
+        let useSystemSR: Bool = {
+            guard AppSettings.shared.clarityEngine == .system else { return false }
+            guard #available(macOS 26.0, *), AppleSuperResolution.isSupported else { return false }
+            let w = clip.videoWidth, h = clip.videoHeight
+            // 尺寸未知时先按可用处理，真跑起来尺寸不对会在流水线里抛错回落
+            guard w > 0.001, h > 0.001 else { return true }
+            return Int(w) <= AppleSuperResolution.maxInputWidth
+                && Int(h) <= AppleSuperResolution.maxInputHeight
+        }()
         let trimStart = clip.trimStart
         let duration = clip.duration * clip.speed
         let sourceTrackID = track.id
@@ -296,6 +309,7 @@ extension ProjectState {
                                 sourceURL: url, trimStart: trimStart, duration: duration,
                                 model: model, workDir: workDir, outputURL: outURL,
                                 cancelFlag: cancelFlag,
+                                useSystemSR: useSystemSR,
                                 onStateChange: { state in
                                     DispatchQueue.main.async {
                                         guard isCurrent() else { return }
@@ -395,10 +409,14 @@ extension ProjectState {
     /// 里 `loadWaveform` 从 `Task {}` 改为 `Thread.detachNewThread` 的教训）——虽然这里
     /// 阻塞的是 ffmpeg/CoreML 而不是挂死的 AVFoundation，不会永久卡住，但协作池本来就不该被
     /// 这类长耗时同步任务反复占用。`onStateChange` 在这条专属线程上被调用，内部自己切回主线程。
+    /// - Parameter useSystemSR: 用系统超分（VTSuperResolutionScaler）而不是随包的
+    ///   FSRCNN。两者走不同的处理路径：系统超分带时序状态（要吃上一帧），必须
+    ///   严格顺序处理；FSRCNN 无状态，可以批内并发。
     nonisolated static func runClarityEnhancePipeline(
         sourceURL: URL, trimStart: Double, duration: Double,
         model: ClarityModel, workDir: URL, outputURL: URL,
         cancelFlag: ClarityCancelFlag,
+        useSystemSR: Bool = false,
         onStateChange: @escaping (ClarityEnhanceState) -> Void
     ) throws -> URL {
         func checkCancelled() throws {
@@ -418,7 +436,7 @@ extension ProjectState {
         onStateChange(.extractingFrames(0))
         let frameRate = 30.0  // 固定输出帧率，跟原素材帧率解耦，简化实现
         let (srcW, srcH) = try ClarityFrameIO.probeVideoSize(sourceURL)
-        let scale = model == .x2 ? 2 : 4
+        let scale = useSystemSR ? AppleSuperResolutionScale : (model == .x2 ? 2 : 4)
         let dstW = srcW * scale, dstH = srcH * scale
         let inFrameBytes = srcW * srcH * 4
         let outFrameBytes = dstW * dstH * 4
@@ -458,44 +476,65 @@ extension ProjectState {
         // 独占访问检查而 SIGTRAP，加锁也没用（详见 ClarityParallelState 的注释）
         let slots = ClarityFrameSlots(capacity: concurrency)
 
-        while true {
-            try checkCancelled()
-            if let e = shared.firstError { throw e }
-
-            // 读一批（顺序读，管道本来就是顺序流）
-            var batch: [Data] = []
-            batch.reserveCapacity(concurrency)
-            for _ in 0..<concurrency {
-                guard let f = ClarityFrameIO.readExactly(decodeOut, count: inFrameBytes) else { break }
-                batch.append(f)
+        if useSystemSR {
+            // 系统超分：必须**逐帧顺序**跑。它靠上一帧的输入和输出来保持时序稳定
+            // （这正是它相对逐帧独立模型的优势），并发送帧会打乱这个链条。
+            guard #available(macOS 26.0, *) else {
+                throw ClarityEnhancer.EnhanceError.inferenceFailed("系统超分需要 macOS 26 及以上")
             }
-            if batch.isEmpty { break }
+            let sr = try AppleSuperResolution(width: srcW, height: srcH)
+            while true {
+                try checkCancelled()
+                guard let f = ClarityFrameIO.readExactly(decodeOut, count: inFrameBytes) else { break }
+                try autoreleasepool {
+                    let out = try sr.process(rgba: [UInt8](f))
+                    guard out.count == outFrameBytes else {
+                        throw ClarityEnhancer.EnhanceError.badOutput
+                    }
+                    try encodeIn.write(contentsOf: Data(out))
+                    onStateChange(.inferring(shared.recordCompletedAndProgress()))
+                }
+            }
+        } else {
+            while true {
+                try checkCancelled()
+                if let e = shared.firstError { throw e }
 
-            // 批内并发处理
-            slots.reset(count: batch.count)
-            DispatchQueue.concurrentPerform(iterations: batch.count) { i in
-                if shared.firstError != nil || cancelFlag.isCancelled { return }
-                autoreleasepool {
-                    do {
-                        let out = try ClarityEnhancer.enhanceRGBA([UInt8](batch[i]),
-                                                                  width: srcW, height: srcH,
-                                                                  model: model)
-                        slots.set(i, Data(out))
-                        onStateChange(.inferring(shared.recordCompletedAndProgress()))
-                    } catch {
-                        shared.record(error)
+                // 读一批（顺序读，管道本来就是顺序流）
+                var batch: [Data] = []
+                batch.reserveCapacity(concurrency)
+                for _ in 0..<concurrency {
+                    guard let f = ClarityFrameIO.readExactly(decodeOut, count: inFrameBytes) else { break }
+                    batch.append(f)
+                }
+                if batch.isEmpty { break }
+
+                // 批内并发处理
+                slots.reset(count: batch.count)
+                DispatchQueue.concurrentPerform(iterations: batch.count) { i in
+                    if shared.firstError != nil || cancelFlag.isCancelled { return }
+                    autoreleasepool {
+                        do {
+                            let out = try ClarityEnhancer.enhanceRGBA([UInt8](batch[i]),
+                                                                      width: srcW, height: srcH,
+                                                                      model: model)
+                            slots.set(i, Data(out))
+                            onStateChange(.inferring(shared.recordCompletedAndProgress()))
+                        } catch {
+                            shared.record(error)
+                        }
                     }
                 }
-            }
-            if let e = shared.firstError { throw e }
-            try checkCancelled()
+                if let e = shared.firstError { throw e }
+                try checkCancelled()
 
-            // 按原始顺序写出——批内并发但批间串行，天然保序，不需要乱序重排缓冲
-            for i in 0..<batch.count {
-                guard let out = slots.get(i), out.count == outFrameBytes else {
-                    throw ClarityEnhancer.EnhanceError.badOutput
+                // 按原始顺序写出——批内并发但批间串行，天然保序，不需要乱序重排缓冲
+                for i in 0..<batch.count {
+                    guard let out = slots.get(i), out.count == outFrameBytes else {
+                        throw ClarityEnhancer.EnhanceError.badOutput
+                    }
+                    try encodeIn.write(contentsOf: out)
                 }
-                try encodeIn.write(contentsOf: out)
             }
         }
 
