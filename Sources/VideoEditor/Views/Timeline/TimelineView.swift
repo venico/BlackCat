@@ -5064,10 +5064,28 @@ private struct TimelineScrollViewFinder: NSViewRepresentable {
 
         func observe(_ sv: NSScrollView) {
             sv.contentView.postsBoundsChangedNotifications = true
+            // queue 必须传 nil（在发通知的线程上同步回调），不能用 .main。
+            //
+            // 用 .main 是异步派发，缩放时会错开一帧：zoomTo 先同步设好滚动位置
+            // （通知只是排进队列），紧接着设 pixelsPerSecond 触发 SwiftUI 布局，
+            // 这一帧拿到的是**新 pps + 旧 scrollOffsetX**；等队列里的通知被处理，
+            // scrollOffsetX 才更新、再布局一次。凡是拿这两个量做减法的地方
+            // （片段标题的吸附位置 clip.startTime*pps - scrollOffsetX、缩略图的
+            // 可视窗口）中间那帧都会算歪，表现就是缩放时文字左右抽动。
+            //
+            // 同步回调就落在同一个更新周期里，两个量一起变，不会错位。
+            // 滚动都是主线程操作，这里理应同步；万一有非主线程来的通知，
+            // 兜底切回主线程，避免在别的线程上改 @State。
             observer = NotificationCenter.default.addObserver(
                 forName: NSView.boundsDidChangeNotification,
-                object: sv.contentView, queue: .main
-            ) { [weak self, weak sv] _ in self?.update(sv) }
+                object: sv.contentView, queue: nil
+            ) { [weak self, weak sv] _ in
+                if Thread.isMainThread {
+                    self?.update(sv)
+                } else {
+                    DispatchQueue.main.async { self?.update(sv) }
+                }
+            }
             update(sv)
         }
 
