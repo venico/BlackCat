@@ -16,6 +16,31 @@ enum BiRefNetModel: String, CaseIterable, Identifiable {
         }
     }
 
+    /// 设置卡片上的功能名。不叫 BiRefNet Lite/BiRefNet ——用户要判断的是
+    /// "我要快还是要细"，不是这俩模型叫什么。组件名进 infoText
+    var featureName: String {
+        switch self {
+        case .lite: return "快速模式"
+        case .full: return "精细模式"
+        }
+    }
+
+    /// 卡片副标题：只说效果差别，不提模型名和体积
+    var featureDetail: String {
+        switch self {
+        case .lite: return "速度快，细小饰品可能丢失"
+        case .full: return "发钗流苏这类细节更完整"
+        }
+    }
+
+    /// ⓘ 气泡：想深究的人才看的实现细节
+    var infoText: String {
+        switch self {
+        case .lite: return "使用 BiRefNet Lite（Swin-Tiny），约 78 MB"
+        case .full: return "使用 BiRefNet（Swin-Large），约 388 MB"
+        }
+    }
+
     var sizeDesc: String {
         switch self {
         case .lite: return "78 MB · Swin-Tiny，速度快，细小饰品可能丢失"

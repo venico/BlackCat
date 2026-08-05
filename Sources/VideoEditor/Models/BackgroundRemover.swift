@@ -36,7 +36,7 @@ enum BackgroundRemover {
         var label: String {
             switch self {
             case .system:   return "系统内置"
-            case .biRefNet: return "BiRefNet"
+            case .biRefNet: return "AI 抠图"
             }
         }
 

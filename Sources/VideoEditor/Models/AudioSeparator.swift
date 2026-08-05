@@ -124,6 +124,13 @@ enum AudioSeparator {
     static let modelFileName = "ggml-model-htdemucs-6s-f16.bin"
     static let modelMinFileSize = 40_000_000
 
+    /// 卸载分离模型。只删模型本身，分离出来的音频产物不动——那些可能正被
+    /// 项目引用着，清理它们是设置里另一个独立的入口
+    static func uninstallModel() throws {
+        guard FileManager.default.fileExists(atPath: supportDir.path) else { return }
+        try FileManager.default.removeItem(at: supportDir)
+    }
+
     static var modelSourceURLs: [String] {
         [
             "https://hf-mirror.com/datasets/Retrobear/demucs.cpp/resolve/main/\(modelFileName)",

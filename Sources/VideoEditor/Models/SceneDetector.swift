@@ -12,6 +12,13 @@ enum SceneDetector {
     static var isInstalled: Bool { FileManager.default.fileExists(atPath: pythonURL.path) }
 
     static let componentSize = "~80 MB"
+
+    /// 卸载：整个组件目录删掉（里面是按需下载的 Python 运行时 + PySceneDetect，
+    /// 不是随 app 分发的，删了随时能重新下）
+    static func uninstall() throws {
+        guard FileManager.default.fileExists(atPath: supportDir.path) else { return }
+        try FileManager.default.removeItem(at: supportDir)
+    }
     static let minFileSize = 10_000_000
 
     static let downloadURLs: [String] = [
