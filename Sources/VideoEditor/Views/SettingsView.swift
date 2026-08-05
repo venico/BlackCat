@@ -613,7 +613,7 @@ struct SettingsView: View {
             .buttonStyle(.plain)
 
 
-            Text("TTS 语速通常比原声慢，生成的语音多半比字幕长。语速调到 1.1~1.3 可从源头缓解；剩下对不齐的由自动对齐压到位。需要压到 1.6 倍以上的不会强压（太快听不清），完成后会告诉你有几条。")
+            Text("生成的语音常比字幕长。语速调到 1.1~1.3 可缓解，剩下的交给自动对齐；需压到 1.6 倍以上的不强压。")
                 .font(.system(size: 10))
                 .foregroundColor(Color.labelSecondary.opacity(0.6))
         }
@@ -1026,7 +1026,7 @@ struct SettingsView: View {
                     )
                 }
 
-                Text("填写后，文字生成模型可开启联网搜索获取实时信息")
+                Text("配置后文字模型支持联网搜索")
                     .font(.system(size: 10))
                     .foregroundColor(Color.labelSecondary.opacity(0.6))
             }
