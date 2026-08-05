@@ -1068,22 +1068,28 @@ struct SettingsView: View {
         }
     }
 
-    /// 单选组里的「默认音色」项：选中它就是把 fishSelectedVoice 清空
+    /// 单选组里的「默认音色」项：选中它就是把 fishSelectedVoice 清空。
+    /// 结构跟 fishVoiceRow 保持一致（同样是 Button 包圆点、同样没有外层
+    /// padding），否则圆点会跟下面几行错开——上一版加了 .padding(.horizontal, 6)
+    /// 就往右偏了 6pt
     private var defaultVoiceRow: some View {
         let isOn = settings.fishSelectedVoice.isEmpty
         return HStack(spacing: 6) {
-            Image(systemName: isOn ? "largecircle.fill.circle" : "circle")
-                .font(.system(size: 12))
-                .foregroundColor(isOn ? Color.accent : Color.labelSecondary.opacity(0.5))
+            Button {
+                settings.fishSelectedVoice = ""
+            } label: {
+                Image(systemName: isOn ? "largecircle.fill.circle" : "circle")
+                    .font(.system(size: 12))
+                    .foregroundColor(isOn ? Color.accent : Color.labelSecondary.opacity(0.5))
+            }
+            .buttonStyle(.plain)
+
             Text("默认音色")
                 .font(.system(size: 11))
                 .foregroundColor(Color.labelPrimary)
             Spacer()
         }
-        .padding(.horizontal, 6)
         .frame(height: 24)
-        .contentShape(Rectangle())
-        .onTapGesture { settings.fishSelectedVoice = "" }
     }
 
     private func fishVoiceRow(_ voice: Binding<AppSettings.FishVoice>) -> some View {
