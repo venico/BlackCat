@@ -350,7 +350,12 @@ extension ProjectState {
                    let ci = videoTracks[ti].clips.firstIndex(where: { $0.id == placeholderClipID }) {
                     let stillClip = videoTracks.flatMap(\.clips).first(where: { $0.id == id })
                     let base = stillClip ?? videoTracks[ti].clips[ci]
-                    var newClip = VideoClip(assetID: assetID, startTime: base.startTime,
+                    // name / url 必须一起给上。缩略图的生成入口是 VideoClipView 的
+                    // `if let url = clip.url { loadTimelineThumbnails(...) }`——之前
+                    // 漏了 url，这个条件永远不成立，片段就一直是纯色块，非得把它删掉
+                    // 再从素材库拖一次才有图（那条路径是带 url 构造的）
+                    var newClip = VideoClip(assetID: assetID, name: outName, url: outURL,
+                                            startTime: base.startTime,
                                             endTime: base.startTime + base.duration)
                     newClip.trimStart = 0
                     // 新文件是按 clip.duration * clip.speed 秒抽帧/编码出来的（未变速的原始时长），
@@ -363,6 +368,12 @@ extension ProjectState {
                     filled.id = placeholderClipID
                     videoTracks[ti].clips[ci] = filled
                     dropPlaceholder(removeTrack: false)   // 摘掉呼吸标记，轨道留下
+
+                    // 素材库封面 + 时间轴缩略图条都主动催一次。前者素材库列表要用，
+                    // 后者虽然 VideoClipView 的 onAppear 也会触发，但这个片段是就地
+                    // 替换占位得来的、视图早就出现过，onAppear 不会再来一次
+                    loadMediaThumbnail(assetID: assetID, url: outURL)
+                    loadTimelineThumbnails(assetID: assetID, url: outURL)
                     // 轨道在 videoSectionOrder 里的位置在开工插占位时就定好了（源轨道
                     // 原位、源轨道后移一位），这里不用再动——顺序注释见占位创建处
                     rebuildTimelinePreviewDebounced()
