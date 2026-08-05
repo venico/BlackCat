@@ -476,8 +476,8 @@ extension ProjectState {
 
     /// 同时最多几条缩略图生成线程真正在跑。
     ///
-    /// 时间轴缩放超过 1.8 倍会触发 refreshAllThumbnails，它对**每个**素材都
-    /// 起一条线程；时间轴上十来个素材就是十几条 AVAssetImageGenerator 同时解码，
+    /// 导入一批素材、或裁剪后重抽时，会对**每个**素材各起一条线程；
+    /// 十来个素材就是十几条 AVAssetImageGenerator 同时解码，
     /// 跟 AVPlayer 抢同一套解码资源，表现出来就是缩放之后按播放键要卡一下才出声
     /// （TTS 生成的语音尤其明显——那些音频文件是新写出来的，没有任何系统级缓存）。
     /// 限流到 2 条，再配合下面把线程 QoS 降到 .utility，让播放始终优先。
@@ -486,7 +486,6 @@ extension ProjectState {
     func generateThumbnails(assetID: UUID, url: URL, isReload: Bool = false) {
         if !isReload { assetThumbnails[assetID] = [] }
         let id = assetID
-        let pps = pixelsPerSecond
         thumbnailsGenerating.insert(id)
         // 线程模型说明见 loadMediaThumbnail：专属 pthread + 信号量超时，不碰协作池/GCD 全局池
         let worker = Thread {
@@ -522,9 +521,18 @@ extension ProjectState {
                 }
                 return
             }
-            let thumbWidth = 48.0
-            let neededFrames = Int(dur * pps / thumbWidth)
-            let frameCount = max(10, min(200, neededFrames))
+            // 帧数**不再跟当前缩放挂钩**，一次按高密度抽好，之后缩放直接复用。
+            //
+            // 原来按 dur * pps / 48 算，等于"当前这个缩放级别够用就行"，于是放大
+            // 超过 1.8 倍就得整批重抽一次——重抽期间片段上盖着呼吸遮罩，缩放体验
+            // 被打断。改成按时长定密度（每 0.05 秒一帧，上限 200 张）：10 秒以上的
+            // 素材一律拿满 200 张，短素材按比例给，任何缩放级别下都够用，再不需要
+            // 因为缩放而重抽。
+            //
+            // 代价是首次生成慢一些（低缩放下原本可能只抽二三十张）。可以接受：
+            // 抽帧本来就在后台跑、有并发限流和 .utility 优先级，不挡交互；而缩放
+            // 是高频操作，不该每次都停下来等重抽。
+            let frameCount = max(10, min(200, Int(dur * 20)))
             let interval = dur / Double(frameCount)
 
             var sorted: [ThumbnailFrame] = []
@@ -580,16 +588,6 @@ extension ProjectState {
         worker.start()
     }
 
-    func refreshAllThumbnails() {
-        var seen = Set<UUID>()
-        for t in videoTracks {
-            for c in t.clips {
-                guard !seen.contains(c.assetID), let url = c.url else { continue }
-                seen.insert(c.assetID)
-                reloadThumbnails(assetID: c.assetID, url: url)
-            }
-        }
-    }
 
     /// Generate waveform peak data for an audio asset.
     ///

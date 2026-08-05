@@ -60,8 +60,6 @@ struct TimelineView: View {
     @State private var scrollFraction: Double = 0
     @State private var scrollViewportFraction: Double = 1
     @State private var scrollOffsetX: CGFloat = 0
-    @State private var thumbRefreshWork: DispatchWorkItem? = nil
-    @State private var lastThumbPPS: Double = 0
     @State private var lastCompoundClickID: UUID? = nil
     @State private var lastCompoundClickTime: Date = .distantPast
     @State private var hoveredMarkerID: UUID? = nil
@@ -310,20 +308,10 @@ struct TimelineView: View {
         }
         // 播放头：三角在固定顶条，竖线在轨道区(DraggablePlayhead)，两者同一横向公式，不会分离
         // 翻译进度已移至右下角全局浮层
-        .onAppear { setupMonitors(); lastThumbPPS = project.pixelsPerSecond }
+        .onAppear { setupMonitors() }
         .onDisappear { teardownMonitors() }
         .onChange(of: clock.currentTime) { _ in
             if project.selectedMarkerID != nil { project.selectedMarkerID = nil }
-        }
-        .onChange(of: project.pixelsPerSecond) { newPPS in
-            let ratio = max(newPPS, lastThumbPPS) / max(min(newPPS, lastThumbPPS), 1)
-            guard ratio > 1.8 else { return }
-            thumbRefreshWork?.cancel()
-            let p = project
-            let work = DispatchWorkItem { p.refreshAllThumbnails() }
-            thumbRefreshWork = work
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: work)
-            lastThumbPPS = newPPS
         }
     }
 
