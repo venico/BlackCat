@@ -144,8 +144,13 @@ struct SettingsView: View {
             case .downloaded:
                 // 装好了才给开文件夹——没装时点进去是空目录
                 Button { NSWorkspace.shared.open(folder) } label: {
-                    Image(systemName: "folder")
-                        .font(.system(size: 11))
+                    // 用项目自己的 SVG 图标，跟「通用」里那两个路径行保持一致，
+                    // 不混用 SF Symbol
+                    Image(nsImage: SidebarSVGIcon.load("folder"))
+                        .renderingMode(.template)
+                        .resizable()
+                        .aspectRatio(contentMode: .fit)
+                        .frame(width: 14, height: 14)
                         .foregroundColor(Color.labelSecondary)
                         .frame(width: 24, height: 24)
                 }
