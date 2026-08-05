@@ -146,9 +146,6 @@ struct SettingsView: View {
                 set: { settings.bgRemovalEngine = $0 }
             ))
 
-            Text(settings.bgRemovalEngine.hint)
-                .font(.system(size: 10))
-                .foregroundColor(Color.labelSecondary.opacity(0.6))
 
             if settings.bgRemovalEngine.needsDownload {
                 pathRow(label: "模型存储位置", path: BiRefNetModel.supportDir,
@@ -165,9 +162,6 @@ struct SettingsView: View {
                 }
             }
 
-            Text("在时间轴上右键图片片段 →「去除背景」，再选智能识别主体或纯色背景。结果会新建一条图片轨道，原片段保持不动。")
-                .font(.system(size: 10))
-                .foregroundColor(Color.labelSecondary.opacity(0.6))
         }
     }
 
@@ -381,9 +375,6 @@ struct SettingsView: View {
                 }
             }
 
-            Text("本地推理耗时约为素材时长的 3 倍，处理长片段请预留时间。")
-                .font(.system(size: 10))
-                .foregroundColor(Color.labelSecondary)
 
             Text("分离产物")
                 .font(.system(size: 11, weight: .medium))
@@ -621,9 +612,6 @@ struct SettingsView: View {
             }
             .buttonStyle(.plain)
 
-            Text("在时间轴上选中字幕片段（可跨轨道多选）右键 →「转换成语音」，生成的音频按字幕起点摆进配音轨道。")
-                .font(.system(size: 10))
-                .foregroundColor(Color.labelSecondary.opacity(0.6))
 
             Text("TTS 语速通常比原声慢，生成的语音多半比字幕长。语速调到 1.1~1.3 可从源头缓解；剩下对不齐的由自动对齐压到位。需要压到 1.6 倍以上的不会强压（太快听不清），完成后会告诉你有几条。")
                 .font(.system(size: 10))
@@ -778,9 +766,6 @@ struct SettingsView: View {
             .background(Color.white.opacity(0.04))
             .cornerRadius(7)
 
-            Text("安装后可在工具栏使用「智能分割」功能，自动检测视频场景切换点并分割片段。")
-                .font(.system(size: 10))
-                .foregroundColor(Color.labelSecondary)
 
             sectionTitle("清晰度提升")
 
@@ -803,9 +788,6 @@ struct SettingsView: View {
                 .cornerRadius(7)
             }
 
-            Text("安装后可在时间轴视频片段右键使用「清晰度提升」，把低清素材放大为高清版本，新建独立轨道，不影响原片段。")
-                .font(.system(size: 10))
-                .foregroundColor(Color.labelSecondary)
 
             sectionTitle("AI 剪辑")
 
@@ -828,9 +810,6 @@ struct SettingsView: View {
                     )
                 )
 
-                Text("使用大模型分析视频字幕，自动识别精彩片段并裁剪。分析前确保语音识别功能可用。")
-                    .font(.system(size: 10))
-                    .foregroundColor(Color.labelSecondary)
             }
         }
     }
@@ -1052,9 +1031,6 @@ struct SettingsView: View {
                     .foregroundColor(Color.labelSecondary.opacity(0.6))
             }
 
-            Text("Key 仅保存在本地，不会上传到任何服务器")
-                .font(.system(size: 10))
-                .foregroundColor(Color.labelSecondary.opacity(0.6))
         }
     }
 
@@ -1084,11 +1060,6 @@ struct SettingsView: View {
                 fishVoiceRow($voice)
             }
 
-            Text(settings.fishVoices.isEmpty
-                 ? "未添加音色时使用服务端默认音色。模型 ID 在 Fish Audio 网站的音色详情页获取"
-                 : "点左侧圆点选中要用的音色，再点一次取消选中回到默认音色")
-                .font(.system(size: 10))
-                .foregroundColor(Color.labelSecondary.opacity(0.6))
         }
     }
 
