@@ -253,19 +253,43 @@ final class ProjectState: ObservableObject {
         return (timelineVisibleWidth * 0.85) / end
     }
 
-    /// 缩放至适合：让所有内容刚好填满时间轴可见区域
+    /// 缩放至适合：让所有内容刚好填满时间轴可见区域，并回到开头。
+    ///
+    /// 回开头是必须的——缩放到"刚好装下全部内容"之后，视口本来就该对齐内容起点；
+    /// 沿用 zoomTo 默认的"保持播放头相对位置"会让左边空出一截、右边被截掉，
+    /// 反而看不全，跟这个操作的名字自相矛盾。
     func zoomToFit() {
         let end = contentEndTime
-        guard end > 0 else { return }
+        guard end > 0 else {
+            // 空时间轴：没有"内容"可以适配，但"回到开头"这半件事仍然该做，
+            // 否则在空项目里点它毫无反应，看着像坏了
+            if let sv = timelineHScrollView {
+                sv.contentView.setBoundsOrigin(NSPoint(x: 0, y: 0))
+                sv.reflectScrolledClipView(sv.contentView)
+            }
+            return
+        }
         let availableWidth = max(timelineVisibleWidth - 40, 100)
-        zoomTo(availableWidth / end)
+        zoomTo(availableWidth / end, scrollTo: 0)
     }
 
-    func zoomTo(_ newPPS: Double) {
+    /// - Parameter forcedX: 指定缩放后的横向滚动位置（内容坐标，pt）。
+    ///   传 nil 走默认行为：保持播放头在视口里的相对位置不动。
+    func zoomTo(_ newPPS: Double, scrollTo forcedX: Double? = nil) {
         let minPPS = min(minPixelsPerSecond, 3000)
         let clamped = newPPS.clamped(to: minPPS...3000)
         let oldPPS = pixelsPerSecond
-        guard clamped != oldPPS else { return }
+
+        // 缩放比例没变（已经在这个档位上）时，如果调用方指定了滚动位置就只滚不缩。
+        // 否则"缩放至合适"在已经合适的时候点下去会毫无反应，而用户要的是回到开头
+        guard clamped != oldPPS else {
+            if let x = forcedX, let sv = timelineHScrollView, let doc = sv.documentView {
+                let maxX = max(0, doc.frame.width - sv.contentView.bounds.width)
+                sv.contentView.setBoundsOrigin(NSPoint(x: min(max(0, x), maxX), y: 0))
+                sv.reflectScrolledClipView(sv.contentView)
+            }
+            return
+        }
         guard let sv = timelineHScrollView, let doc = sv.documentView else {
             pixelsPerSecond = clamped
             return
@@ -273,7 +297,7 @@ final class ProjectState: ObservableObject {
         // 连续快速缩放时，用上次 pending target 而非实际滚动位置（因为上次 async 可能还没执行）
         let effectiveScrollX = _zoomScrollTarget ?? sv.contentView.bounds.origin.x
         let playheadInViewport = currentTime * oldPPS - effectiveScrollX
-        let targetX = max(0, currentTime * clamped - playheadInViewport)
+        let targetX = forcedX ?? max(0, currentTime * clamped - playheadInViewport)
         _zoomScrollTarget = targetX
 
         // ① 预扩容 documentView —— 防止 NSScrollView 在新 PPS 下把 scroll 位置 clamp 到旧的小内容宽度
