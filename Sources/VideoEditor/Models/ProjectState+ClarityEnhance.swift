@@ -95,6 +95,10 @@ extension ProjectState {
             clarityInferStartTime = nil
         case .downloadingModel, .extractingFrames:
             break                      // 保持开工前那个初值
+        case .cloud:
+            // 云端算不出 ETA：耗时主要在 fal 的排队和推理上，本地一无所知。
+            // 卡片那边会改显示阶段名（"上传中" / "排队中" / …）
+            clarityETASeconds = nil
         }
     }
 
@@ -113,9 +117,20 @@ extension ProjectState {
         return max(1, min(hardCap, Int(budget / max(perFrameBytes, 1))))
     }
 
-    private static func estimatedMsPerFrame(scale: ClarityScale, videoWidth: Double, videoHeight: Double) -> Double {
-        // 基准是**串行**单帧耗时（640x480、向量化之后、多帧并行之前实测）
-        let serialBase = scale == .x4 ? 940.0 : 333.0
+    private static func estimatedMsPerFrame(scale: ClarityScale, videoWidth: Double, videoHeight: Double,
+                                            proModel: ClarityProModel? = nil) -> Double {
+        // 基准是**串行**单帧耗时（640x480、向量化之后、多帧并行之前实测）。
+        // 三个高质量模型比 FSRCNN 重一个数量级，用 FSRCNN 的基准会把 3 小时报成
+        // 20 分钟——按各自实测的 ms/tile 换算：640x480 是 3x2=6 个 tile
+        let serialBase: Double = {
+            guard let pro = proModel else { return scale == .x4 ? 940.0 : 333.0 }
+            switch pro {
+            case .animeVideoV3: return 12.5 * 6
+            case .realCUGAN2x:  return 16.5 * 6
+            case .generalX4V3:  return 21.3 * 6
+            case .realCUGAN:    return 24.4 * 6
+            }
+        }()
         guard videoWidth > 0.001, videoHeight > 0.001 else { return serialBase }
 
         let areaRatio = max(1.0, (videoWidth * videoHeight) / (640.0 * 480.0))
@@ -144,6 +159,21 @@ extension ProjectState {
         scale == .x4 ? 1520 : 2160
     }
 
+    /// 设置里选了系统超分时，这次能不能真用上。返回 nil 表示能用，否则是给用户
+    /// 看的原因。抽成独立函数是为了让"尺寸超限"这条判断能被测试直接覆盖。
+    static func systemSRUnavailableReason(width: Double, height: Double) -> String? {
+        guard #available(macOS 26.0, *), AppleSuperResolution.isSupported else {
+            return "系统超分需要 macOS 26"
+        }
+        // 尺寸读不到时放行，交给流水线去撞真实的错（见调用处注释）
+        guard width > 0.001, height > 0.001 else { return nil }
+        let w = Int(width.rounded()), h = Int(height.rounded())
+        guard w > AppleSuperResolution.maxInputWidth
+                || h > AppleSuperResolution.maxInputHeight else { return nil }
+        return "系统超分最大 \(AppleSuperResolution.maxInputWidth)×\(AppleSuperResolution.maxInputHeight)，"
+             + "当前 \(w)×\(h)"
+    }
+
     func enhanceClaritySelection(scale: ClarityScale) {
         guard !isEnhancingClarity else { return }
         guard let id = selectedVideoClipID,
@@ -162,23 +192,37 @@ extension ProjectState {
 
         let model: ClarityModel = scale == .x2 ? .x2 : .x4
 
-        // 这次用不用系统超分：设置里选了、系统版本够、且素材尺寸在它的上限内。
-        // 尺寸超了（比如 4K 素材）自动回落到随包模型——总比直接报错不能用强，
-        // 到时候画质差一些但功能是通的
-        let useSystemSR: Bool = {
-            guard AppSettings.shared.clarityEngine == .system else { return false }
-            guard #available(macOS 26.0, *), AppleSuperResolution.isSupported else { return false }
-            let w = clip.videoWidth, h = clip.videoHeight
-            // 尺寸未知时先按可用处理，真跑起来尺寸不对会在流水线里抛错回落
-            guard w > 0.001, h > 0.001 else { return true }
-            return Int(w) <= AppleSuperResolution.maxInputWidth
-                && Int(h) <= AppleSuperResolution.maxInputHeight
-        }()
+        // 这次用哪个引擎：设置里选的是哪个就是哪个，不做静默回落。
+        // 之前尺寸超限会偷偷换成随包模型，用户选了系统超分却拿到另一个引擎的
+        // 画质，还无从知道——跑不了就明说跑不了，让用户自己决定怎么办
+        let engine = AppSettings.shared.clarityEngine
+        let useSystemSR = engine == .system
         let trimStart = clip.trimStart
         let duration = clip.duration * clip.speed
         let sourceTrackID = track.id
         let sourceName = url.deletingPathExtension().lastPathComponent
         let estimatedFrameCount = Int(duration * 30.0)  // 固定输出帧率 30fps，跟下面流水线里的 frameRate 一致
+
+        // 边界检查 0：选了系统超分但这次跑不了——直接说明原因并停下，不换引擎。
+        // 尺寸未知（读不到 videoWidth/Height）时放行，真跑起来尺寸不对会在
+        // AppleSuperResolution 初始化时抛错，走统一的失败提示
+        if useSystemSR, let reason = Self.systemSRUnavailableReason(width: clip.videoWidth,
+                                                                   height: clip.videoHeight) {
+            showSuccessToast(icon: "exclamationmark.triangle", iconColor: .orange,
+                             title: "清晰度提升", subtitle: reason, autoCountdown: false)
+            return
+        }
+
+        // 云端引擎没 Key 就跑不了。这一步必须在插占位轨道之前——等跑到网络层
+        // 才报错的话，用户会先看到一条占位轨道呼吸起来再被撤掉
+        if engine.isCloud,
+           AppSettings.shared.falAPIKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            showSuccessToast(icon: "exclamationmark.triangle", iconColor: .orange,
+                             title: "清晰度提升",
+                             subtitle: "请先在设置里填写 fal.ai API Key",
+                             autoCountdown: false)
+            return
+        }
 
         // 边界检查 1：分辨率已经较高，放大收益有限——提示但不阻止
         let shortSide = min(clip.videoWidth, clip.videoHeight)
@@ -198,13 +242,19 @@ extension ProjectState {
         // 这里算的是开工前的静态预估，只用来给卡片一个初值，跑起来之后会被按
         // 实际速度推算的值替换掉（见下面 onStateChange 里的 ETA 计算）。
         let estimatedSeconds = Double(estimatedFrameCount)
-            * Self.estimatedMsPerFrame(scale: scale, videoWidth: clip.videoWidth, videoHeight: clip.videoHeight) / 1000.0
+            * Self.estimatedMsPerFrame(scale: scale, videoWidth: clip.videoWidth,
+                                       videoHeight: clip.videoHeight,
+                                       proModel: engine.proModel(scale: scale.rawValue)) / 1000.0
 
         // 边界检查 3：磁盘空间不足直接报错，不要写到一半才失败
         let outputWidth = clip.videoWidth * Double(scale.rawValue)
         let outputHeight = clip.videoHeight * Double(scale.rawValue)
         let bytesPerFrame = Self.estimatedBytesPerFrame(outputWidth: outputWidth, outputHeight: outputHeight)
-        let estimatedBytes = Int64(estimatedFrameCount) * bytesPerFrame * 2  // ×2 覆盖输入+输出两份帧序列
+        // 云端落盘的只有两个压缩 mp4（上传用的片段 + 下载回来的结果），拿本地那套
+        // 裸帧序列的估算去比会高出上百倍，把空间充足的机器也判成"空间不足"
+        let estimatedBytes: Int64 = engine.isCloud
+            ? Int64(duration * max(outputWidth * outputHeight / 1_000_000, 1) * 1_000_000 * 2)
+            : Int64(estimatedFrameCount) * bytesPerFrame * 2  // ×2 覆盖输入+输出两份帧序列
         if let avail = try? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .resourceValues(forKeys: [.volumeAvailableCapacityKey]).volumeAvailableCapacity,
            Int64(avail) < estimatedBytes {
@@ -264,8 +314,9 @@ extension ProjectState {
 
             let cancelFlag = ClarityCancelFlag()
             clarityCancelFlag = cancelFlag
-            // 卡片一开始就得有个数，不能空着等第一次进度回调
-            clarityETASeconds = estimatedSeconds
+            // 卡片一开始就得有个数，不能空着等第一次进度回调。云端例外：耗时全在
+            // fal 的排队和推理上，本地那套按帧算的估算对它毫无意义，宁可不显示
+            clarityETASeconds = engine.isCloud ? nil : estimatedSeconds
             clarityInferStartTime = nil
             // 本次运行的身份标记。取消检查点在后台线程循环顶部、状态回写在循环底部，
             // 两者之间有窗口：cancelClarityEnhance() 已经把状态设成 .idle 之后，
@@ -279,7 +330,18 @@ extension ProjectState {
             func isCurrent() -> Bool { clarityCancelFlag === cancelFlag }
 
             do {
-                if !model.isDownloaded {
+                // 没下载的模型先下。云端引擎和系统超分没有本地模型这一步；
+                // 三个高质量模型走 ClarityProModel，FSRCNN 走 ClarityModel
+                if let pro = engine.proModel(scale: scale.rawValue), !pro.isDownloaded {
+                    clarityEnhanceState = .downloadingModel(0)
+                    try await pro.download { p in
+                        Task { @MainActor in
+                            guard isCurrent() else { return }
+                            self.clarityEnhanceState = .downloadingModel(p)
+                        }
+                    }
+                    try Task.checkCancellation()
+                } else if engine == .builtIn, !model.isDownloaded {
                     clarityEnhanceState = .downloadingModel(0)
                     try await model.download { p in
                         Task { @MainActor in
@@ -293,6 +355,23 @@ extension ProjectState {
                 let outDir = Self.clarityOutputDir
                 let outName = "\(sourceName)_清晰x\(scale.rawValue)_\(UUID().uuidString.prefix(8)).mp4"
                 let outURL = outDir.appendingPathComponent(outName)
+
+                if let endpoint = engine.falEndpoint {
+                    // 云端：整段传上去跑，卡片上显示的是阶段名而不是 ETA
+                    try await Self.runCloudUpscale(
+                        sourceURL: url, trimStart: trimStart, duration: duration,
+                        endpoint: endpoint, upscaleFactor: scale.rawValue,
+                        apiKey: AppSettings.shared.falAPIKey,
+                        workDir: workDir, outputURL: outURL,
+                        onStage: { stage in
+                            Task { @MainActor in
+                                guard isCurrent() else { return }
+                                self.clarityEnhanceState = .cloud(progress: stage.overallProgress,
+                                                                  stage: stage.label)
+                            }
+                        }
+                    )
+                } else {
 
                 // 抽帧 → 逐帧推理 → 编码整段在专属线程上跑，详见 runClarityEnhancePipeline 的注释：
                 // 这几步都是同步阻塞操作，不能用 Task.detached 反复占用 Swift 协作池
@@ -310,6 +389,7 @@ extension ProjectState {
                                 model: model, workDir: workDir, outputURL: outURL,
                                 cancelFlag: cancelFlag,
                                 useSystemSR: useSystemSR,
+                                proModel: engine.proModel(scale: scale.rawValue),
                                 onStateChange: { state in
                                     DispatchQueue.main.async {
                                         guard isCurrent() else { return }
@@ -326,9 +406,20 @@ extension ProjectState {
                     worker.qualityOfService = .utility
                     worker.start()
                 }
+                }   // end else（本地引擎流水线）
                 try Task.checkCancellation()
                 // 已经被取代的旧任务（用户取消后又立刻重新触发）不该再往时间轴里插东西
                 guard isCurrent() else { return }
+
+                // 产物的真实像素尺寸。新片段必须带上它，否则预览区选中时画不出
+                // 裁剪框——computeVideoRect 头一行就是 `guard natW > 0, natH > 0`，
+                // 而这条路径是直接构造 clip + 就地替换占位，走不到正常落轨那套
+                // 异步探测 naturalSize 的逻辑（ProjectState+Timeline.swift:457）。
+                // 用 ffmpeg 探而不是 AVAsset：这个功能全程避开 AVFoundation，
+                // 理由见 ClarityFrameIO 顶部的注释（家用机会永久挂死）
+                let outSize: (width: Int, height: Int)? = await Task.detached(priority: .utility) {
+                    try? ClarityFrameIO.probeVideoSize(outURL)
+                }.value
 
                 pushUndoSavingAssets()
                 var asset = MediaAsset(url: outURL, name: outName, type: .video)
@@ -363,6 +454,17 @@ extension ProjectState {
                     // 播放消耗量（duration * speed）跟新文件的实际时长对上，否则要么截断
                     // （原速度>1 时只播出前半段）要么留空（原速度<1 时后半段没内容）
                     newClip.speed = base.speed
+                    // 像素尺寸：优先用探到的真实值，探不到就按"源尺寸 × 倍数"推
+                    // （流水线里 dstW 就是这么算的）。两个都拿不到时留 0，
+                    // 至少不会写进一个错的尺寸把画面摆歪
+                    if let s = outSize {
+                        newClip.videoWidth = Double(s.width)
+                        newClip.videoHeight = Double(s.height)
+                    } else if base.videoWidth > 0.001, base.videoHeight > 0.001 {
+                        let k = Double(scale.rawValue)
+                        newClip.videoWidth = base.videoWidth * k
+                        newClip.videoHeight = base.videoHeight * k
+                    }
                     // 就地替换占位片段（保留占位片段自己的 id，避免外部还持有旧 id 的引用失效）
                     var filled = newClip
                     filled.id = placeholderClipID
@@ -423,11 +525,44 @@ extension ProjectState {
     /// - Parameter useSystemSR: 用系统超分（VTSuperResolutionScaler）而不是随包的
     ///   FSRCNN。两者走不同的处理路径：系统超分带时序状态（要吃上一帧），必须
     ///   严格顺序处理；FSRCNN 无状态，可以批内并发。
+    /// 云端超分：裁出要处理的那一段 → 传给 fal.ai → 结果落到 outputURL。
+    /// 跟本地流水线不同，这里没有帧级进度，阶段由 FalUpscaleService.Stage 报出来。
+    nonisolated static func runCloudUpscale(
+        sourceURL: URL, trimStart: Double, duration: Double,
+        endpoint: String, upscaleFactor: Int, apiKey: String,
+        workDir: URL, outputURL: URL,
+        onStage: @escaping (FalUpscaleService.Stage) -> Void
+    ) async throws {
+        try FileManager.default.createDirectory(at: workDir, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: outputURL.deletingLastPathComponent(),
+                                                withIntermediateDirectories: true)
+        FalUpscaleService.beginTask()
+
+        let segment = workDir.appendingPathComponent("segment.mp4")
+        try ClarityFrameIO.clipSegment(sourceURL: sourceURL, trimStart: trimStart,
+                                       duration: duration, to: segment)
+
+        let raw = workDir.appendingPathComponent("upscaled.mp4")
+        try await FalUpscaleService.upscale(inputURL: segment, outputURL: raw,
+                                            endpoint: endpoint, upscaleFactor: upscaleFactor,
+                                            apiKey: apiKey, onStage: onStage)
+
+        // FlashVSR 提交时带了 preserve_audio，音轨它自己会拷过来；SeedVR2 的 API
+        // 没有这个参数，出来的是纯视频，得把原片段的音轨合回去
+        if endpoint.contains("seedvr") {
+            try ClarityFrameIO.muxAudio(video: raw, audioFrom: segment, to: outputURL)
+        } else {
+            try? FileManager.default.removeItem(at: outputURL)
+            try FileManager.default.moveItem(at: raw, to: outputURL)
+        }
+    }
+
     nonisolated static func runClarityEnhancePipeline(
         sourceURL: URL, trimStart: Double, duration: Double,
         model: ClarityModel, workDir: URL, outputURL: URL,
         cancelFlag: ClarityCancelFlag,
         useSystemSR: Bool = false,
+        proModel: ClarityProModel? = nil,
         onStateChange: @escaping (ClarityEnhanceState) -> Void
     ) throws -> URL {
         func checkCancelled() throws {
@@ -447,7 +582,10 @@ extension ProjectState {
         onStateChange(.extractingFrames(0))
         let frameRate = 30.0  // 固定输出帧率，跟原素材帧率解耦，简化实现
         let (srcW, srcH) = try ClarityFrameIO.probeVideoSize(sourceURL)
-        let scale = useSystemSR ? AppleSuperResolutionScale : (model == .x2 ? 2 : 4)
+        // 倍数由这次实际用的模型决定：系统超分锁死 4 倍，高质量模型看它自己是
+        // 哪档权重（Real-CUGAN 有 2 和 4 两套），FSRCNN 看传进来的 ClarityModel
+        let scale = useSystemSR ? AppleSuperResolutionScale
+                  : (proModel?.scale ?? (model == .x2 ? 2 : 4))
         let dstW = srcW * scale, dstH = srcH * scale
         let inFrameBytes = srcW * srcH * 4
         let outFrameBytes = dstW * dstH * 4
@@ -526,9 +664,18 @@ extension ProjectState {
                     if shared.firstError != nil || cancelFlag.isCancelled { return }
                     autoreleasepool {
                         do {
-                            let out = try ClarityEnhancer.enhanceRGBA([UInt8](batch[i]),
+                            // 两条推理路子的接口形状一样，只是模型接口不同：
+                            // FSRCNN 走 Y 通道 MultiArray，pro 三个走 RGB ImageType
+                            let out: [UInt8]
+                            if let pro = proModel {
+                                out = try ClarityProEnhancer.enhanceRGBA([UInt8](batch[i]),
+                                                                         width: srcW, height: srcH,
+                                                                         model: pro)
+                            } else {
+                                out = try ClarityEnhancer.enhanceRGBA([UInt8](batch[i]),
                                                                       width: srcW, height: srcH,
                                                                       model: model)
+                            }
                             slots.set(i, Data(out))
                             onStateChange(.inferring(shared.recordCompletedAndProgress()))
                         } catch {

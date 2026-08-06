@@ -16,6 +16,7 @@ struct SettingsView: View {
     @State private var demucsState: ModelState = .notDownloaded
     @State private var biRefNetStates: [BiRefNetModel: ModelState] = [:]
     @State private var clarityModelStates: [ClarityModel: ModelState] = [:]
+    @State private var clarityProStates: [ClarityProModel: ModelState] = [:]
     /// 系统超分模型的状态。它不归我们下载/存放，只能查状态和请求系统去下
     @State private var appleSRState: ModelState = .notDownloaded
     // 分离产物占用，进设置页和每次清理后刷新
@@ -87,7 +88,7 @@ struct SettingsView: View {
         }
         .frame(width: 540, height: 520)
         .background(Color(red: 0.13, green: 0.13, blue: 0.14))
-        .onAppear { refreshModelStates(); refreshSceneDetectState(); refreshDemucsState(); refreshSeparated(); refreshBiRefNetStates(); refreshClarityModelStates() }
+        .onAppear { refreshModelStates(); refreshSceneDetectState(); refreshDemucsState(); refreshSeparated(); refreshBiRefNetStates(); refreshClarityModelStates(); refreshClarityProStates() }
     }
 
     /// 标签页内的一级标题，用来分块
@@ -698,7 +699,36 @@ struct SettingsView: View {
                 .foregroundColor(Color.labelSecondary.opacity(0.7))
                 .fixedSize(horizontal: false, vertical: true)
 
-            if settings.clarityEngine == .system {
+            if settings.clarityEngine.isCloud {
+                // 云端引擎没有本地模型可下载，要的是一把 Key。费用走用户自己的账号
+                apiKeyField(
+                    label: "fal.ai API Key",
+                    placeholder: "在 fal.ai/dashboard/keys 创建",
+                    text: Binding(
+                        get: { settings.falAPIKey },
+                        set: { settings.falAPIKey = $0 }
+                    )
+                )
+            } else if settings.clarityEngine.usesProModel {
+                // 高质量本地模型：一个倍数一张卡片。Real-CUGAN 有 2 倍和 4 倍
+                // 两套权重，各自独立下载——只用 4 倍的人不该被迫连 2 倍一起下
+                ForEach([2, 4], id: \.self) { s in
+                    if let pro = settings.clarityEngine.proModel(scale: s), pro.scale == s {
+                        componentCard(
+                            title: pro.displayName,
+                            detail: pro.detail,
+                            infoText: pro.infoText,
+                            folder: ClarityProModel.supportDir,
+                            state: clarityProStates[pro] ?? .notDownloaded,
+                            onDownload: { downloadClarityProModel(pro) },
+                            onUninstall: {
+                                try? pro.delete()
+                                refreshClarityProStates()
+                            }
+                        )
+                    }
+                }
+            } else if settings.clarityEngine == .system {
                 // 系统超分只有 4 倍这一档，模型也由系统管
                 componentCard(
                     title: "4 倍提升",
@@ -812,6 +842,27 @@ struct SettingsView: View {
                 await MainActor.run { clarityModelStates[model] = .downloaded }
             } catch {
                 await MainActor.run { clarityModelStates[model] = .failed(error.localizedDescription) }
+            }
+        }
+    }
+
+    private func refreshClarityProStates() {
+        for model in ClarityProModel.allCases {
+            if case .downloading = clarityProStates[model] { continue }
+            clarityProStates[model] = model.isDownloaded ? .downloaded : .notDownloaded
+        }
+    }
+
+    private func downloadClarityProModel(_ model: ClarityProModel) {
+        clarityProStates[model] = .downloading(0)
+        Task {
+            do {
+                try await model.download { pct in
+                    DispatchQueue.main.async { clarityProStates[model] = .downloading(pct) }
+                }
+                await MainActor.run { clarityProStates[model] = .downloaded }
+            } catch {
+                await MainActor.run { clarityProStates[model] = .failed(error.localizedDescription) }
             }
         }
     }
@@ -1457,7 +1508,15 @@ private struct ClarityEnginePicker: View {
         let menu = NSMenu()
         menu.minimumWidth = 180
         IPickerItemHandler.shared.actions.removeAll()
+        var lastGroup: AppSettings.ClarityEngine.Group? = nil
         for (tag, eng) in AppSettings.ClarityEngine.allCases.enumerated() {
+            // 本地一组、云端一组，中间画条分隔线——两类的代价完全不同
+            // （一个是等 CPU，一个是花钱），不该混在一起让人一眼扫过去
+            if let last = lastGroup, last != eng.group {
+                menu.addItem(.separator())
+            }
+            lastGroup = eng.group
+
             // 这台机器跑不了系统超分就置灰，别让用户选一个用不了的
             var usable = true
             if eng == .system {

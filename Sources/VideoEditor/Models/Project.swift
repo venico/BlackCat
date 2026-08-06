@@ -559,6 +559,9 @@ final class ProjectState: ObservableObject {
         case extractingFrames(Double)
         case inferring(Double)
         case encoding
+        /// 云端引擎（fal.ai）。整段上传上去跑，没有帧级进度，只能按阶段推进，
+        /// 所以进度和阶段名都由 FalUpscaleService.Stage 直接给出
+        case cloud(progress: Double, stage: String)
         // 没有 .failed case：失败统一走 showSuccessToast 报错（跟本功能其它错误
         // 路径一致），这个状态机不需要单独携带失败态，见 whole-branch review：
         // 之前留着这个 case 是死代码，从没被赋值过，进度气泡里对应分支也永远
@@ -582,7 +585,16 @@ final class ProjectState: ObservableObject {
             case .extractingFrames:        return 0.03
             case .inferring(let p):        return 0.03 + p * 0.94
             case .encoding:                return 0.99
+            case .cloud(let p, _):         return p
             }
+        }
+
+        /// 云端阶段名（"上传中" / "排队中" / …）。本地引擎没有这一层，返回 nil。
+        /// 云端在"处理中"会长时间停在同一个百分比上，光看进度条像卡死了，
+        /// 得把当前在干什么显出来
+        var cloudStage: String? {
+            if case .cloud(_, let s) = self { return s }
+            return nil
         }
     }
     @Published var clarityEnhanceState: ClarityEnhanceState = .idle
@@ -610,6 +622,8 @@ final class ProjectState: ObservableObject {
     func cancelClarityEnhance() {
         clarityCancelFlag?.cancel()
         ClarityFrameIO.killCurrentProcess()
+        // 云端任务光断本地是不够的——不通知 fal 取消的话它会把这单跑完，用户照样被扣钱
+        FalUpscaleService.cancelCurrentTask()
         clarityEnhanceTask?.cancel()
         clarityEnhanceTask = nil
         clarityCancelFlag = nil

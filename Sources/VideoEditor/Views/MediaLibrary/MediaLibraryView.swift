@@ -960,8 +960,10 @@ private struct ClarityEnhanceBubble: View {
     let etaSeconds: Double?
     let onCancel: () -> Void
 
-    /// "还需约 X" —— 取整到分钟，不足一分钟就直说，免得看着秒数一跳一跳
+    /// "还需约 X" —— 取整到分钟，不足一分钟就直说，免得看着秒数一跳一跳。
+    /// 云端引擎算不出 ETA（排队多久是 fal 那边的事），这个位置改显示当前阶段
     private var etaText: String? {
+        if let stage = state.cloudStage { return stage }
         guard let s = etaSeconds, s.isFinite, s > 0 else { return nil }
         if s < 60 { return "还需不到 1 分钟" }
         let totalMinutes = Int((s / 60).rounded())

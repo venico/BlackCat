@@ -146,6 +146,57 @@ enum ClarityFrameIO {
         return (p, inPipe.fileHandleForWriting)
     }
 
+    // MARK: - 云端引擎用的整段裁剪 / 合轨
+
+    /// 同步跑一个 ffmpeg 并等它结束。注册进 _activeProcesses，取消时能一起杀掉
+    private static func runFFmpeg(_ args: [String], failWith: (String) -> FrameIOError) throws {
+        guard let ff = ProjectState.findFFmpeg() else { throw FrameIOError.ffmpegNotFound }
+        let p = Process()
+        p.executableURL = ff
+        p.arguments = ["-hide_banner", "-loglevel", "error", "-nostdin", "-y"] + args
+        let errPipe = Pipe()
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = errPipe
+        p.qualityOfService = .utility
+        register(p)
+        defer { unregister(p) }
+        do { try p.run() } catch { throw failWith(error.localizedDescription) }
+        let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        guard p.terminationStatus == 0 else {
+            // 被 terminate() 杀掉的进程走取消，不是真失败
+            if p.terminationReason == .uncaughtSignal { throw FrameIOError.cancelled }
+            let detail = String(data: errData, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? "退出码 \(p.terminationStatus)"
+            throw failWith(String(detail.suffix(300)))
+        }
+    }
+
+    /// 裁出片段实际用到的那一段。云端按输出画面计费，把整个源文件传上去的话，
+    /// 从一小时素材里剪出的 10 秒片段会按一小时收钱
+    nonisolated static func clipSegment(sourceURL: URL, trimStart: Double, duration: Double,
+                                        to outputURL: URL) throws {
+        var args: [String] = []
+        if trimStart > 0.001 { args += ["-ss", String(format: "%.6f", trimStart)] }
+        args += ["-t", String(format: "%.6f", duration), "-i", sourceURL.path]
+        // 重编码而不是 -c copy：-c copy 只能从关键帧切，起止会偏出去几百毫秒，
+        // 而这段的时长必须跟时间轴上的片段严丝合缝对上。crf 18 接近视觉无损
+        args += ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "18", "-c:a", "aac"]
+        args += [outputURL.path]
+        try runFFmpeg(args, failWith: FrameIOError.extractFailed)
+    }
+
+    /// 把原片段的音轨合进处理结果。SeedVR2 的 API 没有保留音轨的参数，
+    /// 出来的是纯视频，不合回去声音就丢了
+    nonisolated static func muxAudio(video: URL, audioFrom: URL, to outputURL: URL) throws {
+        // -c:v copy：视频流原样搬过去，不要为了塞个音轨把超分结果再压一遍
+        let args = ["-i", video.path, "-i", audioFrom.path,
+                    "-map", "0:v:0", "-map", "1:a:0?",
+                    "-c:v", "copy", "-c:a", "aac", "-shortest",
+                    outputURL.path]
+        try runFFmpeg(args, failWith: FrameIOError.encodeFailed)
+    }
+
     /// 从管道读满 exactly `count` 字节。管道的 read 不保证一次读满（尤其一帧
     /// 几十 MB 时必然被拆成多次），必须循环补齐；读到 0 字节说明对端 EOF。
     /// 返回 nil 表示流已经正常结束（读到的字节数不足一帧）。

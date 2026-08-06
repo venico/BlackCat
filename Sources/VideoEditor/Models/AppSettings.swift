@@ -41,6 +41,7 @@ final class AppSettings: ObservableObject {
         static let fishSelectedVoice = "settings.ai.fish.selectedVoice"
         static let bgRemovalEngine = "settings.image.bgRemovalEngine"
         static let clarityEngine = "settings.video.clarityEngine"
+        static let falAPIKey = "settings.video.fal.apiKey"
         static let ttsProvider = "settings.subtitle.ttsProvider"
         static let ttsSpeed = "settings.subtitle.ttsSpeed"
         static let ttsAutoFit = "settings.subtitle.ttsAutoFit"
@@ -337,15 +338,44 @@ final class AppSettings: ObservableObject {
 
     /// 清晰度提升用哪个超分引擎
     enum ClarityEngine: String, CaseIterable {
-        case system   // 系统自带（VTSuperResolutionScaler，macOS 26+）
-        case builtIn  // 随 app 走的 FSRCNN
+        case system         // 系统自带（VTSuperResolutionScaler，macOS 26+）
+        case builtIn        // 随 app 走的 FSRCNN
+        case generalX4V3    // 本地 Real-ESRGAN general-x4v3：实拍
+        case animeVideoV3   // 本地 Real-ESRGAN animevideov3：动漫·快
+        case realCUGAN      // 本地 Real-CUGAN up4x：动漫·质量
+        case flashVSR       // 云端 fal.ai：阿里 FlashVSR
+        case seedVR2        // 云端 fal.ai：字节 SeedVR2
 
         var label: String {
             switch self {
-            case .system:  return "系统超分"
-            case .builtIn: return "轻量超分"
+            case .system:        return "系统超分"
+            case .builtIn:       return "轻量超分"
+            case .generalX4V3:   return "实拍增强"
+            case .animeVideoV3:  return "动漫增强（快）"
+            case .realCUGAN:     return "动漫增强（质量优先）"
+            case .flashVSR:      return "FlashVSR（云端）"
+            case .seedVR2:       return "SeedVR2（云端）"
             }
         }
+
+        /// 下拉里的分组。同组的连着排，组间画一条分隔线
+        enum Group { case local, cloud }
+        var group: Group { isCloud ? .cloud : .local }
+
+        /// 走本地 CoreML 模型的引擎对应哪个模型（系统超分和云端为 nil）。
+        /// Real-CUGAN 有 2 倍和 4 倍两套权重，得按用户点的倍数取；
+        /// 另外两个只有 x4，传什么倍数都返回同一个
+        func proModel(scale: Int = 4) -> ClarityProModel? {
+            switch self {
+            case .generalX4V3:  return .generalX4V3
+            case .animeVideoV3: return .animeVideoV3
+            case .realCUGAN:    return scale == 2 ? .realCUGAN2x : .realCUGAN
+            case .system, .builtIn, .flashVSR, .seedVR2: return nil
+            }
+        }
+
+        /// 这个引擎用不用本地 CoreML 模型。只是判断类别，不涉及具体倍数
+        var usesProModel: Bool { proModel() != nil }
 
         var hint: String {
             switch self {
@@ -353,15 +383,48 @@ final class AppSettings: ObservableObject {
                 return "画质更好；只支持放大 4 倍，素材分辨率需在 1920×1080 以内，要求 macOS 26 及以上"
             case .builtIn:
                 return "随应用附带的轻量模型，速度快、任何系统都能用，但画质提升有限（接近高质量插值放大）"
+            case .generalX4V3:
+                return "适合真人拍摄、纪录片、老录像，只支持放大 4 倍"
+            case .animeVideoV3:
+                return "适合动画片、二次元视频，本地引擎里速度最快，只支持放大 4 倍"
+            case .realCUGAN:
+                return "线条更锐利、保留景深虚化，比上一档慢一些，只支持放大 4 倍"
+            case .flashVSR:
+                return "适合真实拍摄素材和长片段"
+            case .seedVR2:
+                return "适合 AI 生成视频和重压缩素材"
             }
         }
 
-        /// 系统超分只有 4 倍这一档
-        var supportsX2: Bool { self == .builtIn }
+        /// 走 fal.ai 云端跑的引擎——要 API Key、要联网、按量计费
+        var isCloud: Bool { self == .flashVSR || self == .seedVR2 }
+
+        /// fal.ai 上的 endpoint id（本地引擎为 nil）
+        var falEndpoint: String? {
+            switch self {
+            case .flashVSR: return "fal-ai/flashvsr/upscale/video"
+            case .seedVR2:  return "fal-ai/seedvr/upscale/video"
+            case .system, .builtIn, .generalX4V3, .animeVideoV3, .realCUGAN: return nil
+            }
+        }
+
+        /// 能不能选 2 倍。系统超分是 VTSuperResolutionScaler 的硬限制；
+        /// Real-ESRGAN 那两个轻量分支上游只发布了 x4 权重，补不了
+        var supportsX2: Bool {
+            switch self {
+            case .builtIn, .flashVSR, .seedVR2, .realCUGAN: return true
+            case .system, .generalX4V3, .animeVideoV3: return false
+            }
+        }
     }
 
     @Published var clarityEngine: ClarityEngine {
         didSet { ud.set(clarityEngine.rawValue, forKey: K.clarityEngine) }
+    }
+
+    /// fal.ai 的 API Key，云端超分引擎用。跟其他云服务的 Key 一样存 UserDefaults
+    @Published var falAPIKey: String {
+        didSet { ud.set(falAPIKey, forKey: K.falAPIKey) }
     }
 
     /// 选用 BiRefNet 时具体用哪个权重
@@ -430,6 +493,7 @@ final class AppSettings: ObservableObject {
         } else {
             clarityEngine = .builtIn
         }
+        falAPIKey = ud.string(forKey: K.falAPIKey) ?? ""
         ttsProvider = AIVideoService.Provider(rawValue: ud.string(forKey: K.ttsProvider) ?? "")
             .flatMap { $0.category == .audio ? $0 : nil } ?? .fishAudio
         let savedSpeed = ud.double(forKey: K.ttsSpeed)

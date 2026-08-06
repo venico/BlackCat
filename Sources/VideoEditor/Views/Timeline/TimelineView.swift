@@ -980,8 +980,8 @@ struct TimelineView: View {
                         if project.selectedVideoClipID != nil {
                             Divider()
                             Menu {
-                                // 系统超分只有 4 倍这一档，选了它就别摆一个点了会
-                                // 自动降级的 2 倍出来
+                                // 系统超分只有 4 倍这一档（VTSuperResolutionScaler
+                                // 的硬限制），选了它就不摆一个点了会直接报错的 2 倍
                                 if AppSettings.shared.clarityEngine.supportsX2 {
                                     Button { project.enhanceClaritySelection(scale: .x2) } label: {
                                         Text("放大 2 倍")

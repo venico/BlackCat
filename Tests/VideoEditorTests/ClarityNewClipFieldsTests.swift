@@ -26,6 +26,37 @@ final class ClarityNewClipFieldsTests: XCTestCase {
                      "这个构造重载不带 url；清晰度提升曾经用的就是它，导致片段没有缩略图")
     }
 
+    /// 同一类坑的第二例：像素尺寸不填，预览区选中时画不出裁剪框。
+    /// PlayerView.computeVideoRect 第一行就是 `guard natW > 0, natH > 0 else
+    /// { return .zero }`——尺寸为 0 时整个框退化成零矩形，没有任何报错。
+    /// 正常落轨路径靠异步探测 naturalSize 填这两个字段
+    /// （ProjectState+Timeline.swift:457），而清晰度提升是直接构造 clip +
+    /// 就地替换占位，走不到那里，必须自己填。
+    func testFreshlyConstructedClipHasZeroPixelSize() {
+        let clip = VideoClip(assetID: UUID(), name: "增强版",
+                             url: URL(fileURLWithPath: "/tmp/x.mp4"),
+                             startTime: 0, endTime: 5)
+        XCTAssertEqual(clip.videoWidth, 0, accuracy: 0.001,
+                       "构造函数不会自己填像素尺寸——所以调用方必须显式赋值")
+        XCTAssertEqual(clip.videoHeight, 0, accuracy: 0.001)
+    }
+
+    /// 裁剪框的判定条件本身：尺寸为 0 就画不出来
+    func testCropBoxNeedsNonZeroPixelSize() {
+        var clip = VideoClip(assetID: UUID(), name: "增强版",
+                             url: URL(fileURLWithPath: "/tmp/x.mp4"),
+                             startTime: 0, endTime: 5)
+        // 这是 computeVideoRect 的 guard 条件，尺寸没填时它直接返回 .zero
+        XCTAssertFalse(clip.videoWidth > 0 && clip.videoHeight > 0,
+                       "没填尺寸时不该通过裁剪框的前置判断")
+        // 填上之后（源 1280x720 放大 4 倍）才能通过
+        clip.videoWidth = 1280 * 4
+        clip.videoHeight = 720 * 4
+        XCTAssertTrue(clip.videoWidth > 0 && clip.videoHeight > 0)
+        XCTAssertEqual(clip.videoWidth, 5120, accuracy: 0.001, "放大后的宽应是源 × 倍数")
+        XCTAssertEqual(clip.videoHeight, 2880, accuracy: 0.001)
+    }
+
     /// 新片段要继承源片段的时间范围和速度（这两个之前 review 抓到过）
     func testNewClipInheritsTimingAndSpeed() {
         var src = VideoClip(assetID: UUID(), name: "源", url: URL(fileURLWithPath: "/tmp/a.mp4"),

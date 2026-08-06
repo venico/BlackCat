@@ -60,100 +60,14 @@ enum ClarityModel: String, CaseIterable, Identifiable {
         FileManager.default.fileExists(atPath: localURL.path)
     }
 
-    enum DownloadError: Error, LocalizedError {
-        case noSource
-        case badResponse(Int)
-        case tooSmall
-        case unpackFailed(String)
-
-        var errorDescription: String? {
-            switch self {
-            case .noSource:             return "该模型暂无可用下载源"
-            case .badResponse(let c):   return "下载失败（HTTP \(c)）"
-            case .tooSmall:             return "下载的文件不完整，请重试"
-            case .unpackFailed(let d):  return "解压失败：\(d)"
-            }
-        }
-    }
+    /// 下载相关的错误类型统一在 CoreMLModelDownloader 里。这个别名留着是因为
+    /// 既有调用方和测试都在用 ClarityModel.DownloadError 这个名字
+    typealias DownloadError = CoreMLModelDownloader.DownloadError
 
     func download(onProgress: @escaping (Double) -> Void) async throws {
-        guard !sourceURLs.isEmpty else { throw DownloadError.noSource }
-        var lastError: Error = DownloadError.noSource
-        for urlString in sourceURLs {
-            guard let url = URL(string: urlString) else { continue }
-            do {
-                try await downloadOne(url, onProgress: onProgress)
-                return
-            } catch {
-                lastError = error
-                continue
-            }
-        }
-        throw lastError
-    }
-
-    private func downloadOne(_ url: URL, onProgress: @escaping (Double) -> Void) async throws {
-        var request = URLRequest(url: url)
-        request.setValue("BlackCat/1.0", forHTTPHeaderField: "User-Agent")
-        request.timeoutInterval = 600
-
-        let (bytes, response) = try await URLSession.shared.bytes(for: request)
-        if let http = response as? HTTPURLResponse, http.statusCode != 200 {
-            throw DownloadError.badResponse(http.statusCode)
-        }
-        let total = response.expectedContentLength
-
-        var data = Data()
-        data.reserveCapacity(total > 0 ? Int(total) : 1 << 20)
-        var lastReported = 0.0
-        for try await byte in bytes {
-            data.append(byte)
-            if total > 0 {
-                let pct = Double(data.count) / Double(total)
-                if pct - lastReported >= 0.01 {
-                    lastReported = pct
-                    onProgress(pct)
-                }
-            }
-        }
-        guard data.count >= minFileSize else { throw DownloadError.tooSmall }
-
-        let tmpZip = Self.supportDir.appendingPathComponent("\(archiveName).part")
-        try? FileManager.default.removeItem(at: tmpZip)
-        try data.write(to: tmpZip)
-        defer { try? FileManager.default.removeItem(at: tmpZip) }
-
-        let staging = Self.supportDir.appendingPathComponent("unzip-\(UUID().uuidString)")
-        try? FileManager.default.removeItem(at: staging)
-        defer { try? FileManager.default.removeItem(at: staging) }
-        try unzip(tmpZip, to: staging)
-
-        let extracted = staging.appendingPathComponent(fileName)
-        guard FileManager.default.fileExists(atPath: extracted.path) else {
-            throw DownloadError.unpackFailed("压缩包里没有 \(fileName)")
-        }
-        if FileManager.default.fileExists(atPath: localURL.path) {
-            try? FileManager.default.removeItem(at: localURL)
-        }
-        try FileManager.default.moveItem(at: extracted, to: localURL)
-        onProgress(1.0)
-    }
-
-    private func unzip(_ archive: URL, to dest: URL) throws {
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
-        p.arguments = ["-x", "-k", archive.path, dest.path]
-        let err = Pipe()
-        p.standardError = err
-        p.standardOutput = FileHandle.nullDevice
-        do { try p.run() } catch {
-            throw DownloadError.unpackFailed(error.localizedDescription)
-        }
-        let detail = String(data: err.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-        p.waitUntilExit()
-        guard p.terminationStatus == 0 else {
-            throw DownloadError.unpackFailed(detail.isEmpty ? "ditto 退出码 \(p.terminationStatus)" : detail)
-        }
+        try await CoreMLModelDownloader.download(
+            sourceURLs: sourceURLs, fileName: fileName, destDir: Self.supportDir,
+            minFileSize: minFileSize, onProgress: onProgress)
     }
 
     func delete() throws {

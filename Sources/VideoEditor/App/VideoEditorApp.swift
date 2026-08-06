@@ -30,7 +30,9 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate 
 
     private func createWindow() {
         let contentView = ContentView()
-        let hostingView = NSHostingView(rootView: contentView)
+        // 用 GatedHostingView 而不是 NSHostingView：预览区一直铺到窗口最顶端，
+        // 落在那里的裁剪/缩放手柄按下去会被当成拖窗口。详见 WindowDragGate.swift
+        let hostingView = GatedHostingView(rootView: contentView)
 
         window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 1280, height: 780),
@@ -277,7 +279,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate 
     @objc private func showAbout() {
         NSApp.orderFrontStandardAboutPanel(options: [
             .applicationName: "黑猫剪辑",
-            .applicationVersion: "4.3.1",
+            .applicationVersion: "4.3.5",
             .version: "",
             .credits: NSAttributedString(string: "")
         ])

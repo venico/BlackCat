@@ -1311,6 +1311,7 @@ private struct VideoTransformOverlay: View {
                             let isH = edge < 2
                             let barLen = isH ? max(min(vidRect.width * 0.35, 50), 20) : max(min(vidRect.height * 0.35, 50), 20)
                             VideoCropEdgeBar(isHorizontal: isH, length: barLen, color: accentColor)
+                                .claimsDragFromWindow()   // 必须在 .position() 之前
                                 .position(x: pos.x, y: pos.y)
                                 .gesture(cropDrag(clip: clip, info: info, edge: edge))
                         }
@@ -1319,6 +1320,7 @@ private struct VideoTransformOverlay: View {
                         ForEach(0..<4, id: \.self) { corner in
                             let pos = cornerPos(corner, vidRect)
                             VideoScaleHandleDot(color: accentColor)
+                                .claimsDragFromWindow()   // 必须在 .position() 之前
                                 .position(x: pos.x, y: pos.y)
                                 .gesture(scaleDrag(clip: clip, info: info, corner: corner))
                         }
@@ -1680,6 +1682,7 @@ private struct ImageTransformOverlay: View {
                             let isH = edge < 2
                             let barLen = isH ? max(min(imgRect.width * 0.35, 50), 20) : max(min(imgRect.height * 0.35, 50), 20)
                             CropEdgeBar(isHorizontal: isH, length: barLen)
+                                .claimsDragFromWindow()   // 必须在 .position() 之前
                                 .position(x: pos.x, y: pos.y)
                                 .gesture(cropDrag(clip: clip, info: info, edge: edge))
                         }
@@ -1688,6 +1691,7 @@ private struct ImageTransformOverlay: View {
                         ForEach(0..<4, id: \.self) { corner in
                             let pos = cornerPos(corner, imgRect)
                             ScaleHandleDot()
+                                .claimsDragFromWindow()   // 必须在 .position() 之前
                                 .position(x: pos.x, y: pos.y)
                                 .gesture(scaleDrag(clip: clip, info: info, corner: corner))
                         }

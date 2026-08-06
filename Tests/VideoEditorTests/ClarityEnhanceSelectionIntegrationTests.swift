@@ -149,6 +149,13 @@ final class ClarityEnhanceSelectionIntegrationTests: XCTestCase {
         try XCTSkipUnless(ClarityModel.x2.isDownloaded && ClarityModel.x4.isDownloaded,
                            "本机 FSRCNN 模型未下载全，跳过端到端测试")
 
+        // 这个测试验的是 FSRCNN 那条流水线，必须把引擎钉死在随包模型上。
+        // 不钉的话它会跟着开发者本机的设置走：选了系统超分就强制 4 倍（x2 用例
+        // 于是拿到 4 倍输出而失败），选了云端还会真的发起付费请求
+        let savedEngine = AppSettings.shared.clarityEngine
+        AppSettings.shared.clarityEngine = .builtIn
+        defer { AppSettings.shared.clarityEngine = savedEngine }
+
         let srcW = 640, srcH = 480
         let srcSeconds = Self.testClipSeconds
         let video = try makeLowResTestVideo(width: srcW, height: srcH, seconds: srcSeconds,
@@ -190,6 +197,14 @@ final class ClarityEnhanceSelectionIntegrationTests: XCTestCase {
         let newClip = try XCTUnwrap(newTrack.clips.first)
         XCTAssertEqual(newClip.startTime, 0, accuracy: 0.001, "新片段起点应跟原片段一致")
         XCTAssertEqual(newClip.duration, srcSeconds, accuracy: 0.001, "新片段时长应跟原片段一致")
+
+        // 2b. 像素尺寸必须填上，否则预览区选中这个片段时画不出裁剪框
+        // （PlayerView.computeVideoRect 头一行 `guard natW > 0, natH > 0`）。
+        // 这条路径不走正常落轨那套异步探测 naturalSize 的逻辑，得自己填
+        XCTAssertEqual(newClip.videoWidth, Double(srcW * multiplier), accuracy: 1,
+                       "新片段的像素宽应是源的 \(multiplier) 倍，否则裁剪框画不出来")
+        XCTAssertEqual(newClip.videoHeight, Double(srcH * multiplier), accuracy: 1,
+                       "新片段的像素高应是源的 \(multiplier) 倍")
 
         // 3. 用 ffprobe 检查生成的输出视频文件的真实分辨率，确认宽高确实是原始
         // 测试视频分辨率的 N 倍——这是"画面确实更清晰"这个主观验证要求在这里能
