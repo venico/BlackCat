@@ -52,12 +52,9 @@ enum CoreMLModelDownloader {
         request.setValue("BlackCat/1.0", forHTTPHeaderField: "User-Agent")
         request.timeoutInterval = 600
 
-        // 用 download(for:delegate:)，不要 bytes(for:) 逐字节遍历——
-        // AsyncBytes 是一个字节一个字节吐的，几百 MB 的模型（BiRefNet full 388MB）
-        // 就是几亿次循环迭代加 Data.append，慢到看着像卡死。
-        // download 走系统的分块写盘路径，进度由 delegate 给
-        let delegate = ModelDownloadProgressDelegate(onProgress: onProgress)
-        let (tmp, response) = try await URLSession.shared.download(for: request, delegate: delegate)
+        // 下载走 DownloadProgress——那里记着两个必须绕开的坑（逐字节读、
+        // task 级 delegate 收不到进度）
+        let (tmp, response) = try await DownloadProgress.download(request, onProgress: onProgress)
         if let http = response as? HTTPURLResponse, http.statusCode != 200 {
             throw DownloadError.badResponse(http.statusCode)
         }
@@ -109,24 +106,3 @@ enum CoreMLModelDownloader {
     }
 }
 
-
-/// 模型下载的进度回调。URLSession 的 async download 只有加 delegate 才拿得到进度
-private final class ModelDownloadProgressDelegate: NSObject, URLSessionDownloadDelegate {
-    private let onProgress: (Double) -> Void
-
-    init(onProgress: @escaping (Double) -> Void) {
-        self.onProgress = onProgress
-        super.init()
-    }
-
-    func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask,
-                    didWriteData bytesWritten: Int64,
-                    totalBytesWritten: Int64,
-                    totalBytesExpectedToWrite: Int64) {
-        guard totalBytesExpectedToWrite > 0 else { return }
-        onProgress(Double(totalBytesWritten) / Double(totalBytesExpectedToWrite))
-    }
-
-    func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask,
-                    didFinishDownloadingTo location: URL) {}
-}

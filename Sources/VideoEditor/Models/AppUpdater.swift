@@ -222,12 +222,7 @@ final class AppUpdater: ObservableObject {
         req.setValue("BlackCat/\(Self.currentVersion)", forHTTPHeaderField: "User-Agent")
         req.timeoutInterval = 600
 
-        // 用 download(for:delegate:) 而不是 bytes(for:) 逐字节遍历。
-        // AsyncBytes 是**一个字节一个字节**吐的，65MB 的包就是 6800 万次
-        // 循环迭代加 Data.append，慢到没法用；download 走的是系统的分块写盘路径，
-        // 进度由 delegate 回调给出。
-        let delegate = DownloadProgressDelegate(onProgress: onProgress)
-        let (tmp, resp) = try await URLSession.shared.download(for: req, delegate: delegate)
+        let (tmp, resp) = try await DownloadProgress.download(req, onProgress: onProgress)
         if let http = resp as? HTTPURLResponse, http.statusCode != 200 {
             throw NSError(domain: "AppUpdater", code: http.statusCode,
                           userInfo: [NSLocalizedDescriptionKey: "下载失败（HTTP \(http.statusCode)）"])
@@ -307,24 +302,3 @@ final class AppUpdater: ObservableObject {
     }
 }
 
-/// 下载进度回调。URLSession 的 async download 只有加 delegate 才拿得到进度
-private final class DownloadProgressDelegate: NSObject, URLSessionDownloadDelegate {
-    private let onProgress: (Double) -> Void
-
-    init(onProgress: @escaping (Double) -> Void) {
-        self.onProgress = onProgress
-        super.init()
-    }
-
-    func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask,
-                    didWriteData bytesWritten: Int64,
-                    totalBytesWritten: Int64,
-                    totalBytesExpectedToWrite: Int64) {
-        guard totalBytesExpectedToWrite > 0 else { return }
-        onProgress(Double(totalBytesWritten) / Double(totalBytesExpectedToWrite))
-    }
-
-    /// 协议要求实现。文件的落地由 download(for:delegate:) 自己接管，这里不用做事
-    func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask,
-                    didFinishDownloadingTo location: URL) {}
-}
