@@ -3,7 +3,6 @@ import AppKit
 import UniformTypeIdentifiers
 
 public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
-    private var window: NSWindow!
     private var isCleaningMenus = false
     private var cleanupTimer: Timer?
     /// Finder 双击 bcj 文件时暂存 URL，等 view 就绪后再打开
@@ -29,38 +28,17 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate 
     // MARK: - 窗口
 
     private func createWindow() {
-        let contentView = ContentView()
-        // 用 GatedHostingView 而不是 NSHostingView：预览区一直铺到窗口最顶端，
-        // 落在那里的裁剪/缩放手柄按下去会被当成拖窗口。详见 WindowDragGate.swift
-        let hostingView = GatedHostingView(rootView: contentView)
-
-        window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 1280, height: 780),
-            styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
-            backing: .buffered,
-            defer: false
-        )
-        window.contentView = hostingView
-        window.setContentSize(NSSize(width: 1280, height: 780))
-        window.minSize = NSSize(width: 1100, height: 680)
-        window.titlebarAppearsTransparent = true
-        window.titleVisibility = .hidden
-        window.isMovableByWindowBackground = false
-        // 窗口本身透明，底色交给 NSVisualEffectView（见 VisualEffectBackground.swift）。
-        // 不透明窗口会直接盖住材质对窗口后方内容的采样，界面就不会跟着墙纸变了
-        window.isOpaque = false
-        window.backgroundColor = .clear
-        // 锁死深色。系统材质和 Liquid Glass 都跟随 appearance 走，不锁的话
-        // 用户把系统切成浅色，整个界面会跟着变白——这个 app 只做深色
-        window.appearance = NSAppearance(named: .darkAqua)
-        window.tabbingMode = .disallowed
-        window.center()
-
-        [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton].forEach {
-            window.standardWindowButton($0)?.isHidden = true
+        // 窗口的创建/跟踪都归 WindowManager——多窗口下 AppDelegate 不再持有
+        // 某一个特定窗口，菜单命令按当前 key window 路由
+        Task { @MainActor in
+            if let url = AppDelegate.pendingOpenURL {
+                AppDelegate.pendingOpenURL = nil
+                WindowManager.shared.newWindow(.openProject(url))
+            } else {
+                // 冷启动是**唯一**显示欢迎页的时机
+                WindowManager.shared.newWindow(.welcome)
+            }
         }
-
-        window.makeKeyAndOrderFront(nil)
     }
 
     // MARK: - 菜单栏
@@ -253,16 +231,41 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate 
         NSApp.keyWindow?.toggleFullScreen(nil)
     }
 
+    /// 新建项目：在当前窗口弹「填项目名」的表单，填完再开新窗口建项目。
+    /// 不直接开一个停在欢迎页的空窗口——那样用户还得在新窗口里再点一次新建
     @objc private func newProject() {
-        NotificationCenter.default.post(name: .menuNewProject, object: nil)
+        Task { @MainActor in
+            guard WindowManager.shared.activeWindowID != nil else {
+                // 窗口全关了：只弹表单本身，不先开一个空的主界面窗口垫在下面
+                WindowManager.shared.showNewProjectPanel()
+                return
+            }
+            MenuCommand.newProject.postToActive()
+        }
     }
 
     @objc private func openProjectFile() {
-        NotificationCenter.default.post(name: .menuOpenProject, object: nil)
+        Task { @MainActor in
+            guard WindowManager.shared.activeWindowID != nil else {
+                // 窗口全关了：直接弹选择器（NSOpenPanel 不需要宿主窗口），
+                // 选完开新窗口，同样不退回欢迎页
+                let panel = NSOpenPanel()
+                panel.canChooseFiles = true
+                panel.canChooseDirectories = false
+                panel.allowsMultipleSelection = false
+                panel.allowedContentTypes = [.init(filenameExtension: "bcj") ?? .json]
+                panel.prompt = "打开"
+                if panel.runModal() == .OK, let url = panel.url {
+                    WindowManager.shared.newWindow(.openProject(url))
+                }
+                return
+            }
+            MenuCommand.openProject.postToActive()
+        }
     }
 
     @objc private func saveProject() {
-        NotificationCenter.default.post(name: .menuSaveProject, object: nil)
+        Task { @MainActor in MenuCommand.saveProject.postToActive() }
     }
 
     @objc private func importMedia() {
@@ -271,12 +274,12 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate 
         panel.allowedContentTypes = []  // 不限制，由 importFile 做格式过滤
         panel.begin { r in
             guard r == .OK else { return }
-            NotificationCenter.default.post(name: .menuImportFiles, object: panel.urls)
+            Task { @MainActor in MenuCommand.importFiles.postToActive(object: panel.urls) }
         }
     }
 
     @objc private func exportMedia() {
-        NotificationCenter.default.post(name: .menuExportVideo, object: nil)
+        Task { @MainActor in MenuCommand.exportVideo.postToActive() }
     }
 
     @objc private func showSettings() {
@@ -290,32 +293,42 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate 
     @objc private func showAbout() {
         NSApp.orderFrontStandardAboutPanel(options: [
             .applicationName: "黑猫剪辑",
-            .applicationVersion: "4.3.6",
+            .applicationVersion: "4.5.0",
             .version: "",
             .credits: NSAttributedString(string: "")
         ])
     }
 
-    public func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+    public func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
 
     // 处理 Finder 双击 .bcj 文件打开
     public func application(_ application: NSApplication, open urls: [URL]) {
-        for url in urls {
-            if url.pathExtension.lowercased() == "bcj" {
-                AppDelegate.pendingOpenURL = url
-                NotificationCenter.default.post(name: .menuOpenProjectFile, object: url)
-                break
+        Task { @MainActor in
+            for url in urls where url.pathExtension.lowercased() == "bcj" {
+                // 同一个项目已经开着就聚焦过去，不要开第二个窗口——
+                // 两个窗口各自编辑同一份文件，后保存的那个会覆盖另一个
+                if let (_, existing) = WindowManager.shared.existingWindow(for: url) {
+                    WindowManager.shared.focus(existing)
+                } else {
+                    WindowManager.shared.newWindow(.openProject(url))
+                }
             }
         }
+    }
+
+    /// 关掉最后一个窗口不退出 app：Dock 图标还在，点一下能重新开窗，
+    /// 这是 macOS 的习惯（Sketch、Xcode 都是这样）
+    public func applicationShouldHandleReopen(_ sender: NSApplication,
+                                              hasVisibleWindows flag: Bool) -> Bool {
+        // 从 Dock 重新激活且一个窗口都没有：开个空白工作窗口。
+        // 不显示欢迎页——欢迎页只属于冷启动
+        if !flag { Task { @MainActor in WindowManager.shared.newWindow() } }
+        return true
     }
 }
 
 extension Notification.Name {
-    static let menuImportFiles = Notification.Name("menuImportFiles")
-    static let menuExportVideo = Notification.Name("menuExportVideo")
-    static let menuNewProject  = Notification.Name("menuNewProject")
-    static let menuOpenProject = Notification.Name("menuOpenProject")
-    static let menuSaveProject   = Notification.Name("menuSaveProject")
-    static let menuOpenProjectFile = Notification.Name("menuOpenProjectFile")
+    // 菜单命令的通知名现在由 MenuCommand 统一生成（见 WindowManager.swift）——
+    // 它们必须带 windowID 才能投给正确的窗口，留着这些裸名字容易被误用成广播
     static let togglePlayback    = Notification.Name("togglePlayback")
 }

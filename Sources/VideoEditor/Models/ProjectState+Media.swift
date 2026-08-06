@@ -208,7 +208,10 @@ extension ProjectState {
     /// 带超时的 AVFoundation 单帧抽取（同步版，须在专属 pthread 上调用）。
     /// AVFoundation 交互放在再开的一条 pthread 里：挂死只废弃那条线程；
     /// 超时用信号量 wait(timeout:)，不依赖 GCD 定时器（全局池可能已被挂死任务占满）
-    nonisolated static func avSingleFrameSync(url: URL, maxSize: CGFloat, timeout: Double) -> AVFrameOutcome {
+    /// - Parameter at: 取第几秒的画面。默认 0（首帧）；欢迎页缩略图会传片段的
+    ///   trimStart，好取到用户在时间轴上真正看到的那一帧
+    nonisolated static func avSingleFrameSync(url: URL, maxSize: CGFloat, timeout: Double,
+                                              at seconds: Double = 0) -> AVFrameOutcome {
         let sem = DispatchSemaphore(value: 0)
         let lock = NSLock()
         var outcome: AVFrameOutcome? = nil
@@ -223,7 +226,11 @@ extension ProjectState {
             let gen = AVAssetImageGenerator(asset: av)
             gen.appliesPreferredTrackTransform = true
             gen.maximumSize = CGSize(width: maxSize, height: maxSize)
-            gen.generateCGImagesAsynchronously(forTimes: [NSValue(time: .zero)]) { _, cg, _, result, error in
+            // 容差放宽到 0.5s：精确到帧要解码整个 GOP，慢且没必要
+            gen.requestedTimeToleranceBefore = CMTime(seconds: 0.5, preferredTimescale: 600)
+            gen.requestedTimeToleranceAfter = CMTime(seconds: 0.5, preferredTimescale: 600)
+            let t = CMTime(seconds: max(0, seconds), preferredTimescale: 600)
+            gen.generateCGImagesAsynchronously(forTimes: [NSValue(time: t)]) { _, cg, _, result, error in
                 if result == .succeeded, let cg = cg {
                     finish(.success(cg))
                 } else {
@@ -369,7 +376,9 @@ extension ProjectState {
     }
 
     /// 用内置 ffmpeg 抽单帧（素材库封面用）。同步执行，须在后台线程调用。
-    nonisolated static func ffmpegSingleFrame(url: URL, maxSize: Int) -> NSImage? {
+    /// - Parameter at: 取第几秒。默认 0，用途同 avSingleFrameSync
+    nonisolated static func ffmpegSingleFrame(url: URL, maxSize: Int,
+                                              at seconds: Double = 0) -> NSImage? {
         guard let ff = findFFmpeg() else {
             DiagLog.log("[缩略图] 找不到 ffmpeg（bundle 与系统路径均无），封面兜底放弃 \(url.lastPathComponent)")
             return nil
@@ -380,7 +389,7 @@ extension ProjectState {
         let p = Process()
         p.executableURL = ff
         p.arguments = ["-hide_banner", "-loglevel", "error", "-nostdin",
-                       "-ss", "0", "-i", url.path,
+                       "-ss", String(format: "%.3f", max(0, seconds)), "-i", url.path,
                        "-frames:v", "1",
                        "-vf", "scale=w=\(maxSize):h=\(maxSize):force_original_aspect_ratio=decrease",
                        "-y", out.path]
@@ -543,6 +552,29 @@ extension ProjectState {
                 while t < dur {
                     times.append(NSValue(time: CMTime(seconds: t, preferredTimescale: 600)))
                     t += interval
+                }
+
+                // 先抽一小批打底（12 张），立刻贴到片段上。
+                // 高密度那批要抽 200 张、解码几秒，全抽完才更新的话，
+                // 用户拖素材进轨道后要对着空白片段等好几秒。
+                // 这批出得快（十几次解码），先让片段有画面，细节由下面那批覆盖。
+                let previewCount = min(12, times.count)
+                if previewCount > 0 {
+                    let step = max(1, times.count / previewCount)
+                    let coarse = stride(from: 0, to: times.count, by: step).map { times[$0] }
+                    if case .frames(let fs, _) = Self.avFrameStripSync(
+                        url: url, times: coarse,
+                        maxSize: CGSize(width: 160, height: 104),
+                        tolerance: CMTime(seconds: 0.5, preferredTimescale: 600),
+                        timeout: 15), !fs.isEmpty {
+                        let quick = fs.sorted(by: { $0.time < $1.time })
+                        DispatchQueue.main.async {
+                            // 只在还没有更好的结果时贴，避免覆盖掉已经完成的高密度批
+                            if (self.assetThumbnails[id]?.count ?? 0) < quick.count {
+                                self.assetThumbnails[id] = quick
+                            }
+                        }
+                    }
                 }
                 let tol = CMTime(seconds: 0.3, preferredTimescale: 600)
                 switch Self.avFrameStripSync(url: url, times: times,

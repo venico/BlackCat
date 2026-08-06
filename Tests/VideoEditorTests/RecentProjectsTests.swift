@@ -104,6 +104,90 @@ final class RecentProjectsTests: XCTestCase {
         XCTAssertNil(RecentProjects.makeThumbnail(projectURL: url))
     }
 
+    /// 缩略图取的是**轨道**内容，不是素材库。
+    /// 素材库里可能躺着一堆没用上的素材，排最前的那个未必出现在成片里
+    func testThumbnailReadsTracksNotMediaLibrary() throws {
+        let unused = tmpDir.appendingPathComponent("unused.png")
+        try Data([0]).write(to: unused)
+
+        // mediaAssets 里有图片，但两类轨道都是空的 → 不该拿素材库那张顶上
+        let url = tmpDir.appendingPathComponent("empty-tracks.bcj")
+        try """
+        {"mediaAssets":[{"type":"image","url":"\(unused.path)"}],
+         "videoTracks":[{"clips":[]}],"imageTracks":[]}
+        """.write(to: url, atomically: true, encoding: .utf8)
+
+        XCTAssertNil(RecentProjects.makeThumbnail(projectURL: url),
+                     "轨道是空的就该给缺省图，不能拿素材库里没用上的素材充数")
+    }
+
+    /// 缩略图选素材的优先级：视频 > 图片 > 无。
+    /// 视频最能代表一个剪辑项目，图片往往只是叠加素材——一轮循环 first-match
+    /// 的写法做不到这个，谁排在前面就用谁
+    func testThumbnailPrefersVideoOverImage() throws {
+        // 造两个真实存在的素材文件：图片排在前面，视频在后面
+        let img = tmpDir.appendingPathComponent("a.png")
+        let vid = tmpDir.appendingPathComponent("b.mp4")
+        try Data([0]).write(to: img)
+        try Data([0]).write(to: vid)
+
+        let url = tmpDir.appendingPathComponent("p.bcj")
+        let json = """
+        {"videoTracks":[{"clips":[{"url":"\(vid.path)","startTime":0,"trimStart":0}]}],
+         "imageTracks":[{"clips":[{"url":"\(img.path)","startTime":0}]}]}
+        """
+        try json.write(to: url, atomically: true, encoding: .utf8)
+
+        // 两个都是假文件，解不出画面 → 返回 nil。这里断言的是「不崩、按顺序试过」，
+        // 真实素材的取帧在 testThumbnailParsingToleratesUnknownFields 那类里覆盖不了，
+        // 需要真视频，留给手测
+        XCTAssertNil(RecentProjects.makeThumbnail(projectURL: url))
+    }
+
+    func testThumbnailReturnsNilWhenOnlyAudio() throws {
+        // 纯音频项目没有可用画面 → nil，UI 那边显示缺省图
+        let url = tmpDir.appendingPathComponent("audio-only.bcj")
+        try #"{"audioTracks":[{"clips":[{"url":"/tmp/x.mp3"}]}],"videoTracks":[],"imageTracks":[]}"#
+            .write(to: url, atomically: true, encoding: .utf8)
+        XCTAssertNil(RecentProjects.makeThumbnail(projectURL: url))
+    }
+
+    /// 真的能从视频里取到一帧。用 ffmpeg 现造一段测试视频放在临时目录，
+    /// **不碰用户的真实项目**——之前这条读的是桌面上的实际项目文件，
+    /// 测试跑在真实数据上，出事就是真丢东西
+    func testThumbnailFromRealVideo() throws {
+        guard let ff = ProjectState.findFFmpeg() else {
+            throw XCTSkip("找不到内置 ffmpeg")
+        }
+        let video = tmpDir.appendingPathComponent("clip.mp4")
+        let p = Process()
+        p.executableURL = ff
+        p.arguments = ["-hide_banner", "-loglevel", "error", "-y",
+                       "-f", "lavfi", "-i", "testsrc=size=320x180:duration=1:rate=10",
+                       "-pix_fmt", "yuv420p", video.path]
+        p.standardError = FileHandle.nullDevice
+        try p.run(); p.waitUntilExit()
+        try XCTSkipUnless(p.terminationStatus == 0, "造测试视频失败")
+
+        let proj = tmpDir.appendingPathComponent("real.bcj")
+        try """
+        {"videoTracks":[{"clips":[{"url":"\(video.path)","startTime":0,"trimStart":0}]}],
+         "imageTracks":[]}
+        """.write(to: proj, atomically: true, encoding: .utf8)
+
+        let img = RecentProjects.makeThumbnail(projectURL: proj)
+        XCTAssertNotNil(img, "轨道上有视频，应该能取到一帧")
+        XCTAssertGreaterThan(img?.size.width ?? 0, 0)
+    }
+
+    func testRecordClearsStaleThumbnail() throws {
+        // 保存之后素材可能换了，旧缩略图必须失效，否则一直显示上一版画面
+        let a = try makeProjectFile("A")
+        RecentProjects.shared.record(url: a, name: "A")
+        XCTAssertNil(RecentProjects.shared.thumbnails[a],
+                     "record 时该清掉缓存，让下次进欢迎页重新生成")
+    }
+
     func testThumbnailReturnsNilForGarbageFile() throws {
         let url = tmpDir.appendingPathComponent("bad.bcj")
         try "这不是 JSON".write(to: url, atomically: true, encoding: .utf8)

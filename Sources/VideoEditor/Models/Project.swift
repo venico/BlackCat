@@ -794,6 +794,10 @@ final class ProjectState: ObservableObject {
     @Published var exportSettings  = ExportSettings()
     @Published var showExportSheet = false
     @Published var showSettings = false
+    /// 新建项目表单。菜单栏「新建项目」和欢迎页「新建项目」都开它——
+    /// 菜单栏原来是把整个欢迎页调出来，等于让用户在已经打开项目的情况下
+    /// 退回启动页再点一次，多绕一步
+    @Published var showNewProjectSheet = false
 
     // Preview resolution (for subtitle/image scaling to match export)
     @Published var previewResolution: String = "1080p"

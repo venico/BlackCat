@@ -1,11 +1,15 @@
 import SwiftUI
 import AppKit
 
-/// 新建项目表单。原来是欢迎页里的一个 Tab，欢迎页改成「侧栏动作 + 最近文件」
-/// 之后没地方摆了，抽成 sheet。表单本身的逻辑（校验、同名检查）原样搬过来。
+/// 新建项目表单。两处用：
+///   1. 窗口内（欢迎页/主界面点新建）——ContentView 的 .sheet
+///   2. 一个窗口都没有时点菜单新建——独立面板，见 WindowManager.showNewProjectPanel
+/// 所以它**不持有 ProjectState**——「建在哪」由调用方通过 onCreate 决定，
+/// 表单只管收集名字和目录、做校验
 struct NewProjectSheet: View {
-    @EnvironmentObject private var project: ProjectState
     let onCancel: () -> Void
+    /// 校验通过后回调。调用方决定是就地建还是开新窗口
+    let onCreate: (String, URL) -> Void
 
     @State private var name = ""
     @State private var directory: URL? = AppSettings.shared.effectiveProjectDir
@@ -122,7 +126,6 @@ struct NewProjectSheet: View {
             errorMessage = "该位置已存在同名项目文件"
             return
         }
-        onCancel()   // 先收起 sheet，再建项目——不然欢迎页关掉时 sheet 会留在屏幕上
-        project.createNewProject(name: n, directory: dir)
+        onCreate(n, dir)
     }
 }

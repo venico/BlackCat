@@ -5,6 +5,7 @@ import UniformTypeIdentifiers
 /// 欢迎页。左边是动作（新建/打开，左下角设置），右边是最近文件。
 /// 布局参照 Sketch 的启动窗：侧栏窄、内容区大，最近文件支持缩略图/列表两种视图和搜索。
 struct WelcomeView: View {
+    @Environment(\.windowID) private var windowID
     @EnvironmentObject private var project: ProjectState
     @ObservedObject private var recents = RecentProjects.shared
     @ObservedObject private var updater = AppUpdater.shared
@@ -19,7 +20,6 @@ struct WelcomeView: View {
     @State private var renaming: URL? = nil
     @State private var renameText = ""
     @State private var errorMessage: String?
-    @State private var showNewSheet = false
 
     private var filtered: [RecentProject] {
         let q = search.trimmingCharacters(in: .whitespaces).lowercased()
@@ -58,18 +58,16 @@ struct WelcomeView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .windowMaterial()
         .ignoresSafeArea()
-        .sheet(isPresented: $showNewSheet) {
-            NewProjectSheet(onCancel: { showNewSheet = false })
-                .environmentObject(project)
-        }
         // 欢迎页阶段把窗口缩到 860x560：它铺满整个窗口，而主窗口默认 1280x780，
         // 一屏就两个按钮加几张缩略图，空得离谱。选完文件恢复原尺寸再进主界面
         .onAppear {
-            WelcomeWindowSizer.shrink()
+            WelcomeWindowSizer.shrink(windowID)
             // 静默检查：没更新就什么都不显示，不打扰
             Task { await updater.check(silent: true) }
         }
-        .onDisappear { WelcomeWindowSizer.restore() }
+        // 尺寸恢复由 ContentView 的 onChange 负责（要在消失动画之前做）；
+        // 这里留一手兜底：窗口被直接关掉时也能清掉记录
+        .onDisappear { WelcomeWindowSizer.restore(windowID) }
     }
 
     // MARK: - 左侧
@@ -88,8 +86,8 @@ struct WelcomeView: View {
 
             Spacer().frame(height: 18)
 
-            sidebarButton(icon: "newFile", title: "新建文件", isSVG: true) { showNewSheet = true }
-            sidebarButton(icon: "folder", title: "打开文件", isSVG: true) { openExistingProject() }
+            sidebarButton(icon: "newFile", title: "新建项目", isSVG: true) { project.showNewProjectSheet = true }
+            sidebarButton(icon: "folder", title: "打开项目", isSVG: true) { openExistingProject() }
 
             Spacer()
 
@@ -345,7 +343,10 @@ struct WelcomeView: View {
     // MARK: - 两种视图
 
     private var gridBody: some View {
-        LazyVGrid(columns: [GridItem(.adaptive(minimum: 112, maximum: 142), spacing: 16)],
+        // min == max：列宽**固定**，只有列数随窗口宽度变。
+        // 给一个区间的话（比如 112~142）SwiftUI 会拉伸卡片去填满整行，
+        // 拖窗口时封面尺寸跟着变，看着很晃
+        LazyVGrid(columns: [GridItem(.adaptive(minimum: 142, maximum: 142), spacing: 16)],
                   alignment: .leading, spacing: 16) {
             ForEach(filtered) { item in
                 RecentCard(item: item,
@@ -438,7 +439,7 @@ struct WelcomeView: View {
             return
         }
         errorMessage = nil
-        project.openProject(url: item.url)
+        openInWindow(item.url)
     }
 
     private func commitRename(_ item: RecentProject) {
@@ -458,7 +459,20 @@ struct WelcomeView: View {
         panel.allowedContentTypes = [UTType(filenameExtension: "bcj") ?? .json]
         panel.prompt = "打开"
         guard panel.runModal() == .OK, let url = panel.url else { return }
-        project.openProject(url: url)
+        openInWindow(url)
+    }
+
+    /// 打开项目一律走新窗口，不顶掉当前窗口的内容。
+    /// 例外：这个窗口自己还停在欢迎页（没打开过任何项目），那就地打开，
+    /// 否则用户点一下会多出一个空欢迎页窗口挂在那儿
+    private func openInWindow(_ url: URL) {
+        if let (_, existing) = WindowManager.shared.existingWindow(for: url) {
+            WindowManager.shared.focus(existing)
+        } else if project.projectFileURL == nil {
+            project.openProject(url: url)
+        } else {
+            WindowManager.shared.newWindow(.openProject(url))
+        }
     }
 }
 
@@ -658,27 +672,42 @@ private struct RecentRow: View {
 /// 要先放开 minSize 再 setContentSize：minSize 是硬约束，不放开的话
 /// 设 860 会被夹回 1100，看起来像没生效。
 enum WelcomeWindowSizer {
-    private static let welcomeSize = NSSize(width: 860, height: 560)
-    nonisolated(unsafe) private static var savedFrame: NSRect?
-    nonisolated(unsafe) private static var savedMinSize: NSSize?
+    /// 默认宽度 = 一行正好 4 个封面：
+    ///   网格 142×4 + 间距 16×3 = 616
+    /// + 内容区左右 padding 20×2 = 40
+    /// + 侧栏 220 + 它的 padding 8×2 = 236
+    /// + 内容区右外边距 8
+    /// = 900
+    private static let welcomeSize = NSSize(width: 900, height: 560)
+    /// 最窄 = 一行 2 个封面：网格 142×2 + 间距 16 = 300，+40+236+8 = 584。
+    /// 再窄侧栏就要被压缩了（它是固定 220，不该跟着变）
+    static let minWidth: CGFloat = 584
+    static let minHeight: CGFloat = 460
+    private static let welcomeMinSize = NSSize(width: minWidth, height: minHeight)
+    /// **按窗口**存原始尺寸。之前是全局一份，多窗口下第二个窗口调 shrink 时
+    /// 看到 savedFrame 已有值就直接返回，欢迎页尺寸就不生效了；
+    /// 而且拿窗口用的是 NSApp.windows.first，多窗口下经常拿到别人那个
+    nonisolated(unsafe) private static var saved: [WindowID: (frame: NSRect, minSize: NSSize)] = [:]
 
-    @MainActor static func shrink() {
-        guard let w = NSApp.windows.first(where: { $0.isVisible }) else { return }
-        guard savedFrame == nil else { return }   // 已经缩过了，别把缩后的尺寸当原始值存下来
-        savedFrame = w.frame
-        savedMinSize = w.minSize
-        w.minSize = welcomeSize
+    @MainActor static func shrink(_ id: WindowID) {
+        guard let w = WindowManager.shared.window(for: id) else { return }
+        guard saved[id] == nil else { return }   // 已经缩过，别把缩后的尺寸当原始值存下来
+        saved[id] = (w.frame, w.minSize)
+        w.minSize = welcomeMinSize
         w.setContentSize(welcomeSize)
-        w.center()
+        // 不用 NSWindow.center()，它明显偏上，理由见 centerOnScreen
+        w.centerOnScreen()
     }
 
-    @MainActor static func restore() {
-        guard let w = NSApp.windows.first(where: { $0.isVisible }) else { return }
-        if let min = savedMinSize { w.minSize = min }
-        if let f = savedFrame { w.setFrame(f, display: true, animate: false) }
-        savedFrame = nil
-        savedMinSize = nil
+    @MainActor static func restore(_ id: WindowID) {
+        guard let w = WindowManager.shared.window(for: id), let s = saved[id] else { return }
+        w.minSize = s.minSize
+        w.setFrame(s.frame, display: true, animate: false)
+        saved[id] = nil
     }
+
+    /// 窗口关掉时清掉它的记录，免得 id 复用（不会发生）或长期泄漏
+    @MainActor static func forget(_ id: WindowID) { saved[id] = nil }
 }
 
 // MARK: - 右下角更新卡片

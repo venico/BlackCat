@@ -10,6 +10,9 @@ final class ExportManager: ObservableObject {
 
     struct Job: Identifiable {
         let id = UUID()
+        /// 谁发起的。多个导出可以同时跑，完成提示要回到各自的窗口，
+        /// 不能都落到最后一个注册回调的窗口上
+        var owner: WindowID?
         let filename: String
         var progress: Double = 0
         var state: JobState = .running
@@ -22,8 +25,35 @@ final class ExportManager: ObservableObject {
     @Published var jobs: [Job] = []
     private var exportTasks: [UUID: Task<Void, Never>] = [:]
     private var exporters: [UUID: TimelineExporter] = [:]
-    var onSuccess: ((String, URL?) -> Void)?
-    var onCancel: ((String) -> Void)?
+    /// 每个窗口注册自己的完成/取消回调。
+    /// 之前是单个闭包，多窗口下每个窗口 onAppear 都覆盖一次——
+    /// 结果所有导出的提示都跑到最后开的那个窗口去了
+    private var successHandlers: [WindowID: (String, URL?) -> Void] = [:]
+    private var cancelHandlers: [WindowID: (String) -> Void] = [:]
+
+    func registerHandlers(for id: WindowID,
+                          onSuccess: @escaping (String, URL?) -> Void,
+                          onCancel: @escaping (String) -> Void) {
+        successHandlers[id] = onSuccess
+        cancelHandlers[id] = onCancel
+    }
+
+    func unregisterHandlers(for id: WindowID) {
+        successHandlers[id] = nil
+        cancelHandlers[id] = nil
+    }
+
+    /// 提示投给发起这次导出的窗口。那个窗口已经关了就不提示——
+    /// 别把 A 项目的导出结果报到 B 项目的界面上
+    private func notifySuccess(_ owner: WindowID?, _ filename: String, _ url: URL?) {
+        guard let owner else { return }
+        successHandlers[owner]?(filename, url)
+    }
+
+    private func notifyCancel(_ owner: WindowID?, _ filename: String) {
+        guard let owner else { return }
+        cancelHandlers[owner]?(filename)
+    }
 
     func dismiss(_ id: UUID) {
         withAnimation(.easeOut(duration: 0.25)) {
@@ -40,9 +70,11 @@ final class ExportManager: ObservableObject {
         if let i = jobs.firstIndex(where: { $0.id == id }) {
             let filename = jobs[i].filename
             let url = jobs[i].outputURL
+            // owner 要在移除之前取——移除之后就查不到这条 job 了
+            let owner = jobs[i].owner
             withAnimation(.easeOut(duration: 0.25)) { jobs.remove(at: i) }
             if let url { try? FileManager.default.removeItem(at: url) }
-            onCancel?(filename)
+            notifyCancel(owner, filename)
         }
     }
 
@@ -58,8 +90,10 @@ final class ExportManager: ObservableObject {
         DispatchQueue.main.asyncAfter(deadline: .now() + 5, execute: item)
     }
 
-    func startExport(snapshot: ExportInput) {
-        let job = Job(filename: snapshot.outputURL.lastPathComponent, outputURL: snapshot.outputURL)
+    func startExport(snapshot: ExportInput, owner: WindowID?) {
+        let job = Job(owner: owner,
+                      filename: snapshot.outputURL.lastPathComponent,
+                      outputURL: snapshot.outputURL)
         let jobID = job.id
         let filename = job.filename
         withAnimation(.easeOut(duration: 0.25)) { jobs.append(job) }
@@ -81,7 +115,7 @@ final class ExportManager: ObservableObject {
                     self.dismiss(jobID)
                     self.exportTasks.removeValue(forKey: jobID)
                     self.exporters.removeValue(forKey: jobID)
-                    self.onSuccess?(filename, url)
+                    self.notifySuccess(owner, filename, url)
                 }
             } catch {
                 await MainActor.run {
@@ -253,6 +287,8 @@ private struct ExportJobBubble: View {
 // MARK: - Export Sheet
 
 struct ExportSheetView: View {
+    /// 导出结果的提示要回到发起它的窗口
+    @Environment(\.windowID) private var windowID
     @EnvironmentObject private var project: ProjectState
     private func dismiss() { project.showExportSheet = false }
     @State private var exportError: String?
@@ -608,7 +644,7 @@ struct ExportSheetView: View {
 
         // 立即关闭导出面板，进度在右下角气泡显示
         dismiss()
-        ExportManager.shared.startExport(snapshot: snapshot)
+        ExportManager.shared.startExport(snapshot: snapshot, owner: windowID)
     }
 }
 

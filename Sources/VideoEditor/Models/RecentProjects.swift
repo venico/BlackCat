@@ -43,6 +43,9 @@ final class RecentProjects: ObservableObject {
 
     /// 打开或保存项目后调一次。已存在就提到最前并更新时间，不产生重复项
     func record(url: URL, name: String) {
+        // 清掉这个项目的缩略图缓存。保存之后素材可能已经换了，
+        // 留着旧图会一直显示上一版的画面
+        thumbnails[url] = nil
         items.removeAll { $0.url == url }
         items.insert(RecentProject(url: url, name: name, openedAt: Date()), at: 0)
         if items.count > Self.maxCount { items.removeLast(items.count - Self.maxCount) }
@@ -101,8 +104,8 @@ final class RecentProjects: ObservableObject {
     // MARK: - 缩略图
 
     /// 取这个项目的缩略图，没有就后台生成一张。
-    /// 用的是项目里第一个视频片段的首帧——.bcj 本身是 JSON，没有画面可取，
-    /// 而首个视频片段基本就是用户对这个项目的视觉记忆点。
+    /// .bcj 本身是 JSON 没有画面，所以从它引用的素材里取：
+    /// **视频优先，其次图片，都没有则返回 nil 由 UI 显示缺省图**。
     /// 这样旧项目不用重新保存也能有图。
     func loadThumbnail(for url: URL) {
         guard thumbnails[url] == nil, !loading.contains(url) else { return }
@@ -117,35 +120,59 @@ final class RecentProjects: ObservableObject {
         }
     }
 
-    /// 从 .bcj 里翻出第一个能用的视频/图片素材，生成一帧。
+    /// 从 .bcj 的**轨道**生成缩略图：视频轨优先，其次图片轨，都没有返回 nil。
+    ///
+    /// 取轨道而不是 mediaAssets：素材库里可能躺着一堆没用上的素材，
+    /// 排在最前的那个未必出现在成片里。轨道上的第一个片段才是这个项目的开头。
+    /// 而且片段自带 trimStart，能取到用户在时间轴上真正看到的那一帧。
+    ///
     /// 只解析需要的字段，不整份 decode 成 ProjectDocument——那个结构随版本变，
-    /// 旧文件解不出来就连缩略图都没有了，这里只要 mediaAssets 里的路径
+    /// 旧文件解不出来就连缩略图都没有了。
     nonisolated static func makeThumbnail(projectURL: URL) -> NSImage? {
         guard let data = try? Data(contentsOf: projectURL),
               let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             return nil
         }
-        guard let assets = root["mediaAssets"] as? [[String: Any]] else { return nil }
 
-        for asset in assets {
-            guard let type = asset["type"] as? String, type == "video" || type == "image" else { continue }
-            guard let path = (asset["url"] as? String) ?? (asset["path"] as? String) else { continue }
-            let assetURL = path.hasPrefix("file://") ? (URL(string: path) ?? URL(fileURLWithPath: path))
-                                                    : URL(fileURLWithPath: path)
-            guard FileManager.default.fileExists(atPath: assetURL.path) else { continue }
-
-            if type == "image" {
-                if let img = NSImage(contentsOf: assetURL) { return img }
-                continue
-            }
-            // 视频：先走 AVFoundation，失败/超时用 ffmpeg 兜底，跟素材库封面同一套
-            if case .success(let cg) = ProjectState.avSingleFrameSync(url: assetURL, maxSize: 480, timeout: 6) {
-                return NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
-            }
-            if let img = ProjectState.ffmpegSingleFrame(url: assetURL, maxSize: 480) {
-                return img
-            }
+        /// 把片段里的 url 字段解成本地路径。存的是 file:// 形式且做过百分号编码
+        func localURL(_ clip: [String: Any]) -> URL? {
+            guard let path = clip["url"] as? String else { return nil }
+            let u = path.hasPrefix("file://") ? (URL(string: path) ?? URL(fileURLWithPath: path))
+                                              : URL(fileURLWithPath: path)
+            return FileManager.default.fileExists(atPath: u.path) ? u : nil
         }
+
+        /// 按时间轴顺序摊平某一类轨道上的所有片段
+        func clips(in key: String) -> [[String: Any]] {
+            let tracks = root[key] as? [[String: Any]] ?? []
+            return tracks.flatMap { ($0["clips"] as? [[String: Any]]) ?? [] }
+                .sorted { (($0["startTime"] as? Double) ?? 0) < (($1["startTime"] as? Double) ?? 0) }
+        }
+
+        // 视频轨优先
+        for clip in clips(in: "videoTracks") {
+            guard let u = localURL(clip) else { continue }
+            // trimStart 是这个片段从源文件的哪一秒开始播，取那一帧才是
+            // 用户在时间轴上看到的画面，不是源文件的第 0 秒
+            let at = (clip["trimStart"] as? Double) ?? 0
+            if let img = frame(of: u, at: at) { return img }
+        }
+        // 没有视频轨才看图片轨
+        for clip in clips(in: "imageTracks") {
+            guard let u = localURL(clip), let img = NSImage(contentsOf: u) else { continue }
+            return img
+        }
+        // 两类轨道都没有可用画面（纯音频项目、空项目）→ UI 显示缺省图
         return nil
+    }
+
+    /// 取视频某一秒的画面。AVFoundation 优先，失败或超时退 ffmpeg——
+    /// 跟素材库封面同一套（家用机上 AVFoundation 会挂死，见 home_machine_decode_issue）
+    private nonisolated static func frame(of url: URL, at seconds: Double) -> NSImage? {
+        if case .success(let cg) = ProjectState.avSingleFrameSync(url: url, maxSize: 480,
+                                                                  timeout: 6, at: seconds) {
+            return NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
+        }
+        return ProjectState.ffmpegSingleFrame(url: url, maxSize: 480, at: seconds)
     }
 }

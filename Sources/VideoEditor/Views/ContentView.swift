@@ -2,14 +2,41 @@ import SwiftUI
 import AppKit
 import UniformTypeIdentifiers
 
+/// initialAction 是不是「显示欢迎页」。写成自由函数是因为要在
+/// StateObject 的初值闭包里用，那时还不能碰 self
+private func isWelcome(_ action: ContentView.InitialAction?) -> Bool {
+    if case .welcome = action { return true }
+    return false
+}
+
 struct ContentView: View {
-    @StateObject private var project: ProjectState = {
-        let p = ProjectState()
-        if AppDelegate.pendingOpenURL != nil {
-            p.showWelcome = false
-        }
-        return p
-    }()
+    /// 本视图属于哪个窗口。菜单命令按窗口路由，不是发给所有窗口
+    @Environment(\.windowID) private var windowID
+
+    /// 这个窗口起来之后要立刻做的事。
+    /// **欢迎页只在 .welcome 时出现**——也就是只有 app 冷启动的第一个窗口。
+    /// 新建、打开、关完所有窗口后再操作，都不该再退回启动页
+    enum InitialAction {
+        case welcome                                      // 冷启动
+        case openProject(URL)
+        case createProject(name: String, directory: URL)
+        case promptNewProject                             // 开窗即弹「填项目名」表单
+    }
+    private let initialAction: InitialAction?
+
+    @StateObject private var project: ProjectState
+
+    init(initialAction: InitialAction? = nil) {
+        self.initialAction = initialAction
+        _project = StateObject(wrappedValue: {
+            let p = ProjectState()
+            // 默认不显示欢迎页，只有冷启动那次显式要。放在 StateObject 的初值里
+            // 而不是 onAppear，避免首帧闪一下
+            p.showWelcome = (initialAction == nil && AppDelegate.pendingOpenURL == nil)
+                            || isWelcome(initialAction)
+            return p
+        }())
+    }
     @StateObject private var exportManager = ExportManager.shared
     @State private var topHeight: CGFloat = 420
     @State private var isDraggingH = false
@@ -283,7 +310,6 @@ struct ContentView: View {
                     Color(red: 0.10, green: 0.10, blue: 0.11).ignoresSafeArea()
                     WelcomeView()
                         .environmentObject(project)
-                        .transition(.opacity.combined(with: .scale(scale: 0.98)))
                 }
             }
         }
@@ -306,31 +332,100 @@ struct ContentView: View {
                     }
             }
         }
-        .animation(.easeOut(duration: 0.25), value: project.showWelcome)
+        .sheet(isPresented: $project.showNewProjectSheet) {
+            NewProjectSheet(onCancel: {
+                project.showNewProjectSheet = false
+                // 这个窗口是专为「新建」开出来的，用户取消了就把它收掉，
+                // 别留一个既没项目也没欢迎页的空壳
+                if case .promptNewProject = initialAction, project.projectFileURL == nil {
+                    WindowManager.shared.close(windowID)
+                }
+            }, onCreate: { name, dir in
+                project.showNewProjectSheet = false
+                // 当前窗口还没打开任何项目就地建，否则开新窗口——
+                // 不能把用户正在编辑的项目顶掉
+                if project.projectFileURL == nil {
+                    project.createNewProject(name: name, directory: dir)
+                } else {
+                    WindowManager.shared.newWindow(.createProject(name: name, directory: dir))
+                }
+            })
+        }
+        // 窗口的最小尺寸只能从这里声明：NSHostingView 会按 SwiftUI 内容的
+        // 固有最小尺寸**反过来覆盖** window.minSize，直接设 window.minSize 会被冲掉
+        // （实测设 584 后被改成 228）。加在 WelcomeView 上也没用——它在 overlay 里，
+        // overlay 的内容不参与父视图的尺寸计算
+        // 只在欢迎页时约束最小尺寸，主界面传 nil = 不加约束，维持原有行为。
+        //
+        // 为什么要写在这儿：NSHostingView 会按 SwiftUI 内容的固有最小尺寸
+        // 反过来覆盖 window.minSize，直接设 window.minSize 会被冲掉；
+        // 加在 WelcomeView 上也没用——它在 overlay 里，overlay 的内容不参与
+        // 父视图的尺寸计算。
+        // maxWidth/maxHeight 必须一起给 .infinity：只给 min 的话 SwiftUI 认为
+        // 这个视图只想要最小尺寸，窗口会被直接压到 584 宽
+        .frame(minWidth: project.showWelcome ? WelcomeWindowSizer.minWidth : nil,
+               maxWidth: .infinity,
+               minHeight: project.showWelcome ? WelcomeWindowSizer.minHeight : nil,
+               maxHeight: .infinity)
+        // 不给 showWelcome 加动画：欢迎页 → 主界面要一步到位。
+        // 带动画的话窗口尺寸恢复和内容切换会错开，看着像被"撑开"，
+        // 而且打开项目/新建项目两条路的观感还不一致
         .onAppear {
+            switch initialAction {
+            case .openProject(let url):
+                project.openProject(url: url)
+            case .createProject(let name, let dir):
+                project.createNewProject(name: name, directory: dir)
+            case .promptNewProject:
+                project.showNewProjectSheet = true
+            case .welcome, nil:
+                break
+            }
             setupEscMonitor()
-            exportManager.onSuccess = { [weak project] filename, url in
-                project?.showSuccessToast(icon: "checkmark", title: filename.truncatedFileName(maxVisualWidth: 24), subtitle: "导出完成", revealURL: url)
-            }
-            exportManager.onCancel = { [weak project] filename in
-                project?.showSuccessToast(icon: "stop.fill", iconColor: .yellow, title: filename.truncatedFileName(maxVisualWidth: 24), subtitle: "已停止", autoCountdown: false)
-            }
+            // 关窗自动保存。**只存已经有文件路径的项目**。
+            //
+            // 没保存过的项目一律不存：saveProject(silent:) 在 projectFileURL == nil 时
+            // 会自己拼「默认目录/项目名.bcj」，而新项目默认叫"未命名项目"——
+            // 撞上同名文件就直接覆盖，别人的项目内容当场没了。
+            // 实测踩过：一个空的欢迎页窗口关掉时，把桌面上同名的真实项目冲成了空轨道。
+            WindowManager.shared.setWillClose({ [weak project] in
+                guard let p = project, !p.isSaved, p.projectFileURL != nil else { return }
+                p.saveProject(silent: true)
+            }, for: windowID)
+            // 按窗口注册：多个导出可以同时跑，各自的提示回到各自的窗口
+            exportManager.registerHandlers(
+                for: windowID,
+                onSuccess: { [weak project] filename, url in
+                    project?.showSuccessToast(icon: "checkmark",
+                                              title: filename.truncatedFileName(maxVisualWidth: 24),
+                                              subtitle: "导出完成", revealURL: url)
+                },
+                onCancel: { [weak project] filename in
+                    project?.showSuccessToast(icon: "stop.fill", iconColor: .yellow,
+                                              title: filename.truncatedFileName(maxVisualWidth: 24),
+                                              subtitle: "已停止", autoCountdown: false)
+                })
         }
-        .onReceive(NotificationCenter.default.publisher(for: .menuImportFiles)) { note in
-            if let urls = note.object as? [URL] {
-                urls.forEach { project.importFile($0) }
-            }
+        // 下面这些菜单命令都要先确认「是发给我这个窗口的」——
+        // 不过滤的话多窗口下按一次保存会把所有打开的项目都存一遍
+        .onReceive(NotificationCenter.default.publisher(for: MenuCommand.importFiles.notificationName)) { note in
+            guard note.isFor(windowID), let urls = note.object as? [URL] else { return }
+            urls.forEach { project.importFile($0) }
         }
-        .onReceive(NotificationCenter.default.publisher(for: .menuExportVideo)) { _ in
+        .onReceive(NotificationCenter.default.publisher(for: MenuCommand.newProject.notificationName)) { note in
+            guard note.isFor(windowID) else { return }
+            project.showNewProjectSheet = true
+        }
+        .onReceive(NotificationCenter.default.publisher(for: MenuCommand.exportVideo.notificationName)) { note in
+            guard note.isFor(windowID) else { return }
             project.showExportSheet = true
         }
-        .onReceive(NotificationCenter.default.publisher(for: .menuSaveProject)) { _ in
+        .onReceive(NotificationCenter.default.publisher(for: MenuCommand.saveProject.notificationName)) { note in
+            guard note.isFor(windowID) else { return }
             project.saveProject()
         }
-        .onReceive(NotificationCenter.default.publisher(for: .menuNewProject)) { _ in
-            project.showWelcome = true
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .menuOpenProject)) { _ in
+        .onReceive(NotificationCenter.default.publisher(for: MenuCommand.openProject.notificationName)) { note in
+            guard note.isFor(windowID) else { return }
             let panel = NSOpenPanel()
             panel.canChooseFiles = true
             panel.canChooseDirectories = false
@@ -338,13 +433,30 @@ struct ContentView: View {
             panel.allowedContentTypes = [.init(filenameExtension: "bcj") ?? .json]
             panel.prompt = "打开"
             if panel.runModal() == .OK, let url = panel.url {
-                project.openProject(url: url)
+                // 一律开新窗口，不动当前窗口里正在编辑的项目。
+                // 已经开着的项目则聚焦过去，不重复开——两个窗口编辑同一份文件，
+                // 后保存的那个会覆盖另一个
+                if let (_, existing) = WindowManager.shared.existingWindow(for: url) {
+                    WindowManager.shared.focus(existing)
+                } else {
+                    WindowManager.shared.newWindow(.openProject(url))
+                }
             }
         }
-        .onReceive(NotificationCenter.default.publisher(for: .menuOpenProjectFile)) { note in
-            if let url = note.object as? URL {
-                project.openProject(url: url)
-            }
+        .onReceive(NotificationCenter.default.publisher(for: MenuCommand.openProjectFile.notificationName)) { note in
+            guard note.isFor(windowID), let url = note.object as? URL else { return }
+            project.openProject(url: url)
+        }
+        // 退出欢迎页时**立刻**把窗口尺寸恢复回去。
+        // 不能等 WelcomeView 的 onDisappear：欢迎页有 0.25s 的消失动画，
+        // onDisappear 在动画结束后才触发，那 0.25s 里主界面已经显示出来了、
+        // 却还挤在 900×560 的小窗口里，然后窗口才"撑开"——看着就是卡了一下
+        .onChange(of: project.showWelcome) { _, isShowing in
+            if !isShowing { WelcomeWindowSizer.restore(windowID) }
+        }
+        // 项目路径回报给 WindowManager，「同一个项目不重复开窗」靠它判断
+        .onChange(of: project.projectFileURL) { _, newValue in
+            WindowManager.shared.setOpenedURL(newValue, for: windowID)
         }
         .alert("清空\(project.currentLibraryAssetType?.label ?? "")素材", isPresented: $project.showClearLibraryConfirm) {
             Button("清空", role: .destructive) {
