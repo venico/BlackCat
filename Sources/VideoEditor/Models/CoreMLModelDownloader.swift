@@ -2,8 +2,8 @@
 // 按需下载 CoreML 模型的共用实现：GitHub release 上的 .mlmodelc.zip
 // → 下载 → 校验体积 → ditto 解压 → 落到 Application Support。
 //
-// 从 ClarityModel 里抽出来的，原样保留它的行为（含逐字节读取报进度、
-// 多镜像依次重试、解压到临时目录再整体搬过去）。抽出来是因为
+// 从 ClarityModel 里抽出来的，保留它的多镜像重试、解压到临时目录再整体搬走等行为。
+// 下载本身已从逐字节读取改成 URLSession.download（见 downloadOne 的注释）。抽出来是因为
 // ClarityProModel 要走完全相同的流程，没必要再抄一份两百行。
 import Foundation
 
@@ -52,32 +52,25 @@ enum CoreMLModelDownloader {
         request.setValue("BlackCat/1.0", forHTTPHeaderField: "User-Agent")
         request.timeoutInterval = 600
 
-        let (bytes, response) = try await URLSession.shared.bytes(for: request)
+        // 用 download(for:delegate:)，不要 bytes(for:) 逐字节遍历——
+        // AsyncBytes 是一个字节一个字节吐的，几百 MB 的模型（BiRefNet full 388MB）
+        // 就是几亿次循环迭代加 Data.append，慢到看着像卡死。
+        // download 走系统的分块写盘路径，进度由 delegate 给
+        let delegate = ModelDownloadProgressDelegate(onProgress: onProgress)
+        let (tmp, response) = try await URLSession.shared.download(for: request, delegate: delegate)
         if let http = response as? HTTPURLResponse, http.statusCode != 200 {
             throw DownloadError.badResponse(http.statusCode)
         }
-        let total = response.expectedContentLength
-
-        var data = Data()
-        data.reserveCapacity(total > 0 ? Int(total) : 1 << 20)
-        var lastReported = 0.0
-        for try await byte in bytes {
-            data.append(byte)
-            if total > 0 {
-                let pct = Double(data.count) / Double(total)
-                if pct - lastReported >= 0.01 {
-                    lastReported = pct
-                    onProgress(pct)
-                }
-            }
-        }
-        guard data.count >= minFileSize else { throw DownloadError.tooSmall }
 
         let archiveName = "\(fileName).zip"
         let tmpZip = destDir.appendingPathComponent("\(archiveName).part")
         try? FileManager.default.removeItem(at: tmpZip)
-        try data.write(to: tmpZip)
+        try FileManager.default.moveItem(at: tmp, to: tmpZip)
         defer { try? FileManager.default.removeItem(at: tmpZip) }
+
+        // 体积校验挪到落盘之后：现在文件不经过内存，拿不到 data.count
+        let size = (try? FileManager.default.attributesOfItem(atPath: tmpZip.path)[.size] as? Int) ?? 0
+        guard size >= minFileSize else { throw DownloadError.tooSmall }
 
         // 先解到临时目录，确认里面确实有要的东西再整体搬走——直接解到目标位置的话，
         // 半路失败会留下一个残缺的 .mlmodelc，之后 isDownloaded 判定为真但加载会崩
@@ -114,4 +107,26 @@ enum CoreMLModelDownloader {
             throw DownloadError.unpackFailed(detail.isEmpty ? "ditto 退出码 \(p.terminationStatus)" : detail)
         }
     }
+}
+
+
+/// 模型下载的进度回调。URLSession 的 async download 只有加 delegate 才拿得到进度
+private final class ModelDownloadProgressDelegate: NSObject, URLSessionDownloadDelegate {
+    private let onProgress: (Double) -> Void
+
+    init(onProgress: @escaping (Double) -> Void) {
+        self.onProgress = onProgress
+        super.init()
+    }
+
+    func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask,
+                    didWriteData bytesWritten: Int64,
+                    totalBytesWritten: Int64,
+                    totalBytesExpectedToWrite: Int64) {
+        guard totalBytesExpectedToWrite > 0 else { return }
+        onProgress(Double(totalBytesWritten) / Double(totalBytesExpectedToWrite))
+    }
+
+    func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask,
+                    didFinishDownloadingTo location: URL) {}
 }

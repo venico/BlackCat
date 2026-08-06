@@ -222,25 +222,18 @@ final class AppUpdater: ObservableObject {
         req.setValue("BlackCat/\(Self.currentVersion)", forHTTPHeaderField: "User-Agent")
         req.timeoutInterval = 600
 
-        let (bytes, resp) = try await URLSession.shared.bytes(for: req)
+        // 用 download(for:delegate:) 而不是 bytes(for:) 逐字节遍历。
+        // AsyncBytes 是**一个字节一个字节**吐的，65MB 的包就是 6800 万次
+        // 循环迭代加 Data.append，慢到没法用；download 走的是系统的分块写盘路径，
+        // 进度由 delegate 回调给出。
+        let delegate = DownloadProgressDelegate(onProgress: onProgress)
+        let (tmp, resp) = try await URLSession.shared.download(for: req, delegate: delegate)
         if let http = resp as? HTTPURLResponse, http.statusCode != 200 {
             throw NSError(domain: "AppUpdater", code: http.statusCode,
                           userInfo: [NSLocalizedDescriptionKey: "下载失败（HTTP \(http.statusCode)）"])
         }
-        let total = resp.expectedContentLength
-
-        var data = Data()
-        data.reserveCapacity(total > 0 ? Int(total) : 1 << 22)
-        var lastReported = 0.0
-        for try await byte in bytes {
-            try Task.checkCancellation()
-            data.append(byte)
-            if total > 0 {
-                let p = Double(data.count) / Double(total)
-                if p - lastReported >= 0.005 { lastReported = p; onProgress(p) }
-            }
-        }
-        try data.write(to: dest)
+        try? FileManager.default.removeItem(at: dest)
+        try FileManager.default.moveItem(at: tmp, to: dest)
         onProgress(1)
     }
 
@@ -312,4 +305,26 @@ final class AppUpdater: ObservableObject {
 
         NSApp.terminate(nil)
     }
+}
+
+/// 下载进度回调。URLSession 的 async download 只有加 delegate 才拿得到进度
+private final class DownloadProgressDelegate: NSObject, URLSessionDownloadDelegate {
+    private let onProgress: (Double) -> Void
+
+    init(onProgress: @escaping (Double) -> Void) {
+        self.onProgress = onProgress
+        super.init()
+    }
+
+    func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask,
+                    didWriteData bytesWritten: Int64,
+                    totalBytesWritten: Int64,
+                    totalBytesExpectedToWrite: Int64) {
+        guard totalBytesExpectedToWrite > 0 else { return }
+        onProgress(Double(totalBytesWritten) / Double(totalBytesExpectedToWrite))
+    }
+
+    /// 协议要求实现。文件的落地由 download(for:delegate:) 自己接管，这里不用做事
+    func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask,
+                    didFinishDownloadingTo location: URL) {}
 }
