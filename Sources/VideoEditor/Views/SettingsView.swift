@@ -44,9 +44,7 @@ struct SettingsView: View {
             }
             .padding(.horizontal, 24)
             .padding(.top, 24)
-            .padding(.bottom, 16)
-
-            Divider().background(Color.divider)
+            .padding(.bottom, 4)
 
             // 标签栏
             HStack(spacing: 0) {
@@ -67,7 +65,7 @@ struct SettingsView: View {
             .background(Color.white.opacity(0.06))
             .clipShape(Capsule())
             .padding(.horizontal, 24)
-            .padding(.top, 12)
+            .padding(.top, 4)
             .padding(.bottom, 8)
 
             ScrollView {
@@ -87,7 +85,8 @@ struct SettingsView: View {
             }
         }
         .frame(width: 540, height: 520)
-        .background(Color(red: 0.13, green: 0.13, blue: 0.14))
+        .background(Color.black.opacity(0.30))
+        .floatingPanelMaterial()
         .onAppear { refreshModelStates(); refreshSceneDetectState(); refreshDemucsState(); refreshSeparated(); refreshBiRefNetStates(); refreshClarityModelStates(); refreshClarityProStates() }
     }
 

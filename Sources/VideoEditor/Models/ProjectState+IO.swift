@@ -152,6 +152,8 @@ extension ProjectState {
         currentTime = 0
         showWelcome = false
         isSaved = true
+        let recordedName = projectName
+        Task { @MainActor in RecentProjects.shared.record(url: url, name: recordedName) }
         rebuildTimelinePreview()
     }
 
@@ -213,6 +215,9 @@ extension ProjectState {
         do {
             try data.write(to: fileURL, options: .atomic)
             isSaved = true
+            // 进「最近文件」。放在写盘成功之后——写失败的项目不该出现在列表里
+            let recordedName = projectName
+            Task { @MainActor in RecentProjects.shared.record(url: fileURL, name: recordedName) }
         } catch {
             isSaved = false
             if silent {

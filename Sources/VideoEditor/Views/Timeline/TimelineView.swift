@@ -280,7 +280,7 @@ struct TimelineView: View {
                         .allowsHitTesting(false)
                     }
                     .frame(width: clipW, height: rulerH)
-                    .background(Color(red: 0.09, green: 0.09, blue: 0.10))
+                    .background(Color.clear)   // 底色交给外层的系统材质
                     .clipped()
                     // 顶条自己接管点击/拖拽定位播放头，不再靠 allowsHitTesting(false)
                     // 把事件漏给下层的滚动内容去处理。
@@ -446,7 +446,7 @@ struct TimelineView: View {
                 .foregroundColor(Color.labelSecondary)
                 .allowsHitTesting(false)
         }
-        .background(Color(red: 0.09, green: 0.09, blue: 0.10))
+        .background(Color.clear)   // 底色交给外层的系统材质
     }
 
     private var labelColumn: some View {
@@ -521,7 +521,7 @@ struct TimelineView: View {
             }
             } // end inner VStack
             .overlay(trackDropIndicatorLine())
-            .background(Color(red:0.09,green:0.09,blue:0.10))
+            .background(Color.clear)   // 底色交给外层的系统材质
         }
         .frame(width: labelW)
         .frame(maxHeight: .infinity, alignment: .top)
@@ -4160,7 +4160,7 @@ private struct TimelineRuler: View {
                 t += minorStep
             }
         }
-        .background(Color(red: 0.09, green: 0.09, blue: 0.10))
+        .background(Color.clear)   // 底色交给外层的系统材质
     }
 }
 
@@ -4391,7 +4391,7 @@ struct TimelineToolbar: View {
             }.padding(.trailing,12)
         }
         .frame(height:36)
-        .background(Color(red:0.09,green:0.09,blue:0.10))
+        .background(Color.clear)   // 底色交给外层的系统材质
     }
 }
 

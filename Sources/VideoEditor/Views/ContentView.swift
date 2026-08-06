@@ -48,12 +48,8 @@ struct ContentView: View {
                 }
                 .frame(width: sidebarWidth)
                 .frame(maxHeight: .infinity)
-                .background(Color(hex: "#19191C"))
-                .clipShape(RoundedRectangle(cornerRadius: 12))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 12)
-                        .stroke(Color.white.opacity(0.20), lineWidth: 0.5)
-                )
+                .panelSurface(.sidebar)
+                .softPanelShadow()
                 .simultaneousGesture(TapGesture().onEnded {
                     NSApp.keyWindow?.makeFirstResponder(nil)
                 })
@@ -94,18 +90,16 @@ struct ContentView: View {
                             PlayerView()
                                 .frame(maxWidth: .infinity)
                                 .background(Color.previewBg)
-                                .clipShape(RoundedRectangle(cornerRadius: 12))
-                                .overlay(RoundedRectangle(cornerRadius: 12)
-                                    .stroke(Color.white.opacity(0.20), lineWidth: 0.5))
+                                // 预览区容器也要材质：容器透了却没铺材质的话，
+                                // 它和中间那块纯黑的画布就都是黑的，安全区边界看不出来
+                                .panelSurfaceClear(.content)
                                 .simultaneousGesture(TapGesture().onEnded {
                                     NSApp.keyWindow?.makeFirstResponder(nil)
                                 })
                             InspectorView()
                                 .frame(width: inspectorWidth)
                                 .background(Color.panelBg)
-                                .clipShape(RoundedRectangle(cornerRadius: 12))
-                                .overlay(RoundedRectangle(cornerRadius: 12)
-                                    .stroke(Color.white.opacity(0.20), lineWidth: 0.5))
+                                .panelSurfaceClear(.content)
                                 // Inspector left-edge drag handle (overlaps the 8px gap)
                                 .overlay(alignment: .leading) {
                                     Color.clear
@@ -162,9 +156,7 @@ struct ContentView: View {
                         }
                         .frame(maxHeight: .infinity)
                         .background(Color.timelineBg)
-                        .clipShape(RoundedRectangle(cornerRadius: 12))
-                        .overlay(RoundedRectangle(cornerRadius: 12)
-                            .stroke(Color.white.opacity(0.20), lineWidth: 0.5))
+                        .panelSurfaceClear(.content)
                         .simultaneousGesture(TapGesture().onEnded {
                             NSApp.keyWindow?.makeFirstResponder(nil)
                         })
@@ -187,7 +179,6 @@ struct ContentView: View {
                 }
             }
         }
-        .background(Color.black)
         .overlay(alignment: .bottomTrailing) {
             VStack(alignment: .trailing, spacing: 8) {
                 if !project.activeTasks.isEmpty {
@@ -202,6 +193,7 @@ struct ContentView: View {
                     SeparateOverlay()
                         .environmentObject(project)
                 }
+                UpdateBubble()
                 if project.isRemovingBackground {
                     RemoveBackgroundOverlay()
                         .environmentObject(project)
@@ -276,6 +268,25 @@ struct ContentView: View {
             }
         }
         .animation(.easeOut(duration: 0.2), value: project.showExportSheet)
+        .onReceive(NotificationCenter.default.publisher(for: .showSettings)) { _ in
+            project.showSettings = true
+        }
+        // 窗口已改成透明（底色交给系统材质，跟着墙纸走），主界面自己得铺一层
+        // 材质，否则会直接透到桌面
+        .windowMaterial()
+        // 欢迎页在场时把主界面整个盖住（不是半透明蒙层）——用户没选文件之前
+        // 不该看到后面的素材栏和时间轴
+        .opacity(project.showWelcome ? 0 : 1)
+        .overlay {
+            if project.showWelcome {
+                ZStack {
+                    Color(red: 0.10, green: 0.10, blue: 0.11).ignoresSafeArea()
+                    WelcomeView()
+                        .environmentObject(project)
+                        .transition(.opacity.combined(with: .scale(scale: 0.98)))
+                }
+            }
+        }
         .overlay {
             if project.showSettings {
                 Color.black.opacity(0.4 * (settingsVisible ? 1 : 0))
@@ -293,25 +304,6 @@ struct ContentView: View {
                     .onAppear {
                         withAnimation(.easeOut(duration: 0.2)) { settingsVisible = true }
                     }
-            }
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .showSettings)) { _ in
-            project.showSettings = true
-        }
-        .overlay {
-            if project.showWelcome {
-                ZStack {
-                    Color.black.opacity(0.5)
-                        .ignoresSafeArea()
-                        .onTapGesture { }
-                    WelcomeView()
-                        .environmentObject(project)
-                        .transition(.opacity.combined(with: .scale(scale: 0.95)))
-                    Button("") { project.showWelcome = false }
-                        .keyboardShortcut(.escape, modifiers: [])
-                        .opacity(0)
-                        .frame(width: 0, height: 0)
-                }
             }
         }
         .animation(.easeOut(duration: 0.25), value: project.showWelcome)
@@ -434,10 +426,14 @@ struct ContentView: View {
 
 // MARK: - Design Tokens
 extension Color {
-    static let panelBg        = Color(hex: "#19191C")
-    static let previewBg      = Color(red: 0.07, green: 0.07, blue: 0.08)
-    static let timelineBg     = Color(red: 0.10, green: 0.10, blue: 0.11)
-    static let divider        = Color.white.opacity(0.08)
+    /// 面板底色一律透明，底色完全交给系统材质（见 VisualEffectBackground.swift）。
+    /// 之前叠了一层 black.opacity(0.28) 压暗，结果把材质对墙纸的采样压死了——
+    /// 界面还是黑的，跟系统那种能透出墙纸色调的观感差很远。系统 app 就是不叠色
+    static let panelBg        = Color.clear
+    static let previewBg      = Color.clear
+    static let timelineBg     = Color.clear
+    /// 分隔线跟系统一致，用动态的 separatorColor 而不是自己调透明度
+    static let divider        = Color.systemSeparator
     static let labelPrimary   = Color.white.opacity(0.88)
     static let labelSecondary = Color.white.opacity(0.45)
     static let accent         = Color(hex: "#F5B942")

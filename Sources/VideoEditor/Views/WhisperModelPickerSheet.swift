@@ -79,7 +79,8 @@ struct WhisperModelPickerSheet: View {
             .padding(.vertical, 16)
         }
         .frame(width: 460)
-        .background(Color(red: 0.13, green: 0.13, blue: 0.14))
+        .background(Color.black.opacity(0.30))
+        .floatingPanelMaterial()
         .onAppear { selected = project.selectedWhisperModel }
     }
 

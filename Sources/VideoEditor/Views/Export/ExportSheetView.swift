@@ -305,9 +305,7 @@ struct ExportSheetView: View {
             }
             .padding(.horizontal, 24)
             .padding(.top, 20)
-            .padding(.bottom, 16)
-
-            Divider().background(Color.divider)
+            .padding(.bottom, 4)
 
             // Settings
             VStack(alignment: .leading, spacing: 12) {
@@ -483,8 +481,6 @@ struct ExportSheetView: View {
             .padding(.vertical, 16)
             .frame(maxWidth: .infinity)
 
-            Divider().background(Color.divider)
-
             // Action row
             HStack(spacing: 16) {
                 if let err = exportError {
@@ -520,7 +516,8 @@ struct ExportSheetView: View {
             .padding(.vertical, 16)
         }
         .frame(width: 540)
-        .background(Color(red: 0.13, green: 0.13, blue: 0.14))
+        .background(Color.black.opacity(0.30))
+        .floatingPanelMaterial()
         .onAppear { syncFromPreview() }
     }
 

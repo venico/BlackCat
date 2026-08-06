@@ -46,7 +46,13 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate 
         window.titlebarAppearsTransparent = true
         window.titleVisibility = .hidden
         window.isMovableByWindowBackground = false
-        window.backgroundColor = NSColor(red: 0.10, green: 0.10, blue: 0.11, alpha: 1)
+        // 窗口本身透明，底色交给 NSVisualEffectView（见 VisualEffectBackground.swift）。
+        // 不透明窗口会直接盖住材质对窗口后方内容的采样，界面就不会跟着墙纸变了
+        window.isOpaque = false
+        window.backgroundColor = .clear
+        // 锁死深色。系统材质和 Liquid Glass 都跟随 appearance 走，不锁的话
+        // 用户把系统切成浅色，整个界面会跟着变白——这个 app 只做深色
+        window.appearance = NSAppearance(named: .darkAqua)
         window.tabbingMode = .disallowed
         window.center()
 
@@ -66,6 +72,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate 
         let appMenu = NSMenu()
         let appItem = NSMenuItem(); appItem.submenu = appMenu
         appMenu.addItem(withTitle: "关于 黑猫剪辑", action: #selector(showAbout), keyEquivalent: "")
+        appMenu.addItem(withTitle: "检查更新…", action: #selector(checkForUpdates), keyEquivalent: "")
         appMenu.addItem(.separator())
         appMenu.addItem(NSMenuItem(title: "设置…", action: #selector(showSettings), keyEquivalent: ","))
         appMenu.addItem(.separator())
@@ -276,10 +283,14 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate 
         NotificationCenter.default.post(name: .showSettings, object: nil)
     }
 
+    @objc private func checkForUpdates() {
+        Task { @MainActor in AppUpdater.shared.checkFromMenu() }
+    }
+
     @objc private func showAbout() {
         NSApp.orderFrontStandardAboutPanel(options: [
             .applicationName: "黑猫剪辑",
-            .applicationVersion: "4.3.5",
+            .applicationVersion: "4.3.6",
             .version: "",
             .credits: NSAttributedString(string: "")
         ])
