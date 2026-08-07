@@ -1,0 +1,19 @@
+# 这个目录只放脚本。权重、产物、环境、测试图都不入库（见 README 第八节）
+venv/
+tf_venv/
+__pycache__/
+
+# 上游权重（按 README 第三节下载，SHA256 可核对）
+*.pth
+*.pb
+*.npz
+
+# 转换产物
+*.mlpackage/
+*.mlmodelc/
+*.zip
+
+# 测试图和日志
+*.png
+*.jpg
+*.log
