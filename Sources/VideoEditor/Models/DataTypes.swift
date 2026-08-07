@@ -15,6 +15,10 @@ final class PlaybackClock: ObservableObject {
     @Published var lastVideoEndTime: Double = 0
     @Published var seekRequest: Int = 0
     @Published var refreshSeekRequest: Int = 0
+    /// 播放/暂停请求。每个窗口一份 clock，所以天然按窗口隔离——
+    /// 原来空格走 NotificationCenter 的裸广播（不带目标窗口），
+    /// 多开两个窗口按一次空格，两边的预览一起播/停
+    @Published var togglePlaybackRequest: Int = 0
     var pendingSeekTime: Double? = nil
 }
 

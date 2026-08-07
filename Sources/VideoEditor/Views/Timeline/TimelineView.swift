@@ -14,6 +14,8 @@ private struct VScrollOffsetKey: PreferenceKey {
 struct TimelineView: View {
     @EnvironmentObject private var project: ProjectState
     @EnvironmentObject private var clock: PlaybackClock
+    /// 本视图属于哪个窗口。键盘快捷键要按窗口隔离，见 setupMonitors
+    @Environment(\.windowID) private var windowID
     private let labelW: CGFloat = 84
     private let rulerH: CGFloat = 26
 
@@ -321,6 +323,13 @@ struct TimelineView: View {
         // (an NSTextView acting as field editor inside an NSTextField).
         // Inspector panels contain TextFields but only block delete while focused.
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            // local monitor 是**进程级**的，每个窗口都会装一个。不按当前窗口过滤的话，
+            // 按一次 ⌘Z 所有打开的项目一起撤销、按一次空格所有预览一起播/停、
+            // 删除键把每个窗口选中的片段都删掉（跟菜单命令当初那个
+            // 「保存把所有项目都存一遍」是同一类问题）
+            guard WindowManager.shared.window(for: windowID)?.isKeyWindow == true else {
+                return event
+            }
             // 文本编辑中不拦截（包括 NSTextField 的 field editor 和 SwiftUI TextEditor 的独立 NSTextView）
             if let tv = NSApp.keyWindow?.firstResponder as? NSTextView {
                 return event
@@ -372,9 +381,11 @@ struct TimelineView: View {
                 return nil
             }
 
-            // 空格键 → 播放/暂停
+            // 空格键 → 播放/暂停。
+            // 走 clock（每个窗口一份）而不是 NotificationCenter 裸广播——
+            // 那个通知没有目标窗口，所有窗口的 PlayerView 都会收到
             if event.keyCode == 49 {
-                NotificationCenter.default.post(name: .togglePlayback, object: nil)
+                clock.togglePlaybackRequest &+= 1
                 return nil
             }
 

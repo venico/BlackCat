@@ -293,7 +293,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate 
     @objc private func showAbout() {
         NSApp.orderFrontStandardAboutPanel(options: [
             .applicationName: "黑猫剪辑",
-            .applicationVersion: "4.5.5",
+            .applicationVersion: "4.5.6",
             .version: "",
             .credits: NSAttributedString(string: "")
         ])
@@ -327,8 +327,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate 
     }
 }
 
-extension Notification.Name {
-    // 菜单命令的通知名现在由 MenuCommand 统一生成（见 WindowManager.swift）——
-    // 它们必须带 windowID 才能投给正确的窗口，留着这些裸名字容易被误用成广播
-    static let togglePlayback    = Notification.Name("togglePlayback")
-}
+// 这里原来留着 `togglePlayback` 这个裸通知名。它没有目标窗口，多窗口下
+// 按一次空格所有预览一起播/停，正是当初注释担心的"被误用成广播"。
+// 播放/暂停已改走 PlaybackClock.togglePlaybackRequest（每窗口一份），
+// 通知名一并删掉，杜绝再被捡起来用

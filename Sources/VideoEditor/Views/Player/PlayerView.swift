@@ -109,7 +109,8 @@ struct PlayerView: View {
             ctrl.getTime    = { clock.currentTime }
             ctrl.getDuration = { clock.duration }
         }
-        .onReceive(NotificationCenter.default.publisher(for: .togglePlayback)) { _ in
+        // 走 clock 而不是通知：clock 是本窗口的，不会被别的窗口的空格触发
+        .onChange(of: clock.togglePlaybackRequest) { _, _ in
             ctrl.toggle()
         }
     }
