@@ -134,32 +134,54 @@ final class RecentProjects: ObservableObject {
             return nil
         }
 
-        /// 把片段里的 url 字段解成本地路径。存的是 file:// 形式且做过百分号编码
-        func localURL(_ clip: [String: Any]) -> URL? {
-            guard let path = clip["url"] as? String else { return nil }
+        /// 把片段里的 URL 字段解成本地路径。存的是 file:// 形式且做过百分号编码。
+        ///
+        /// 字段名按片段类型不同：`VideoClip` 是 `url`、`ImageClip` 是 `imageURL`。
+        /// 原来写死 `clip["url"]`，图片轨一个都取不到——这就是"项目里明明有图片、
+        /// 欢迎页却始终是缺省图"的原因。
+        /// 图片片段里另有个 `videoURL`，那是给预览/导出用的临时生成视频（在 /var/folders 下，
+        /// 随时可能被系统清掉），不能拿来当封面
+        func localURL(_ clip: [String: Any], key: String) -> URL? {
+            guard let path = clip[key] as? String else { return nil }
             let u = path.hasPrefix("file://") ? (URL(string: path) ?? URL(fileURLWithPath: path))
                                               : URL(fileURLWithPath: path)
             return FileManager.default.fileExists(atPath: u.path) ? u : nil
         }
 
-        /// 按时间轴顺序摊平某一类轨道上的所有片段
-        func clips(in key: String) -> [[String: Any]] {
-            let tracks = root[key] as? [[String: Any]] ?? []
+        /// 按时间轴顺序摊平某一类轨道上的所有片段。
+        ///
+        /// `container` 为 nil 时取项目顶层，否则取复合片段内部——
+        /// 内容全在复合片段里的项目（顶层只有一条复合轨道）顶层是空的，
+        /// 不往里看就永远取不到封面
+        func clips(in key: String, of container: [String: Any]? = nil) -> [[String: Any]] {
+            let tracks = (container ?? root)[key] as? [[String: Any]] ?? []
             return tracks.flatMap { ($0["clips"] as? [[String: Any]]) ?? [] }
                 .sorted { (($0["startTime"] as? Double) ?? 0) < (($1["startTime"] as? Double) ?? 0) }
         }
 
-        // 视频轨优先
-        for clip in clips(in: "videoTracks") {
-            guard let u = localURL(clip) else { continue }
+        /// 复合片段（含嵌套）里的视频/图片片段，按开始时间排。
+        /// 深度设上限，防手工改坏的文件里出现自引用把这里转死
+        func compoundClips(in container: [String: Any]?, key: String, depth: Int = 0) -> [[String: Any]] {
+            guard depth < 8 else { return [] }
+            var result: [[String: Any]] = []
+            for compound in clips(in: "compoundTracks", of: container) {
+                result += clips(in: key, of: compound)
+                result += compoundClips(in: compound, key: key, depth: depth + 1)
+            }
+            return result.sorted { (($0["startTime"] as? Double) ?? 0) < (($1["startTime"] as? Double) ?? 0) }
+        }
+
+        // 视频轨优先，顶层找不到再进复合片段里找
+        for clip in clips(in: "videoTracks") + compoundClips(in: nil, key: "videoTracks") {
+            guard let u = localURL(clip, key: "url") else { continue }
             // trimStart 是这个片段从源文件的哪一秒开始播，取那一帧才是
             // 用户在时间轴上看到的画面，不是源文件的第 0 秒
             let at = (clip["trimStart"] as? Double) ?? 0
             if let img = frame(of: u, at: at) { return img }
         }
-        // 没有视频轨才看图片轨
-        for clip in clips(in: "imageTracks") {
-            guard let u = localURL(clip), let img = NSImage(contentsOf: u) else { continue }
+        // 没有视频轨才看图片轨，同样顶层优先、再进复合片段
+        for clip in clips(in: "imageTracks") + compoundClips(in: nil, key: "imageTracks") {
+            guard let u = localURL(clip, key: "imageURL"), let img = NSImage(contentsOf: u) else { continue }
             return img
         }
         // 两类轨道都没有可用画面（纯音频项目、空项目）→ UI 显示缺省图

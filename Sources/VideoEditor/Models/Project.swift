@@ -52,6 +52,60 @@ final class ProjectState: ObservableObject {
         }
     }
 
+    /// 一帧要合成的 overlay 图层清单，**从底到顶**。
+    ///
+    /// 预览（OverlayStack）和导出（writerExport）必须走同一份，不能各自遍历
+    /// `overlayTrackOrder`——因为那张表并不包含全部要画的东西：
+    /// 按复合片段的归属规则，含视频的进 `videoSectionOrder`、只含音频的进
+    /// `audioSectionOrder`，只有纯 overlay 内容的才进 `overlayTrackOrder`。
+    /// 前两类的**内部** overlay（字幕/文字/图形/图片）仍然要烧到画面上，
+    /// 得单独补进来，压在所有 overlay 之下——它们本质是视频层，overlay 层理应盖在其上。
+    ///
+    /// 曾经预览侧自己做了这个兜底而导出侧没有，于是复合片段里的字幕"预览有、导出没有"。
+    /// 静态方法是因为导出跑在 nonisolated 上下文里，只有数据快照、拿不到 ProjectState 实例。
+    ///
+    /// - Returns: 从底到顶。调用方按这个顺序依次合成即可（后合成的盖在先合成的上面）
+    static func overlayLayersBottomUp(
+        overlayTrackOrder: [OverlayTrackRef],
+        imageTracks: [Track<ImageClip>] = [],
+        subtitleTracks: [Track<SubtitleClip>] = [],
+        textTracks: [Track<TextClip>] = [],
+        shapeTracks: [Track<ShapeClip>] = [],
+        compoundTracks: [Track<CompoundClip>] = []
+    ) -> [OverlayTrackRef] {
+        // 没登记的一律补进来，压在最底下。不只是复合轨道——任何一条轨道只要
+        // 没进 overlayTrackOrder 就会彻底不显示，而"渲染完全照这张表走"之后，
+        // 表里漏一条的后果从"顺序不对"升级成"整条内容消失"
+        let listed = Set(overlayTrackOrder.map(\.trackID))
+        var unlisted: [OverlayTrackRef] = []
+        for t in imageTracks where t.isVisible && !listed.contains(t.id) {
+            unlisted.append(.image(t.id))
+        }
+        for t in subtitleTracks where t.isVisible && !listed.contains(t.id) {
+            unlisted.append(.subtitle(t.id))
+        }
+        for t in textTracks where t.isVisible && !listed.contains(t.id) {
+            unlisted.append(.text(t.id))
+        }
+        for t in shapeTracks where t.isVisible && !listed.contains(t.id) {
+            unlisted.append(.shape(t.id))
+        }
+        for t in compoundTracks where t.isVisible && !listed.contains(t.id) {
+            unlisted.append(.compound(t.id))
+        }
+        // overlayTrackOrder 是从顶到底存的（index 0 = 最上面），反过来即从底到顶
+        return unlisted + overlayTrackOrder.reversed()
+    }
+
+    /// 顶层的 overlay 图层清单，从底到顶
+    var overlayLayersBottomUp: [OverlayTrackRef] {
+        Self.overlayLayersBottomUp(
+            overlayTrackOrder: overlayTrackOrder,
+            imageTracks: imageTracks, subtitleTracks: subtitleTracks,
+            textTracks: textTracks, shapeTracks: shapeTracks,
+            compoundTracks: compoundTracks)
+    }
+
     enum CompoundTrackKind { case overlay, video, audio }
 
     func compoundTrackKind(_ track: Track<CompoundClip>) -> CompoundTrackKind {
@@ -81,12 +135,13 @@ final class ProjectState: ObservableObject {
     }
     @Published var overlayTrackOrder: [OverlayTrackRef] = []
 
-    enum VideoSectionRef: Equatable, Hashable {
+    // Codable：这两个要跟着项目文件存盘，否则复合片段重新打开后位置会跑掉
+    enum VideoSectionRef: Equatable, Hashable, Codable {
         case video(UUID)
         case compound(UUID)
         var trackID: UUID { switch self { case .video(let id), .compound(let id): return id } }
     }
-    enum AudioSectionRef: Equatable, Hashable {
+    enum AudioSectionRef: Equatable, Hashable, Codable {
         case audio(UUID)
         case compound(UUID)
         var trackID: UUID { switch self { case .audio(let id), .compound(let id): return id } }

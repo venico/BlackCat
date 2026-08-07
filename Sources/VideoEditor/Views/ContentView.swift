@@ -409,7 +409,6 @@ struct ContentView: View {
                                               subtitle: "已停止", autoCountdown: false)
                 })
         }
-        .onDisappear { teardownEscMonitor() }
         // 下面这些菜单命令都要先确认「是发给我这个窗口的」——
         // 不过滤的话多窗口下按一次保存会把所有打开的项目都存一遍
         .onReceive(NotificationCenter.default.publisher(for: MenuCommand.importFiles.notificationName)) { note in
@@ -532,13 +531,21 @@ struct ContentView: View {
             if project.showNewProjectSheet { return event }
             if project.showExportSheet { project.showExportSheet = false; return nil }
             if project.showSettings { closeSettings(); return nil }
-            if project.showWelcome { project.showWelcome = false; return nil }
+            // 欢迎页的 esc 一律不接管：交给 SwiftUI，让 WelcomeView 的 onExitCommand
+            // 去取消重命名。欢迎页本身不响应 esc（要关窗用左上角红灯或 ⌘W）——
+            // 这里做过"esc 关窗"，但窗口焦点/事件分发上的坑绕不干净，改成手动关
+            if project.showWelcome { return event }
             if project.showClearLibraryConfirm { project.showClearLibraryConfirm = false; return nil }
             if project.showAssetDeleteConfirm { project.showAssetDeleteConfirm = false; project.pendingDeleteAssetID = nil; return nil }
             return event
         }
     }
 
+    /// 注意**不要**挂到 SwiftUI 的 .onDisappear 上：那个回调在视图重建、
+    /// overlay 切换时也会来，监听器被提前拆掉之后 onAppear 不会再触发一次，
+    /// esc 就永久失效了（实测：欢迎页 esc 时灵时不灵、点 Dock 再开就一直不灵）。
+    /// 窗口真正关闭时进程也不需要它了，残留的那个有 windowID guard 兜着——
+    /// 窗口没了 window(for:) 返回 nil，直接放行，不会误伤别的窗口
     private func teardownEscMonitor() {
         if let m = escMonitor { NSEvent.removeMonitor(m); escMonitor = nil }
     }

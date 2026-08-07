@@ -19,6 +19,8 @@ struct WelcomeView: View {
     @State private var search = ""
     @State private var renaming: URL? = nil
     @State private var renameText = ""
+    /// 正在走 esc 取消。挡住紧随其后的失焦回调，别把取消又变成确认
+    @State private var cancelingRename = false
     @State private var errorMessage: String?
 
     private var filtered: [RecentProject] {
@@ -56,6 +58,15 @@ struct WelcomeView: View {
             content
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        // 点空白处确认改名。加在最外层并用 simultaneousGesture：普通 .onTapGesture
+        // 会把点击吃掉，卡片、按钮、列头排序就都点不动了
+        .simultaneousGesture(TapGesture().onEnded {
+            if let url = renaming, let item = recents.items.first(where: { $0.url == url }) {
+                commitRename(item)
+            }
+        })
+        // esc 取消改名，名字保持原样。没在改名时什么都不做（欢迎页不响应 esc）
+        .onExitCommand { cancelRename() }
         .windowMaterial()
         .ignoresSafeArea()
         // 欢迎页阶段把窗口缩到 860x560：它铺满整个窗口，而主窗口默认 1280x780，
@@ -443,12 +454,24 @@ struct WelcomeView: View {
     }
 
     private func commitRename(_ item: RecentProject) {
+        // esc 取消时 TextField 会先失焦，失焦回调紧跟着就来——不挡住的话
+        // 取消完又被当成确认提交一次，等于 esc 无效
+        guard !cancelingRename else { return }
         defer { renaming = nil }
         if let err = RecentProjects.shared.rename(item.url, to: renameText) {
             errorMessage = err
         } else {
             errorMessage = nil
         }
+    }
+
+    /// esc：放弃改名，名字保持原样
+    private func cancelRename() {
+        guard renaming != nil else { return }
+        cancelingRename = true
+        renaming = nil
+        // 失焦回调是下一个 runloop 才到，这一拍之后再解锁
+        DispatchQueue.main.async { cancelingRename = false }
     }
 
     private func openExistingProject() {

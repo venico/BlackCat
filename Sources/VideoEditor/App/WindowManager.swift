@@ -106,6 +106,11 @@ final class WindowManager: NSObject {
         window.contentView = hosting
 
         window.makeKeyAndOrderFront(nil)
+        // 必须显式激活 app。关掉最后一个窗口后 app 会退到后台，那时再开窗，
+        // makeKeyAndOrderFront 只是把窗口显示出来，键盘焦点仍在别的 app——
+        // 窗口看着好好的，按 esc 却毫无反应（事件压根没分发到本进程，
+        // 连 local monitor 都不会被调用）。showNewProjectPanel 一直带着这句，这里漏了
+        NSApp.activate(ignoringOtherApps: true)
         DiagLog.log("[窗口] 新开一个，当前共 \(windows.count) 个")
 
         return id
@@ -212,7 +217,11 @@ final class WindowManager: NSObject {
     /// 关掉某个窗口。「开窗即弹表单」那条路上用户点取消时用——
     /// 不关的话会留一个既没项目也没欢迎页的空壳窗口挂在那儿
     func close(_ id: WindowID) {
-        windows[id]?.close()
+        guard let w = windows[id] else { return }
+        // 延到下一个 runloop 再关。从 NSEvent 的 local monitor 回调里同步 close，
+        // AppKit 正在分发这个事件，close 会被静默忽略——实测按 esc 时
+        // 「→ 关掉欢迎页窗口」的日志出来了，windowWillClose 一次都没触发
+        DispatchQueue.main.async { w.close() }
     }
 
     func focus(_ window: NSWindow) {

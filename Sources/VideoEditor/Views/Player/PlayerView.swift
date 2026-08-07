@@ -182,7 +182,9 @@ private struct OverlayStack: View {
     @State private var subtitleHeights: [UUID: CGFloat] = [:]   // 每条字幕实测高度，用于精确堆叠
 
     var body: some View {
-        let count = project.overlayTrackOrder.count
+        // 图层清单跟导出共用（含未登记复合轨道的兜底，见 overlayLayersBottomUp）。
+        // 那边是从底到顶依次合成，这边靠 zIndex 叠，所以序号越大越靠上
+        let layersBottomUp = project.overlayLayersBottomUp
 
         ZStack {
             Color.clear.contentShape(Rectangle())
@@ -197,8 +199,8 @@ private struct OverlayStack: View {
                 }
                 .zIndex(-1)
 
-            ForEach(Array(project.overlayTrackOrder.enumerated()), id: \.element.trackID) { i, ref in
-                let z = Double(count - i)
+            ForEach(Array(layersBottomUp.enumerated()), id: \.element.trackID) { i, ref in
+                let z = Double(i)
                 switch ref {
                 case .image(let id):
                     imageTrackView(trackID: id).zIndex(z)
@@ -212,17 +214,7 @@ private struct OverlayStack: View {
                     compoundOverlayView(trackID: id).zIndex(z)
                 }
             }
-            ForEach(nonOverlayCompoundTrackIDs, id: \.self) { trackID in
-                compoundOverlayView(trackID: trackID).zIndex(-0.5)
-            }
         }
-    }
-
-    private var nonOverlayCompoundTrackIDs: [UUID] {
-        let overlayIDs = Set(project.overlayTrackOrder.compactMap { ref -> UUID? in
-            if case .compound(let id) = ref { return id }; return nil
-        })
-        return project.compoundTracks.map(\.id).filter { !overlayIDs.contains($0) }
     }
 
     @ViewBuilder
@@ -512,29 +504,63 @@ private struct OverlayStack: View {
         let found = compoundClipAt(trackID: trackID, time: t)
         GeometryReader { geo in
             if let (compound, it) = found {
-                compoundImages(compound: compound, it: it, geo: geo)
-                compoundShapes(compound: compound, it: it, geo: geo)
-                compoundTexts(compound: compound, it: it, geo: geo)
-                compoundSubtitles(compound: compound, it: it, geo: geo)
-                nestedCompoundOverlays(compound: compound, it: it, geo: geo)
+                // 按复合片段**自己的** overlayTrackOrder 叠。
+                // 原来是写死的类型顺序（图片→图形→文字→字幕），字幕永远画在最后=永远
+                // 盖在最上面，跟它在复合片段里排第几层无关；进入复合片段编辑后走的是
+                // 外层那条按 order 排的路径，于是"外面看字幕在最上、进去看在第二层"。
+                // 导出侧那份写死的顺序还跟这边不一样（图片→字幕→文字→图形）
+                let layers = compound.overlayLayersBottomUp
+                ForEach(Array(layers.enumerated()), id: \.element.trackID) { i, ref in
+                    compoundLayerView(ref: ref, isFirstSubtitle: firstSubtitleIndex(layers) == i,
+                                      compound: compound, it: it, geo: geo)
+                        .zIndex(Double(i))
+                }
             }
         }
         .allowsHitTesting(false)
     }
 
-    private func nestedCompoundOverlays(compound: CompoundClip, it: Double, geo: GeometryProxy) -> AnyView {
-        let active = compound.compoundTracks
-            .filter { $0.isVisible }
-            .flatMap(\.clips)
-            .filter { $0.startTime <= it && $0.endTime > it }
+    /// 清单里第一条字幕轨的位置。多条字幕轨要作为一组一起排版（否则互相重叠），
+    /// 所以只在第一条出现的那层整组画出来，其余跳过——跟导出侧 subtitleRendered 同一个思路
+    private func firstSubtitleIndex(_ layers: [ProjectState.OverlayTrackRef]) -> Int? {
+        layers.firstIndex { if case .subtitle = $0 { return true }; return false }
+    }
+
+    @ViewBuilder
+    private func compoundLayerView(ref: ProjectState.OverlayTrackRef, isFirstSubtitle: Bool,
+                                   compound: CompoundClip, it: Double, geo: GeometryProxy) -> some View {
+        switch ref {
+        case .image(let id):
+            compoundImages(compound: compound, trackID: id, it: it, geo: geo)
+        case .shape(let id):
+            compoundShapes(compound: compound, trackID: id, it: it, geo: geo)
+        case .text(let id):
+            compoundTexts(compound: compound, trackID: id, it: it, geo: geo)
+        case .subtitle:
+            if isFirstSubtitle {
+                compoundSubtitles(compound: compound, it: it, geo: geo)
+            }
+        case .compound(let id):
+            nestedCompoundOverlay(compound: compound, trackID: id, it: it, geo: geo)
+        }
+    }
+
+    /// 嵌套的复合片段。同样按嵌套那层自己的 overlayTrackOrder 叠
+    private func nestedCompoundOverlay(compound: CompoundClip, trackID: UUID,
+                                       it: Double, geo: GeometryProxy) -> AnyView {
+        guard let track = compound.compoundTracks.first(where: { $0.id == trackID }),
+              track.isVisible else { return AnyView(EmptyView()) }
+        let active = track.clips.filter { $0.startTime <= it && $0.endTime > it }
         guard !active.isEmpty else { return AnyView(EmptyView()) }
         return AnyView(ForEach(active) { nested in
             let nit = it - nested.startTime + nested.internalStart
-            self.compoundImages(compound: nested, it: nit, geo: geo)
-            self.compoundShapes(compound: nested, it: nit, geo: geo)
-            self.compoundTexts(compound: nested, it: nit, geo: geo)
-            self.compoundSubtitles(compound: nested, it: nit, geo: geo)
-            self.nestedCompoundOverlays(compound: nested, it: nit, geo: geo)
+            let layers = nested.overlayLayersBottomUp
+            ForEach(Array(layers.enumerated()), id: \.element.trackID) { i, ref in
+                self.compoundLayerView(ref: ref,
+                                       isFirstSubtitle: self.firstSubtitleIndex(layers) == i,
+                                       compound: nested, it: nit, geo: geo)
+                    .zIndex(Double(i))
+            }
         })
     }
 
@@ -548,30 +574,39 @@ private struct OverlayStack: View {
     }
 
     @ViewBuilder
-    private func compoundImages(compound: CompoundClip, it: Double, geo: GeometryProxy) -> some View {
-        let clips = compound.imageTracks.flatMap(\.clips).filter { $0.startTime <= it && $0.endTime > it }
-        ForEach(clips) { clip in
-            ImageLayerView(clip: clip, viewSize: geo.size, videoSize: project.previewRenderSize)
+    private func compoundImages(compound: CompoundClip, trackID: UUID,
+                                it: Double, geo: GeometryProxy) -> some View {
+        if let track = compound.imageTracks.first(where: { $0.id == trackID }), track.isVisible {
+            let clips = track.clips.filter { $0.startTime <= it && $0.endTime > it }
+            ForEach(clips) { clip in
+                ImageLayerView(clip: clip, viewSize: geo.size, videoSize: project.previewRenderSize)
+            }
         }
     }
 
     @ViewBuilder
-    private func compoundShapes(compound: CompoundClip, it: Double, geo: GeometryProxy) -> some View {
-        let scale = geo.size.width / max(project.previewRenderSize.width, 1)
-        let clips = compound.shapeTracks.flatMap(\.clips).filter { $0.startTime <= it && $0.endTime > it }
-        ForEach(clips) { clip in
-            ShapeClipView(clip: clip, scale: scale, selected: false)
-                .position(x: geo.size.width * clip.posX, y: geo.size.height * clip.posY)
+    private func compoundShapes(compound: CompoundClip, trackID: UUID,
+                                it: Double, geo: GeometryProxy) -> some View {
+        if let track = compound.shapeTracks.first(where: { $0.id == trackID }), track.isVisible {
+            let scale = geo.size.width / max(project.previewRenderSize.width, 1)
+            let clips = track.clips.filter { $0.startTime <= it && $0.endTime > it }
+            ForEach(clips) { clip in
+                ShapeClipView(clip: clip, scale: scale, selected: false)
+                    .position(x: geo.size.width * clip.posX, y: geo.size.height * clip.posY)
+            }
         }
     }
 
     @ViewBuilder
-    private func compoundTexts(compound: CompoundClip, it: Double, geo: GeometryProxy) -> some View {
-        let scale = geo.size.width / max(project.previewRenderSize.width, 1)
-        let clips = compound.textTracks.flatMap(\.clips).filter { $0.startTime <= it && $0.endTime > it }
-        ForEach(clips) { clip in
-            TextLabel(clip: clip, scale: scale)
-                .position(x: geo.size.width * clip.posX, y: geo.size.height * clip.posY)
+    private func compoundTexts(compound: CompoundClip, trackID: UUID,
+                               it: Double, geo: GeometryProxy) -> some View {
+        if let track = compound.textTracks.first(where: { $0.id == trackID }), track.isVisible {
+            let scale = geo.size.width / max(project.previewRenderSize.width, 1)
+            let clips = track.clips.filter { $0.startTime <= it && $0.endTime > it }
+            ForEach(clips) { clip in
+                TextLabel(clip: clip, scale: scale)
+                    .position(x: geo.size.width * clip.posX, y: geo.size.height * clip.posY)
+            }
         }
     }
 
@@ -2792,6 +2827,10 @@ private struct PenDrawingOverlay: View {
 
     private func installKeyMonitor(clipID: UUID) {
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            // 必须判状态，不能只靠"这个 monitor 只在绘制时安装"：local monitor 是
+            // 进程级的，SwiftUI 的 onDisappear 漏触发一次它就永久留着，之后
+            // 全 app 的 esc 和回车都会被这里吃掉（欢迎页 esc 关不掉窗口就是这么来的）
+            guard project.penDrawingMode else { return event }
             if event.keyCode == 53 || event.keyCode == 36 {
                 if project.penRawPoints.count >= 2 {
                     project.finalizePenDrawing(clipID: clipID, rawPoints: project.penRawPoints, closed: false)
@@ -2923,6 +2962,8 @@ private struct PenEditOverlay: View {
 
     private func installEscMonitor() {
         escMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            // 同上：没在钢笔编辑就别碰事件，残留的 monitor 不能吞掉别处的 esc/回车
+            guard project.penEditingClipID != nil else { return event }
             if event.keyCode == 53 || event.keyCode == 36 { // Escape or Enter → exit edit
                 project.penEditingClipID = nil; return nil
             }

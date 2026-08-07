@@ -807,6 +807,13 @@ struct ProjectDocument: Codable {
     var subtitleBottomMargin: Double?
     var subtitleLineSpacing: Double?
     var overlayTrackOrder: [ProjectState.OverlayTrackRef]?
+    /// 复合片段轨道。**必须存**——不存的话保存再打开，时间轴上的复合片段整个消失。
+    /// 可选是为了兼容没有这个字段的旧 .bcj
+    var compoundTracks: [Track<CompoundClip>]?
+    /// 视频/音频区的轨道顺序。复合片段按归属规则可能落在这两个区里，
+    /// 只存 overlayTrackOrder 的话它重新打开后位置会跑掉
+    var videoSectionOrder: [ProjectState.VideoSectionRef]?
+    var audioSectionOrder: [ProjectState.AudioSectionRef]?
 }
 
 extension ExportSettings: Codable {}
@@ -830,6 +837,16 @@ struct CompoundClip: Identifiable, Equatable, Codable {
     var compoundTracks: [Track<CompoundClip>] = []
     var overlayTrackOrder: [ProjectState.OverlayTrackRef] = []
     var markers: [Marker]? = nil
+
+    /// 复合片段内部的 overlay 图层清单，从底到顶。没登记进自己那份
+    /// overlayTrackOrder 的轨道会补在最底下——漏一条就是整条内容不显示
+    var overlayLayersBottomUp: [ProjectState.OverlayTrackRef] {
+        ProjectState.overlayLayersBottomUp(
+            overlayTrackOrder: overlayTrackOrder,
+            imageTracks: imageTracks, subtitleTracks: subtitleTracks,
+            textTracks: textTracks, shapeTracks: shapeTracks,
+            compoundTracks: compoundTracks)
+    }
 
     /// 字幕轨按**自己的** overlayTrackOrder 排，index 0 排最上面。
     ///

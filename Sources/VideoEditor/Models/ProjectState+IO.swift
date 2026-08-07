@@ -111,6 +111,9 @@ extension ProjectState {
         subtitleBottomMargin = doc.subtitleBottomMargin ?? doc.subtitleStyles.first?.bottomMargin ?? 5
         subtitleLineSpacing = doc.subtitleLineSpacing ?? doc.subtitleStyles.first?.lineSpacing ?? 6
         overlayTrackOrder = doc.overlayTrackOrder ?? []
+        compoundTracks = doc.compoundTracks ?? []
+        videoSectionOrder = doc.videoSectionOrder ?? []
+        audioSectionOrder = doc.audioSectionOrder ?? []
         exportSettings = doc.exportSettings
         previewResolution = doc.previewResolution
         previewAspectRatio = doc.previewAspectRatio ?? "原始"
@@ -207,7 +210,10 @@ extension ProjectState {
             projectBitrate: projectBitrate,
             subtitleBottomMargin: subtitleBottomMargin,
             subtitleLineSpacing: subtitleLineSpacing,
-            overlayTrackOrder: overlayTrackOrder.isEmpty ? nil : overlayTrackOrder
+            overlayTrackOrder: overlayTrackOrder.isEmpty ? nil : overlayTrackOrder,
+            compoundTracks: compoundTracks.isEmpty ? nil : compoundTracks,
+            videoSectionOrder: videoSectionOrder.isEmpty ? nil : videoSectionOrder,
+            audioSectionOrder: audioSectionOrder.isEmpty ? nil : audioSectionOrder
         )
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
