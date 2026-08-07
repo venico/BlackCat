@@ -831,6 +831,25 @@ struct CompoundClip: Identifiable, Equatable, Codable {
     var overlayTrackOrder: [ProjectState.OverlayTrackRef] = []
     var markers: [Marker]? = nil
 
+    /// 字幕轨按**自己的** overlayTrackOrder 排，index 0 排最上面。
+    ///
+    /// 预览和导出都得用这个，不能直接拿 `subtitleTracks` 的数组顺序：进入复合片段
+    /// 编辑后走的是外层那条路径（`ProjectState.orderedSubtitleIndices`，按
+    /// overlayTrackOrder 排），依据不一样的话，双语字幕的上下位置里外互换。
+    /// 排不进去的（比如 flattened 展开嵌套时新生成的轨）按原顺序追加在后面
+    var orderedSubtitleTracks: [Track<SubtitleClip>] {
+        var result: [Track<SubtitleClip>] = []
+        for ref in overlayTrackOrder {
+            if case .subtitle(let id) = ref,
+               let t = subtitleTracks.first(where: { $0.id == id }) {
+                result.append(t)
+            }
+        }
+        let seen = Set(result.map(\.id))
+        result.append(contentsOf: subtitleTracks.filter { !seen.contains($0.id) })
+        return result
+    }
+
     func flattened() -> CompoundClip {
         guard !compoundTracks.isEmpty else { return self }
         var r = self

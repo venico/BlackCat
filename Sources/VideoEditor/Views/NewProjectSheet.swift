@@ -107,6 +107,9 @@ struct NewProjectSheet: View {
                 }
                 .buttonStyle(.plain)
                 .disabled(!canCreate)
+                // 填完名字直接回车就建，不用去点按钮。
+                // modifiers: [] 是必须的——默认带 .command，那样就成了 ⌘↩
+                .keyboardShortcut(.return, modifiers: [])
             }
             .padding(.top, 2)
         }

@@ -38,6 +38,9 @@ struct ContentView: View {
         }())
     }
     @StateObject private var exportManager = ExportManager.shared
+    /// esc 监听器句柄。关窗时必须移除——local monitor 挂在进程上，
+    /// 窗口没了它还在，闭包又持有那个窗口的 project
+    @State private var escMonitor: Any? = nil
     @State private var topHeight: CGFloat = 420
     @State private var isDraggingH = false
     @State private var sidebarVisible = true
@@ -406,6 +409,7 @@ struct ContentView: View {
                                               subtitle: "已停止", autoCountdown: false)
                 })
         }
+        .onDisappear { teardownEscMonitor() }
         // 下面这些菜单命令都要先确认「是发给我这个窗口的」——
         // 不过滤的话多窗口下按一次保存会把所有打开的项目都存一遍
         .onReceive(NotificationCenter.default.publisher(for: MenuCommand.importFiles.notificationName)) { note in
@@ -511,8 +515,21 @@ struct ContentView: View {
     }
 
     private func setupEscMonitor() {
-        NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+        escMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
             guard event.keyCode == 53 else { return event }
+            // local monitor 是**进程级**的：每开一个窗口就多一个 monitor，各自捕获
+            // 自己的 project。不按当前窗口过滤的话，按一次 esc 会把所有窗口的
+            // 面板/欢迎页一起关掉（跟菜单命令当初那个「保存把所有项目都存一遍」同类）。
+            // sheet 弹出时 key window 是 sheet 自己，所以 attachedSheet 也算本窗口
+            let w = WindowManager.shared.window(for: windowID)
+            guard w?.isKeyWindow == true || w?.attachedSheet?.isKeyWindow == true else {
+                return event
+            }
+            // 新建项目表单开着时把 esc 让给它自己的 onExitCommand：那条路径除了关表单
+            // 还要收掉「专为新建开出来的空窗口」，这里抢着处理会跳过那段清理。
+            // 必须排在 showWelcome 前面——从欢迎页点新建时两个状态同时为真，
+            // 顺序反了就成了「esc 关掉欢迎页、露出空主界面」，而表单还留在上面
+            if project.showNewProjectSheet { return event }
             if project.showExportSheet { project.showExportSheet = false; return nil }
             if project.showSettings { closeSettings(); return nil }
             if project.showWelcome { project.showWelcome = false; return nil }
@@ -520,6 +537,10 @@ struct ContentView: View {
             if project.showAssetDeleteConfirm { project.showAssetDeleteConfirm = false; project.pendingDeleteAssetID = nil; return nil }
             return event
         }
+    }
+
+    private func teardownEscMonitor() {
+        if let m = escMonitor { NSEvent.removeMonitor(m); escMonitor = nil }
     }
 
     private var toggleButton: some View {

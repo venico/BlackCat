@@ -578,16 +578,29 @@ private struct OverlayStack: View {
     @ViewBuilder
     private func compoundSubtitles(compound: CompoundClip, it: Double, geo: GeometryProxy) -> some View {
         let scale = geo.size.width / max(project.previewRenderSize.width, 1)
-        ForEach(compound.subtitleTracks) { subTrack in
-            if let clip = subTrack.clips.first(where: { $0.startTime <= it && $0.endTime > it }) {
-                let style = subTrack.subtitleStyle ?? SubtitleStyle()
-                let text = style.mergeLineBreaks ? SubtitleOverlay.mergeBreaks(clip.text) : clip.text
-                SubtitleLabel(text: text, style: style, scale: scale)
-                    .frame(maxWidth: geo.size.width * style.widthPercent / 100)
-                    .multilineTextAlignment(subtitleAlign(style.alignment))
-                    .padding(.bottom, geo.size.height * project.subtitleBottomMargin / 100.0)
-                    .frame(width: geo.size.width, height: geo.size.height, alignment: .bottom)
+        // 多条字幕轨要**竖着摞**，跟外层 SubtitleOverlay 同一个排法。
+        // 原来是 ForEach 里每条各自 `.frame(alignment: .bottom)` + 同一个
+        // subtitleBottomMargin，等于每条都贴到底边同一位置——中英双语轨直接叠在一起。
+        // 进入复合片段编辑时看着正常，是因为那时走的是外层那条路径
+        let pairs: [(String, SubtitleStyle)] = compound.orderedSubtitleTracks.compactMap { subTrack in
+            guard subTrack.isVisible else { return nil }
+            let style = subTrack.subtitleStyle ?? SubtitleStyle()
+            guard let clip = subTrack.clips.first(where: {
+                $0.startTime <= it && $0.endTime > it
+            }) else { return nil }
+            let text = style.mergeLineBreaks ? SubtitleOverlay.mergeBreaks(clip.text) : clip.text
+            return (text, style)
+        }
+        if !pairs.isEmpty {
+            VStack(spacing: CGFloat(project.subtitleLineSpacing) * scale) {
+                ForEach(pairs.indices, id: \.self) { i in
+                    SubtitleLabel(text: pairs[i].0, style: pairs[i].1, scale: scale)
+                        .frame(maxWidth: geo.size.width * pairs[i].1.widthPercent / 100)
+                        .multilineTextAlignment(subtitleAlign(pairs[i].1.alignment))
+                }
             }
+            .padding(.bottom, geo.size.height * project.subtitleBottomMargin / 100.0)
+            .frame(width: geo.size.width, height: geo.size.height, alignment: .bottom)
         }
     }
 }

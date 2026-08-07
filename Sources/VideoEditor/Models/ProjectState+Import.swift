@@ -64,7 +64,12 @@ extension ProjectState {
             return
         }
         let ext = url.pathExtension.lowercased()
-        guard let type = Self.assetType(for: ext) else { return }
+        guard let type = Self.assetType(for: ext) else {
+            // 这里原本是静默 return——扩展名不认识时用户看到的就是「完全没反应」，
+            // 跟"拖拽根本没触发"从表现上分不开。留一行日志，至少排查时能区分
+            DiagLog.log("[导入] 不支持的扩展名 .\(ext)，已忽略：\(url.lastPathComponent)")
+            return
+        }
 
         // 需要转码的音频格式，先转为 M4A 再导入
         if type == .audio && Self.needsTranscodeAudioExtensions.contains(ext) {

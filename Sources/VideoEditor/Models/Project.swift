@@ -228,6 +228,9 @@ final class ProjectState: ObservableObject {
         for t in subtitleTracks { for c in t.clips { maxEnd = max(maxEnd, c.endTime) } }
         for t in textTracks { for c in t.clips { maxEnd = max(maxEnd, c.endTime) } }
         for t in shapeTracks { for c in t.clips { maxEnd = max(maxEnd, c.endTime) } }
+        // 复合片段也是时间轴上的内容。漏掉它，「缩放至适合」会把复合片段留在视口外，
+        // 滚动区总宽和缩放下限也会算短
+        for t in compoundTracks { for c in t.clips { maxEnd = max(maxEnd, c.endTime) } }
         return maxEnd
     }
 

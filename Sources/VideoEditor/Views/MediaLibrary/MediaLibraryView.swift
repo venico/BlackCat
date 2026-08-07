@@ -3,6 +3,8 @@ import UniformTypeIdentifiers
 
 struct MediaLibraryView: View {
     @EnvironmentObject private var project: ProjectState
+    /// 拖入接收区按窗口登记，多窗口时各认各的
+    @Environment(\.windowID) private var windowID
     @State private var isDragOver = false
 
     private var isTransitionTab: Bool { project.mediaLibraryTab == "transition" }
@@ -157,37 +159,32 @@ struct MediaLibraryView: View {
                     }
                 }
 
-                // Drag overlay
+                // 拖入反馈：整块素材区染个底色，不加描边也不加文字提示
                 if isDragOver {
                     RoundedRectangle(cornerRadius: 10)
-                        .stroke(Color.accent, lineWidth: 1.5)
-                        .background(Color.accent.opacity(0.06).cornerRadius(10))
-                        .overlay {
-                            VStack(spacing: 8) {
-                                Image(systemName: "arrow.down.circle")
-                                    .font(.system(size: 26, weight: .ultraLight))
-                                Text("松开以导入")
-                                    .font(.system(size: 11))
-                            }
-                            .foregroundColor(Color.accent)
-                        }
-                        .padding(10)
+                        .fill(Color.accent.opacity(0.06))
+                        .allowsHitTesting(false)
                 }
             }
-            .onDrop(of: [.fileURL], isTargeted: $isDragOver) { providers in
-                for p in providers {
-                    _ = p.loadObject(ofClass: URL.self) { url, _ in
-                        guard let url else { return }
-                        DispatchQueue.main.async { project.importFile(url) }
-                    }
-                }
-                return true
-            }
+            // 把这块登记成文件拖入的接收区，drop 由宿主统一收了再按坐标分发过来。
+            // 这里不能用 SwiftUI 的 .onDrop——实测收不到 Finder 拖拽，原因见 FileDropRouter
+            .background(GeometryReader { g in
+                Color.clear
+                    .onAppear { registerDropZone(g.frame(in: .global)) }
+                    // 侧栏能拖宽、窗口能缩放、切 tab 也会变，位置得跟着更新
+                    .onChange(of: g.frame(in: .global)) { _, r in registerDropZone(r) }
+            })
 
             Spacer()
             }
             } // else (non-AI tabs)
         }
+    }
+
+    private func registerDropZone(_ rect: CGRect) {
+        FileDropRouter.register(windowID, rect: rect,
+                                onFiles: { urls in urls.forEach { project.importFile($0) } },
+                                onTargetChange: { isDragOver = $0 })
     }
 
     // 左侧竖排图标标签栏
@@ -264,24 +261,31 @@ struct MediaLibraryView: View {
     }
 
     private var emptyState: some View {
-        let icon: String = {
-            switch project.mediaLibraryTab {
-            case "video":    return "film"
-            case "audio":    return "music.note"
-            case "image":    return "photo"
-            case "subtitle": return "captions.bubble"
-            default:         return "photo.badge.plus"
-            }
-        }()
-        return VStack(spacing: 10) {
-            Image(systemName: icon)
-                .font(.system(size: 28, weight: .ultraLight))
+        // 图标直接复用左侧标签栏那套 SVG（同一个 key），只是放大。
+        // 原来这里是 SF Symbols，跟标签栏的自绘图标不是一套，形状对不上
+        VStack(spacing: 10) {
+            Image(nsImage: SidebarSVGIcon.load(project.mediaLibraryTab))
+                .renderingMode(.template)
+                .resizable()
+                .aspectRatio(contentMode: .fit)
+                .frame(width: 44, height: 44)
                 .foregroundColor(Color.labelSecondary.opacity(0.30))
             Text("拖入文件或点击导入")
                 .font(.system(size: 11))
                 .foregroundColor(Color.labelSecondary.opacity(0.45))
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        // 摆在空白区上方三分之一处，不居中——居中的话整组图文会掉到视觉重心以下，
+        // 素材区又高又窄，看着像沉在底下
+        .modifier(PositionedAtOneThird())
+    }
+
+    /// 把内容摆到容器高度 1/3 的位置（水平居中）
+    private struct PositionedAtOneThird: ViewModifier {
+        func body(content: Content) -> some View {
+            GeometryReader { g in
+                content.position(x: g.size.width / 2, y: g.size.height / 3)
+            }
+        }
     }
 
     // 导入/导出合并菜单按钮

@@ -890,7 +890,8 @@ struct TimelineView: View {
                             .allowsHitTesting(false)
                     }
 
-                    DraggablePlayhead(pps: project.pixelsPerSecond, fullHeight: effectiveH)
+                    DraggablePlayhead(pps: project.pixelsPerSecond, fullHeight: effectiveH,
+                                      topInset: rulerH)
                         .zIndex(10)
 
                     if let hid = hoveredMarkerID, editingMarkerID == nil,
@@ -4171,12 +4172,19 @@ private struct DraggablePlayhead: View {
     @EnvironmentObject private var clock: PlaybackClock
     let pps: Double
     let fullHeight: CGFloat
+    /// 顶部要让开的高度（= 刻度尺高度）。
+    /// 滚动内容的最上面 rulerH 那一段是给固定顶条留的透明占位，顶条自己没有底色
+    /// （底色交给外层材质），所以从 y=0 画的话这一截会从顶条底下透出来，
+    /// 看着就是竖线穿过播放头三角、还高出三角顶边一截。
+    /// 顶条内部的 connector 画到 y=rulerH 为止，这里正好从那里接上
+    let topInset: CGFloat
 
     var body: some View {
         let x = clock.currentTime * pps
         Canvas { ctx, size in
             // 三角已移到固定顶条；这里只画贯穿轨道的竖线
-            let line = CGRect(x: x - 0.5, y: 0, width: 1, height: fullHeight)
+            let line = CGRect(x: x - 0.5, y: topInset, width: 1,
+                              height: max(0, fullHeight - topInset))
             ctx.fill(Path(line), with: .color(Color.accent))
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)

@@ -45,9 +45,124 @@ enum WindowDragGate {
     static func resetForTesting() { claimCount = 0 }
 }
 
-/// 主窗口的宿主视图。把 mouseDownCanMoveWindow 接到上面那个开关上。
+/// 从 Finder 拖进来的文件，落在窗口哪个区域算数、交给谁处理。
+///
+/// **为什么要有这张表**：SwiftUI 的 `.onDrop` 在这个 app 里收不到 Finder 的拖拽，
+/// 连用 NSViewRepresentable 插进去的**真实 NSView** 也收不到。实测（诊断日志）：
+/// 拖拽经过素材区时只有最外层 `GatedHostingView` 的 `draggingEntered` 触发，
+/// 挂在素材区上的 `.onDrop`、挂在整棵子树最外层的兜底 `.onDrop`、以及插进去的
+/// NSView，三个一次都没进过，而那块的 frame 是正常的 `(52, 106, 176, 438)`。
+///
+/// 原因就是本文件顶部记过的那条：SwiftUI 合并绘制，hitTest 命中的**始终**是最外层
+/// NSHostingView——当时是为 `mouseDownCanMoveWindow` 发现的，而 AppKit 找拖放目标
+/// 走的正是 hitTest，所以内层无论 SwiftUI 还是 AppKit 视图都轮不到。
+///
+/// 于是反过来：宿主统一收，按落点坐标分发。
+@MainActor
+enum FileDropRouter {
+    private struct Zone {
+        /// SwiftUI `.global` 坐标系（原点左上）里的接收区
+        let rect: CGRect
+        let onFiles: ([URL]) -> Void
+        /// 拖拽进出这块区域时的通知，用来点亮"松开以导入"
+        let onTargetChange: (Bool) -> Void
+    }
+
+    /// 按窗口分开存。多窗口下不区分的话，A 窗口的素材区矩形会拿去匹配 B 窗口的拖拽
+    private static var zones: [WindowID: Zone] = [:]
+
+    static func register(_ id: WindowID, rect: CGRect,
+                         onFiles: @escaping ([URL]) -> Void,
+                         onTargetChange: @escaping (Bool) -> Void) {
+        zones[id] = Zone(rect: rect, onFiles: onFiles, onTargetChange: onTargetChange)
+    }
+
+    static func unregister(_ id: WindowID) { zones[id] = nil }
+
+    static func canAccept(_ point: CGPoint, in id: WindowID) -> Bool {
+        zones[id]?.rect.contains(point) ?? false
+    }
+
+    static func setTargeted(_ targeted: Bool, in id: WindowID) {
+        zones[id]?.onTargetChange(targeted)
+    }
+
+    @discardableResult
+    static func deliver(_ urls: [URL], at point: CGPoint, in id: WindowID) -> Bool {
+        guard let z = zones[id], z.rect.contains(point) else { return false }
+        z.onFiles(urls)
+        return true
+    }
+}
+
+/// 主窗口的宿主视图。把 mouseDownCanMoveWindow 接到上面那个开关上，
+/// 并统一接收 Finder 拖进来的文件（见 FileDropRouter）。
 final class GatedHostingView<Content: View>: NSHostingView<Content> {
     override var mouseDownCanMoveWindow: Bool { WindowDragGate.allowsWindowDrag }
+
+    /// 这个宿主属于哪个窗口。拖进来的文件要按窗口找对应的接收区
+    var windowID: WindowID?
+
+    /// 上一次 draggingUpdated 时鼠标在不在接收区内。只在变化时才回调，
+    /// 不然拖动过程中每帧都会推一次 @Published，白白触发重绘
+    private var wasInsideZone = false
+
+    required init(rootView: Content) {
+        super.init(rootView: rootView)
+        registerForDraggedTypes([.fileURL])
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("init(coder:) 未实现") }
+
+    /// AppKit 的窗口坐标 → SwiftUI 的 `.global` 坐标。
+    /// NSHostingView 是 flipped 的（原点左上），跟 SwiftUI 一致；
+    /// 万一哪个版本不是，按未翻转的算法兜一下
+    private func swiftUIPoint(_ sender: NSDraggingInfo) -> CGPoint {
+        let p = convert(sender.draggingLocation, from: nil)
+        return isFlipped ? p : CGPoint(x: p.x, y: bounds.height - p.y)
+    }
+
+    private func updateTarget(_ sender: NSDraggingInfo) -> NSDragOperation {
+        guard let id = windowID else { return [] }
+        let inside = FileDropRouter.canAccept(swiftUIPoint(sender), in: id)
+        if inside != wasInsideZone {
+            wasInsideZone = inside
+            FileDropRouter.setTargeted(inside, in: id)
+        }
+        return inside ? .copy : []
+    }
+
+    private func clearTarget() {
+        guard wasInsideZone, let id = windowID else { return }
+        wasInsideZone = false
+        FileDropRouter.setTargeted(false, in: id)
+    }
+
+    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
+        updateTarget(sender)
+    }
+
+    override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation {
+        updateTarget(sender)
+    }
+
+    override func draggingExited(_ sender: NSDraggingInfo?) { clearTarget() }
+
+    override func draggingEnded(_ sender: NSDraggingInfo) { clearTarget() }
+
+    override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        clearTarget()
+        guard let id = windowID else { return false }
+        // readObjects 直接给 [URL]，不用自己解 pasteboard 的 data 表示
+        let urls = sender.draggingPasteboard.readObjects(forClasses: [NSURL.self]) as? [URL] ?? []
+        let pt = swiftUIPoint(sender)
+        let accepted = !urls.isEmpty && FileDropRouter.deliver(urls, at: pt, in: id)
+        // 留一条：拖入这条链路排查过一整轮（SwiftUI onDrop / 内嵌 NSView 都收不到），
+        // 万一以后又不灵，这一行能直接分清是「没触发」还是「落点没落进接收区」
+        DiagLog.log("[拖入] 落点=\(pt) 文件=\(urls.count) 接收=\(accepted)")
+        return accepted
+    }
 }
 
 extension View {

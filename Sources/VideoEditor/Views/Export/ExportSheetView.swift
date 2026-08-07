@@ -1426,8 +1426,22 @@ actor TimelineExporter {
                 .filter { $0.isVisible }
                 .flatMap { $0.clips }
 
+            // 复合片段**内部**的字幕/文字/图形/图片同样要逐帧烧录。
+            // 上面那几个 visibleXxxClips 收的都是顶层轨道，不含复合片段里的内容——
+            // 漏掉它的话，一个「只有复合片段、顶层没有任何 overlay」的项目会被判成
+            // 不需要逐帧处理，直接走下面的快速路径，复合片段里的字幕一个字都进不了成片。
+            // flattened() 是为了连嵌套复合片段里的也算上
+            let compoundHasOverlays = input.compoundTracks
+                .filter(\.isVisible)
+                .flatMap(\.clips)
+                .contains { clip in
+                    let c = clip.flattened()
+                    return !c.subtitleTracks.isEmpty || !c.textTracks.isEmpty
+                        || !c.shapeTracks.isEmpty || !c.imageTracks.isEmpty
+                }
+
             // ── 快速路径：无 overlay 时用 AVAssetExportSession（5-10x 加速）──
-            let needsPerFrameProcessing = subRenderInfo.hasSubtitles || !visibleTextClips.isEmpty || !visibleShapeClips.isEmpty || !visibleImageClips.isEmpty || !colorRanges.isEmpty
+            let needsPerFrameProcessing = subRenderInfo.hasSubtitles || !visibleTextClips.isEmpty || !visibleShapeClips.isEmpty || !visibleImageClips.isEmpty || !colorRanges.isEmpty || compoundHasOverlays
             if !needsPerFrameProcessing {
                 try? FileManager.default.removeItem(at: input.outputURL)
                 try await fastExportSession(
@@ -1723,6 +1737,20 @@ actor TimelineExporter {
             uniqueKeysWithValues: shapeTracks.filter { $0.isVisible }.map { ($0.id, $0.clips) })
         let compoundClips = compoundTracks.filter { $0.isVisible }.flatMap(\.clips)
         let hasOverlays = hasSubtitles || !imageClipsByTrack.isEmpty || !textClipsByTrack.isEmpty || !shapeClipsByTrack.isEmpty || !compoundClips.isEmpty
+        // 没登记进 overlayTrackOrder 的复合轨道。
+        //
+        // 复合片段**含视频**时只登记进 videoSectionOrder（见 createCompoundFromSelected），
+        // 而下面的合成循环只遍历 overlayTrackOrder —— 于是这类复合片段里的
+        // 字幕/文字/图形/图片在导出时被整段跳过，用户看到的就是"预览有、导出没有"。
+        // 预览侧一直有兜底（PlayerView.nonOverlayCompoundTrackIDs），导出侧漏了。
+        // 每帧都重算这个集合太浪费，在这儿算一次
+        let unorderedCompoundTrackIDs: [UUID] = {
+            let ordered = Set(overlayTrackOrder.compactMap { ref -> UUID? in
+                if case .compound(let id) = ref { return id }
+                return nil
+            })
+            return compoundTracks.filter { $0.isVisible && !ordered.contains($0.id) }.map(\.id)
+        }()
         let videoQueue = DispatchQueue(label: "export.video")
         let audioQueue = DispatchQueue(label: "export.audio")
         let targetFps = fps
@@ -1817,6 +1845,17 @@ actor TimelineExporter {
                                             image = ColorAdjust.apply(image, adj)
                                         }
 
+                                        // 没登记进 overlayTrackOrder 的复合轨道先合成，压在所有
+                                        // overlay 底下——跟预览侧 nonOverlayCompoundTrackIDs
+                                        // 那条 zIndex(-0.5) 对齐
+                                        for cid in unorderedCompoundTrackIDs {
+                                            image = self.composeCompoundOverlays(
+                                                trackID: cid, tracks: compoundTracks,
+                                                atTime: targetTime, onto: image,
+                                                renderSize: renderSize, imageCICache: imageCICache,
+                                                subtitleInfo: subtitleInfo)
+                                        }
+
                                         // 按 overlayTrackOrder 从底到顶合成（reversed: 最后元素=最底层，最先合成）
                                         var subtitleRendered = false
                                         for ref in overlayTrackOrder.reversed() {
@@ -1860,39 +1899,11 @@ actor TimelineExporter {
                                                     image = overlay.composited(over: image)
                                                 }
                                             case .compound(let trackID):
-                                                if let track = compoundTracks.first(where: { $0.id == trackID && $0.isVisible }),
-                                                   let rawCompound = track.clips.first(where: { $0.startTime <= targetTime && $0.endTime > targetTime }) {
-                                                    let compound = rawCompound.flattened()
-                                                    let it = targetTime - compound.startTime + compound.internalStart
-                                                    for imgTrack in compound.imageTracks {
-                                                        if let clip = imgTrack.clips.first(where: { $0.startTime <= it && $0.endTime > it }),
-                                                           let overlay = self.renderImageOverlay(clip: clip, renderSize: renderSize, ciCache: imageCICache) {
-                                                            image = overlay.composited(over: image)
-                                                        }
-                                                    }
-                                                    let cSubTracks = compound.subtitleTracks.map { t in
-                                                        (track: t, style: t.subtitleStyle ?? SubtitleStyle())
-                                                    }
-                                                    if !cSubTracks.isEmpty {
-                                                        let cSubInfo = SubtitleRenderInfo(
-                                                            tracks: cSubTracks, fontScale: subtitleInfo.fontScale,
-                                                            bottomMargin: subtitleInfo.bottomMargin,
-                                                            lineSpacing: subtitleInfo.lineSpacing, renderSize: renderSize)
-                                                        if let overlay = self.renderSubtitleOverlay(atTime: it, info: cSubInfo) {
-                                                            image = overlay.composited(over: image)
-                                                        }
-                                                    }
-                                                    let cTextClips = compound.textTracks.flatMap(\.clips)
-                                                    if let overlay = self.renderTextOverlay(atTime: it, clips: cTextClips,
-                                                                                            fontScale: subtitleInfo.fontScale, renderSize: renderSize) {
-                                                        image = overlay.composited(over: image)
-                                                    }
-                                                    let cShapeClips = compound.shapeTracks.flatMap(\.clips)
-                                                    if let overlay = self.renderShapeOverlay(atTime: it, clips: cShapeClips,
-                                                                                             scale: subtitleInfo.fontScale, renderSize: renderSize) {
-                                                        image = overlay.composited(over: image)
-                                                    }
-                                                }
+                                                image = self.composeCompoundOverlays(
+                                                    trackID: trackID, tracks: compoundTracks,
+                                                    atTime: targetTime, onto: image,
+                                                    renderSize: renderSize, imageCICache: imageCICache,
+                                                    subtitleInfo: subtitleInfo)
                                             }
                                         }
 
@@ -1995,6 +2006,70 @@ actor TimelineExporter {
     // MARK: - GPU overlay 渲染（CIImage 管线）
 
     // MARK: - 图片 overlay 渲染（CIImage 管线，与预览 ImageLayerView 一致）
+
+    /// 把一条复合轨道在 `targetTime` 时刻的 overlay 子内容（图片/字幕/文字/图形）
+    /// 合成到 image 上，返回合成后的结果。轨道上这一刻没有复合片段时原样返回。
+    ///
+    /// 两个调用点共用同一份实现：`overlayTrackOrder` 里登记过的按顺序合成，
+    /// 没登记的（含视频的复合片段只进 videoSectionOrder）在所有 overlay 之前合成。
+    /// 抽出来是因为这两处必须完全一致——写两遍就是漏一处的开始
+    private nonisolated func composeCompoundOverlays(
+        trackID: UUID,
+        tracks: [Track<CompoundClip>],
+        atTime targetTime: Double,
+        onto image: CIImage,
+        renderSize: CGSize,
+        imageCICache: [URL: CIImage],
+        subtitleInfo: SubtitleRenderInfo
+    ) -> CIImage {
+        guard let track = tracks.first(where: { $0.id == trackID && $0.isVisible }),
+              let rawCompound = track.clips.first(where: {
+                  $0.startTime <= targetTime && $0.endTime > targetTime
+              })
+        else { return image }
+
+        var image = image
+        let compound = rawCompound.flattened()
+        let it = targetTime - compound.startTime + compound.internalStart
+
+        for imgTrack in compound.imageTracks {
+            if let clip = imgTrack.clips.first(where: { $0.startTime <= it && $0.endTime > it }),
+               let overlay = renderImageOverlay(clip: clip, renderSize: renderSize,
+                                                ciCache: imageCICache) {
+                image = overlay.composited(over: image)
+            }
+        }
+
+        // 顺序必须跟预览一致，所以走 orderedSubtitleTracks 而不是 subtitleTracks
+        let cSubTracks = compound.orderedSubtitleTracks
+            .filter(\.isVisible)
+            .map { t in (track: t, style: t.subtitleStyle ?? SubtitleStyle()) }
+        if !cSubTracks.isEmpty {
+            let cSubInfo = SubtitleRenderInfo(
+                tracks: cSubTracks, fontScale: subtitleInfo.fontScale,
+                bottomMargin: subtitleInfo.bottomMargin,
+                lineSpacing: subtitleInfo.lineSpacing, renderSize: renderSize)
+            if let overlay = renderSubtitleOverlay(atTime: it, info: cSubInfo) {
+                image = overlay.composited(over: image)
+            }
+        }
+
+        let cTextClips = compound.textTracks.flatMap(\.clips)
+        if let overlay = renderTextOverlay(atTime: it, clips: cTextClips,
+                                           fontScale: subtitleInfo.fontScale,
+                                           renderSize: renderSize) {
+            image = overlay.composited(over: image)
+        }
+
+        let cShapeClips = compound.shapeTracks.flatMap(\.clips)
+        if let overlay = renderShapeOverlay(atTime: it, clips: cShapeClips,
+                                            scale: subtitleInfo.fontScale,
+                                            renderSize: renderSize) {
+            image = overlay.composited(over: image)
+        }
+
+        return image
+    }
 
     private nonisolated func renderImageOverlay(
         clip: ImageClip, renderSize: CGSize, ciCache: [URL: CIImage]

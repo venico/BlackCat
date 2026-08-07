@@ -64,6 +64,8 @@ final class WindowManager: NSObject {
         // GatedHostingView 见 WindowDragGate.swift：预览区铺到窗口顶端，
         // 落在那儿的裁剪手柄按下去会被当成拖窗口
         let hosting = GatedHostingView(rootView: root)
+        // 宿主统一接收 Finder 拖进来的文件，按窗口找接收区（见 FileDropRouter）
+        hosting.windowID = id
 
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 1280, height: 780),
