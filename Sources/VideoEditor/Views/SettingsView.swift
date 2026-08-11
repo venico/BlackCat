@@ -5,7 +5,11 @@ struct SettingsView: View {
     @ObservedObject private var settings = AppSettings.shared
     @EnvironmentObject var project: ProjectState
     @State private var modelStates: [WhisperTranscriber.ModelSize: ModelState] = [:]
-    @State private var selectedTab = 0
+    /// 打开时定位到哪个标签。外部通过 .showSettings 通知的 object 传下标
+    /// （比如字幕校对弹窗跳「AI 生成」），没传就还是第一个
+    @State private var selectedTab = SettingsView.pendingTab
+    /// 通知只能带 object，这里做个中转：发通知前先写它，SettingsView 起来时读
+    nonisolated(unsafe) static var pendingTab = 0
     var dismiss: () -> Void
 
     enum ModelState {
@@ -24,6 +28,8 @@ struct SettingsView: View {
     @State private var separatedBytes: Int64 = 0
     @State private var cleanHint: String? = nil
     private let tabs = ["通用", "视频", "图片", "音频", "字幕", "AI 生成"]
+    /// 「AI 生成」在 tabs 里的位置。别处要跳过来，写死下标容易随改动失效
+    static let aiTabIndex = 5
 
     var body: some View {
         VStack(spacing: 0) {
@@ -1250,18 +1256,90 @@ struct SettingsView: View {
     }
 
     private func apiKeyField(label: String, placeholder: String, text: Binding<String>) -> some View {
+        APIKeyField(label: label, placeholder: placeholder, text: text)
+    }
+}
+
+/// API Key 输入框。
+///
+/// 必须用本地 @State 兜一层，不能直接把 SecureField 绑到外部 Binding：
+/// 「AI 生成」那批 Key 存在 UserDefaults 里，setter 会调 objectWillChange.send()，
+/// 于是每敲一个字符就触发整个 AppSettings 的观察者刷新、输入框被重建，
+/// 字打不进去——表现就是「输入框点不动」。@Published 的那些 Key 没这个问题，
+/// 所以同一个界面上有的能输有的不能，很容易看岔。
+private struct APIKeyField: View {
+    let label: String
+    let placeholder: String
+    let text: Binding<String>
+    @State private var draft: String = ""
+    @State private var loaded = false
+
+    var body: some View {
         VStack(alignment: .leading, spacing: 4) {
             Text(label)
                 .font(.system(size: 11, weight: .medium))
                 .foregroundColor(Color.labelSecondary)
-            SecureField(placeholder, text: text)
-                .textFieldStyle(.plain)
-                .font(.system(size: 12))
-                .foregroundColor(Color.labelPrimary)
+            // 用 AppKit 的 NSSecureTextField，不用 SwiftUI 的 SecureField：
+            // 后者在这个面板里会出现「不显示 placeholder 且点不动」，而同一个面板里
+            // 另一个同样写法的框却正常（实测换成 TextField 立刻可输入，
+            // 说明是 SecureField 自身在这套窗口/宿主配置下的问题，不是绑定写错）
+            SecureKeyField(text: $draft, placeholder: placeholder)
                 .padding(.horizontal, 10)
                 .frame(height: 32)
                 .background(Color.white.opacity(0.06))
                 .cornerRadius(7)
+                .onAppear {
+                    guard !loaded else { return }
+                    draft = text.wrappedValue
+                    loaded = true
+                }
+                .onChange(of: draft) { _, v in
+                    guard loaded, v != text.wrappedValue else { return }
+                    text.wrappedValue = v
+                }
+                // 切换模型时把草稿换成新模型的 Key
+                .onChange(of: text.wrappedValue) { _, v in
+                    if v != draft && !v.isEmpty { draft = v }
+                }
+        }
+    }
+}
+
+/// 密码输入框。SwiftUI 的 SecureField 在这个设置面板里不可靠（见 APIKeyField 的说明），
+/// 换成 AppKit 原生控件：既有圆点遮罩，也不会出现点不动的情况
+private struct SecureKeyField: NSViewRepresentable {
+    @Binding var text: String
+    let placeholder: String
+
+    func makeNSView(context: Context) -> NSSecureTextField {
+        let f = NSSecureTextField()
+        f.isBordered = false
+        f.drawsBackground = false          // 背景/圆角交给 SwiftUI 外层
+        f.focusRingType = .none
+        f.font = .systemFont(ofSize: 12)
+        f.textColor = .labelColor          // 窗口锁了 darkAqua，这里就是白色
+        f.placeholderString = placeholder
+        f.lineBreakMode = .byTruncatingTail
+        f.delegate = context.coordinator
+        f.stringValue = text
+        return f
+    }
+
+    func updateNSView(_ v: NSSecureTextField, context: Context) {
+        context.coordinator.text = $text
+        v.placeholderString = placeholder
+        // 只在外部真的换了值时回写，否则会把光标顶到末尾
+        if v.stringValue != text { v.stringValue = text }
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator(text: $text) }
+
+    final class Coordinator: NSObject, NSTextFieldDelegate {
+        var text: Binding<String>
+        init(text: Binding<String>) { self.text = text }
+        func controlTextDidChange(_ note: Notification) {
+            guard let f = note.object as? NSTextField else { return }
+            text.wrappedValue = f.stringValue
         }
     }
 }

@@ -214,6 +214,20 @@ final class WindowManager: NSObject {
     /// 按 id 取窗口。欢迎页要缩放自己那个窗口，不能靠 NSApp.windows.first 猜
     func window(for id: WindowID) -> NSWindow? { windows[id] }
 
+    /// 各窗口的 esc 监听器，由这里统一保管、随窗口一起销毁。
+    ///
+    /// 不放在 ContentView 的 @State 里靠 SwiftUI 回调拆：`onDisappear` 在视图重建、
+    /// overlay 切换时也会来，拆早了 esc 就永久失效（onAppear 不会再触发第二次）；
+    /// 不拆又会每关一个窗口残留一个——local monitor 挂在进程上，闭包还攥着
+    /// 那个窗口的 ProjectState 不放。绑到窗口生命周期上才两头都对
+    private var escMonitors: [WindowID: Any] = [:]
+
+    func setEscMonitor(_ monitor: Any?, for id: WindowID) {
+        // 同一个窗口重复注册时先撤掉旧的，避免一个窗口挂两个
+        if let old = escMonitors[id] { NSEvent.removeMonitor(old) }
+        escMonitors[id] = monitor
+    }
+
     /// 关掉某个窗口。「开窗即弹表单」那条路上用户点取消时用——
     /// 不关的话会留一个既没项目也没欢迎页的空壳窗口挂在那儿
     func close(_ id: WindowID) {
@@ -236,6 +250,7 @@ extension WindowManager: NSWindowDelegate {
         // 不会出现"存了但用户又取消关闭"的错位
         willCloseHandlers[id]?()
         willCloseHandlers[id] = nil
+        if let m = escMonitors[id] { NSEvent.removeMonitor(m); escMonitors[id] = nil }
         ExportManager.shared.unregisterHandlers(for: id)
         windows[id] = nil
         order.removeAll { $0 == id }

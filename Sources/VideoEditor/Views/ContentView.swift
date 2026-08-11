@@ -38,9 +38,6 @@ struct ContentView: View {
         }())
     }
     @StateObject private var exportManager = ExportManager.shared
-    /// esc 监听器句柄。关窗时必须移除——local monitor 挂在进程上，
-    /// 窗口没了它还在，闭包又持有那个窗口的 project
-    @State private var escMonitor: Any? = nil
     @State private var topHeight: CGFloat = 420
     @State private var isDraggingH = false
     @State private var sidebarVisible = true
@@ -285,6 +282,23 @@ struct ContentView: View {
         .environmentObject(project.clock)
         .ignoresSafeArea()
         .animation(.spring(response: 0.28, dampingFraction: 0.82), value: sidebarVisible)
+        // 识别方式选择。用 overlay 不用 .sheet：floatingPanelMaterial 走的是
+        // .withinWindow 混合，采样的是**同窗口内下层的内容**；系统 sheet 是独立窗口，
+        // 采样不到主界面，材质就成了一块不透的灰板。导出/设置都是 overlay，这里跟上
+        .overlay {
+            if project.showTranscribeOptions {
+                Color.black.opacity(0.4).ignoresSafeArea()
+                    .onTapGesture { project.showTranscribeOptions = false }
+                TranscribeOptionsSheet()
+                    .environmentObject(project)
+                    .clipShape(RoundedRectangle(cornerRadius: 14))
+                    .overlay(RoundedRectangle(cornerRadius: 14)
+                        .stroke(Color.white.opacity(0.15), lineWidth: 0.5))
+                    .shadow(color: .black.opacity(0.6), radius: 30, y: 10)
+                    .transition(.opacity.combined(with: .scale(scale: 0.95)))
+            }
+        }
+        .animation(.easeOut(duration: 0.2), value: project.showTranscribeOptions)
         .overlay {
             if project.showExportSheet {
                 Color.black.opacity(0.4).ignoresSafeArea()
@@ -298,7 +312,9 @@ struct ContentView: View {
             }
         }
         .animation(.easeOut(duration: 0.2), value: project.showExportSheet)
-        .onReceive(NotificationCenter.default.publisher(for: .showSettings)) { _ in
+        .onReceive(NotificationCenter.default.publisher(for: .showSettings)) { note in
+            // object 带了标签下标就定位过去（字幕校对弹窗跳「AI 生成」用）
+            SettingsView.pendingTab = (note.object as? Int) ?? 0
             project.showSettings = true
         }
         // 窗口已改成透明（底色交给系统材质，跟着墙纸走），主界面自己得铺一层
@@ -514,7 +530,8 @@ struct ContentView: View {
     }
 
     private func setupEscMonitor() {
-        escMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+        // 句柄交给 WindowManager 保管，跟窗口一起销毁（见 setEscMonitor 的说明）
+        let monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
             guard event.keyCode == 53 else { return event }
             // local monitor 是**进程级**的：每开一个窗口就多一个 monitor，各自捕获
             // 自己的 project。不按当前窗口过滤的话，按一次 esc 会把所有窗口的
@@ -539,15 +556,7 @@ struct ContentView: View {
             if project.showAssetDeleteConfirm { project.showAssetDeleteConfirm = false; project.pendingDeleteAssetID = nil; return nil }
             return event
         }
-    }
-
-    /// 注意**不要**挂到 SwiftUI 的 .onDisappear 上：那个回调在视图重建、
-    /// overlay 切换时也会来，监听器被提前拆掉之后 onAppear 不会再触发一次，
-    /// esc 就永久失效了（实测：欢迎页 esc 时灵时不灵、点 Dock 再开就一直不灵）。
-    /// 窗口真正关闭时进程也不需要它了，残留的那个有 windowID guard 兜着——
-    /// 窗口没了 window(for:) 返回 nil，直接放行，不会误伤别的窗口
-    private func teardownEscMonitor() {
-        if let m = escMonitor { NSEvent.removeMonitor(m); escMonitor = nil }
+        WindowManager.shared.setEscMonitor(monitor, for: windowID)
     }
 
     private var toggleButton: some View {

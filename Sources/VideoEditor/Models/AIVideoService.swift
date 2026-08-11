@@ -1660,7 +1660,9 @@ final class AIVideoService: ObservableObject {
 
     // MARK: - 文字生成
 
-    private func generateText(provider: Provider, prompt: String, webSearch: Bool = false) async throws -> String {
+    /// 发一段 prompt 给文字模型，拿回复。
+    /// 字幕 AI 校对也走这里——共用「AI 生成」里配好的模型和 Key，不再单独一套配置
+    func generateText(provider: Provider, prompt: String, webSearch: Bool = false) async throws -> String {
         let apiKey = settings.providerAPIKey(for: provider.rawValue)
         guard !apiKey.isEmpty else {
             throw AIError.missingAPIKey("请先在设置中填写 \(provider.displayName) 的 API Key")

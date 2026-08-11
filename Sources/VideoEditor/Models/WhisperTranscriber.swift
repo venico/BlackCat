@@ -23,6 +23,130 @@ enum WhisperTranscriber {
         return nil
     }
 
+    /// VAD 工具。跟 whisper-cli 同目录
+    static func findVadTool() -> URL? {
+        if let dir = Bundle.main.executableURL?.deletingLastPathComponent() {
+            let p = dir.appendingPathComponent("whisper-vad-speech-segments")
+            if FileManager.default.isExecutableFile(atPath: p.path) { return p }
+        }
+        let dev = URL(fileURLWithPath: devDir).appendingPathComponent("whisper-vad-speech-segments")
+        if FileManager.default.isExecutableFile(atPath: dev.path) { return dev }
+        return nil
+    }
+
+    /// Silero VAD 模型。只有 864 KB，直接打包进 Resources，不走按需下载
+    static func findVadModel() -> URL? {
+        if let u = Bundle.main.url(forResource: "ggml-silero-v5.1.2", withExtension: "bin") { return u }
+        let dev = URL(fileURLWithPath: devDir)
+            .deletingLastPathComponent()
+            .appendingPathComponent("Resources/ggml-silero-v5.1.2.bin")
+        return FileManager.default.fileExists(atPath: dev.path) ? dev : nil
+    }
+
+    /// 用 VAD 找出音频里**真正在说话**的区间。
+    ///
+    /// 为什么必须单独跑这一趟：whisper 自己输出的段落是首尾相接填满整条音频的，
+    /// 静音也算在段落里，所以每条字幕的起止都比实际语音宽。给 whisper-cli 加 `--vad`
+    /// 也只修正整条音频的首尾，段落之间照样 0 间隙（实测各种 -vsd/-vt 组合都一样）。
+    /// 词级时间戳同理不可用——token 间隔几乎全是 0，时间是均匀摊给 token 的。
+    /// 只有 VAD 的语音区间才带真实停顿（实测同一段音频里找出了 1.83 秒的静音）。
+    ///
+    /// - Returns: 秒为单位的语音区间，按时间升序；VAD 不可用时返回空数组（调用方退回原行为）
+    static func detectSpeechSegments(wavURL: URL) -> [(start: Double, end: Double)] {
+        guard let tool = findVadTool(), let model = findVadModel() else { return [] }
+        let out = runProcessCapturing(tool, ["-vm", model.path, "-f", wavURL.path])
+        var result: [(Double, Double)] = []
+        // 工具把结果打在 stdout：`Speech segment 0: start = 138.00, end = 179.00`
+        // 数值单位是**厘秒**（1/100 秒），不是毫秒——同一行的 VAD 调试输出
+        // 写作 start = 1.38 秒，正好差 100 倍
+        let re = try? NSRegularExpression(
+            pattern: #"Speech segment\s+\d+:\s*start\s*=\s*([0-9.]+),\s*end\s*=\s*([0-9.]+)"#)
+        for line in out.components(separatedBy: .newlines) {
+            let r = NSRange(line.startIndex..., in: line)
+            guard let m = re?.firstMatch(in: line, range: r), m.numberOfRanges == 3,
+                  let r1 = Range(m.range(at: 1), in: line),
+                  let r2 = Range(m.range(at: 2), in: line),
+                  let a = Double(line[r1]), let b = Double(line[r2]), b > a else { continue }
+            result.append((a / 100.0, b / 100.0))
+        }
+        return result.sorted { $0.0 < $1.0 }
+    }
+
+    /// 用语音区间收紧每条字幕的起止，让静音处不再挂着字幕。
+    ///
+    /// 参数是拿真实素材调出来的，别随手改：
+    /// - `minOverlap 0.15s`：重叠短于这个当噪声，不算数
+    /// - `mergeGap 0.6s`：短于这个的停顿属于句内换气，不拆句
+    /// - `minSeg 0.5s`：过短的语音块（呼吸声、语气词）并进相邻块，
+    ///   不然会单独顶出一条只有一两个词的字幕
+    ///
+    /// 一条字幕跨越长静音时才拆，且**按词边界**分配文本——按字符比例硬切会
+    /// 切出 "At ove" / "r 600 grams" 这种劈开单词的碎片。
+    /// whisper 没给可用的词级对齐（token 时间是均匀摊的），所以拆分点只能按
+    /// 时长比例估，这也是「能不拆就不拆」的原因
+    static func alignToSpeech(_ segs: [(start: Double, end: Double, text: String)],
+                              speech: [(start: Double, end: Double)])
+    -> [(start: Double, end: Double, text: String)] {
+        guard !speech.isEmpty else { return segs }
+        let minOverlap = 0.15, mergeGap = 0.6, minSeg = 0.5
+
+        var out: [(start: Double, end: Double, text: String)] = []
+        for s in segs {
+            let hits = speech.compactMap { sp -> (Double, Double)? in
+                let a = max(s.start, sp.start), b = min(s.end, sp.end)
+                return b - a > minOverlap ? (a, b) : nil
+            }
+            if hits.isEmpty { continue }        // 整条落在静音里 → 丢掉
+
+            // 句内换气合并
+            var blocks: [[Double]] = [[hits[0].0, hits[0].1]]
+            for h in hits.dropFirst() {
+                if h.0 - blocks[blocks.count - 1][1] < mergeGap {
+                    blocks[blocks.count - 1][1] = h.1
+                } else {
+                    blocks.append([h.0, h.1])
+                }
+            }
+            // 过短的块并进相邻块
+            var i = 0
+            while blocks.count > 1 && i < blocks.count {
+                if blocks[i][1] - blocks[i][0] < minSeg {
+                    if i + 1 < blocks.count { blocks[i + 1][0] = blocks[i][0] }
+                    else { blocks[i - 1][1] = blocks[i][1] }
+                    blocks.remove(at: i)
+                } else {
+                    i += 1
+                }
+            }
+
+            if blocks.count == 1 {
+                out.append((blocks[0][0], blocks[0][1], s.text))
+                continue
+            }
+
+            // 跨长静音：按词切
+            let hasSpace = s.text.contains(" ")
+            let units: [String] = hasSpace
+                ? s.text.split(separator: " ").map(String.init)
+                : s.text.map(String.init)
+            guard !units.isEmpty else { continue }
+            let total = blocks.reduce(0.0) { $0 + ($1[1] - $1[0]) }
+            var used = 0
+            for (bi, b) in blocks.enumerated() {
+                let take = bi == blocks.count - 1
+                    ? units.count - used
+                    : max(1, Int((Double(units.count) * (b[1] - b[0]) / total).rounded()))
+                guard take > 0, used < units.count else { continue }
+                let slice = units[used..<min(used + take, units.count)]
+                used += take
+                let piece = slice.joined(separator: hasSpace ? " " : "")
+                    .trimmingCharacters(in: .whitespaces)
+                if !piece.isEmpty { out.append((b[0], b[1], piece)) }
+            }
+        }
+        return out.sorted { $0.start < $1.start }
+    }
+
     /// 模型下载存放目录（沙盒安全的 Application Support）
     static var supportDir: URL {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -350,8 +474,12 @@ enum WhisperTranscriber {
         }
         let segs = parseSRT(srtText)
         guard !segs.isEmpty else { throw TranscribeError.noResult }
+
+        // 4. 用 VAD 的语音区间收紧字幕边界，静音处不再挂着字幕
+        let speech = detectSpeechSegments(wavURL: wavURL)
+        let aligned = alignToSpeech(segs, speech: speech)
         onProgress?(0.95)
-        return segs
+        return aligned.isEmpty ? segs : aligned
     }
 
     // MARK: - Process helper
@@ -369,6 +497,29 @@ enum WhisperTranscriber {
     }
 
     static var lastProcessError: String?
+
+    /// 跑一个进程并把 stdout + stderr 一起收回来。
+    /// VAD 工具把结果和调试信息混在两个流里输出，只读一个会漏
+    private static func runProcessCapturing(_ exe: URL, _ args: [String]) -> String {
+        let p = Process()
+        p.executableURL = exe
+        p.arguments = args
+        let pipe = Pipe()
+        p.standardOutput = pipe
+        p.standardError = pipe
+        currentProcess = p
+        var data = Data()
+        do {
+            try p.run()
+            // 先读完再 wait：管道缓冲区满了子进程会卡住写不动
+            data = pipe.fileHandleForReading.readDataToEndOfFile()
+            p.waitUntilExit()
+        } catch {
+            lastProcessError = error.localizedDescription
+        }
+        currentProcess = nil
+        return String(data: data, encoding: .utf8) ?? ""
+    }
 
     private static func runProcess(_ exe: URL, _ args: [String]) -> Bool {
         let p = Process()

@@ -211,7 +211,9 @@ extension ProjectState {
 
     /// 对选中的视频/音频片段做语音识别并生成字幕轨道。
     /// 未选中片段时，识别时间轴上第一个视频片段。
-    func autoTranscribeSelectedClip() {
+    /// - Parameter useAI: 识别完再让大模型校对一遍（修错别字、合并被切碎的句子）。
+    ///   模型不碰时间戳——合并后的起止由代码取首尾，见 LLMAnalyzer.proofreadSubtitles
+    func autoTranscribeSelectedClip(useAI: Bool = false) {
         guard !isTranscribing else { return }
 
         // 解析识别目标：选中视频 > 选中音频 > 第一个视频片段
@@ -293,12 +295,30 @@ extension ProjectState {
                     }
                 }
 
+                // AI 校对（可选）。失败不影响出字幕，原样用识别结果
+                var proofed = finalSegs
+                var proofChanged = 0
+                var proofError: String?
+                if useAI, let model = AIVideoService.Provider(rawValue: self.transcribeAIModel) {
+                    await MainActor.run { self.transcribeState = .running(0.96) }
+                    let r = await LLMAnalyzer.proofreadSubtitles(finalSegs, send: { prompt in
+                        try await AIVideoService.shared.generateText(provider: model, prompt: prompt)
+                    }, progress: { pct in
+                        DispatchQueue.main.async {
+                            self.transcribeState = .running(0.96 + pct * 0.03)
+                        }
+                    })
+                    proofed = r.segs; proofChanged = r.changed; proofError = r.error
+                }
+                let outSegs = proofed
+                let capChanged = proofChanged, capError = proofError
+
                 try Task.checkCancellation()
                 await MainActor.run {
                     self.pushUndo()
-                    var track = Track<SubtitleClip>(label: "识别字幕")
+                    var track = Track<SubtitleClip>(label: useAI ? "识别字幕·已校对" : "识别字幕")
                     track.subtitleStyle = self.newSubtitleStyle()
-                    for s in finalSegs {
+                    for s in outSegs {
                         let st = capOffset + s.start / capSpeed
                         let en = capOffset + s.end   / capSpeed
                         track.clips.append(SubtitleClip(text: s.text, startTime: st, endTime: en))
@@ -308,7 +328,26 @@ extension ProjectState {
                     self.syncOverlayOrder()
                     self.transcribeState = .idle
                     self.transcribeTask = nil
-                    self.showSuccessToast(icon: "checkmark", title: "语音识别", subtitle: "完成，生成 \(finalSegs.count) 条字幕")
+                    if useAI {
+                        // 校对结果必须如实说。之前失败是静默返回原文，
+                        // 用户只看到"完成"，根本分不清模型到底跑没跑
+                        if let err = capError {
+                            self.showSuccessToast(icon: "exclamationmark.triangle", iconColor: .orange,
+                                                  title: "AI 校对未完成",
+                                                  subtitle: "已出字幕 \(outSegs.count) 条。\(err.prefix(60))",
+                                                  autoCountdown: false)
+                        } else if capChanged == 0 {
+                            self.showSuccessToast(icon: "checkmark", title: "语音识别",
+                                                  subtitle: "完成 \(outSegs.count) 条，AI 校对未改动任何内容",
+                                                  autoCountdown: false)
+                        } else {
+                            self.showSuccessToast(icon: "checkmark", title: "语音识别",
+                                                  subtitle: "完成 \(outSegs.count) 条，AI 校对改动 \(capChanged) 处",
+                                                  autoCountdown: false)
+                        }
+                    } else {
+                        self.showSuccessToast(icon: "checkmark", title: "语音识别", subtitle: "完成，生成 \(outSegs.count) 条字幕")
+                    }
                 }
             } catch is CancellationError {
                 await MainActor.run {

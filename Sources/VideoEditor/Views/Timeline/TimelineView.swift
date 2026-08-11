@@ -48,6 +48,10 @@ struct TimelineView: View {
     @State private var dragGhostPos: CGPoint? = nil  // ghost center position during clip drag
     @State private var dragGhostOffset: CGSize = .zero // offset from mouse to clip center at drag start
     @State private var draggingClipID: UUID? = nil   // hide original while dragging
+    /// 多选拖动时正在搬的那一组。原片段要全部隐藏，只显示跟着鼠标的半透明幻影
+    @State private var draggingClipIDs: Set<UUID> = []
+    /// 多选幻影：每个的外观 + 相对抓取点的偏移（拖动开始时算一次，之后整体跟着鼠标走）
+    @State private var multiGhosts: [MultiGhost] = []
     @State private var activeSnapTime: Double? = nil  // 吸附指示线位置
 
     // Global event monitors
@@ -867,27 +871,17 @@ struct TimelineView: View {
                             .allowsHitTesting(false)
                     }
 
-                    if let gPos = dragGhostPos, let ghostInfo = dragGhostInfo() {
-                        let cr: CGFloat = ghostInfo.isSubtitle ? 3 : 4
-                        RoundedRectangle(cornerRadius: cr)
-                            .fill(ghostInfo.color.opacity(0.5))
-                            .overlay(
-                                RoundedRectangle(cornerRadius: cr)
-                                    .stroke(Color.white.opacity(0.6), lineWidth: 1.5)
-                            )
-                            .overlay(
-                                Text(ghostInfo.name)
-                                    .font(.system(size: ghostInfo.isSubtitle ? 8 : 9, weight: .medium))
-                                    .foregroundColor(.white.opacity(0.9))
-                                    .lineLimit(1)
-                                    .padding(.leading, ghostInfo.isSubtitle ? 4 : 5)
-                                    .padding(.top, ghostInfo.isSubtitle ? 0 : 4)
-                                , alignment: ghostInfo.isSubtitle ? .leading : .topLeading
-                            )
-                            .frame(width: max(ghostInfo.duration * project.pixelsPerSecond, 30),
-                                   height: ghostInfo.height)
-                            .position(x: gPos.x, y: gPos.y)
-                            .allowsHitTesting(false)
+                    if let gPos = dragGhostPos {
+                        if multiGhosts.isEmpty {
+                            if let ghostInfo = dragGhostInfo() {
+                                ghostView(ghostInfo).position(x: gPos.x, y: gPos.y)
+                            }
+                        } else {
+                            // 多选：整组一起跟手，各自保持拖动开始时的相对位置
+                            ForEach(multiGhosts) { g in
+                                ghostView(g.info).position(x: gPos.x + g.dx, y: gPos.y + g.dy)
+                            }
+                        }
                     }
 
                     // 吸附指示线（延伸到视口底部）
@@ -1180,7 +1174,8 @@ struct TimelineView: View {
                 guard let op = dragOp else { return }
                 // Track ghost position for move ops (offset so clip stays under grab point)
                 switch op {
-                case .moveVideo, .moveImage, .moveAudio, .moveSubtitle, .moveText, .moveShape, .moveCompound:
+                case .moveVideo, .moveImage, .moveAudio, .moveSubtitle, .moveText, .moveShape, .moveCompound,
+                     .moveMulti:
                     dragGhostPos = CGPoint(x: v.location.x - dragGhostOffset.width,
                                            y: v.location.y - dragGhostOffset.height)
                 default: break
@@ -1372,8 +1367,46 @@ struct TimelineView: View {
                         if let dst = destTrack.compoundIndex, dst != srcTrack {
                             project.moveCompoundClipToTrack(id: id, from: srcTrack, to: dst)
                         }
-                    case .moveMulti:
-                        break
+                    case .moveMulti(let items):
+                        // 多选整体换轨。只在「所有片段同类型 + 都来自同一条轨道」时做：
+                        // 混合类型（比如同时选了字幕和图片）或跨多条源轨道选出来的一组，
+                        // 「整体搬到落点那条轨道」没有唯一解——那种情况只平移时间，不动轨道。
+                        // 时间平移在 onChanged 里已经做完了，这里只负责换轨道
+                        if let first = items.first,
+                           items.allSatisfy({ $0.kind == first.kind && $0.srcTrack == first.srcTrack }) {
+                            let src = first.srcTrack
+                            let ids = items.map(\.id)
+                            switch first.kind {
+                            case .video:
+                                if let dst = destTrack.videoIndex, dst != src {
+                                    ids.forEach { project.moveVideoClipToTrack(id: $0, from: src, to: dst) }
+                                }
+                            case .image:
+                                if let dst = destTrack.imageIndex, dst != src {
+                                    ids.forEach { project.moveImageClipToTrack(id: $0, from: src, to: dst) }
+                                }
+                            case .audio:
+                                if let dst = destTrack.audioIndex, dst != src {
+                                    ids.forEach { project.moveAudioClipToTrack(id: $0, from: src, to: dst) }
+                                }
+                            case .subtitle:
+                                if let dst = destTrack.subtitleIndex, dst != src {
+                                    ids.forEach { project.moveSubtitleClipToTrack(id: $0, from: src, to: dst) }
+                                }
+                            case .text:
+                                if let dst = destTrack.textIndex, dst != src {
+                                    ids.forEach { project.moveTextClipToTrack(id: $0, from: src, to: dst) }
+                                }
+                            case .shape:
+                                if let dst = destTrack.shapeIndex, dst != src {
+                                    ids.forEach { project.moveShapeClipToTrack(id: $0, from: src, to: dst) }
+                                }
+                            case .compound:
+                                if let dst = destTrack.compoundIndex, dst != src {
+                                    ids.forEach { project.moveCompoundClipToTrack(id: $0, from: src, to: dst) }
+                                }
+                            }
+                        }
                     default: break
                     }
                 }
@@ -1436,6 +1469,8 @@ struct TimelineView: View {
                 boxStart = nil
                 boxEnd = nil
                 dragGhostPos = nil
+                draggingClipIDs.removeAll()
+                multiGhosts = []
                 dragGhostOffset = .zero
                 draggingClipID = nil
                 activeSnapTime = nil
@@ -1464,12 +1499,22 @@ struct TimelineView: View {
         }
 
         if let (hit, trimEdge) = findClipTarget(at: pt) {
-            // Multi-drag only for interior (move) grabs on already-selected group.
-            if trimEdge == nil,
-               project.selectedClipIDs.contains(hit.id),
+            // 多选状态下，按住选中集合里的**任何一条**都是整体移动——包括按在边缘上。
+            //
+            // 原来这里要求 trimEdge == nil（只认片段"内部"）。字幕片段普遍很窄，
+            // 而边缘判定按宽度分级：≥20pt 时两端各 8pt 算拉伸区，12~20pt 时两端
+            // 各占 30%。一条 30pt 宽的字幕，中间只剩十几 pt 算"内部"，多选之后
+            // 想整体拖，十次有八次落在边缘上，变成拉伸其中一条。
+            // 多选时用户要的就是整体移动，单条拉伸没有意义，直接不看 trimEdge
+            if project.selectedClipIDs.contains(hit.id),
                project.selectedClipIDs.count > 1 {
                 let items = collectMultiDragItems()
                 project.pushUndo()
+                // 整组原片段隐藏，改成半透明幻影跟着鼠标走，松手才落到目标轨道——
+                // 跟单选拖动一个观感
+                draggingClipIDs = Set(items.map(\.id))
+                multiGhosts = buildMultiGhosts(items, grab: pt)
+                dragGhostOffset = .zero
                 dragOp = .moveMulti(items: items)
                 return
             }
@@ -2353,7 +2398,7 @@ struct TimelineView: View {
                         ForEach(project.videoTracks[i].clips.filter { isClipVisible(startTime: $0.startTime, endTime: $0.endTime) }) { clip in
                             VideoClipView(clip: clip, pps: project.pixelsPerSecond, h: vidH(i),
                                           sel: isSelected(clip.id, primary: project.selectedVideoClipID),
-                                          isDragging: draggingClipID == clip.id,
+                                          isDragging: isDraggingClip(clip.id),
                                           scrollOffsetX: scrollOffsetX)
                         }
                         transitionIcons(trackIndex: i, trackHeight: vidH(i))
@@ -2371,7 +2416,7 @@ struct TimelineView: View {
                             CompoundClipView(clip: clip, pps: project.pixelsPerSecond, h: cmpH(ti),
                                              scrollOffsetX: scrollOffsetX,
                                              sel: isSelected(clip.id, primary: project.selectedCompoundClipID),
-                                             isDragging: draggingClipID == clip.id)
+                                             isDragging: isDraggingClip(clip.id))
                         }
                         clipMarkerPins(project.compoundTracks[ti].clips, pps: project.pixelsPerSecond,
                                        trackHeight: cmpH(ti), startTime: \.startTime, markers: \.markers)
@@ -2392,7 +2437,7 @@ struct TimelineView: View {
                         ForEach(project.audioTracks[i].clips.filter { isClipVisible(startTime: $0.startTime, endTime: $0.endTime) }) { clip in
                             AudioClipView(clip: clip, pps: project.pixelsPerSecond, h: audH(i),
                                           sel: isSelected(clip.id, primary: project.selectedAudioClipID),
-                                          isDragging: draggingClipID == clip.id,
+                                          isDragging: isDraggingClip(clip.id),
                                           scrollOffsetX: scrollOffsetX)
                         }
                         clipMarkerPins(project.audioTracks[i].clips, pps: project.pixelsPerSecond,
@@ -2409,7 +2454,7 @@ struct TimelineView: View {
                             CompoundClipView(clip: clip, pps: project.pixelsPerSecond, h: cmpH(ti),
                                              scrollOffsetX: scrollOffsetX,
                                              sel: isSelected(clip.id, primary: project.selectedCompoundClipID),
-                                             isDragging: draggingClipID == clip.id)
+                                             isDragging: isDraggingClip(clip.id))
                         }
                         clipMarkerPins(project.compoundTracks[ti].clips, pps: project.pixelsPerSecond,
                                        trackHeight: cmpH(ti), startTime: \.startTime, markers: \.markers)
@@ -2492,7 +2537,7 @@ struct TimelineView: View {
                 ForEach(project.imageTracks[i].clips.filter { isClipVisible(startTime: $0.startTime, endTime: $0.endTime) }) { clip in
                     ImageClipView(clip: clip, pps: project.pixelsPerSecond, h: imgH(i),
                                   sel: isSelected(clip.id, primary: project.selectedImageClipID),
-                                  isDragging: draggingClipID == clip.id,
+                                  isDragging: isDraggingClip(clip.id),
                                   scrollOffsetX: scrollOffsetX)
                 }
                 clipMarkerPins(project.imageTracks[i].clips, pps: project.pixelsPerSecond,
@@ -2503,7 +2548,7 @@ struct TimelineView: View {
                 ForEach(project.subtitleTracks[i].clips.filter { isClipVisible(startTime: $0.startTime, endTime: $0.endTime) }) { clip in
                     SubtitleClipView(clip: clip, pps: project.pixelsPerSecond, h: subH(i),
                                      sel: isSelected(clip.id, primary: project.selectedSubtitleClipID),
-                                     isDragging: draggingClipID == clip.id,
+                                     isDragging: isDraggingClip(clip.id),
                                      scrollOffsetX: scrollOffsetX)
                 }
                 clipMarkerPins(project.subtitleTracks[i].clips, pps: project.pixelsPerSecond,
@@ -2514,7 +2559,7 @@ struct TimelineView: View {
                 ForEach(project.textTracks[i].clips.filter { isClipVisible(startTime: $0.startTime, endTime: $0.endTime) }) { clip in
                     TextClipView(clip: clip, pps: project.pixelsPerSecond, h: txtH(i),
                                  sel: isSelected(clip.id, primary: project.selectedTextClipID),
-                                 isDragging: draggingClipID == clip.id,
+                                 isDragging: isDraggingClip(clip.id),
                                  scrollOffsetX: scrollOffsetX)
                 }
                 clipMarkerPins(project.textTracks[i].clips, pps: project.pixelsPerSecond,
@@ -2525,7 +2570,7 @@ struct TimelineView: View {
                 ForEach(project.shapeTracks[i].clips.filter { isClipVisible(startTime: $0.startTime, endTime: $0.endTime) }) { clip in
                     ShapeTimelineClipView(clip: clip, pps: project.pixelsPerSecond, h: shpH(i),
                                           sel: isSelected(clip.id, primary: project.selectedShapeClipID),
-                                          isDragging: draggingClipID == clip.id,
+                                          isDragging: isDraggingClip(clip.id),
                                           scrollOffsetX: scrollOffsetX)
                 }
                 clipMarkerPins(project.shapeTracks[i].clips, pps: project.pixelsPerSecond,
@@ -2538,7 +2583,7 @@ struct TimelineView: View {
                     CompoundClipView(clip: clip, pps: project.pixelsPerSecond, h: cmpH(i),
                                      scrollOffsetX: scrollOffsetX,
                                      sel: isSelected(clip.id, primary: project.selectedCompoundClipID),
-                                     isDragging: draggingClipID == clip.id)
+                                     isDragging: isDraggingClip(clip.id))
                 }
                 clipMarkerPins(project.compoundTracks[i].clips, pps: project.pixelsPerSecond,
                                trackHeight: cmpH(i), startTime: \.startTime, markers: \.markers)
@@ -2552,6 +2597,106 @@ struct TimelineView: View {
         let color: Color
         let height: CGFloat
         let isSubtitle: Bool
+    }
+
+    /// 多选拖动的一个幻影。dx/dy 是它相对抓取点的偏移，
+    /// 拖动过程中整组保持相对位置不变，跟单选那个幻影一样跟手
+    /// 拖动时跟着鼠标的半透明幻影。单选和多选共用一套外观
+    @ViewBuilder
+    private func ghostView(_ info: GhostInfo) -> some View {
+        let cr: CGFloat = info.isSubtitle ? 3 : 4
+        RoundedRectangle(cornerRadius: cr)
+            .fill(info.color.opacity(0.5))
+            .overlay(
+                RoundedRectangle(cornerRadius: cr)
+                    .stroke(Color.white.opacity(0.6), lineWidth: 1.5)
+            )
+            .overlay(
+                Text(info.name)
+                    .font(.system(size: info.isSubtitle ? 8 : 9, weight: .medium))
+                    .foregroundColor(.white.opacity(0.9))
+                    .lineLimit(1)
+                    .padding(.leading, info.isSubtitle ? 4 : 5)
+                    .padding(.top, info.isSubtitle ? 0 : 4)
+                , alignment: info.isSubtitle ? .leading : .topLeading
+            )
+            .frame(width: max(info.duration * project.pixelsPerSecond, 30), height: info.height)
+            .allowsHitTesting(false)
+    }
+
+    private struct MultiGhost: Identifiable {
+        let id: UUID
+        let info: GhostInfo
+        let dx: CGFloat
+        let dy: CGFloat
+    }
+
+    /// 这个片段是不是正在被拖（单选或多选）。原片段隐藏、只留幻影时用
+    private func isDraggingClip(_ id: UUID) -> Bool {
+        draggingClipID == id || draggingClipIDs.contains(id)
+    }
+
+    /// 按 DragItem 取幻影外观 + 它在时间轴上的命中信息（用来算所在行）
+    private func ghostInfoAndHit(for it: DragItem) -> (GhostInfo, ClipHit)? {
+        switch it.kind {
+        case .video:
+            guard let c = project.videoTracks.flatMap(\.clips).first(where: { $0.id == it.id }) else { return nil }
+            let ti = project.videoTracks.firstIndex { $0.clips.contains { $0.id == it.id } } ?? 0
+            return (GhostInfo(name: c.name, duration: c.duration, color: Color(hex: "#3DBFBA"),
+                              height: vidH(ti) - 4, isSubtitle: false),
+                    .video(id: it.id, start: c.startTime, dur: c.duration))
+        case .image:
+            guard let c = project.imageTracks.flatMap(\.clips).first(where: { $0.id == it.id }) else { return nil }
+            let ti = project.imageTracks.firstIndex { $0.clips.contains { $0.id == it.id } } ?? 0
+            return (GhostInfo(name: c.name, duration: c.duration, color: Color(hex: "#E8A54B"),
+                              height: imgH(ti) - 4, isSubtitle: false),
+                    .image(id: it.id, start: c.startTime, dur: c.duration))
+        case .audio:
+            guard let c = project.audioTracks.flatMap(\.clips).first(where: { $0.id == it.id }) else { return nil }
+            let ti = project.audioTracks.firstIndex { $0.clips.contains { $0.id == it.id } } ?? 0
+            return (GhostInfo(name: c.name, duration: c.duration, color: Color(hex: "#5DB85D"),
+                              height: audH(ti) - 4, isSubtitle: false),
+                    .audio(id: it.id, start: c.startTime, dur: c.duration))
+        case .subtitle:
+            guard let c = project.subtitleTracks.flatMap(\.clips).first(where: { $0.id == it.id }) else { return nil }
+            let ti = project.subtitleTracks.firstIndex { $0.clips.contains { $0.id == it.id } } ?? 0
+            return (GhostInfo(name: c.text.components(separatedBy: "\n").first ?? c.text,
+                              duration: c.duration, color: Color(hex: "#7B6FC4"),
+                              height: subH(ti) - 4, isSubtitle: true),
+                    .subtitle(id: it.id, start: c.startTime, dur: c.duration))
+        case .text:
+            guard let c = project.textTracks.flatMap(\.clips).first(where: { $0.id == it.id }) else { return nil }
+            let ti = project.textTracks.firstIndex { $0.clips.contains { $0.id == it.id } } ?? 0
+            return (GhostInfo(name: c.text, duration: c.duration, color: Color(hex: "#D4668E"),
+                              height: txtH(ti) - 4, isSubtitle: true),
+                    .text(id: it.id, start: c.startTime, dur: c.duration))
+        case .shape:
+            guard let c = project.shapeTracks.flatMap(\.clips).first(where: { $0.id == it.id }) else { return nil }
+            let ti = project.shapeTracks.firstIndex { $0.clips.contains { $0.id == it.id } } ?? 0
+            return (GhostInfo(name: c.type.label, duration: c.duration, color: Color(hex: "#5B8FF9"),
+                              height: shpH(ti) - 4, isSubtitle: true),
+                    .shape(id: it.id, start: c.startTime, dur: c.duration))
+        case .compound:
+            guard let ti = project.compoundTracks.firstIndex(where: { $0.clips.contains { $0.id == it.id } }),
+                  let ci = project.compoundTracks[ti].clips.firstIndex(where: { $0.id == it.id })
+            else { return nil }
+            let c = project.compoundTracks[ti].clips[ci]
+            return (GhostInfo(name: c.name, duration: c.duration, color: Color(hex: "#FF9F43"),
+                              height: cmpH(ti) - 4, isSubtitle: false),
+                    .compound(id: it.id, start: c.startTime, dur: c.duration,
+                              trackIndex: ti, clipIndex: ci))
+        }
+    }
+
+    /// 拖动开始时算好整组幻影相对抓取点的位置，之后只跟着鼠标平移
+    private func buildMultiGhosts(_ items: [DragItem], grab: CGPoint) -> [MultiGhost] {
+        let pps = project.pixelsPerSecond
+        return items.compactMap { it in
+            guard let (info, hit) = ghostInfoAndHit(for: it) else { return nil }
+            let cx = CGFloat((it.originStart + it.originDur / 2) * pps)
+            let cy = trackCenterY(row: trackRowForClip(hit))
+            return MultiGhost(id: it.id, info: info, dx: cx - grab.x, dy: cy - grab.y)
+        }
     }
 
     private func dragGhostInfo() -> GhostInfo? {
@@ -2717,7 +2862,12 @@ struct TimelineView: View {
     /// 在视频轨道中渲染转场菱形图标（相邻 clip 之间）
     @ViewBuilder
     private func transitionIcons(trackIndex: Int, trackHeight: CGFloat) -> some View {
+        // 正在被拖的片段，它的转场图标一起藏起来。
+        // 图标位置是实时从 clip.startTime 算的，而拖动过程中数据只做水平平移
+        // （垂直方向由跟手的幻影表现），不藏的话图标会横着挪、却留在原来那条轨道上，
+        // 跟幻影分家。松手落位后自然按新位置重新出现
         let pairs = adjacentPairs(in: project.videoTracks[trackIndex])
+            .filter { !isDraggingClip($0.clipID) }
         ForEach(pairs, id: \.clipID) { pair in
             TransitionDiamond(hasTransition: pair.hasTransition, isSelected: project.selectedTransitionClipID == pair.clipID)
                 .offset(x: pair.cutX - 16, y: 0)
@@ -4509,7 +4659,7 @@ private struct TranslateToolGroup: View {
                  enabled: translateAllEnabled) { translateAll() }
             TBtn(icon: "whisper",
                  help: project.isTranscribing ? "正在识别字幕…" : "自动识别字幕（按当前翻译目标语言生成）",
-                 enabled: !project.isTranscribing) { project.autoTranscribeSelectedClip() }
+                 enabled: !project.isTranscribing) { project.showTranscribeOptions = true }
         }
     }
 
@@ -4603,46 +4753,59 @@ private struct TranslateToolGroup: View {
         project.translationProgress = 0
 
         project.translationTask = Task {
-            let maxConcurrent = 6
             let total = clips.count
-            var done = 0
-            await withTaskGroup(of: (Int, String).self) { group in
-                var nextIdx = 0
-                for _ in 0..<min(maxConcurrent, total) {
-                    let idx = nextIdx; let text = clips[idx].text
-                    group.addTask { (idx, await Translator.translateSmart(text, to: lang)) }
-                    nextIdx += 1
-                }
-                for await (i, translated) in group {
-                    guard !Task.isCancelled else { return }
-                    done += 1
+            let texts = clips.map(\.text)
+
+            // 批量：15 条合并成一次请求，最多 4 路并发。
+            // 原来是**每条一个请求、6 路并发**，选中几百条字幕就是几百个请求打过去，
+            // Google 的免费接口直接限流，而所有引擎失败时都静默返回原文——
+            // 于是前一部分翻好了、后面全是原文，界面还显示"翻译完成"。
+            // 合并之后请求数掉一个数量级，Translator.translate 里也加了退避重试
+            let translated = await Translator.translateConcurrent(
+                texts, to: lang, batchSize: 15, concurrency: 4,
+                onProgress: { done in
+                    await MainActor.run {
+                        guard project.translationTask != nil else { return }
+                        project.translationDone = min(done, total)
+                        project.translationProgress = Double(min(done, total)) / Double(max(total, 1))
+                    }
+                },
+                onBatch: { offset, batch in
+                    // 一批翻完就回填一批，不用等全部结束
                     await MainActor.run {
                         guard project.translationTask != nil else { return }
                         guard let ti = project.subtitleTracks.firstIndex(where: { $0.id == destTrackID }) else { return }
-                        let phID = placeholders[i].id
-                        if let ci = project.subtitleTracks[ti].clips.firstIndex(where: { $0.id == phID }) {
-                            project.subtitleTracks[ti].clips[ci] = SubtitleClip(
-                                text: translated, startTime: clips[i].startTime, endTime: clips[i].endTime)
+                        for (j, t) in batch.enumerated() {
+                            let i = offset + j
+                            guard i < clips.count else { break }
+                            let phID = placeholders[i].id
+                            if let ci = project.subtitleTracks[ti].clips.firstIndex(where: { $0.id == phID }) {
+                                project.subtitleTracks[ti].clips[ci] = SubtitleClip(
+                                    text: t, startTime: clips[i].startTime, endTime: clips[i].endTime)
+                            }
+                            project.placeholderClipIDs.remove(phID)
                         }
-                        project.placeholderClipIDs.remove(phID)
-                        project.translationDone = done
-                        project.translationProgress = Double(done) / Double(total)
                     }
-                    if nextIdx < total {
-                        let idx = nextIdx; let text = clips[idx].text
-                        group.addTask { (idx, await Translator.translateSmart(text, to: lang)) }
-                        nextIdx += 1
-                    }
-                }
-            }
+                })
+
             guard !Task.isCancelled else { return }
+            // 结果跟原文一字不差的，多半是重试之后仍然失败（限流/网络）。
+            // 以前这种情况完全无感，只能靠肉眼一条条发现
+            let failed = zip(texts, translated).filter { $0 == $1 && !$0.trimmingCharacters(in: .whitespaces).isEmpty }.count
             await MainActor.run {
                 project.translatingTrackIDs.remove(destTrackID)
                 project.translationTotal = 0
                 project.translationDone = 0
                 project.translationProgress = 0
                 project.translationTask = nil
-                project.showSuccessToast(icon: "checkmark", title: "翻译", subtitle: "翻译完成")
+                if failed > 0 {
+                    project.showSuccessToast(icon: "exclamationmark.triangle", iconColor: .orange,
+                                             title: "翻译",
+                                             subtitle: "完成 \(total - failed)/\(total) 条，\(failed) 条未成功（可能被限流，稍后重试这几条）",
+                                             autoCountdown: false)
+                } else {
+                    project.showSuccessToast(icon: "checkmark", title: "翻译", subtitle: "翻译完成")
+                }
             }
         }
     }

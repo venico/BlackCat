@@ -534,6 +534,11 @@ final class ProjectState: ObservableObject {
     }
     @Published var transcribeState: TranscribeState = .idle
     @Published var showWhisperModelPicker = false
+    /// 识别前问「直接识别 / 识别+AI校对」的弹窗
+    @Published var showTranscribeOptions = false
+    /// 校对用哪个文字模型（AIVideoService.Provider 的 rawValue）。
+    /// 跟「AI 生成」共用配置，不再单独一套 Key
+    @Published var transcribeAIModel = "deepseek-ai"
     @Published var selectedWhisperModel: WhisperTranscriber.ModelSize = .small
     var transcribeTask: Task<Void, Never>? = nil
     var isTranscribing: Bool {

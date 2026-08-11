@@ -422,9 +422,31 @@ enum Translator {
         }
     }
 
+    /// 翻译一段文本，失败会退避重试。
+    ///
+    /// 各家引擎的失败路径清一色是「返回原文」（网络错、解析失败、被限流，
+    /// 表现完全一样），所以只能拿「结果跟原文一模一样」当失败信号。
+    /// 批量翻几百条时 Google 的免费接口必然限流，不重试的话后半段原样返回，
+    /// 界面上还显示"翻译完成"——用户看到的就是"只翻译了前面一部分"。
+    ///
+    /// 误判的代价可以接受：本来就翻不动的内容（纯数字、专名）无非多发两次请求，
+    /// 而 translateSmart 已经把「本来就是目标语言」的行挑走了，不会走到这儿。
     static func translate(_ text: String, to lang: String) async -> String {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return text }
+
+        var delay: UInt64 = 400_000_000   // 0.4s 起步，每次翻倍
+        for attempt in 1...3 {
+            let result = await translateOnce(text, to: lang)
+            if result != text { return result }
+            guard attempt < 3 else { break }
+            try? await Task.sleep(nanoseconds: delay)
+            delay *= 2
+        }
+        return text
+    }
+
+    private static func translateOnce(_ text: String, to lang: String) async -> String {
         switch AppSettings.shared.translateProvider {
         case .google:   return await translateGoogle(text, to: lang)
         case .deepL:    return await translateDeepL(text, to: lang)
@@ -708,10 +730,13 @@ enum Translator {
 
     /// 并发 + 批量翻译：分批（每批 batchSize 条），最多 concurrency 路同时发。
     /// onProgress 在每批完成时回调已翻译总数。
+    /// - Parameter onBatch: 每批完成时回调 (该批在原数组里的起始下标, 该批结果)，
+    ///   调用方据此逐批回填界面，不用等全部翻完
     static func translateConcurrent(
         _ texts: [String], to lang: String,
         batchSize: Int = 15, concurrency: Int = 6,
-        onProgress: (@Sendable (Int) async -> Void)? = nil
+        onProgress: (@Sendable (Int) async -> Void)? = nil,
+        onBatch: (@Sendable (Int, [String]) async -> Void)? = nil
     ) async -> [String] {
         guard !texts.isEmpty else { return texts }
 
@@ -737,6 +762,7 @@ enum Translator {
                 }
                 completed += translated.count
                 await onProgress?(completed)
+                await onBatch?(offset, translated)
 
                 if launched < batches.count {
                     let b = batches[launched]

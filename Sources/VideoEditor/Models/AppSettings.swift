@@ -444,7 +444,9 @@ final class AppSettings: ObservableObject {
 
     func setProviderAPIKey(_ key: String, for provider: String) {
         ud.set(key, forKey: "settings.ai.providerKey.\(provider)")
-        objectWillChange.send()
+        // 延后一拍再通知。在输入框 setter 里同步 send 会当场重建输入框，
+        // 字就打不进去了（见 SettingsView.APIKeyField 的说明）
+        DispatchQueue.main.async { [weak self] in self?.objectWillChange.send() }
     }
 
     // MARK: - Init
