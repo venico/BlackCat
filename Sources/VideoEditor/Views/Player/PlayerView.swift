@@ -8,6 +8,7 @@ private let kPreviewInset: CGFloat = 8
 struct PlayerView: View {
     @EnvironmentObject private var project: ProjectState
     @EnvironmentObject private var clock: PlaybackClock
+    @Environment(\.windowID) private var windowID
     @StateObject private var ctrl = PlayerController()
     @State private var hoveringPlayer = false
 
@@ -66,6 +67,13 @@ struct PlayerView: View {
                         .frame(width: fitW, height: fitH)
                         .position(x: geo.size.width / 2, y: geo.size.height / 2)
                     }
+                    // 裁剪/变换手柄是贴着**素材边界**画的，素材被拖出或放大超出画面时
+                    // 手柄跟着跑到画面外 —— SwiftUI 默认不裁剪子视图的绘制，于是那些边框
+                    // 会一路画到素材区、属性区、时间轴上去。这里按预览区裁掉。
+                    //
+                    // 裁在 GeometryReader 这层而不是上面那个 fitW/fitH 的 frame 上：
+                    // 后者会把贴着画面边缘的手柄切掉一半，而黑边区域本来就该能显示手柄
+                    .clipped()
                 }
                 .padding(EdgeInsets(top: kPreviewInset, leading: kPreviewInset, bottom: 0, trailing: kPreviewInset))
             }
@@ -108,6 +116,14 @@ struct PlayerView: View {
             ctrl.onTime     = { t in clock.currentTime = t }
             ctrl.getTime    = { clock.currentTime }
             ctrl.getDuration = { clock.duration }
+            // 关窗时由 WindowManager 显式停播。**不能挂 onDisappear**——
+            // 那个在视图重建时也会触发，正播着会被误停
+            WindowManager.shared.setStopPlayback({ [weak ctrl, weak project] in
+                ctrl?.stopAndRelease()
+                // 关窗时把这个项目起的 ffmpeg 一并收掉（倒放/变速/转码）——
+                // 子进程不会跟着窗口走，不然关了窗它还在后台跑完
+                project?.killMyFFmpeg()
+            }, for: windowID)
         }
         // 走 clock 而不是通知：clock 是本窗口的，不会被别的窗口的空格触发
         .onChange(of: clock.togglePlaybackRequest) { _, _ in
@@ -180,7 +196,6 @@ private struct OverlayStack: View {
     @EnvironmentObject private var clock: PlaybackClock
     @State private var editText: String = ""
     @State private var dragStart: [UUID: CGPoint] = [:]
-    @State private var subtitleHeights: [UUID: CGFloat] = [:]   // 每条字幕实测高度，用于精确堆叠
 
     var body: some View {
         // 图层清单跟导出共用（含未登记复合轨道的兜底，见 overlayLayersBottomUp）。
@@ -388,25 +403,17 @@ private struct OverlayStack: View {
                let clip = track.clips.first(where: { $0.startTime <= clock.currentTime && $0.endTime > clock.currentTime }) {
                 let style = track.subtitleStyle ?? SubtitleStyle()
                 let text = style.mergeLineBreaks ? SubtitleOverlay.mergeBreaks(clip.text) : clip.text
-                let bottomPad = subtitleBottomPad(trackID: trackID, geoH: geo.size.height, scale: scale, style: style)
+                let bottomPad = subtitleBottomPad(trackID: trackID, geoW: geo.size.width,
+                                                  geoH: geo.size.height, scale: scale,
+                                                  time: clock.currentTime)
                 SubtitleLabel(text: text, style: style, scale: scale)
                     .frame(maxWidth: geo.size.width * style.widthPercent / 100)
                     .multilineTextAlignment(subtitleAlign(style.alignment))
-                    .background(GeometryReader { g in
-                        Color.clear
-                            .onAppear { setSubHeight(trackID, g.size.height) }
-                            .onChange(of: g.size.height) { _ in setSubHeight(trackID, g.size.height) }
-                    })
                     .padding(.bottom, bottomPad)
                     .frame(width: geo.size.width, height: geo.size.height, alignment: .bottom)
             }
         }
         .allowsHitTesting(false)
-    }
-
-    private func setSubHeight(_ id: UUID, _ h: CGFloat) {
-        guard h > 0, abs((subtitleHeights[id] ?? -1) - h) > 0.5 else { return }
-        DispatchQueue.main.async { subtitleHeights[id] = h }
     }
 
     /// 当前有字幕显示的可见字幕轨道（按 overlayTrackOrder 顺序，第一个=最上）
@@ -423,16 +430,25 @@ private struct OverlayStack: View {
         return active
     }
 
-    /// 用实测高度精确累加堆叠偏移：本轨道底边距 = margin + 其下方各条(高度+间距)之和
-    private func subtitleBottomPad(trackID: UUID, geoH: CGFloat, scale: CGFloat, style: SubtitleStyle) -> CGFloat {
+    /// 本轨道底边距 = margin + 其下方各条(层高 + 行距)之和。
+    ///
+    /// 层高走 `SubtitleStyle.layerSize`（跟导出同一份 CoreText 计算），**同步算出来**。
+    /// 原来这里读的是 SwiftUI 实测高度，那份值异步写回 @State，快速拖播放头时
+    /// 跟不上字幕切换，会拿上一条的高度排版 → 间距忽大忽小
+    private func subtitleBottomPad(trackID: UUID, geoW: CGFloat, geoH: CGFloat,
+                                   scale: CGFloat, time: Double) -> CGFloat {
         let margin = geoH * project.subtitleBottomMargin / 100.0
         let spacing = CGFloat(project.subtitleLineSpacing) * scale
         let active = activeSubtitleTrackIDs()
         guard let level = active.firstIndex(of: trackID), active.count > 1 else { return margin }
-        let fallback = style.fontSize * scale * 1.3 + 6 * scale
         var pad = margin
         for k in (level + 1)..<active.count {
-            pad += (subtitleHeights[active[k]] ?? fallback) + spacing
+            guard let t = project.subtitleTracks.first(where: { $0.id == active[k] }),
+                  let clip = t.clips.first(where: { $0.startTime <= time && $0.endTime > time })
+            else { continue }
+            let s = t.subtitleStyle ?? SubtitleStyle()
+            let text = s.mergeLineBreaks ? SubtitleOverlay.mergeBreaks(clip.text) : clip.text
+            pad += s.layerSize(text: text, scale: scale, renderWidth: geoW).height + spacing
         }
         return pad
     }
@@ -484,7 +500,10 @@ private struct OverlayStack: View {
         guard imgW > 0, imgH > 0 else { return .zero }
         let videoSize = project.previewRenderSize
         let vs = viewSize.width / max(videoSize.width, 1)
-        let baseScale = min(videoSize.width / imgW, videoSize.height / imgH)
+        // 与 ImageOverlay 的渲染同一套：按旋转后的朝向 fit
+        let fitSize = rotatedFitSize(CGSize(width: imgW, height: imgH),
+                                          rotation: clip.rotation)
+        let baseScale = min(videoSize.width / fitSize.width, videoSize.height / fitSize.height)
         let finalSX = baseScale * clip.scaleX
         let finalSY = baseScale * clip.scaleY
         let fullW = imgW * finalSX
@@ -696,7 +715,12 @@ private struct ImageLayerView: View {
             let originY = (viewSize.height - renderH) / 2
             let vs = renderW / videoSize.width   // 视频坐标 → 屏幕坐标
 
-            let baseScale = min(videoSize.width / imgW, videoSize.height / imgH)
+            // fit 按**旋转后**的朝向算：SwiftUI 的 rotationEffect 只做视觉旋转、
+            // 不改布局尺寸，所以竖图转 90° 后画面横过来了、尺寸还按竖的适配，
+            // 于是画面和选择框对不上（选择框停在旋转前的竖框位置）
+            let fitSize = rotatedFitSize(CGSize(width: imgW, height: imgH),
+                                              rotation: clip.rotation)
+            let baseScale = min(videoSize.width / fitSize.width, videoSize.height / fitSize.height)
             let finalSX = baseScale * CGFloat(clip.scaleX)
             let finalSY = baseScale * CGFloat(clip.scaleY)
             let fullW = imgW * finalSX
@@ -738,6 +762,25 @@ private struct ImageLayerView: View {
             }
         }
     }
+}
+
+/// 把屏幕坐标下的拖动位移转回画面自身的坐标（抵消 rotationEffect）。
+/// 视频和图片共用。
+func unrotateTranslation(_ t: CGSize, rotation: Int) -> CGSize {
+    let rot = ((rotation % 360) + 360) % 360
+    guard rot != 0 else { return t }
+    let rad = -CGFloat(rot) * .pi / 180
+    return CGSize(width:  t.width * cos(rad) - t.height * sin(rad),
+                  height: t.width * sin(rad) + t.height * cos(rad))
+}
+
+/// 旋转把画面的宽高换了个个儿：90°/270° 时用 (h, w) 去适配画布。
+/// 合成层（ColorCompositor / 导出的 videoTransform）也是按旋转后的整幅尺寸 fit 的，
+/// 预览这边必须同步，否则画面转了、框还停在旋转前的位置上。
+/// 视频和图片共用一套。
+func rotatedFitSize(_ size: CGSize, rotation: Int) -> CGSize {
+    let rot = ((rotation % 360) + 360) % 360
+    return (rot == 90 || rot == 270) ? CGSize(width: size.height, height: size.width) : size
 }
 
 // MARK: - Subtitle Overlay
@@ -1375,8 +1418,19 @@ private struct VideoTransformOverlay: View {
                         }
                     }
                 }
+                // 整个框跟着画面转，锚点用画面中心 —— 跟合成层的旋转锚点是同一个，
+                // 这样框始终贴着画面边界，而不是停在旋转前的位置
+                .rotationEffect(.degrees(Double(clip.rotation)),
+                                anchor: rotationAnchor(clip: clip, info: info, in: geo.size))
             }
         }
+    }
+
+    /// 把画面中心换算成 rotationEffect 要的 UnitPoint
+    private func rotationAnchor(clip: VideoClip, info: RenderInfo, in size: CGSize) -> UnitPoint {
+        guard size.width > 0, size.height > 0 else { return .center }
+        let c = videoFrameCenter(clip: clip, info: info)
+        return UnitPoint(x: c.x / size.width, y: c.y / size.height)
     }
 
     private func tapThrough(at pt: CGPoint, viewSize: CGSize) {
@@ -1532,12 +1586,16 @@ private struct VideoTransformOverlay: View {
                 }
                 guard dragMode == .crop, let startClip = cropStartClip else { return }
                 let vidRect = computeVideoRect(clip: startClip, info: info)
+                // 手势给的是屏幕坐标的位移，而 cropTop/cropLeft 说的是画面**自己**的
+                // 上下左右。画面转了 90° 之后两者差一个旋转，得先转回画面坐标，
+                // 否则拖上边的手柄画面从侧面被裁
+                let d = unrotateTranslation(value.translation, rotation: startClip.rotation)
                 var delta: Double = 0
                 switch edge {
-                case 0: delta =  value.translation.height / vidRect.height
-                case 1: delta = -value.translation.height / vidRect.height
-                case 2: delta =  value.translation.width  / vidRect.width
-                case 3: delta = -value.translation.width  / vidRect.width
+                case 0: delta =  d.height / vidRect.height
+                case 1: delta = -d.height / vidRect.height
+                case 2: delta =  d.width  / vidRect.width
+                case 3: delta = -d.width  / vidRect.width
                 default: break
                 }
                 let startVal: Double
@@ -1647,13 +1705,27 @@ private struct VideoTransformOverlay: View {
             videoSize: CGSize(width: videoW, height: videoH))
     }
 
+    /// 画面中心在视图坐标里的位置 —— 裁剪框绕它旋转（跟合成层的旋转锚点一致）
+    private func videoFrameCenter(clip: VideoClip, info: RenderInfo) -> CGPoint {
+        let vs = info.renderArea.width / info.videoSize.width
+        let cx = info.videoSize.width / 2 + CGFloat(clip.offsetX) * info.videoSize.width
+        let cy = info.videoSize.height / 2 + CGFloat(clip.offsetY) * info.videoSize.height
+        return CGPoint(x: cx * vs + info.renderArea.origin.x,
+                       y: cy * vs + info.renderArea.origin.y)
+    }
+
     private func computeVideoRect(clip: VideoClip, info: RenderInfo) -> CGRect {
-        let natW = CGFloat(clip.videoWidth)
-        let natH = CGFloat(clip.videoHeight)
+        // 用转正后的尺寸：clip.videoWidth 是文件里的 naturalSize，竖拍视频那是横的，
+        // 而画面在预览里已经被 preferredTransform 转正了
+        let oriented = project.orientedSize(for: clip)
+        let natW = oriented?.width ?? CGFloat(clip.videoWidth)
+        let natH = oriented?.height ?? CGFloat(clip.videoHeight)
         guard natW > 0, natH > 0 else { return .zero }
 
-        // 素材在画布内等比摆放（合成层同样逻辑），裁剪框据此贴合素材边界
-        let baseScale = min(info.videoSize.width / natW, info.videoSize.height / natH)
+        // 素材在画布内等比摆放（合成层同样逻辑），裁剪框据此贴合素材边界。
+        // 尺寸取旋转后的整幅画面，跟 ColorCompositor 第 5 步用的是同一个值
+        let fit = rotatedFitSize(CGSize(width: natW, height: natH), rotation: clip.rotation)
+        let baseScale = min(info.videoSize.width / fit.width, info.videoSize.height / fit.height)
         let finalSX = baseScale * CGFloat(clip.scaleX)
         let finalSY = baseScale * CGFloat(clip.scaleY)
 
@@ -1746,8 +1818,21 @@ private struct ImageTransformOverlay: View {
                         }
                     }
                 }
+                // 框跟着画面转，锚点用画面中心（同视频那套）
+                .rotationEffect(.degrees(Double(clip.rotation)),
+                                anchor: imageRotationAnchor(clip: clip, info: info, in: geo.size))
             }
         }
+    }
+
+    /// 图片画面中心 → rotationEffect 的 UnitPoint
+    private func imageRotationAnchor(clip: ImageClip, info: RenderInfo, in size: CGSize) -> UnitPoint {
+        guard size.width > 0, size.height > 0 else { return .center }
+        let vs = info.renderArea.width / info.videoSize.width
+        let cx = info.videoSize.width / 2 + clip.offsetX * info.videoSize.width
+        let cy = info.videoSize.height / 2 + clip.offsetY * info.videoSize.height
+        return UnitPoint(x: (cx * vs + info.renderArea.origin.x) / size.width,
+                         y: (cy * vs + info.renderArea.origin.y) / size.height)
     }
 
     // MARK: - 移动手势（含 tap 穿透）
@@ -1850,12 +1935,15 @@ private struct ImageTransformOverlay: View {
 
                 // 计算拖动的裁剪量：基于当前图片的实际渲染尺寸
                 let imgRect = computeImageRect(clip: startClip, info: info)
+                // 手势是屏幕坐标，cropTop/cropLeft 说的是图片自己的上下左右 ——
+                // 画面转过之后要先转回图片坐标（同视频那套）
+                let d = unrotateTranslation(value.translation, rotation: startClip.rotation)
                 var delta: Double = 0
                 switch edge {
-                case 0: delta =  value.translation.height / imgRect.height  // 拖上
-                case 1: delta = -value.translation.height / imgRect.height  // 拖下
-                case 2: delta =  value.translation.width  / imgRect.width   // 拖左
-                case 3: delta = -value.translation.width  / imgRect.width   // 拖右
+                case 0: delta =  d.height / imgRect.height  // 拖上
+                case 1: delta = -d.height / imgRect.height  // 拖下
+                case 2: delta =  d.width  / imgRect.width   // 拖左
+                case 3: delta = -d.width  / imgRect.width   // 拖右
                 default: break
                 }
 
@@ -2018,7 +2106,9 @@ private struct ImageTransformOverlay: View {
         guard imgW > 0, imgH > 0 else { return .zero }
 
         // Scale based on FULL image (crop does NOT affect scale)
-        let baseScale = min(info.videoSize.width / imgW, info.videoSize.height / imgH)
+        // 按旋转后的朝向 fit，跟 ImageLayerView 的渲染保持一致
+        let fitSize = rotatedFitSize(CGSize(width: imgW, height: imgH), rotation: clip.rotation)
+        let baseScale = min(info.videoSize.width / fitSize.width, info.videoSize.height / fitSize.height)
         let finalSX = baseScale * clip.scaleX
         let finalSY = baseScale * clip.scaleY
 
@@ -2406,6 +2496,7 @@ private struct TextTransformOverlay: View {
 private struct ShapeTransformOverlay: View {
     @EnvironmentObject private var project: ProjectState
     @EnvironmentObject private var clock: PlaybackClock
+    @Environment(\.windowID) private var windowID
 
     @State private var dragMode = 0   // 0=none 1=scale 2=rotate 3=endpoint
     @State private var didPushUndo = false
@@ -2473,6 +2564,11 @@ private struct ShapeTransformOverlay: View {
     private func installPenEnterMonitor() {
         removePenEnterMonitor()
         penKeyMon = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            // local monitor 是进程级的，每个窗口都装一个。不按当前窗口过滤的话，
+            // 两个窗口都选中钢笔片段时按一次回车，两边会一起进编辑态
+            guard WindowManager.shared.window(for: windowID)?.isKeyWindow == true else {
+                return event
+            }
             guard event.keyCode == 36,  // Enter
                   project.penEditingClipID == nil,
                   !project.penDrawingMode,
@@ -2637,6 +2733,7 @@ private struct ShapeTransformOverlay: View {
 
 private struct PenDrawingOverlay: View {
     @EnvironmentObject private var project: ProjectState
+    @Environment(\.windowID) private var windowID
     @State private var draggingHandle = false
     @State private var dragStartPos: CGPoint? = nil
     @State private var dragCurrentPos: CGPoint? = nil
@@ -2831,6 +2928,11 @@ private struct PenDrawingOverlay: View {
             // 必须判状态，不能只靠"这个 monitor 只在绘制时安装"：local monitor 是
             // 进程级的，SwiftUI 的 onDisappear 漏触发一次它就永久留着，之后
             // 全 app 的 esc 和回车都会被这里吃掉（欢迎页 esc 关不掉窗口就是这么来的）
+            //
+            // 状态守卫挡不住多窗口：两个窗口可以同时处于绘制态，所以还要按窗口过滤
+            guard WindowManager.shared.window(for: windowID)?.isKeyWindow == true else {
+                return event
+            }
             guard project.penDrawingMode else { return event }
             if event.keyCode == 53 || event.keyCode == 36 {
                 if project.penRawPoints.count >= 2 {
@@ -2852,6 +2954,7 @@ private struct PenDrawingOverlay: View {
 
 private struct PenEditOverlay: View {
     @EnvironmentObject private var project: ProjectState
+    @Environment(\.windowID) private var windowID
     @State private var didPushUndo = false
 
     var body: some View {
@@ -2963,7 +3066,11 @@ private struct PenEditOverlay: View {
 
     private func installEscMonitor() {
         escMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
-            // 同上：没在钢笔编辑就别碰事件，残留的 monitor 不能吞掉别处的 esc/回车
+            // 同上：没在钢笔编辑就别碰事件，残留的 monitor 不能吞掉别处的 esc/回车。
+            // 另外两个窗口可以同时处于钢笔编辑态，状态守卫挡不住，还要按窗口过滤
+            guard WindowManager.shared.window(for: windowID)?.isKeyWindow == true else {
+                return event
+            }
             guard project.penEditingClipID != nil else { return event }
             if event.keyCode == 53 || event.keyCode == 36 { // Escape or Enter → exit edit
                 project.penEditingClipID = nil; return nil
@@ -3036,6 +3143,27 @@ final class PlayerController: ObservableObject {
     }
 
     func toggle() { isPlaying ? pause() : play() }
+
+    /// 彻底停下并交出播放资源。关窗时必须调 —— 只靠视图销毁不够：
+    /// 窗口关了、项目关了，AVPlayer 还在后台继续出声。
+    /// 光 pause() 也不保险，得把 item 摘掉，让 AVFoundation 释放解码链路
+    func stopAndRelease() {
+        stopTimer()
+        isPlaying = false
+        player.pause()
+        player.replaceCurrentItem(with: nil)
+        onTime = nil
+        getTime = nil
+        getDuration = nil
+    }
+
+    deinit {
+        // 正常释放路径的兜底。SwiftUI 不保证 @StateObject 何时销毁，
+        // 所以关窗那条路走的是显式 stopAndRelease()，这里只管收尾
+        timer?.invalidate()
+        player.pause()
+        player.replaceCurrentItem(with: nil)
+    }
 
     func seek(to t: Double) {
         lastTick = Date()   // 重置 timer 基准

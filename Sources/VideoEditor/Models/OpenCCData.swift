@@ -22,4 +22,14 @@ enum OpenCC {
     static func toSimplified(_ s: String) -> String {
         String(s.map { tsMap[$0] ?? $0 })
     }
+
+    /// 简体转繁体。
+    ///
+    /// 用系统 ICU 的 `Hans-Hant` transform，而不是把上面那张表反过来查 ——
+    /// 反查会撞上一简对多繁（"发" = 髮/發、"里" = 裡/裏/里、"干" = 乾/幹/干），
+    /// 单字表只能二选一必然出错。ICU 带词组上下文规则，实测
+    /// 头发→頭髮、干净→乾淨、面条→麵條、手表→手錶、冲突→衝突 都正确。
+    static func toTraditional(_ s: String) -> String {
+        s.applyingTransform(StringTransform("Hans-Hant"), reverse: false) ?? s
+    }
 }

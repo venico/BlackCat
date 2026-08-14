@@ -180,6 +180,60 @@ final class RecentProjectsTests: XCTestCase {
         XCTAssertGreaterThan(img?.size.width ?? 0, 0)
     }
 
+    /// TC-PM-021: 内容全封装在复合片段里时，封面要能从复合片段**内部**取到。
+    /// 顶层轨道是空的，只看顶层就永远是缺省图
+    func testThumbnailFindsContentInsideCompound() throws {
+        guard let ff = ProjectState.findFFmpeg() else {
+            throw XCTSkip("找不到内置 ffmpeg")
+        }
+        let video = tmpDir.appendingPathComponent("inner.mp4")
+        let p = Process()
+        p.executableURL = ff
+        p.arguments = ["-hide_banner", "-loglevel", "error", "-y",
+                       "-f", "lavfi", "-i", "testsrc=size=320x180:duration=1:rate=10",
+                       "-pix_fmt", "yuv420p", video.path]
+        p.standardError = FileHandle.nullDevice
+        try p.run(); p.waitUntilExit()
+        try XCTSkipUnless(p.terminationStatus == 0, "造测试视频失败")
+
+        let proj = tmpDir.appendingPathComponent("compound-only.bcj")
+        try """
+        {"videoTracks":[{"clips":[]}],"imageTracks":[],
+         "compoundTracks":[{"clips":[{"startTime":0,"endTime":5,
+           "videoTracks":[{"clips":[{"url":"\(video.path)","startTime":0,"trimStart":0}]}]}]}]}
+        """.write(to: proj, atomically: true, encoding: .utf8)
+
+        XCTAssertNotNil(RecentProjects.makeThumbnail(projectURL: proj),
+                        "顶层空、内容在复合片段里时，封面该往复合片段内部找")
+    }
+
+    /// 复合片段可以嵌套，往里找不能只找一层
+    func testThumbnailFindsContentInNestedCompound() throws {
+        guard let ff = ProjectState.findFFmpeg() else {
+            throw XCTSkip("找不到内置 ffmpeg")
+        }
+        let video = tmpDir.appendingPathComponent("nested.mp4")
+        let p = Process()
+        p.executableURL = ff
+        p.arguments = ["-hide_banner", "-loglevel", "error", "-y",
+                       "-f", "lavfi", "-i", "testsrc=size=320x180:duration=1:rate=10",
+                       "-pix_fmt", "yuv420p", video.path]
+        p.standardError = FileHandle.nullDevice
+        try p.run(); p.waitUntilExit()
+        try XCTSkipUnless(p.terminationStatus == 0, "造测试视频失败")
+
+        let proj = tmpDir.appendingPathComponent("nested.bcj")
+        try """
+        {"videoTracks":[{"clips":[]}],"imageTracks":[],
+         "compoundTracks":[{"clips":[{"startTime":0,"endTime":5,"videoTracks":[],
+           "compoundTracks":[{"clips":[{"startTime":0,"endTime":5,
+             "videoTracks":[{"clips":[{"url":"\(video.path)","startTime":0,"trimStart":0}]}]}]}]}]}]}
+        """.write(to: proj, atomically: true, encoding: .utf8)
+
+        XCTAssertNotNil(RecentProjects.makeThumbnail(projectURL: proj),
+                        "嵌套复合片段里的内容也该找得到")
+    }
+
     func testRecordClearsStaleThumbnail() throws {
         // 保存之后素材可能换了，旧缩略图必须失效，否则一直显示上一版画面
         let a = try makeProjectFile("A")

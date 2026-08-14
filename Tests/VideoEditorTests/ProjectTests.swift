@@ -123,12 +123,15 @@ final class ProjectManagementTests: XCTestCase {
 
     // TC-PM-010: Finder 双击 .bcj 文件打开项目
     func testPM010_FinderOpenBCJ() {
-        // AppDelegate has application(_:open:) that checks .bcj extension
-        // Verify pendingOpenURL mechanism
-        let url = URL(fileURLWithPath: "/tmp/test.bcj")
-        AppDelegate.pendingOpenURL = url
-        XCTAssertEqual(AppDelegate.pendingOpenURL, url)
-        AppDelegate.pendingOpenURL = nil
+        // 冷启动双击时 application(_:open:) 比 applicationDidFinishLaunching 早到，
+        // 所以它只把 URL 暂存进这里，由 createWindow() 统一开窗——
+        // 否则紧接着还会多开一个欢迎页（一次双击弹两个窗口）
+        let a = URL(fileURLWithPath: "/tmp/test.bcj")
+        let b = URL(fileURLWithPath: "/tmp/test2.bcj")
+        AppDelegate.pendingOpenURLs = [a, b]
+        XCTAssertEqual(AppDelegate.pendingOpenURLs, [a, b], "要支持一次选中多个 .bcj 打开")
+        AppDelegate.pendingOpenURLs = []
+        XCTAssertTrue(AppDelegate.pendingOpenURLs.isEmpty)
     }
 
     // TC-PM-012: 数据序列化完整性 — 保存后重开 ID 一致

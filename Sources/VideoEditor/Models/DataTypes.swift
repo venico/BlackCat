@@ -71,6 +71,39 @@ struct SubtitleStyle: Equatable, Codable {
     var lineSpacing: Double   = 6      // px between bilingual lines
     var mergeLineBreaks: Bool = false   // 合并换行：去掉字幕中的手动换行，按宽度自动重排
 
+    /// 字幕层的排版尺寸（文字尺寸 + 内边距），**预览和导出共用这一份**。
+    ///
+    /// 预览侧原来是另一套：`.background(GeometryReader)` 实测 SwiftUI 的 Label 高度，
+    /// 再 `DispatchQueue.main.async` 写回 `@State`，堆叠时读这份实测值。
+    /// 结果是**快速拖动播放头时字幕间距忽大忽小** —— 字幕一条接一条切换，
+    /// 每条文字长短不同、高度一直在变，而异步写回跟不上帧率，
+    /// 那几帧就用了上一条字幕的高度来排版。导出没这个毛病，因为它一直是同步算的。
+    ///
+    /// 统一到这里之后：没有异步状态、不存在竞态，预览和导出的行距也必然一致。
+    ///
+    /// - Parameters:
+    ///   - scale: 预览传 `预览区宽 / previewRenderSize.width`，导出传 `renderSize.width / previewRenderSize.width`
+    ///   - renderWidth: 对应坐标系下的画面宽度
+    func layerSize(text: String, scale: CGFloat, renderWidth: CGFloat) -> CGSize {
+        let padH: CGFloat = 10 * scale, padV: CGFloat = 3 * scale
+        let scaledSize = fontSize * scale
+        var ctFont = CTFontCreateWithName(fontName as CFString, scaledSize, nil)
+        if bold, let bf = CTFontCreateCopyWithSymbolicTraits(ctFont, scaledSize, nil,
+                                                             .boldTrait, .boldTrait) {
+            ctFont = bf
+        }
+        let attrStr = NSAttributedString(
+            string: text,
+            attributes: [.init(kCTFontAttributeName as String): ctFont])
+        let setter = CTFramesetterCreateWithAttributedString(attrStr)
+        let maxW = renderWidth * widthPercent / 100
+        let constraint = CGSize(width: maxW - padH * 2, height: .greatestFiniteMagnitude)
+        let size = CTFramesetterSuggestFrameSizeWithConstraints(
+            setter, CFRange(), nil, constraint, nil)
+        return CGSize(width: ceil(size.width) + padH * 2,
+                      height: ceil(size.height) + padV * 2)
+    }
+
     enum CodingKeys: String, CodingKey {
         case fontName, fontSize, bold, italic
         case textColorHex, backgroundColorHex, backgroundOpacity

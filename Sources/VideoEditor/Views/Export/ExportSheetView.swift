@@ -121,8 +121,12 @@ final class ExportManager: ObservableObject {
                 await MainActor.run {
                     if let i = self.jobs.firstIndex(where: { $0.id == jobID }) {
                         self.jobs[i].state = .failed
-                        self.jobs[i].error = error.localizedDescription
+                        // 卡片上只给中文「导出失败」——AVFoundation 抛的是
+                        // "Operation Stopped" 这类英文系统文案，给用户看没意义。
+                        // 原始错误进诊断日志，排查时去那儿看
+                        self.jobs[i].error = nil
                     }
+                    DiagLog.log("[导出] 失败 \(filename)：\(error.localizedDescription)")
                     self.exportTasks.removeValue(forKey: jobID)
                     self.exporters.removeValue(forKey: jobID)
                     self.scheduleAutoDismiss(id: jobID)
@@ -758,14 +762,17 @@ actor TimelineExporter {
             return try exportSRT(input: input, progress: progress)
         }
 
-        // 计算所有轨道的最大结束时间（包括字幕）
-        let vEnd = input.videoTracks.flatMap(\.clips).map(\.endTime).max() ?? 0
-        let iEnd = input.imageTracks.flatMap(\.clips).map(\.endTime).max() ?? 0
-        let aEnd = input.audioTracks.flatMap(\.clips).map(\.endTime).max() ?? 0
-        let sEnd = input.subtitleTracks.flatMap(\.clips).map(\.endTime).max() ?? 0
-        let tEnd = input.textTracks.flatMap(\.clips).map(\.endTime).max() ?? 0
-        let shEnd = input.shapeTracks.flatMap(\.clips).map(\.endTime).max() ?? 0
-        let cEnd = input.compoundTracks.flatMap(\.clips).map(\.endTime).max() ?? 0
+        // 各轨道的最大结束时间。**只算参与导出的轨道**：下面每一处取素材都按
+        // isVisible 过滤（音频还要看 isMuted），隐藏轨的内容根本不会被写进去，
+        // 却在这里撑长了总时长 —— 表现就是关掉字幕轨导出，尾巴多出一段黑屏
+        let vEnd = input.videoTracks.filter(\.isVisible).flatMap(\.clips).map(\.endTime).max() ?? 0
+        let iEnd = input.imageTracks.filter(\.isVisible).flatMap(\.clips).map(\.endTime).max() ?? 0
+        let aEnd = input.audioTracks.filter { $0.isVisible && !$0.isMuted }
+            .flatMap(\.clips).map(\.endTime).max() ?? 0
+        let sEnd = input.subtitleTracks.filter(\.isVisible).flatMap(\.clips).map(\.endTime).max() ?? 0
+        let tEnd = input.textTracks.filter(\.isVisible).flatMap(\.clips).map(\.endTime).max() ?? 0
+        let shEnd = input.shapeTracks.filter(\.isVisible).flatMap(\.clips).map(\.endTime).max() ?? 0
+        let cEnd = input.compoundTracks.filter(\.isVisible).flatMap(\.clips).map(\.endTime).max() ?? 0
         let globalEndTime = max(vEnd, max(iEnd, max(aEnd, max(sEnd, max(tEnd, max(shEnd, cEnd))))))
 
         let composition = AVMutableComposition()
@@ -856,6 +863,11 @@ actor TimelineExporter {
                                                          preferredTrackID: kCMPersistentTrackID_Invalid)
                     try vt?.insertTimeRange(CMTimeRange(start: exEffTrimSt, duration: exEffSrcDur),
                                             of: vAsset, at: at)
+                    // 素材自带方向（手机竖拍）。存到 composition track 上，
+                    // 下面建 layerInstruction 时读出来交给 videoTransform
+                    if let stf = try? await vAsset.load(.preferredTransform) {
+                        vt?.preferredTransform = stf
+                    }
                     if let vt {
                         if abs(speed - 1.0) > 0.001 {
                             let compRange = CMTimeRange(start: at, duration: exEffSrcDur)
@@ -866,7 +878,12 @@ actor TimelineExporter {
                                                 endTime: clip.endTime + aExtend))
                     }
                     if clip.id == firstVideoClipID {
-                        sourceVideoSize = try await vAsset.load(.naturalSize)
+                        // 画布尺寸要用**转正后**的：竖拍视频 naturalSize 是横的，
+                        // 直接拿它当 fallback，导出画布就成了横的（画面竖着、两侧大黑边）。
+                        // 预览侧的 nativeVideoSize 也是这么算的，两边必须一致
+                        sourceVideoSize = Self.orientedNaturalSize(
+                            raw: try await vAsset.load(.naturalSize),
+                            transform: try? await vAsset.load(.preferredTransform))
                         let mfd = try await vAsset.load(.minFrameDuration)
                         if mfd.isValid && mfd.seconds > 0 { sourceFrameDuration = mfd }
                     }
@@ -973,7 +990,9 @@ actor TimelineExporter {
                             }
                             if firstVideoClipID == nil {
                                 firstVideoClipID = clip.id
-                                sourceVideoSize = try await vTrack.load(.naturalSize)
+                                sourceVideoSize = Self.orientedNaturalSize(
+                                    raw: try await vTrack.load(.naturalSize),
+                                    transform: try? await vTrack.load(.preferredTransform))
                                 let mfd = try await vTrack.load(.minFrameDuration)
                                 if mfd.isValid && mfd.seconds > 0 { sourceFrameDuration = mfd }
                             }
@@ -1294,12 +1313,17 @@ actor TimelineExporter {
                         let active = segStartCM >= clipStart && segStartCM < clipEnd
                         if active {
                             let natSize = (try? await entry.track.load(.naturalSize)) ?? .zero
+                            let srcTF = (try? await entry.track.load(.preferredTransform)) ?? .identity
                             if natSize.width > 0, natSize.height > 0 {
-                                let t = ProjectState.videoTransform(clip: entry.clip, natSize: natSize, renderSize: renderSize)
+                                let t = ProjectState.videoTransform(clip: entry.clip, natSize: natSize,
+                                                                    renderSize: renderSize,
+                                                                    sourceTransform: srcTF)
                                 li.setTransform(t, at: .zero)
                                 let c = entry.clip
                                 if c.cropTop > 0.001 || c.cropBottom > 0.001 || c.cropLeft > 0.001 || c.cropRight > 0.001 {
-                                    li.setCropRectangle(ProjectState.videoCropRect(clip: c, natSize: natSize), at: .zero)
+                                    li.setCropRectangle(ProjectState.videoCropRect(clip: c, natSize: natSize,
+                                                                                   sourceTransform: srcTF),
+                                                        at: .zero)
                                 }
                                 ProjectState.applyTransitionRamp(
                                     li: li, track: entry.track, clip: entry.clip,
@@ -2083,6 +2107,14 @@ actor TimelineExporter {
         return image
     }
 
+    /// 应用 preferredTransform 后的尺寸（手机竖拍视频的 naturalSize 是横的）
+    static func orientedNaturalSize(raw: CGSize, transform: CGAffineTransform?) -> CGSize {
+        guard let tf = transform else { return raw }
+        let applied = raw.applying(tf)
+        let w = abs(applied.width), h = abs(applied.height)
+        return (w > 0 && h > 0) ? CGSize(width: w, height: h) : raw
+    }
+
     private nonisolated func renderImageOverlay(
         clip: ImageClip, renderSize: CGSize, ciCache: [URL: CIImage]
     ) -> CIImage? {
@@ -2108,11 +2140,30 @@ actor TimelineExporter {
             ciImg = ciImg.cropped(to: CGRect(x: cx, y: cy, width: cw, height: ch))
         }
 
-        let croppedW = ciImg.extent.width
-        let croppedH = ciImg.extent.height
+        // 整幅画面（未裁剪）的范围。旋转锚点和 fit 尺寸都以它为准，
+        // 裁剪只遮住一块、不改变画面的缩放和位置
+        let fullExtent = CGRect(x: 0, y: 0, width: natW, height: natH)
+        let fullCX = fullExtent.midX, fullCY = fullExtent.midY
 
-        // 缩放：baseScale 使图片 fit 画布，再乘用户 scaleX/scaleY
-        let baseScale = min(rw / natW, rh / natH)
+        // 镜像 / 旋转：绕**整幅画面**中心，在源坐标里做（跟 ColorCompositor 同一套规则）。
+        // 以前是 fit 之后绕画布中心转，预览那边又是绕画面中心，两边对不上；
+        // 而且按旋转前的方向 fit 完再转，画面跟画布必然错位
+        var mt = CGAffineTransform.identity
+        if clip.mirrorH || clip.mirrorV || clip.rotation != 0 {
+            mt = CGAffineTransform(translationX: -fullCX, y: -fullCY)
+            if clip.mirrorH { mt = mt.concatenating(CGAffineTransform(scaleX: -1, y: 1)) }
+            if clip.mirrorV { mt = mt.concatenating(CGAffineTransform(scaleX: 1, y: -1)) }
+            let rad = CGFloat(clip.rotation) * .pi / 180
+            if abs(rad) > 0.001 { mt = mt.concatenating(CGAffineTransform(rotationAngle: rad)) }
+            mt = mt.concatenating(CGAffineTransform(translationX: fullCX, y: fullCY))
+            ciImg = ciImg.transformed(by: mt)
+        }
+
+        // 旋转后整幅画面占的范围：90°/270° 时宽高互换，fit 据此按新方向适配画布
+        let rotFull = fullExtent.applying(mt)
+
+        // 缩放：baseScale 让整幅画面 fit 画布，再乘用户 scaleX/scaleY
+        let baseScale = min(rw / rotFull.width, rh / rotFull.height)
         let sx = baseScale * CGFloat(clip.scaleX)
         let sy = baseScale * CGFloat(clip.scaleY)
 
@@ -2122,30 +2173,16 @@ actor TimelineExporter {
 
         // CIImage 变换：先移到原点 → 缩放 → 移到目标中心
         // CIImage 是 y-up 坐标系
-        let originX = ciImg.extent.origin.x
-        let originY = ciImg.extent.origin.y
-        var t = CGAffineTransform(translationX: -originX, y: -originY)   // 归零
+        var t = CGAffineTransform(translationX: -rotFull.origin.x, y: -rotFull.origin.y)   // 归零
         t = t.concatenating(CGAffineTransform(scaleX: sx, y: sy))
-        let scaledW = croppedW * sx
-        let scaledH = croppedH * sy
+        let scaledW = rotFull.width * sx
+        let scaledH = rotFull.height * sy
         // CIImage y-up: centerY 需要翻转（renderSize 的 y 轴是 y-down）
         let destX = centerX - scaledW / 2
         let destY = (rh - centerY) - scaledH / 2
         t = t.concatenating(CGAffineTransform(translationX: destX, y: destY))
 
         ciImg = ciImg.transformed(by: t)
-
-        // 镜像 / 旋转（以画布中心为锚）
-        if clip.mirrorH || clip.mirrorV || clip.rotation != 0 {
-            let mcx = rw / 2, mcy = rh / 2
-            var mt = CGAffineTransform(translationX: -mcx, y: -mcy)
-            if clip.mirrorH { mt = mt.scaledBy(x: -1, y: 1) }
-            if clip.mirrorV { mt = mt.scaledBy(x: 1, y: -1) }
-            let rad = CGFloat(clip.rotation) * .pi / 180
-            if abs(rad) > 0.001 { mt = mt.rotated(by: rad) }
-            mt = mt.translatedBy(x: mcx, y: mcy)
-            ciImg = ciImg.transformed(by: mt)
-        }
 
         // 色调调节
         let adj = clip.colorAdjust
@@ -2237,7 +2274,6 @@ actor TimelineExporter {
                 return CTParagraphStyleCreate(&setting, 1)
             }
 
-            let maxW = CGFloat(w) * item.style.widthPercent / 100
             let attrs: [NSAttributedString.Key: Any] = [
                 .init(kCTFontAttributeName as String): ctFont,
                 .init(kCTForegroundColorAttributeName as String): textCGColor,
@@ -2245,12 +2281,11 @@ actor TimelineExporter {
             ]
             let attrStr = NSAttributedString(string: item.text, attributes: attrs)
             let setter = CTFramesetterCreateWithAttributedString(attrStr)
-            let constraint = CGSize(width: maxW - padH * 2, height: CGFloat.greatestFiniteMagnitude)
-            let textSize = CTFramesetterSuggestFrameSizeWithConstraints(setter, CFRange(), nil, constraint, nil)
-            let layerW = ceil(textSize.width) + padH * 2
-            let layerH = ceil(textSize.height) + padV * 2
+            // 层尺寸走 SubtitleStyle.layerSize —— 跟预览共用同一份计算。
+            // 预览那边原来靠 SwiftUI 实测高度再异步写回 state，快速拖播放头会出竞态
+            let layer = item.style.layerSize(text: item.text, scale: scale, renderWidth: CGFloat(w))
             layouts.append(SubLayout(text: item.text, style: item.style, ctFont: ctFont,
-                                     layerW: layerW, layerH: layerH, setter: setter))
+                                     layerW: layer.width, layerH: layer.height, setter: setter))
         }
 
         var yPos = CGFloat(h) - bottomPad
@@ -2647,7 +2682,6 @@ actor TimelineExporter {
                 return CTParagraphStyleCreate(&setting, 1)
             }
 
-            let maxW = CGFloat(w) * item.style.widthPercent / 100
             let attrs: [NSAttributedString.Key: Any] = [
                 .init(kCTFontAttributeName as String): ctFont,
                 .init(kCTForegroundColorAttributeName as String): textCGColor,
@@ -2655,12 +2689,11 @@ actor TimelineExporter {
             ]
             let attrStr = NSAttributedString(string: item.text, attributes: attrs)
             let setter = CTFramesetterCreateWithAttributedString(attrStr)
-            let constraint = CGSize(width: maxW - padH * 2, height: CGFloat.greatestFiniteMagnitude)
-            let textSize = CTFramesetterSuggestFrameSizeWithConstraints(setter, CFRange(), nil, constraint, nil)
-            let layerW = ceil(textSize.width) + padH * 2
-            let layerH = ceil(textSize.height) + padV * 2
+            // 层尺寸走 SubtitleStyle.layerSize —— 跟预览共用同一份计算。
+            // 预览那边原来靠 SwiftUI 实测高度再异步写回 state，快速拖播放头会出竞态
+            let layer = item.style.layerSize(text: item.text, scale: scale, renderWidth: CGFloat(w))
             layouts.append(SubLayout(text: item.text, style: item.style, ctFont: ctFont,
-                                     layerW: layerW, layerH: layerH, setter: setter))
+                                     layerW: layer.width, layerH: layer.height, setter: setter))
         }
 
         // 从底部往上堆叠绘制（y-down 坐标系）

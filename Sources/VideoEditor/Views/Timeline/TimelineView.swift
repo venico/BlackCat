@@ -1109,20 +1109,16 @@ struct TimelineView: View {
                     }
                 }
                 .simultaneousGesture(unifiedDragGesture)
-                .onDrop(of: [UTType.plainText], isTargeted: $isLibraryDragOver) { providers, location in
-                    guard let provider = providers.first else { return false }
-                    _ = provider.loadObject(ofClass: NSString.self) { obj, _ in
-                        guard let idStr = obj as? String,
-                              let assetID = UUID(uuidString: idStr) else { return }
-                        DispatchQueue.main.async {
-                            let time = max(0, location.x / self.project.pixelsPerSecond)
-                            if let asset = self.project.mediaAssets.first(where: { $0.id == assetID }) {
-                                self.project.addToTimelineAt(asset, time: time)
-                            }
-                        }
-                    }
-                    return true
-                }
+                // 收素材库拖过来的素材。**不能用 `.onDrop`** —— SwiftUI 合并绘制，
+                // hitTest 命中的始终是最外层 GatedHostingView，内层的 onDrop 一次都收不到
+                // （Finder 拖入排查过一整轮，见 WindowDragGate.swift 顶部）。
+                // 所以跟素材区一样：宿主统一收，按落点分发到这里
+                .background(GeometryReader { g in
+                    Color.clear
+                        .onAppear { registerTimelineDropZone(g.frame(in: .global)) }
+                        .onChange(of: g.frame(in: .global)) { _, r in registerTimelineDropZone(r) }
+                        .onDisappear { FileDropRouter.unregister(windowID, kind: .timeline) }
+                })
             }
 
 
@@ -2063,6 +2059,37 @@ struct TimelineView: View {
         return nil
     }
 
+    /// 登记时间轴的拖入接收区。素材库把素材 id 拖过来，落点 x 换算成插入时间。
+    ///
+    /// rect 取的是**内容层**的 global frame：横向滚动时它的 minX 会变成负值，
+    /// 所以 `落点 - rect.minX` 自动带上了滚动偏移，直接除 pixelsPerSecond 就是时间码
+    private func registerTimelineDropZone(_ rect: CGRect) {
+        FileDropRouter.register(
+            windowID, kind: .timeline, rect: rect,
+            accepts: {
+                switch $0 {
+                case .asset, .shape: return true
+                case .files:         return false   // Finder 拖的文件归素材区
+                }
+            },
+            onDrop: { payload, local in
+                let time = max(0, local.x / project.pixelsPerSecond)
+                switch payload {
+                case .asset(let assetID):
+                    guard let asset = project.mediaAssets.first(where: { $0.id == assetID })
+                    else { return }
+                    // 文件丢了的素材不该能拖（素材库那边 onDrag 已经拦了一道，这里兜底）
+                    guard asset.fileExists else { return }
+                    project.addToTimelineAt(asset, time: time)
+                case .shape(let type):
+                    project.addShape(type: type, at: time)
+                case .files:
+                    break
+                }
+            },
+            onTargetChange: { isLibraryDragOver = $0 })
+    }
+
     private func findClipTarget(at pt: CGPoint) -> (hit: ClipHit, trimEdge: ClipTrimEdge?)? {
         guard pt.y >= rulerH else { return nil }
         let pps = project.pixelsPerSecond
@@ -2597,6 +2624,13 @@ struct TimelineView: View {
         let color: Color
         let height: CGFloat
         let isSubtitle: Bool
+        /// 片段自带的标记，画在幻影上跟着一起走。
+        ///
+        /// 标记本来是按**轨道**渲染的（clipMarkerPins 挂在每条 trackRow 里），
+        /// 而跨轨移动要到松手才执行 moveXxxClipToTrack —— 拖动全程 clip 还属于原轨道，
+        /// 于是标记钉在原轨道那一行不动，只有 x 跟着变，看着就是「标记不跟片段走」。
+        /// 幻影自己带一份就跟手了
+        var markers: [Marker] = []
     }
 
     /// 多选拖动的一个幻影。dx/dy 是它相对抓取点的偏移，
@@ -2620,8 +2654,40 @@ struct TimelineView: View {
                     .padding(.top, info.isSubtitle ? 0 : 4)
                 , alignment: info.isSubtitle ? .leading : .topLeading
             )
+            // 标记跟着幻影走。轨道上那份标记在拖动期间仍钉在原轨道
+            // （clip 要到松手才换轨），所以这里自己画一份
+            .overlay(alignment: .topLeading) {
+                ForEach(info.markers) { m in
+                    ghostMarkerPin(m)
+                        // 幻影比轨道行矮（height 取的是 xxxH(ti) - 4），
+                        // 所以这里贴边（y = pin 高一半）才跟轨道上那份留 2px 的效果对齐。
+                        // 别照抄轨道那份的 +2，会多沉一截
+                        .position(x: m.time * project.pixelsPerSecond + 1, y: 6)
+                }
+            }
             .frame(width: max(info.duration * project.pixelsPerSecond, 30), height: info.height)
             .allowsHitTesting(false)
+    }
+
+    /// 幻影上的标记图钉。形状跟 clipMarkerPins 保持一致，只是不做选中/悬停态
+    private func ghostMarkerPin(_ m: Marker) -> some View {
+        Canvas { ctx, size in
+            let w = size.width, h = size.height
+            var pin = Path()
+            let r: CGFloat = 1.5
+            pin.move(to: CGPoint(x: r, y: 0))
+            pin.addLine(to: CGPoint(x: w - r, y: 0))
+            pin.addQuadCurve(to: CGPoint(x: w, y: r), control: CGPoint(x: w, y: 0))
+            pin.addLine(to: CGPoint(x: w, y: h * 0.6))
+            pin.addLine(to: CGPoint(x: w / 2, y: h))
+            pin.addLine(to: CGPoint(x: 0, y: h * 0.6))
+            pin.addLine(to: CGPoint(x: 0, y: r))
+            pin.addQuadCurve(to: CGPoint(x: r, y: 0), control: CGPoint(x: 0, y: 0))
+            pin.closeSubpath()
+            ctx.fill(pin, with: .color(m.color.swiftUIColor))
+        }
+        .frame(width: 8, height: 12)
+        .allowsHitTesting(false)
     }
 
     private struct MultiGhost: Identifiable {
@@ -2643,38 +2709,38 @@ struct TimelineView: View {
             guard let c = project.videoTracks.flatMap(\.clips).first(where: { $0.id == it.id }) else { return nil }
             let ti = project.videoTracks.firstIndex { $0.clips.contains { $0.id == it.id } } ?? 0
             return (GhostInfo(name: c.name, duration: c.duration, color: Color(hex: "#3DBFBA"),
-                              height: vidH(ti) - 4, isSubtitle: false),
+                              height: vidH(ti) - 4, isSubtitle: false, markers: c.markers ?? []),
                     .video(id: it.id, start: c.startTime, dur: c.duration))
         case .image:
             guard let c = project.imageTracks.flatMap(\.clips).first(where: { $0.id == it.id }) else { return nil }
             let ti = project.imageTracks.firstIndex { $0.clips.contains { $0.id == it.id } } ?? 0
             return (GhostInfo(name: c.name, duration: c.duration, color: Color(hex: "#E8A54B"),
-                              height: imgH(ti) - 4, isSubtitle: false),
+                              height: imgH(ti) - 4, isSubtitle: false, markers: c.markers ?? []),
                     .image(id: it.id, start: c.startTime, dur: c.duration))
         case .audio:
             guard let c = project.audioTracks.flatMap(\.clips).first(where: { $0.id == it.id }) else { return nil }
             let ti = project.audioTracks.firstIndex { $0.clips.contains { $0.id == it.id } } ?? 0
             return (GhostInfo(name: c.name, duration: c.duration, color: Color(hex: "#5DB85D"),
-                              height: audH(ti) - 4, isSubtitle: false),
+                              height: audH(ti) - 4, isSubtitle: false, markers: c.markers ?? []),
                     .audio(id: it.id, start: c.startTime, dur: c.duration))
         case .subtitle:
             guard let c = project.subtitleTracks.flatMap(\.clips).first(where: { $0.id == it.id }) else { return nil }
             let ti = project.subtitleTracks.firstIndex { $0.clips.contains { $0.id == it.id } } ?? 0
             return (GhostInfo(name: c.text.components(separatedBy: "\n").first ?? c.text,
                               duration: c.duration, color: Color(hex: "#7B6FC4"),
-                              height: subH(ti) - 4, isSubtitle: true),
+                              height: subH(ti) - 4, isSubtitle: true, markers: c.markers ?? []),
                     .subtitle(id: it.id, start: c.startTime, dur: c.duration))
         case .text:
             guard let c = project.textTracks.flatMap(\.clips).first(where: { $0.id == it.id }) else { return nil }
             let ti = project.textTracks.firstIndex { $0.clips.contains { $0.id == it.id } } ?? 0
             return (GhostInfo(name: c.text, duration: c.duration, color: Color(hex: "#D4668E"),
-                              height: txtH(ti) - 4, isSubtitle: true),
+                              height: txtH(ti) - 4, isSubtitle: true, markers: c.markers ?? []),
                     .text(id: it.id, start: c.startTime, dur: c.duration))
         case .shape:
             guard let c = project.shapeTracks.flatMap(\.clips).first(where: { $0.id == it.id }) else { return nil }
             let ti = project.shapeTracks.firstIndex { $0.clips.contains { $0.id == it.id } } ?? 0
             return (GhostInfo(name: c.type.label, duration: c.duration, color: Color(hex: "#5B8FF9"),
-                              height: shpH(ti) - 4, isSubtitle: true),
+                              height: shpH(ti) - 4, isSubtitle: true, markers: c.markers ?? []),
                     .shape(id: it.id, start: c.startTime, dur: c.duration))
         case .compound:
             guard let ti = project.compoundTracks.firstIndex(where: { $0.clips.contains { $0.id == it.id } }),
@@ -2682,7 +2748,7 @@ struct TimelineView: View {
             else { return nil }
             let c = project.compoundTracks[ti].clips[ci]
             return (GhostInfo(name: c.name, duration: c.duration, color: Color(hex: "#FF9F43"),
-                              height: cmpH(ti) - 4, isSubtitle: false),
+                              height: cmpH(ti) - 4, isSubtitle: false, markers: c.markers ?? []),
                     .compound(id: it.id, start: c.startTime, dur: c.duration,
                               trackIndex: ti, clipIndex: ci))
         }
@@ -2704,31 +2770,31 @@ struct TimelineView: View {
         case .moveVideo(let id, _, _, _):
             guard let clip = project.videoTracks.flatMap(\.clips).first(where: { $0.id == id }) else { return nil }
             let ti = project.videoTracks.firstIndex { $0.clips.contains { $0.id == id } } ?? 0
-            return GhostInfo(name: clip.name, duration: clip.duration, color: Color(hex: "#3DBFBA"), height: vidH(ti) - 4, isSubtitle: false)
+            return GhostInfo(name: clip.name, duration: clip.duration, color: Color(hex: "#3DBFBA"), height: vidH(ti) - 4, isSubtitle: false, markers: clip.markers ?? [])
         case .moveImage(let id, _, _, _):
             guard let clip = project.imageTracks.flatMap(\.clips).first(where: { $0.id == id }) else { return nil }
             let ti = project.imageTracks.firstIndex { $0.clips.contains { $0.id == id } } ?? 0
-            return GhostInfo(name: clip.name, duration: clip.duration, color: Color(hex: "#E8A54B"), height: imgH(ti) - 4, isSubtitle: false)
+            return GhostInfo(name: clip.name, duration: clip.duration, color: Color(hex: "#E8A54B"), height: imgH(ti) - 4, isSubtitle: false, markers: clip.markers ?? [])
         case .moveAudio(let id, _, _, _):
             guard let clip = project.audioTracks.flatMap(\.clips).first(where: { $0.id == id }) else { return nil }
             let ti = project.audioTracks.firstIndex { $0.clips.contains { $0.id == id } } ?? 0
-            return GhostInfo(name: clip.name, duration: clip.duration, color: Color(hex: "#5DB85D"), height: audH(ti) - 4, isSubtitle: false)
+            return GhostInfo(name: clip.name, duration: clip.duration, color: Color(hex: "#5DB85D"), height: audH(ti) - 4, isSubtitle: false, markers: clip.markers ?? [])
         case .moveSubtitle(let id, _, _, _):
             guard let clip = project.subtitleTracks.flatMap(\.clips).first(where: { $0.id == id }) else { return nil }
             let ti = project.subtitleTracks.firstIndex { $0.clips.contains { $0.id == id } } ?? 0
-            return GhostInfo(name: clip.text.components(separatedBy: "\n").first ?? clip.text, duration: clip.duration, color: Color(hex: "#7B6FC4"), height: subH(ti) - 4, isSubtitle: true)
+            return GhostInfo(name: clip.text.components(separatedBy: "\n").first ?? clip.text, duration: clip.duration, color: Color(hex: "#7B6FC4"), height: subH(ti) - 4, isSubtitle: true, markers: clip.markers ?? [])
         case .moveText(let id, _, _, _):
             guard let clip = project.textTracks.flatMap(\.clips).first(where: { $0.id == id }) else { return nil }
             let ti = project.textTracks.firstIndex { $0.clips.contains { $0.id == id } } ?? 0
-            return GhostInfo(name: clip.text, duration: clip.duration, color: Color(hex: "#D4668E"), height: txtH(ti) - 4, isSubtitle: true)
+            return GhostInfo(name: clip.text, duration: clip.duration, color: Color(hex: "#D4668E"), height: txtH(ti) - 4, isSubtitle: true, markers: clip.markers ?? [])
         case .moveShape(let id, _, _, _):
             guard let clip = project.shapeTracks.flatMap(\.clips).first(where: { $0.id == id }) else { return nil }
             let ti = project.shapeTracks.firstIndex { $0.clips.contains { $0.id == id } } ?? 0
-            return GhostInfo(name: clip.type.label, duration: clip.duration, color: Color(hex: "#5B8FF9"), height: shpH(ti) - 4, isSubtitle: true)
+            return GhostInfo(name: clip.type.label, duration: clip.duration, color: Color(hex: "#5B8FF9"), height: shpH(ti) - 4, isSubtitle: true, markers: clip.markers ?? [])
         case .moveCompound(let id, _, _, _):
             guard let clip = project.compoundTracks.flatMap(\.clips).first(where: { $0.id == id }) else { return nil }
             let ti = project.compoundTracks.firstIndex { $0.clips.contains { $0.id == id } } ?? 0
-            return GhostInfo(name: clip.name, duration: clip.duration, color: Color(hex: "#FF9F43"), height: cmpH(ti) - 4, isSubtitle: false)
+            return GhostInfo(name: clip.name, duration: clip.duration, color: Color(hex: "#FF9F43"), height: cmpH(ti) - 4, isSubtitle: false, markers: clip.markers ?? [])
         default: return nil
         }
     }
@@ -2913,9 +2979,13 @@ struct TimelineView: View {
     }
 
     @ViewBuilder
-    private func clipMarkerPins<Clip>(_ clips: [Clip], pps: Double, trackHeight: CGFloat,
-                                      startTime: KeyPath<Clip, Double>, markers: KeyPath<Clip, [Marker]?>) -> some View {
-        ForEach(clips.flatMap { clip in
+    private func clipMarkerPins<Clip: Identifiable>(_ clips: [Clip], pps: Double, trackHeight: CGFloat,
+                                                    startTime: KeyPath<Clip, Double>,
+                                                    markers: KeyPath<Clip, [Marker]?>) -> some View
+    where Clip.ID == UUID {
+        // 正在拖的片段跳过：它的原体已经隐藏、显示的是幻影，而幻影自己带了一份标记。
+        // 不跳过的话拖动时会看到两份标记 —— 一份钉在原位、一份跟着手走
+        ForEach(clips.filter { !isDraggingClip($0.id) }.flatMap { clip in
             (clip[keyPath: markers] ?? []).map { m in
                 (id: m.id, absTime: clip[keyPath: startTime] + m.time, marker: m)
             }
@@ -2948,7 +3018,11 @@ struct TimelineView: View {
                 MarkerEditPopover(markerID: entry.id)
                     .environmentObject(project)
             }
-            .position(x: entry.absTime * pps + 1, y: 8)
+            // 顶部距片段上边缘固定留 2px。
+            // 原来写死 y: 8，常态 pin 高 12 顶部落在 2 是对的，
+            // 但 hover 时 pin 变高到 14、顶部就成了 1，间距会跳一下 ——
+            // 改成按高度算，两种状态都稳定在 2
+            .position(x: entry.absTime * pps + 1, y: (isHov ? 14 : 12) / 2 + 2)
             .allowsHitTesting(false)
         }
     }
@@ -3508,7 +3582,10 @@ private struct VideoClipView: View {
                 // closestFrame 就选到另一帧、图片内容闪一下。用 (thumbW*i)/clipWidth
                 // 是连续量，缩放过程中采样点平滑移动，不会闪。
                 let posRatio = clipWidth > 0 ? Double(thumbW * CGFloat(i) / clipWidth) : 0
-                let t = clip.trimStart + clip.duration * max(0.01, clip.speed) * min(1, posRatio)
+                // 倒放的片段，左端放的是源素材**末尾**那一帧，所以采样比例要翻过来 ——
+                // 不翻的话画面倒着播、缩略图却顺着排，对不上
+                let srcRatio = clip.reversed ? (1 - min(1, posRatio)) : min(1, posRatio)
+                let t = clip.trimStart + clip.duration * max(0.01, clip.speed) * srcRatio
                 let frame = closestFrame(frames, at: t)
                 // 最后一格用余数宽度，避免最后一张越过片段右边缘
                 let wCell = i == count - 1 ? max(0, clipWidth - thumbW * CGFloat(count - 1)) : thumbW
@@ -3571,12 +3648,26 @@ private struct ImageClipView: View {
         ZStack(alignment:.leading) {
             if w > TimelineClipMetrics.contentMinWidth,
                let thumb = project.mediaThumbnails[clip.assetID] {
-                Image(nsImage: thumb)
-                    .resizable()
-                    .aspectRatio(contentMode: .fill)
-                    .frame(width: w, height: h - 4)
-                    .clipped()
-                    .clipShape(RoundedRectangle(cornerRadius: 6))
+                // 按固定单元宽（轨道高 × 宽高比）平铺，跟视频缩略图条一致。
+                // 原来是 frame(width: w) 拉满整条，左右裁剪时封面会被拉伸压扁
+                let ratio = CGFloat(thumb.size.width) / max(CGFloat(thumb.size.height), 1)
+                let cellH = h - 4
+                let cellW = max(cellH * ratio, 1)
+                let count = max(1, Int(ceil(w / cellW)))
+                HStack(spacing: 0) {
+                    ForEach(0..<count, id: \.self) { i in
+                        let wCell = i == count - 1
+                            ? max(0, w - cellW * CGFloat(count - 1)) : cellW
+                        Image(nsImage: thumb)
+                            .resizable()
+                            .aspectRatio(contentMode: .fill)
+                            .frame(width: wCell, height: cellH)
+                            .clipped()
+                    }
+                }
+                .frame(width: w, height: cellH, alignment: .leading)
+                .clipped()
+                .clipShape(RoundedRectangle(cornerRadius: 6))
             } else {
                 RoundedRectangle(cornerRadius:6).fill(Color(hex:"#E8A54B").opacity(0.82))
             }
@@ -4001,11 +4092,11 @@ private struct CompoundClipView: View {
 
     private var isRenaming: Bool { project.renamingCompoundClipID == clip.id }
 
-    private enum ContentKind { case video(UUID), image(UUID), audio(UUID), subtitle(String), text(String), shape, empty }
+    private enum ContentKind { case video(UUID, reversed: Bool), image(UUID), audio(UUID), subtitle(String), text(String), shape, empty }
 
     private var primaryContent: ContentKind {
         let c = clip.flattened()
-        if let vc = c.videoTracks.flatMap(\.clips).first { return .video(vc.assetID) }
+        if let vc = c.videoTracks.flatMap(\.clips).first { return .video(vc.assetID, reversed: vc.reversed) }
         if let ic = c.imageTracks.flatMap(\.clips).first { return .image(ic.assetID) }
         if let ac = c.audioTracks.flatMap(\.clips).first { return .audio(ac.assetID) }
         if !c.shapeTracks.flatMap(\.clips).isEmpty { return .shape }
@@ -4141,17 +4232,16 @@ private struct CompoundClipView: View {
     @ViewBuilder
     private func compoundContent(w: CGFloat, clipH: CGFloat) -> some View {
         switch primaryContent {
-        case .video(let assetID):
+        case .video(let assetID, let reversed):
             if let frames = project.assetThumbnails[assetID], !frames.isEmpty {
-                videoThumbnailStrip(frames: frames, clipWidth: w, clipH: clipH)
+                videoThumbnailStrip(frames: frames, clipWidth: w, clipH: clipH, reversed: reversed)
                     .overlay(Color(hex: "#FF9F43").opacity(0.15))
             } else {
                 RoundedRectangle(cornerRadius: 6).fill(Color(hex: "#FF9F43").opacity(0.82))
             }
         case .image(let assetID):
             if let thumb = project.mediaThumbnails[assetID] {
-                Image(nsImage: thumb).resizable().aspectRatio(contentMode: .fill)
-                    .frame(width: w, height: clipH).clipped()
+                imageThumbnailStrip(thumb, clipWidth: w, clipH: clipH)
                     .overlay(Color(hex: "#FF9F43").opacity(0.15))
             } else {
                 RoundedRectangle(cornerRadius: 6).fill(Color(hex: "#FF9F43").opacity(0.82))
@@ -4200,8 +4290,34 @@ private struct CompoundClipView: View {
         }
     }
 
+    /// 图片片段的缩略图条：按**固定单元宽**（轨道高 × 图片宽高比）平铺同一张图。
+    ///
+    /// 原来是 `frame(width: 整个片段宽)` 直接拉满，左右裁剪改变片段长度时
+    /// 封面就跟着被拉伸压扁 —— 视频那边一直是按单元宽平铺的，这里跟它对齐
     @ViewBuilder
-    private func videoThumbnailStrip(frames: [ThumbnailFrame], clipWidth: CGFloat, clipH: CGFloat) -> some View {
+    private func imageThumbnailStrip(_ thumb: NSImage, clipWidth: CGFloat, clipH: CGFloat) -> some View {
+        let ratio = CGFloat(thumb.size.width) / max(CGFloat(thumb.size.height), 1)
+        let thumbW = max(clipH * ratio, 1)
+        let count = max(1, Int(ceil(clipWidth / thumbW)))
+        HStack(spacing: 0) {
+            ForEach(0..<count, id: \.self) { i in
+                // 最后一格用余数宽度，别越过片段右边缘
+                let wCell = i == count - 1
+                    ? max(0, clipWidth - thumbW * CGFloat(count - 1)) : thumbW
+                Image(nsImage: thumb)
+                    .resizable()
+                    .aspectRatio(contentMode: .fill)
+                    .frame(width: wCell, height: clipH)
+                    .clipped()
+            }
+        }
+        .frame(width: clipWidth, height: clipH, alignment: .leading)
+        .clipped()
+    }
+
+    @ViewBuilder
+    private func videoThumbnailStrip(frames: [ThumbnailFrame], clipWidth: CGFloat, clipH: CGFloat,
+                                     reversed: Bool = false) -> some View {
         let ratio: CGFloat = frames.first.map { CGFloat($0.image.size.width) / max(CGFloat($0.image.size.height), 1) } ?? 1.0
         let thumbW = max(clipH * ratio, 1)
         let count = max(1, Int(ceil(clipWidth / thumbW)))
@@ -4213,7 +4329,9 @@ private struct CompoundClipView: View {
         HStack(spacing: 0) {
             if startIdx > 0 { Color.clear.frame(width: thumbW * CGFloat(startIdx), height: clipH) }
             ForEach(startIdx..<endIdx, id: \.self) { i in
-                let t = clip.duration * Double(i) / Double(count)
+                // 里面的视频是倒放的话，缩略图也得倒着排（跟画面走）
+                let idx = reversed ? (count - 1 - i) : i
+                let t = clip.duration * Double(idx) / Double(count)
                 let frame = frames.min(by: { abs($0.time - t) < abs($1.time - t) }) ?? frames[0]
                 Image(nsImage: frame.image).resizable().aspectRatio(contentMode: .fill)
                     .frame(width: i == count - 1 ? clipWidth - thumbW * CGFloat(count - 1) : thumbW, height: clipH)
@@ -4700,6 +4818,26 @@ private struct TranslateToolGroup: View {
 
     // MARK: - 翻译逻辑
 
+    /// 这批字幕是不是**基本上**已经是目标语言了 —— 是就别翻。
+    ///
+    /// 按多数判而不是"一条都不能有"：语言识别对短句、人名、数字、中英混排都不可靠，
+    /// 一整轨中文里混一条 "Jony Ive" 就会被判成需要翻译，结果拉出一条几乎全是原文的新轨
+    /// （非目标语言的条目在 Translator.translate 那层还会被逐条挡回原文）。
+    /// 需要翻的不到两成就当作不用翻
+    private func mostlyAlreadyTarget(_ texts: [String], lang: String) -> Bool {
+        let meaningful = texts.filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        guard !meaningful.isEmpty else { return true }
+        let need = meaningful.filter { text in
+            // 简繁差异也算「需要处理」：isAlreadyTarget 对 4 字以下一律返回"已是目标"，
+            // 只看它的话，一整轨简体短句想转繁体会被当成"无需翻译"直接拒掉
+            if let converted = Translator.localChineseConvert(text, to: lang) {
+                return converted != text
+            }
+            return !Translator.isAlreadyTarget(text, lang: lang)
+        }.count
+        return Double(need) / Double(meaningful.count) <= 0.2
+    }
+
     /// 确定要翻译的源轨道 index
     private func sourceTrackIndex() -> Int? {
         let count = project.subtitleTracks.count
@@ -4725,36 +4863,75 @@ private struct TranslateToolGroup: View {
         return srcIdx
     }
 
-    private func translateCurrent() {
-        guard let srcIdx = sourceTrackIndex() else { return }
+    /// 一条待翻译的字幕：文本 + 它该回填到哪条翻译轨的哪个占位片段。
+    /// 跨轨多选时每条源轨各有自己的翻译轨，所以目标轨要跟着每一条走
+    private struct TranslateItem {
+        let text: String
+        let start: Double
+        let end: Double
+        let destTrackID: UUID
+        let placeholderID: UUID
+    }
 
+    private func translateCurrent() {
         var allSelectedIDs = project.selectedClipIDs
         if let pid = project.selectedSubtitleClipID { allSelectedIDs.insert(pid) }
-        let srcClips = project.subtitleTracks[srcIdx].clips
-        let clips = srcClips.filter { allSelectedIDs.contains($0.id) }
-            .sorted { $0.startTime < $1.startTime }
-        guard !clips.isEmpty else { return }
+
+        // 按**源轨道**分组收集选中的字幕。
+        // 原来这里先用 sourceTrackIndex() 锁死一条轨、再从那条轨里 filter，
+        // 跨轨多选时其余轨道的选中项被静默丢掉，表现为「只有第一条被翻译」
+        var groups: [(srcTrackID: UUID, clips: [SubtitleClip])] = []
+        for track in project.subtitleTracks {
+            let picked = track.clips.filter { allSelectedIDs.contains($0.id) }
+                .sorted { $0.startTime < $1.startTime }
+            if !picked.isEmpty { groups.append((track.id, picked)) }
+        }
+        guard !groups.isEmpty else { return }
 
         let lang = project.translationTargetLang
-        project.pushUndo()
-        let destIdx = createTranslationTrack(before: srcIdx)
-        let destTrackID = project.subtitleTracks[destIdx].id
 
-        var placeholders: [SubtitleClip] = []
-        for c in clips {
-            let ph = SubtitleClip(text: "", startTime: c.startTime, endTime: c.endTime)
-            placeholders.append(ph)
-            project.placeholderClipIDs.insert(ph.id)
+        // 原文已经就是目标语言 → 提前退出：不建翻译轨、不亮进度卡片、不占撤销栈。
+        // （只在 Translator.translate 里挡住请求是不够的，那时轨道和占位都建好了，
+        // 表现就是"点了翻译，进度条闪一下，多出一条内容一模一样的轨"）
+        guard !mostlyAlreadyTarget(groups.flatMap { $0.clips.map(\.text) }, lang: lang) else {
+            project.showSuccessToast(icon: "checkmark", title: "翻译",
+                                     subtitle: "已经是目标语言，无需翻译")
+            return
         }
-        project.subtitleTracks[destIdx].clips = placeholders
-        project.translatingTrackIDs.insert(destTrackID)
-        project.translationTotal = clips.count
+
+        project.pushUndo()
+
+        // 每条源轨各建一条翻译轨。插入会让后面的 index 整体后移，
+        // 所以每次都按 ID 重新定位源轨，不能缓存 index
+        var items: [TranslateItem] = []
+        var destTrackIDs: [UUID] = []
+        for g in groups {
+            guard let srcIdx = project.subtitleTracks.firstIndex(where: { $0.id == g.srcTrackID }) else { continue }
+            let destIdx = createTranslationTrack(before: srcIdx)
+            let destTrackID = project.subtitleTracks[destIdx].id
+            destTrackIDs.append(destTrackID)
+
+            var placeholders: [SubtitleClip] = []
+            for c in g.clips {
+                let ph = SubtitleClip(text: "", startTime: c.startTime, endTime: c.endTime)
+                placeholders.append(ph)
+                project.placeholderClipIDs.insert(ph.id)
+                items.append(TranslateItem(text: c.text, start: c.startTime, end: c.endTime,
+                                           destTrackID: destTrackID, placeholderID: ph.id))
+            }
+            project.subtitleTracks[destIdx].clips = placeholders
+            project.translatingTrackIDs.insert(destTrackID)
+        }
+        guard !items.isEmpty else { return }
+
+        project.translationTotal = items.count
         project.translationDone = 0
         project.translationProgress = 0
 
+        TranslateDiagnostics.reset()   // 别把上一轮的失败原因带到这次提示里
         project.translationTask = Task {
-            let total = clips.count
-            let texts = clips.map(\.text)
+            let total = items.count
+            let texts = items.map(\.text)
 
             // 批量：15 条合并成一次请求，最多 4 路并发。
             // 原来是**每条一个请求、6 路并发**，选中几百条字幕就是几百个请求打过去，
@@ -4762,7 +4939,7 @@ private struct TranslateToolGroup: View {
             // 于是前一部分翻好了、后面全是原文，界面还显示"翻译完成"。
             // 合并之后请求数掉一个数量级，Translator.translate 里也加了退避重试
             let translated = await Translator.translateConcurrent(
-                texts, to: lang, batchSize: 15, concurrency: 4,
+                texts, to: lang, batchSize: 15, concurrency: Translator.recommendedConcurrency,
                 onProgress: { done in
                     await MainActor.run {
                         guard project.translationTask != nil else { return }
@@ -4771,19 +4948,21 @@ private struct TranslateToolGroup: View {
                     }
                 },
                 onBatch: { offset, batch in
-                    // 一批翻完就回填一批，不用等全部结束
+                    // 一批翻完就回填一批，不用等全部结束。
+                    // 一批里的条目可能分属不同的翻译轨（跨轨多选），所以逐条按自己的
+                    // destTrackID 定位，不能在循环外一次性取轨道
                     await MainActor.run {
                         guard project.translationTask != nil else { return }
-                        guard let ti = project.subtitleTracks.firstIndex(where: { $0.id == destTrackID }) else { return }
                         for (j, t) in batch.enumerated() {
                             let i = offset + j
-                            guard i < clips.count else { break }
-                            let phID = placeholders[i].id
-                            if let ci = project.subtitleTracks[ti].clips.firstIndex(where: { $0.id == phID }) {
+                            guard i < items.count else { break }
+                            let item = items[i]
+                            if let ti = project.subtitleTracks.firstIndex(where: { $0.id == item.destTrackID }),
+                               let ci = project.subtitleTracks[ti].clips.firstIndex(where: { $0.id == item.placeholderID }) {
                                 project.subtitleTracks[ti].clips[ci] = SubtitleClip(
-                                    text: t, startTime: clips[i].startTime, endTime: clips[i].endTime)
+                                    text: t, startTime: item.start, endTime: item.end)
                             }
-                            project.placeholderClipIDs.remove(phID)
+                            project.placeholderClipIDs.remove(item.placeholderID)
                         }
                     }
                 })
@@ -4793,15 +4972,29 @@ private struct TranslateToolGroup: View {
             // 以前这种情况完全无感，只能靠肉眼一条条发现
             let failed = zip(texts, translated).filter { $0 == $1 && !$0.trimmingCharacters(in: .whitespaces).isEmpty }.count
             await MainActor.run {
-                project.translatingTrackIDs.remove(destTrackID)
+                for id in destTrackIDs { project.translatingTrackIDs.remove(id) }
+                // 一条都没翻成 → 把刚建的翻译轨收掉，撤销栈里那步也弹掉。
+                // 留一条内容全是原文的空壳轨没有意义，还得用户手动删
+                if failed == total {
+                    for id in destTrackIDs {
+                        project.subtitleTracks.removeAll { $0.id == id }
+                        project.overlayTrackOrder.removeAll { $0 == .subtitle(id) }
+                    }
+                    project.popUndo()
+                }
                 project.translationTotal = 0
                 project.translationDone = 0
                 project.translationProgress = 0
                 project.translationTask = nil
                 if failed > 0 {
+                    // 完成情况放标题、原因放副标题 —— 都塞进 subtitle 会被气泡截断，
+                    // 恰好把最有用的失败原因截没了。
+                    // 全军覆没时翻译轨已经被收掉了，就别再说"完成 0/N"
                     project.showSuccessToast(icon: "exclamationmark.triangle", iconColor: .orange,
-                                             title: "翻译",
-                                             subtitle: "完成 \(total - failed)/\(total) 条，\(failed) 条未成功（可能被限流，稍后重试这几条）",
+                                             title: failed == total
+                                                 ? "翻译失败"
+                                                 : "翻译完成 \(total - failed)/\(total) 条，\(failed) 条未成功",
+                                             subtitle: TranslateDiagnostics.lastFailureHint ?? "可能被限流，稍后重试这几条",
                                              autoCountdown: false)
                 } else {
                     project.showSuccessToast(icon: "checkmark", title: "翻译", subtitle: "翻译完成")
@@ -4815,6 +5008,14 @@ private struct TranslateToolGroup: View {
         let lang = project.translationTargetLang
         let originals = project.subtitleTracks[srcIdx].clips
         guard !originals.isEmpty else { return }
+
+        // 同 translateCurrent：整轨已经是目标语言就别建轨、别亮进度
+        guard !mostlyAlreadyTarget(originals.map(\.text), lang: lang) else {
+            project.showSuccessToast(icon: "checkmark", title: "翻译",
+                                     subtitle: "已经是目标语言，无需翻译")
+            return
+        }
+
         project.pushUndo()
         let destIdx = createTranslationTrack(before: srcIdx)
         let destTrackID = project.subtitleTracks[destIdx].id
@@ -4831,10 +5032,12 @@ private struct TranslateToolGroup: View {
         project.translationDone = 0
         project.translationProgress = 0
 
+        TranslateDiagnostics.reset()   // 别把上一轮的失败原因带到这次提示里
         project.translationTask = Task {
-            let maxConcurrent = 6
+            let maxConcurrent = Translator.recommendedConcurrency
             let total = originals.count
             var done = 0
+            var failed = 0
             await withTaskGroup(of: (Int, String).self) { group in
                 var nextIdx = 0
                 for _ in 0..<min(maxConcurrent, total) {
@@ -4845,6 +5048,11 @@ private struct TranslateToolGroup: View {
                 for await (i, translated) in group {
                     guard !Task.isCancelled else { return }
                     done += 1
+                    // 结果跟原文一字不差 = 这条没翻成（各引擎失败时都返回原文）
+                    if translated == originals[i].text,
+                       !originals[i].text.trimmingCharacters(in: .whitespaces).isEmpty {
+                        failed += 1
+                    }
                     await MainActor.run {
                         guard project.translationTask != nil else { return }
                         guard let ti = project.subtitleTracks.firstIndex(where: { $0.id == destTrackID }) else { return }
@@ -4867,11 +5075,29 @@ private struct TranslateToolGroup: View {
             guard !Task.isCancelled else { return }
             await MainActor.run {
                 project.translatingTrackIDs.remove(destTrackID)
+                // 同上：整轨一条都没翻成就别留这条轨
+                if failed == total {
+                    project.subtitleTracks.removeAll { $0.id == destTrackID }
+                    project.overlayTrackOrder.removeAll { $0 == .subtitle(destTrackID) }
+                    project.popUndo()
+                }
                 project.translationTotal = 0
                 project.translationDone = 0
                 project.translationProgress = 0
                 project.translationTask = nil
-                project.showSuccessToast(icon: "checkmark", title: "翻译", subtitle: "翻译完成")
+                if failed > 0 {
+                    // 完成情况放标题、原因放副标题 —— 都塞进 subtitle 会被气泡截断，
+                    // 恰好把最有用的失败原因截没了。
+                    // 全军覆没时翻译轨已经被收掉了，就别再说"完成 0/N"
+                    project.showSuccessToast(icon: "exclamationmark.triangle", iconColor: .orange,
+                                             title: failed == total
+                                                 ? "翻译失败"
+                                                 : "翻译完成 \(total - failed)/\(total) 条，\(failed) 条未成功",
+                                             subtitle: TranslateDiagnostics.lastFailureHint ?? "可能被限流，稍后重试这几条",
+                                             autoCountdown: false)
+                } else {
+                    project.showSuccessToast(icon: "checkmark", title: "翻译", subtitle: "翻译完成")
+                }
             }
         }
     }

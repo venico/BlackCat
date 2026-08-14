@@ -1,5 +1,6 @@
 import SwiftUI
 import AVFoundation
+import CryptoKit
 
 // MARK: - File Import + Transcode
 
@@ -391,7 +392,49 @@ extension ProjectState {
     }
 
     /// 同步执行 FFmpeg 命令，返回是否成功
-    static func runFFmpegSync(ffmpeg: URL, arguments: [String]) -> Bool {
+    // 在跑的 ffmpeg 子进程。父进程退出不会带走子进程 —— 不登记就没法收拾，
+    // 表现是「关掉软件/关掉窗口，倒放还在后台生成」。
+    // owner 是发起项目的标记：关一个窗口只收它自己的，别的窗口的任务不能误杀
+    private static let ffmpegProcLock = NSLock()
+    private static var liveFFmpegProcs: [(proc: Process, owner: UUID?)] = []
+
+    /// 退出 app 时把所有在跑的 ffmpeg 一起收掉
+    static func killAllFFmpeg() {
+        ffmpegProcLock.lock()
+        let procs = liveFFmpegProcs.map(\.proc)
+        liveFFmpegProcs.removeAll()
+        ffmpegProcLock.unlock()
+        for p in procs where p.isRunning { p.terminate() }
+    }
+
+    /// 关窗时只收这个项目起的
+    static func killFFmpeg(owner: UUID) {
+        ffmpegProcLock.lock()
+        let procs = liveFFmpegProcs.filter { $0.owner == owner }.map(\.proc)
+        liveFFmpegProcs.removeAll { $0.owner == owner }
+        ffmpegProcLock.unlock()
+        for p in procs where p.isRunning { p.terminate() }
+    }
+
+    /// 关窗时收掉本项目所有后台活儿。
+    ///
+    /// 光 terminate 进程不够 —— generateReversedVideo 见 ok == false 会当成"失败"，
+    /// 紧接着起一个无音频版本重试，看着就是「关了窗还在生成」。
+    /// 预览重建的 debounce/Task 也要一起停，否则它会再唤起一轮倒放。
+    func killMyFFmpeg() {
+        isShutDown = true
+        ffmpegCancelled = true
+        rebuildDebounceTimer?.invalidate()
+        rebuildDebounceTimer = nil
+        rebuildTask?.cancel()
+        sceneDetectTask?.cancel()
+        sceneDetectTask = nil
+        SceneDetector.killCurrentProcess()
+        Self.killFFmpeg(owner: ffmpegOwnerID)
+        isReversingVideo = false
+    }
+
+    static func runFFmpegSync(ffmpeg: URL, arguments: [String], owner: UUID? = nil) -> Bool {
         let proc = Process()
         proc.executableURL = ffmpeg
         proc.arguments = arguments
@@ -399,7 +442,13 @@ extension ProjectState {
         proc.standardError = FileHandle.nullDevice
         do {
             try proc.run()
+            ffmpegProcLock.lock()
+            liveFFmpegProcs.append((proc, owner))
+            ffmpegProcLock.unlock()
             proc.waitUntilExit()
+            ffmpegProcLock.lock()
+            liveFFmpegProcs.removeAll { $0.proc === proc }
+            ffmpegProcLock.unlock()
             return proc.terminationStatus == 0
         } catch {
             return false
@@ -447,17 +496,36 @@ extension ProjectState {
         return nil
     }
 
+    /// 跨进程稳定的哈希。**不能用 hashValue** —— Swift 每次启动的种子不同，
+    /// 同一个 key 在下次打开时会算出完全不一样的值，缓存就永远命不中
+    static func stableKeyHash(_ s: String) -> String {
+        SHA256.hash(data: Data(s.utf8)).prefix(12)
+            .map { String(format: "%02x", $0) }.joined()
+    }
+
     // MARK: - 倒放视频预处理（ffmpeg reverse）
 
     func generateReversedVideo(inputURL: URL, trimStart: Double, srcDurSec: Double) async -> URL? {
+        guard !isShutDown else { return nil }   // 窗口已关，不再起新的生成
         let key = "\(inputURL.path)|\(trimStart)|\(srcDurSec)"
         if let cached = reversedVideoCache[key], FileManager.default.fileExists(atPath: cached.path) {
             return cached
         }
+        // 文件名按「源路径 + 区间」算，同样的片段永远落到同一个文件 ——
+        // 以前带随机 UUID，关掉项目再打开就认不出来，只能重新生成一遍
+        // （倒放片段不生成完就没法播，表现成"一打开又在生成"）
+        let destURL = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("bc_rev_\(Self.stableKeyHash(key)).mp4")
+        if FileManager.default.fileExists(atPath: destURL.path) {
+            reversedVideoCache[key] = destURL
+            return destURL
+        }
         guard let ffmpeg = Self.findFFmpeg() else { return nil }
         DispatchQueue.main.async { [weak self] in self?.isReversingVideo = true }
+        // 先写到临时名，成功了再挪到稳定名 —— 中途被取消/失败留下的半截文件
+        // 不会占着稳定名，下次打开才不会拿它当成品
         let tmpURL = URL(fileURLWithPath: NSTemporaryDirectory())
-            .appendingPathComponent("bc_rev_\(UUID().uuidString).mp4")
+            .appendingPathComponent("bc_rev_work_\(UUID().uuidString).mp4")
         let ss = max(0, trimStart)
         var args = ["-y"]
         if ss > 0.001 { args += ["-ss", String(format: "%.6f", ss)] }
@@ -466,9 +534,16 @@ extension ProjectState {
         args += ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "18"]
         args += ["-c:a", "aac", "-ar", "44100", "-ac", "2"]
         args += [tmpURL.path]
+        let ownerID = ffmpegOwnerID
+        ffmpegCancelled = false
         var ok = await Task.detached(priority: .userInitiated) {
-            Self.runFFmpegSync(ffmpeg: ffmpeg, arguments: args)
+            Self.runFFmpegSync(ffmpeg: ffmpeg, arguments: args, owner: ownerID)
         }.value
+        // 被关窗收掉的，别当成"生成失败"去重试
+        if ffmpegCancelled {
+            isReversingVideo = false
+            return nil
+        }
         if !ok {
             let argsNoAudio = ["-y"] +
                 (ss > 0.001 ? ["-ss", String(format: "%.6f", ss)] : []) +
@@ -477,14 +552,27 @@ extension ProjectState {
                  "-c:v", "libx264", "-preset", "ultrafast", "-crf", "18",
                  tmpURL.path]
             ok = await Task.detached(priority: .userInitiated) {
-                Self.runFFmpegSync(ffmpeg: ffmpeg, arguments: argsNoAudio)
+                Self.runFFmpegSync(ffmpeg: ffmpeg, arguments: argsNoAudio, owner: ownerID)
             }.value
         }
         DispatchQueue.main.async { [weak self] in self?.isReversingVideo = false }
-        if ok {
-            reversedVideoCache[key] = tmpURL
-            return tmpURL
+        if ffmpegCancelled {
+            try? FileManager.default.removeItem(at: tmpURL)
+            return nil
         }
+        if ok {
+            try? FileManager.default.removeItem(at: destURL)
+            do {
+                try FileManager.default.moveItem(at: tmpURL, to: destURL)
+            } catch {
+                // 挪不过去就将就用临时文件，只是下次打开还得重生成
+                reversedVideoCache[key] = tmpURL
+                return tmpURL
+            }
+            reversedVideoCache[key] = destURL
+            return destURL
+        }
+        try? FileManager.default.removeItem(at: tmpURL)
         DispatchQueue.main.async { [weak self] in
             self?.showSuccessToast(icon: "xmark.circle.fill", iconColor: .red,
                                    title: "倒放", subtitle: "生成失败", autoCountdown: false)

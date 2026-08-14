@@ -18,6 +18,16 @@ extension ProjectState {
         scheduleAutoSave()
     }
 
+    /// 撤下最近一次 `pushUndo()` 压进去的快照。
+    ///
+    /// 给"操作最终没做成、要连痕迹一起收掉"的场景用（如翻译整批失败后删掉刚建的翻译轨）——
+    /// 不弹的话撤销栈里会留一步"什么都没变"的记录，用户按 ⌘Z 像是没反应
+    func popUndo() {
+        guard !undoStack.isEmpty else { return }
+        undoStack.removeLast()
+        undoCount = undoStack.count
+    }
+
     func pushUndoSavingAssets() {
         var snap = currentSnapshot()
         snap.mediaAssets = mediaAssets
@@ -135,23 +145,29 @@ extension ProjectState {
                 if let ci = videoTracks[ti].clips.firstIndex(where: { $0.id == id }) {
                     let c = videoTracks[ti].clips[ci]
                     if c.startTime + 0.01 < t && c.endTime - 0.01 > t {
+                        let splitOffset = t - c.startTime
                         videoTracks[ti].clips[ci].endTime = t
-                        var newClip = VideoClip(
-                            assetID: c.assetID, name: c.name, url: c.url,
-                            startTime: t, endTime: c.endTime,
-                            // 分割点在时间轴上的偏移 * speed = 源素材消耗量
-                            trimStart: c.trimStart + (t - c.startTime) * c.speed,
-                            overrideResolution: c.overrideResolution,
-                            overrideFPS: c.overrideFPS,
-                            overrideBitrate: c.overrideBitrate)
-                        newClip.volume = c.volume
-                        newClip.speed = c.speed   // 继承速率
-                        newClip.videoWidth = c.videoWidth; newClip.videoHeight = c.videoHeight
-                        newClip.scaleX = c.scaleX; newClip.scaleY = c.scaleY
-                        newClip.lockAspect = c.lockAspect
-                        newClip.offsetX = c.offsetX; newClip.offsetY = c.offsetY
-                        newClip.cropTop = c.cropTop; newClip.cropBottom = c.cropBottom
-                        newClip.cropLeft = c.cropLeft; newClip.cropRight = c.cropRight
+                        // 整体复制再改必要字段。原来是逐字段手抄，colorAdjust、mirrorH/V、
+                        // rotation、reversed、audioTrackIndex 全漏了 —— 表现就是
+                        // 「片段变色后分割，只有前半段还留着变色」。图片/文字/图形那几路
+                        // 本来就是这么复制的，这里跟上，以后 VideoClip 加字段也不会再漏
+                        var newClip = c
+                        newClip.id = UUID()
+                        newClip.startTime = t
+                        newClip.endTime = c.endTime
+                        // 分割点在时间轴上的偏移 * speed = 源素材消耗量
+                        newClip.trimStart = c.trimStart + splitOffset * c.speed
+                        // 入场转场属于原片段的开头，右半段不该凭空多出一个
+                        newClip.inTransition = nil
+                        // 标记按落点各归各家。time 是相对片段起点的偏移
+                        // （clipMarkerPins 里 absTime = clip.startTime + m.time）
+                        videoTracks[ti].clips[ci].markers = c.markers?.filter { $0.time <= splitOffset }
+                        newClip.markers = c.markers?.compactMap { m in
+                            guard m.time > splitOffset else { return nil }
+                            var moved = m
+                            moved.time = m.time - splitOffset
+                            return moved
+                        }
                         videoTracks[ti].clips.insert(newClip, at: ci + 1)
                         changed = true
                     }
@@ -1439,11 +1455,17 @@ extension ProjectState {
                 }
                 await MainActor.run { applySceneCuts(trackIdx: trackIdx, clipIdx: clipIdx, clip: c, cuts: cuts) }
             } catch {
+                // 用户点取消时 cancelSceneDetect 已经弹过「已停止」，进程被 kill 又会
+                // 从这里抛出 CancellationError —— 再弹一张就成了「已停止 + 失败」两张卡，
+                // 而且失败那张显示的是 CancellationError 的英文描述
+                if error is CancellationError || Task.isCancelled { return }
                 await MainActor.run {
                     isDetectingScenes = false
                     sceneDetectProgress = 0
                     showSuccessToast(icon: "xmark.circle.fill", iconColor: .red,
-                                     title: "智能分割", subtitle: error.localizedDescription, autoCountdown: false)
+                                     title: "智能分割",
+                                     subtitle: "智能分割失败（\(error.localizedDescription)）",
+                                     autoCountdown: false)
                 }
             }
         }

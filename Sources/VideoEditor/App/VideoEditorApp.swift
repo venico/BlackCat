@@ -5,10 +5,19 @@ import UniformTypeIdentifiers
 public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var isCleaningMenus = false
     private var cleanupTimer: Timer?
-    /// Finder 双击 bcj 文件时暂存 URL，等 view 就绪后再打开
-    public static var pendingOpenURL: URL?
+    /// Finder 双击 bcj 冷启动时暂存 URL，交给 `createWindow()` 开窗。
+    ///
+    /// 实测时序：`application(_:open:)` 比 `applicationDidFinishLaunching` **早 1ms**。
+    /// 如果 open 那边直接开窗，紧接着 createWindow() 会因为这里是空的再开一个欢迎页 ——
+    /// 双击一个项目文件却弹出两个窗口。所以启动阶段只暂存，开窗统一由 createWindow() 做
+    public static var pendingOpenURLs: [URL] = []
+
+    /// applicationDidFinishLaunching 是否已经跑过。用来区分
+    /// 「冷启动时双击文件」和「app 已经在跑，再双击一个文件」两种情况
+    private var didFinishLaunching = false
 
     public func applicationDidFinishLaunching(_ notification: Notification) {
+        didFinishLaunching = true
         // 启动即写一条，保证诊断日志文件必然存在（版本/构建时间在 header 里）
         DiagLog.log("[启动] app 启动完成")
         setupMenuBar()
@@ -31,12 +40,14 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate 
         // 窗口的创建/跟踪都归 WindowManager——多窗口下 AppDelegate 不再持有
         // 某一个特定窗口，菜单命令按当前 key window 路由
         Task { @MainActor in
-            if let url = AppDelegate.pendingOpenURL {
-                AppDelegate.pendingOpenURL = nil
-                WindowManager.shared.newWindow(.openProject(url))
-            } else {
+            let pending = AppDelegate.pendingOpenURLs
+            AppDelegate.pendingOpenURLs = []
+            if pending.isEmpty {
                 // 冷启动是**唯一**显示欢迎页的时机
                 WindowManager.shared.newWindow(.welcome)
+            } else {
+                // 双击文件启动的：直接进项目，不要先闪一下欢迎页
+                for url in pending { WindowManager.shared.newWindow(.openProject(url)) }
             }
         }
     }
@@ -293,7 +304,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate 
     @objc private func showAbout() {
         NSApp.orderFrontStandardAboutPanel(options: [
             .applicationName: "黑猫剪辑",
-            .applicationVersion: "4.6.0",
+            .applicationVersion: "4.6.5",
             .version: "",
             .credits: NSAttributedString(string: "")
         ])
@@ -301,10 +312,28 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate 
 
     public func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
 
+    public func applicationWillTerminate(_ notification: Notification) {
+        // 子进程不会跟着父进程死。不收拾的话倒放/变速/转码的 ffmpeg 会变成孤儿
+        // 继续跑完，用户看到的是「关了软件它还在生成」
+        ProjectState.killAllFFmpeg()
+        SceneDetector.killCurrentProcess()
+    }
+
     // 处理 Finder 双击 .bcj 文件打开
     public func application(_ application: NSApplication, open urls: [URL]) {
+        let bcjs = urls.filter { $0.pathExtension.lowercased() == "bcj" }
+        guard !bcjs.isEmpty else { return }
+        DiagLog.log("[启动] 收到 open urls：\(bcjs.map(\.lastPathComponent).joined(separator: ", "))")
+
+        // 冷启动双击文件：这里比 applicationDidFinishLaunching 早到，
+        // 自己开窗的话紧接着还会多出一个欢迎页。交给 createWindow() 统一开
+        guard didFinishLaunching else {
+            AppDelegate.pendingOpenURLs.append(contentsOf: bcjs)
+            return
+        }
+
         Task { @MainActor in
-            for url in urls where url.pathExtension.lowercased() == "bcj" {
+            for url in bcjs {
                 // 同一个项目已经开着就聚焦过去，不要开第二个窗口——
                 // 两个窗口各自编辑同一份文件，后保存的那个会覆盖另一个
                 if let (_, existing) = WindowManager.shared.existingWindow(for: url) {

@@ -40,54 +40,45 @@ extension ProjectState {
         saveProject(silent: true)
     }
 
+    /// 打开项目失败时的提示。测试环境下只写日志——没人点「确定」的话
+    /// `runModal()` 会永久阻塞主线程，把整套测试卡死（见 DiagLog.isUnitTesting）
+    private func reportOpenFailure(_ title: String, _ detail: String) {
+        guard !DiagLog.isUnitTesting else {
+            DiagLog.log("[打开项目] \(title)：\(detail)")
+            return
+        }
+        DispatchQueue.main.async {
+            let alert = NSAlert()
+            alert.alertStyle = .warning
+            alert.messageText = title
+            alert.informativeText = detail
+            alert.addButton(withTitle: "确定")
+            alert.runModal()
+        }
+    }
+
     func openProject(url: URL) {
         // 检查文件是否存在
         guard FileManager.default.fileExists(atPath: url.path) else {
-            DispatchQueue.main.async {
-                let alert = NSAlert()
-                alert.alertStyle = .warning
-                alert.messageText = "无法打开项目"
-                alert.informativeText = "文件不存在：\(url.lastPathComponent)\n路径：\(url.path)"
-                alert.addButton(withTitle: "确定")
-                alert.runModal()
-            }
+            reportOpenFailure("无法打开项目",
+                              "文件不存在：\(url.lastPathComponent)\n路径：\(url.path)")
             return
         }
 
         guard url.startAccessingSecurityScopedResource() else {
-            DispatchQueue.main.async {
-                let alert = NSAlert()
-                alert.alertStyle = .warning
-                alert.messageText = "无法访问项目文件"
-                alert.informativeText = "系统安全权限不足，请重新选择文件或检查权限设置。\n路径：\(url.path)"
-                alert.addButton(withTitle: "确定")
-                alert.runModal()
-            }
+            reportOpenFailure("无法访问项目文件",
+                              "系统安全权限不足，请重新选择文件或检查权限设置。\n路径：\(url.path)")
             return
         }
         accessedURLs.append(url)
         defer { /* keep access alive */ }
 
         guard let data = try? Data(contentsOf: url) else {
-            DispatchQueue.main.async {
-                let alert = NSAlert()
-                alert.alertStyle = .warning
-                alert.messageText = "无法读取项目"
-                alert.informativeText = "文件可能已损坏：\(url.lastPathComponent)"
-                alert.addButton(withTitle: "确定")
-                alert.runModal()
-            }
+            reportOpenFailure("无法读取项目", "文件可能已损坏：\(url.lastPathComponent)")
             return
         }
         guard let doc = try? JSONDecoder().decode(ProjectDocument.self, from: data) else {
-            DispatchQueue.main.async {
-                let alert = NSAlert()
-                alert.alertStyle = .warning
-                alert.messageText = "无法解析项目"
-                alert.informativeText = "文件格式不正确：\(url.lastPathComponent)"
-                alert.addButton(withTitle: "确定")
-                alert.runModal()
-            }
+            reportOpenFailure("无法解析项目", "文件格式不正确：\(url.lastPathComponent)")
             return
         }
 
@@ -173,6 +164,11 @@ extension ProjectState {
     }
 
     func saveProject(silent: Bool = false) {
+        // 测试环境下弹保存面板同样会卡死主线程，直接放弃这次保存
+        if projectFileURL == nil && !silent && DiagLog.isUnitTesting {
+            DiagLog.log("[保存项目] 测试环境跳过 NSSavePanel，未保存")
+            return
+        }
         if projectFileURL == nil && !silent {
             let panel = NSSavePanel()
             panel.title = "保存项目"
@@ -230,6 +226,8 @@ extension ProjectState {
                 showSuccessToast(icon: "xmark.circle.fill", iconColor: .red,
                                  title: "自动保存失败",
                                  subtitle: error.localizedDescription)
+            } else if DiagLog.isUnitTesting {
+                DiagLog.log("[保存项目] 保存失败：\(error.localizedDescription)")
             } else {
                 let alert = NSAlert()
                 alert.alertStyle = .critical

@@ -27,7 +27,6 @@ struct WhisperModelPickerSheet: View {
             .padding(.top, 20)
             .padding(.bottom, 16)
 
-            Divider().background(Color.divider)
 
             // Content
             VStack(alignment: .leading, spacing: 12) {
@@ -44,7 +43,6 @@ struct WhisperModelPickerSheet: View {
             .padding(.horizontal, 24)
             .padding(.vertical, 16)
 
-            Divider().background(Color.divider)
 
             // Action row
             HStack(spacing: 16) {

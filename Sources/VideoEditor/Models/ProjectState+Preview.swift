@@ -10,6 +10,7 @@ extension ProjectState {
     /// Debounced rebuild — coalesces rapid changes (e.g. dragging sliders)
     /// into a single rebuild after a short delay, preventing flicker.
     func rebuildTimelinePreviewDebounced() {
+        guard !isShutDown else { return }
         rebuildDebounceTimer?.invalidate()
         rebuildDebounceTimer = Timer.scheduledTimer(withTimeInterval: 0.15, repeats: false) { [weak self] _ in
             self?.rebuildTimelinePreview()
@@ -20,6 +21,8 @@ extension ProjectState {
     /// playerItem. If `seekTo` is given, also seeks to that time after load.
     /// Gaps between clips are rendered black by AVPlayer automatically.
     func rebuildTimelinePreview(seekTo: Double? = nil) {
+        // 窗口关了就别再重建 —— 重建会连带把倒放/变速的 ffmpeg 又拉起来
+        guard !isShutDown else { return }
         // Snapshot the clip arrays so the async task captures stable values.
         let vTracks = videoTracks
         let iTracks = imageTracks
@@ -149,6 +152,12 @@ extension ProjectState {
                                                                 preferredTrackID: kCMPersistentTrackID_Invalid) {
                             try? vt.insertTimeRange(CMTimeRange(start: effTrimSt, duration: effSrcDur),
                                                     of: vAsset, at: at)
+                            // 素材自带方向存到 composition track 上，构建 entry 时读出来
+                            // 交给 ColorCompositor 自己应用（倒放生成的文件已经是正的，
+                            // 它的 preferredTransform 就是 identity，天然不会重复转）
+                            if let stf = try? await vAsset.load(.preferredTransform) {
+                                vt.preferredTransform = stf
+                            }
                             if abs(speed - 1.0) > 0.001 {
                                 let compRange = CMTimeRange(start: at, duration: effSrcDur)
                                 vt.scaleTimeRange(compRange, toDuration: CMTime(seconds: targetDurSec, preferredTimescale: 600))
@@ -592,6 +601,7 @@ extension ProjectState {
                             mirrorV:     clip.mirrorV,
                             rotation:    clip.rotation,
                             naturalSize: natSize,
+                            sourceTransform: (try? await entry.track.load(.preferredTransform)) ?? .identity,
                             opacityRamp: nil,
                             pushRamp:    nil)
                         // 转场渐变
@@ -752,25 +762,69 @@ extension ProjectState {
 
     // MARK: - Video transform helpers
 
-    static func videoTransform(clip: VideoClip, natSize: CGSize, renderSize: CGSize) -> CGAffineTransform {
+    /// 导出用的视频变换，和预览的 ColorCompositor 走同一条链路：
+    /// **素材方向 → 用户旋转/镜像 → fit(按最终朝向)**。
+    ///
+    /// 以前这里只有 scale + translate，两样都缺：竖拍视频不转正（画布竖的、画面横的），
+    /// 用户在预览里旋转过的视频导出来也是没转的。
+    static func videoTransform(clip: VideoClip, natSize: CGSize, renderSize: CGSize,
+                               sourceTransform: CGAffineTransform = .identity) -> CGAffineTransform {
         guard natSize.width > 0, natSize.height > 0 else {
             return CGAffineTransform(scaleX: 0, y: 0)
         }
-        let baseScale = min(renderSize.width / natSize.width, renderSize.height / natSize.height)
+
+        // ① 素材自带方向（手机竖拍），转正后把画面挪回原点
+        let orientedRect = CGRect(origin: .zero, size: natSize).applying(sourceTransform)
+        let orientedSize = orientedRect.size
+        guard orientedSize.width > 0, orientedSize.height > 0 else {
+            return CGAffineTransform(scaleX: 0, y: 0)
+        }
+        var m = sourceTransform.concatenating(
+            CGAffineTransform(translationX: -orientedRect.origin.x, y: -orientedRect.origin.y))
+
+        // ② 用户旋转 / 镜像，绕转正后画面的中心
+        var r = CGAffineTransform.identity
+        if clip.mirrorH || clip.mirrorV || clip.rotation != 0 {
+            let cx = orientedSize.width / 2, cy = orientedSize.height / 2
+            r = CGAffineTransform(translationX: -cx, y: -cy)
+            if clip.mirrorH { r = r.concatenating(CGAffineTransform(scaleX: -1, y: 1)) }
+            if clip.mirrorV { r = r.concatenating(CGAffineTransform(scaleX: 1, y: -1)) }
+            let rad = CGFloat(clip.rotation) * .pi / 180
+            if abs(rad) > 0.001 { r = r.concatenating(CGAffineTransform(rotationAngle: rad)) }
+            r = r.concatenating(CGAffineTransform(translationX: cx, y: cy))
+            m = m.concatenating(r)
+        }
+        let rotRect = CGRect(origin: .zero, size: orientedSize).applying(r)
+        m = m.concatenating(CGAffineTransform(translationX: -rotRect.origin.x,
+                                              y: -rotRect.origin.y))
+
+        // ③ fit：尺寸取最终朝向的（90°/270° 已经宽高互换），画面完整不变形
+        let fitSize = rotRect.size
+        let baseScale = min(renderSize.width / fitSize.width, renderSize.height / fitSize.height)
         let finalSX = baseScale * CGFloat(clip.scaleX)
         let finalSY = baseScale * CGFloat(clip.scaleY)
-        let tx = (renderSize.width  - natSize.width  * finalSX) / 2 + CGFloat(clip.offsetX) * renderSize.width
-        let ty = (renderSize.height - natSize.height * finalSY) / 2 + CGFloat(clip.offsetY) * renderSize.height
-        return CGAffineTransform(scaleX: finalSX, y: finalSY)
+        let tx = (renderSize.width  - fitSize.width  * finalSX) / 2 + CGFloat(clip.offsetX) * renderSize.width
+        let ty = (renderSize.height - fitSize.height * finalSY) / 2 + CGFloat(clip.offsetY) * renderSize.height
+        return m.concatenating(CGAffineTransform(scaleX: finalSX, y: finalSY))
             .concatenating(CGAffineTransform(translationX: tx, y: ty))
     }
 
-    static func videoCropRect(clip: VideoClip, natSize: CGSize) -> CGRect {
-        let x = natSize.width  * CGFloat(clip.cropLeft)
-        let y = natSize.height * CGFloat(clip.cropTop)
-        let w = natSize.width  * (1 - CGFloat(clip.cropLeft + clip.cropRight))
-        let h = natSize.height * (1 - CGFloat(clip.cropTop  + clip.cropBottom))
-        return CGRect(x: x, y: y, width: max(w, 1), height: max(h, 1))
+    /// 裁剪框。cropLeft/cropTop 说的是**用户在预览里看到的**左边和上边，
+    /// 所以先在转正后的画面里取框，再换算回源坐标 ——
+    /// `setCropRectangle` 是在 `setTransform` **之前**生效的，吃的是源坐标
+    static func videoCropRect(clip: VideoClip, natSize: CGSize,
+                              sourceTransform: CGAffineTransform = .identity) -> CGRect {
+        let orientedRect = CGRect(origin: .zero, size: natSize).applying(sourceTransform)
+        let ow = orientedRect.width, oh = orientedRect.height
+        let r = CGRect(x: ow * CGFloat(clip.cropLeft),
+                       y: oh * CGFloat(clip.cropTop),
+                       width:  max(ow * (1 - CGFloat(clip.cropLeft + clip.cropRight)), 1),
+                       height: max(oh * (1 - CGFloat(clip.cropTop  + clip.cropBottom)), 1))
+        guard !sourceTransform.isIdentity else { return r }
+        let backToSource = CGAffineTransform(translationX: orientedRect.origin.x,
+                                             y: orientedRect.origin.y)
+            .concatenating(sourceTransform.inverted())
+        return r.applying(backToSource)
     }
 
     // MARK: - Transition ramp helper

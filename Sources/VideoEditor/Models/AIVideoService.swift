@@ -808,7 +808,7 @@ final class AIVideoService: ObservableObject {
             }
 
             await MainActor.run {
-                updateAssistantStatus(.generating(progress: "生成中（\(status)）…"))
+                updateAssistantStatus(.generating(progress: "生成中…"))
             }
         }
         throw AIError.timeout
@@ -1007,7 +1007,7 @@ final class AIVideoService: ObservableObject {
             }
 
             await MainActor.run {
-                updateAssistantStatus(.generating(progress: "生成中（\(status)）…"))
+                updateAssistantStatus(.generating(progress: "生成中…"))
             }
         }
         throw AIError.timeout

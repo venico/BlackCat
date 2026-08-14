@@ -858,9 +858,15 @@ extension ProjectState {
 
     /// 在播放头处添加图形片段（无轨道则新建），并选中它。参照 addTextAtPlayhead。
     func addShapeAtPlayhead(type: ShapeType) {
+        addShape(type: type, at: currentTime)
+    }
+
+    /// 在指定时间插入图形。点击素材库图形卡片走播放头位置，
+    /// 从素材库拖到时间轴则走落点换算出来的时间
+    func addShape(type: ShapeType, at time: Double) {
         let snap = currentSnapshot()
-        let start = currentTime
-        let end   = currentTime + 2.0
+        let start = max(0, time)
+        let end   = start + 2.0
         let trackIdx: Int
         if shapeTracks.isEmpty {
             let newTrack = Track<ShapeClip>(label: "图形")

@@ -233,7 +233,11 @@ extension ProjectState {
             alert.informativeText = "这个片段短边已有 \(Int(shortSide))px，放大 \(scale.rawValue) 倍收益可能有限。是否仍要继续？"
             alert.addButton(withTitle: "继续")
             alert.addButton(withTitle: "取消")
-            guard alert.runModal() == .alertFirstButtonReturn else { return }
+            // 测试环境不弹框（会卡死主线程），当作用户选了「继续」——
+            // 这里只是「素材已经够清晰」的提醒，继续执行不具破坏性
+            if !DiagLog.isUnitTesting {
+                guard alert.runModal() == .alertFirstButtonReturn else { return }
+            }
         }
 
         // 预计耗时不再弹确认框拦一道——耗时长是这个功能的常态而不是异常，每次都

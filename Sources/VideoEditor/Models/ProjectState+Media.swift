@@ -29,6 +29,12 @@ extension ProjectState {
         alert.addButton(withTitle: "移除")
         alert.addButton(withTitle: "取消")
 
+        // 测试环境按「取消」处理：没人点确认，runModal 会卡死主线程；
+        // 而且删素材是破坏性操作，无人值守时宁可不做
+        guard !DiagLog.isUnitTesting else {
+            DiagLog.log("[移除素材] 测试环境跳过确认框，未执行移除")
+            return
+        }
         guard alert.runModal() == .alertFirstButtonReturn else { return }
 
         // User confirmed — save snapshot WITH mediaAssets for undo

@@ -194,19 +194,59 @@ final class TextToSpeechTests: XCTestCase {
         _ = await p.testHook_addSpeechClips(items)
         let elapsed = Date().timeIntervalSince(t0)
 
-        XCTAssertEqual(p.mediaAssets.count, count, "素材应全部导入")
         XCTAssertEqual(p.audioTracks.flatMap(\.clips).count, count, "片段应全部落轨")
+        // 配音**按轨道合成一个素材**：这 24 条互不重叠，全进同一条配音轨，
+        // 所以素材库只多一条「配音」，而不是 24 条碎条目。
+        // 时间轴上仍是 24 段独立片段，各自用 trimStart 偏移到自己那一段
+        XCTAssertEqual(p.mediaAssets.count, p.audioTracks.count,
+                       "每条配音轨该对应一个合成素材")
 
         let worst = gaps.max() ?? 0
         print(String(format: "插入 %d 条耗时 %.2fs，主线程最长停顿 %.2fs", count, elapsed, worst))
         XCTAssertLessThan(worst, 1.5, "主线程停顿过久（\(worst)s），界面会转圈")
     }
 
-    /// 超长的要被压到字幕时长，压得动的听起来还得是完整一句
+    /// 超长的要被压进**可用空档**，压得动的听起来还得是完整一句。
+    ///
+    /// 空档 = max(字幕自身时长, 下一条起点 − 自身起点 − speechGap)。
+    /// 所以测压缩必须放**两条**字幕——只放一条的话它就是最后一条，
+    /// 空档是无穷大（后面没内容挡着，让它自然播完），永远走不到压缩分支
     func testAutoFitCompressesOverlongAudio() async throws {
         try XCTSkipUnless(ProjectState.findFFmpeg() != nil, "没有 ffmpeg，跳过")
 
-        // 音频 1.2s，字幕只有 1.0s → 需要 1.2 倍压缩，在上限内
+        // 第一条：音频 1.2s，空档 = max(1.0, 1.15 − 0 − 0.15) = 1.0 → 需 1.2 倍，在上限内
+        let url = try makeSilentAudio(seconds: 1.2)
+        let tailURL = try makeSilentAudio(seconds: 0.4)
+        defer {
+            try? FileManager.default.removeItem(at: url)
+            try? FileManager.default.removeItem(at: tailURL)
+        }
+
+        let saved = AppSettings.shared.ttsAutoFit
+        AppSettings.shared.ttsAutoFit = true
+        defer { AppSettings.shared.ttsAutoFit = saved }
+
+        let p = ProjectState()
+        let clip = sub("要压缩", 0, 1.0)
+        let tail = sub("后面这条只负责把空档卡出来", 1.15, 2.0)
+        p.subtitleTracks.append(Track(clips: [clip, tail], label: "字幕"))
+
+        let overlong = await p.testHook_addSpeechClips([(clip: clip, url: url),
+                                                        (clip: tail, url: tailURL)])
+
+        XCTAssertEqual(overlong, 0, "1.2 倍在上限内，应该压得动")
+        let placed = try XCTUnwrap(p.audioTracks.flatMap(\.clips)
+                                    .sorted { $0.startTime < $1.startTime }.first)
+        XCTAssertEqual(placed.duration, 1.0, accuracy: 0.06, "应被压进可用空档")
+        XCTAssertEqual(placed.startTime, 0, accuracy: 0.001, "起点仍对齐字幕")
+        // 原始文件不该被改动——落轨的要么是变速后的新文件，要么是整条轨道合成后的文件
+        XCTAssertNotEqual(placed.url, url, "不该还指向原始音频")
+    }
+
+    /// 最后一条（后面没有字幕挡着）不压缩，让它自然播完
+    func testAutoFitLeavesLastClipUncompressed() async throws {
+        try XCTSkipUnless(ProjectState.findFFmpeg() != nil, "没有 ffmpeg，跳过")
+
         let url = try makeSilentAudio(seconds: 1.2)
         defer { try? FileManager.default.removeItem(at: url) }
 
@@ -215,26 +255,27 @@ final class TextToSpeechTests: XCTestCase {
         defer { AppSettings.shared.ttsAutoFit = saved }
 
         let p = ProjectState()
-        let clip = sub("要压缩", 0, 1.0)
+        let clip = sub("最后一条", 0, 1.0)
         p.subtitleTracks.append(Track(clips: [clip], label: "字幕"))
 
         let overlong = await p.testHook_addSpeechClips([(clip: clip, url: url)])
 
-        XCTAssertEqual(overlong, 0, "1.2 倍在上限内，应该压得动")
+        XCTAssertEqual(overlong, 0, "没压也没超长，后面本来就没内容挡着")
         let placed = try XCTUnwrap(p.audioTracks.flatMap(\.clips).first)
-        XCTAssertEqual(placed.duration, 1.0, accuracy: 0.06, "应被压到字幕时长")
-        XCTAssertEqual(placed.startTime, 0, accuracy: 0.001, "起点仍对齐字幕")
-        // 压完的是新文件，原始文件不该被改动
-        XCTAssertNotEqual(placed.url, url, "应指向变速后的新文件")
+        XCTAssertEqual(placed.duration, 1.2, accuracy: 0.06, "保持原时长，不压到字幕长度")
     }
 
     /// 压过头会听不清，超上限的保持原速并如实计数
     func testAutoFitSkipsExtremeRatio() async throws {
         try XCTSkipUnless(ProjectState.findFFmpeg() != nil, "没有 ffmpeg，跳过")
 
-        // 音频 2.0s，字幕 0.5s → 需要 4 倍，远超 1.6 上限
+        // 第一条：音频 2.0s，空档 = max(0.5, 0.65 − 0 − 0.15) = 0.5 → 需 4 倍，远超 1.6 上限
         let url = try makeSilentAudio(seconds: 2.0)
-        defer { try? FileManager.default.removeItem(at: url) }
+        let tailURL = try makeSilentAudio(seconds: 0.4)
+        defer {
+            try? FileManager.default.removeItem(at: url)
+            try? FileManager.default.removeItem(at: tailURL)
+        }
 
         let saved = AppSettings.shared.ttsAutoFit
         AppSettings.shared.ttsAutoFit = true
@@ -242,14 +283,16 @@ final class TextToSpeechTests: XCTestCase {
 
         let p = ProjectState()
         let clip = sub("压不动", 0, 0.5)
-        p.subtitleTracks.append(Track(clips: [clip], label: "字幕"))
+        let tail = sub("后面这条只负责把空档卡出来", 0.65, 1.5)
+        p.subtitleTracks.append(Track(clips: [clip, tail], label: "字幕"))
 
-        let overlong = await p.testHook_addSpeechClips([(clip: clip, url: url)])
+        let overlong = await p.testHook_addSpeechClips([(clip: clip, url: url),
+                                                        (clip: tail, url: tailURL)])
 
         XCTAssertEqual(overlong, 1, "超上限的应计入超长，提示用户")
-        let placed = try XCTUnwrap(p.audioTracks.flatMap(\.clips).first)
-        XCTAssertEqual(placed.url, url, "不该变速，仍用原文件")
-        XCTAssertGreaterThan(placed.duration, 1.5, "保持原时长")
+        let placed = try XCTUnwrap(p.audioTracks.flatMap(\.clips)
+                                    .sorted { $0.startTime < $1.startTime }.first)
+        XCTAssertEqual(placed.duration, 2.0, accuracy: 0.06, "不该变速，保持原时长")
     }
 
     /// 关掉自动对齐就一律按原时长摆

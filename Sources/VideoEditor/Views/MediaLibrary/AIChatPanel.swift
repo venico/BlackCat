@@ -206,11 +206,23 @@ struct AIChatPanel: View {
                     .padding(.vertical, 10)
                 }
             }
-            .onChange(of: service.messages.count) { _ in
-                if let last = service.messages.last {
-                    withAnimation { proxy.scrollTo(last.id, anchor: .bottom) }
-                }
+            .onChange(of: service.messages.count) { _ in scrollToLast(proxy) }
+            // 生成完成时消息条数**没变**：同一条 assistant 消息的 status 从 .generating
+            // 变成 .completed 并挂上视频卡片。只看 count 就不会滚，用户得自己往下拖
+            .onChange(of: service.messages.last?.status) { _ in
+                scrollToLast(proxy, waitForLayout: true)
             }
+        }
+    }
+
+    private func scrollToLast(_ proxy: ScrollViewProxy, waitForLayout: Bool = false) {
+        guard let last = service.messages.last else { return }
+        withAnimation { proxy.scrollTo(last.id, anchor: .bottom) }
+        // 视频卡片是状态变完成之后才挂上去的，挂上去气泡才变高 —— 这一下只能滚到
+        // 旧高度，等布局稳定再补一次才真到底
+        guard waitForLayout else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+            withAnimation { proxy.scrollTo(last.id, anchor: .bottom) }
         }
     }
 

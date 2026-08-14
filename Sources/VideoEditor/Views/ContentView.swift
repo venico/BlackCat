@@ -32,7 +32,7 @@ struct ContentView: View {
             let p = ProjectState()
             // 默认不显示欢迎页，只有冷启动那次显式要。放在 StateObject 的初值里
             // 而不是 onAppear，避免首帧闪一下
-            p.showWelcome = (initialAction == nil && AppDelegate.pendingOpenURL == nil)
+            p.showWelcome = (initialAction == nil && AppDelegate.pendingOpenURLs.isEmpty)
                             || isWelcome(initialAction)
             return p
         }())
@@ -287,8 +287,9 @@ struct ContentView: View {
         // 采样不到主界面，材质就成了一块不透的灰板。导出/设置都是 overlay，这里跟上
         .overlay {
             if project.showTranscribeOptions {
+                // 蒙层只拦点击，不当关闭按钮 —— 选识别方式时误点一下就关掉太容易了。
+                // 关闭走右上角 ✕ 或 Esc（onExitCommand）
                 Color.black.opacity(0.4).ignoresSafeArea()
-                    .onTapGesture { project.showTranscribeOptions = false }
                 TranscribeOptionsSheet()
                     .environmentObject(project)
                     .clipShape(RoundedRectangle(cornerRadius: 14))
@@ -301,8 +302,8 @@ struct ContentView: View {
         .animation(.easeOut(duration: 0.2), value: project.showTranscribeOptions)
         .overlay {
             if project.showExportSheet {
+                // 蒙层只拦点击，不当关闭按钮（同识别方式弹窗）。关闭走 ✕ 或 Esc
                 Color.black.opacity(0.4).ignoresSafeArea()
-                    .onTapGesture { project.showExportSheet = false }
                 ExportSheetView().environmentObject(project)
                     .clipShape(RoundedRectangle(cornerRadius: 14))
                     .overlay(RoundedRectangle(cornerRadius: 14)
@@ -334,10 +335,10 @@ struct ContentView: View {
         }
         .overlay {
             if project.showSettings {
+                // 蒙层只拦点击，不当关闭按钮（同识别方式弹窗）。关闭走 ✕ 或 Esc
                 Color.black.opacity(0.4 * (settingsVisible ? 1 : 0))
                     .ignoresSafeArea()
                     .allowsHitTesting(settingsVisible)
-                    .onTapGesture { closeSettings() }
                 SettingsView(dismiss: { closeSettings() })
                     .environmentObject(project)
                     .clipShape(RoundedRectangle(cornerRadius: 14))
@@ -514,8 +515,9 @@ struct ContentView: View {
                 .environmentObject(project)
         }
         .onAppear {
-            if let url = AppDelegate.pendingOpenURL {
-                AppDelegate.pendingOpenURL = nil
+            // 兜底：正常路径下 createWindow() 已经消费掉了，这里只捞漏网的
+            if !AppDelegate.pendingOpenURLs.isEmpty {
+                let url = AppDelegate.pendingOpenURLs.removeFirst()
                 project.showWelcome = false
                 project.openProject(url: url)
             }

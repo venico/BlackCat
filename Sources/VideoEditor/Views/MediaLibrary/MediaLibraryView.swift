@@ -1978,9 +1978,15 @@ private struct ShapeCard: View {
         .background(hover ? Color.white.opacity(0.08) : Color.clear)
         .cornerRadius(8)
         .contentShape(Rectangle())
+        // 拖到时间轴按落点插入。载荷带 "shape:" 前缀，跟素材拖拽的裸 UUID 区分；
+        // 接收方是宿主 GatedHostingView（内层 .onDrop 收不到，见 WindowDragGate.swift）。
+        //
+        // **必须排在 .gesture(TapGesture) 之前**：后加的手势包在外层先收事件，
+        // 写反了双击会把拖拽的起始事件抢走，拖动完全没反应（素材项就是这个顺序）
+        .onDrag { NSItemProvider(object: FileDropRouter.pasteboardString(for: type) as NSString) }
         .onHover { hover = $0 }
         .gesture(TapGesture(count: 2).onEnded { onAdd() })
-        .help("双击添加\(type.label)")
+        .help("双击添加\(type.label)，或拖到时间轴")
     }
 }
 

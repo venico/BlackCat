@@ -9,6 +9,18 @@ enum DiagLog {
     private static let lock = NSLock()
     private static var headerWritten = false
 
+    /// 是否跑在单元测试进程里。
+    ///
+    /// 测试环境没有人去点弹框的「确定」，`NSAlert.runModal()` / `NSSavePanel.runModal()`
+    /// 会**永久阻塞主线程**，整套测试从此跑不完。而且现象极具迷惑性——卡住的位置显示为
+    /// 前一条用例，实际元凶是按字母序排在后面的那条（`testPM005_OpenNonExistentProject`
+    /// 曾被误记为「卡在 testIN008_ImagePosition 附近」，白排查了很久）。
+    ///
+    /// 所以模型层凡是会弹模态的地方都要过一道这个判断：测试环境下改为写诊断日志，
+    /// 确认类弹框一律按「取消」处理（宁可不执行，也不能在无人值守时做破坏性操作）。
+    /// 生产环境行为完全不变。
+    static let isUnitTesting = NSClassFromString("XCTestCase") != nil
+
     static let fileURL: URL = {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
         let dir = base.appendingPathComponent("黑猫剪辑/logs", isDirectory: true)

@@ -60,37 +60,82 @@ enum WindowDragGate {
 /// 于是反过来：宿主统一收，按落点坐标分发。
 @MainActor
 enum FileDropRouter {
+    /// 拖进来的东西。Finder 拖的是文件，素材库拖到时间轴的是素材 id 或图形类型
+    enum Payload {
+        case files([URL])
+        case asset(UUID)
+        case shape(ShapeType)
+    }
+
+    /// 接收区。素材区收文件，时间轴收素材 id —— 两边收的载荷类型不同，
+    /// 所以匹配时既要看落点在不在区里，也要看这个区收不收这种载荷
+    enum Kind: Hashable { case mediaLibrary, timeline }
+
     private struct Zone {
         /// SwiftUI `.global` 坐标系（原点左上）里的接收区
         let rect: CGRect
-        let onFiles: ([URL]) -> Void
+        let accepts: (Payload) -> Bool
+        /// 落点用 zone 的**本地坐标**给出（时间轴要拿 x 换算时间码）
+        let onDrop: (Payload, CGPoint) -> Void
         /// 拖拽进出这块区域时的通知，用来点亮"松开以导入"
         let onTargetChange: (Bool) -> Void
     }
 
     /// 按窗口分开存。多窗口下不区分的话，A 窗口的素材区矩形会拿去匹配 B 窗口的拖拽
-    private static var zones: [WindowID: Zone] = [:]
+    private static var zones: [WindowID: [Kind: Zone]] = [:]
 
+    static func register(_ id: WindowID, kind: Kind, rect: CGRect,
+                         accepts: @escaping (Payload) -> Bool,
+                         onDrop: @escaping (Payload, CGPoint) -> Void,
+                         onTargetChange: @escaping (Bool) -> Void) {
+        zones[id, default: [:]][kind] = Zone(rect: rect, accepts: accepts,
+                                             onDrop: onDrop, onTargetChange: onTargetChange)
+    }
+
+    /// 只收 Finder 文件的区（素材库用），保持原来的调用形状
     static func register(_ id: WindowID, rect: CGRect,
                          onFiles: @escaping ([URL]) -> Void,
                          onTargetChange: @escaping (Bool) -> Void) {
-        zones[id] = Zone(rect: rect, onFiles: onFiles, onTargetChange: onTargetChange)
+        register(id, kind: .mediaLibrary, rect: rect,
+                 accepts: { if case .files = $0 { return true } else { return false } },
+                 onDrop: { payload, _ in
+                     if case .files(let urls) = payload { onFiles(urls) }
+                 },
+                 onTargetChange: onTargetChange)
     }
 
     static func unregister(_ id: WindowID) { zones[id] = nil }
+    static func unregister(_ id: WindowID, kind: Kind) { zones[id]?[kind] = nil }
 
-    static func canAccept(_ point: CGPoint, in id: WindowID) -> Bool {
-        zones[id]?.rect.contains(point) ?? false
+    /// 图形卡片写进 pasteboard 的前缀。素材拖的是裸 UUID 字符串，
+    /// 图形拖的是 "shape:rectangle"，靠这个前缀区分
+    static let shapePrefix = "shape:"
+    static func pasteboardString(for type: ShapeType) -> String { shapePrefix + type.rawValue }
+
+    private static func zone(at point: CGPoint, for payload: Payload,
+                             in id: WindowID) -> Zone? {
+        zones[id]?.values.first { $0.rect.contains(point) && $0.accepts(payload) }
     }
 
-    static func setTargeted(_ targeted: Bool, in id: WindowID) {
-        zones[id]?.onTargetChange(targeted)
+    static func canAccept(_ point: CGPoint, payload: Payload, in id: WindowID) -> Bool {
+        zone(at: point, for: payload, in: id) != nil
+    }
+
+    /// 只点亮命中的那个区，其余区一律熄灭 —— 否则拖过时间轴时素材区还亮着
+    static func setTargeted(_ targeted: Bool, at point: CGPoint,
+                            payload: Payload, in id: WindowID) {
+        guard let all = zones[id] else { return }
+        let hit = targeted ? zone(at: point, for: payload, in: id) : nil
+        for z in all.values {
+            z.onTargetChange(hit != nil && z.rect == hit!.rect)
+        }
     }
 
     @discardableResult
-    static func deliver(_ urls: [URL], at point: CGPoint, in id: WindowID) -> Bool {
-        guard let z = zones[id], z.rect.contains(point) else { return false }
-        z.onFiles(urls)
+    static func deliver(_ payload: Payload, at point: CGPoint, in id: WindowID) -> Bool {
+        guard let z = zone(at: point, for: payload, in: id) else { return false }
+        // 落点转成区内本地坐标：时间轴要用 x 算时间码
+        z.onDrop(payload, CGPoint(x: point.x - z.rect.minX, y: point.y - z.rect.minY))
         return true
     }
 }
@@ -109,7 +154,9 @@ final class GatedHostingView<Content: View>: NSHostingView<Content> {
 
     required init(rootView: Content) {
         super.init(rootView: rootView)
-        registerForDraggedTypes([.fileURL])
+        // .string 是素材库拖到时间轴时带的素材 id —— 应用内拖拽同样走 hitTest，
+        // 内层的 .onDrop 一样收不到，也得由宿主统一接
+        registerForDraggedTypes([.fileURL, .string])
     }
 
     @available(*, unavailable)
@@ -123,20 +170,48 @@ final class GatedHostingView<Content: View>: NSHostingView<Content> {
         return isFlipped ? p : CGPoint(x: p.x, y: bounds.height - p.y)
     }
 
+    /// 从 pasteboard 认出拖的是什么。
+    ///
+    /// **应用内载荷必须先认**：`"shape:rectangle"` 是个合法 URL 字符串（scheme = shape），
+    /// 先问 `readObjects(forClasses: [NSURL.self])` 的话它会解析成功、被判成文件拖拽，
+    /// 时间轴就收不到了 —— 而且是在 `draggingEntered` 阶段就被拒，
+    /// 连 performDragOperation 的日志都不会打，现象是「能拖但落不下去」。
+    /// 素材那边侥幸没事，只因为裸 UUID 不是合法的 URL scheme。
+    private func payload(_ sender: NSDraggingInfo) -> FileDropRouter.Payload? {
+        let pb = sender.draggingPasteboard
+        if let s = pb.string(forType: .string) {
+            if let uuid = UUID(uuidString: s) { return .asset(uuid) }
+            if s.hasPrefix(FileDropRouter.shapePrefix),
+               let t = ShapeType(rawValue: String(s.dropFirst(FileDropRouter.shapePrefix.count))) {
+                return .shape(t)
+            }
+        }
+        // Finder 拖进来的文件。只认 file:// —— 别把应用内那些串当成 URL
+        if let urls = pb.readObjects(forClasses: [NSURL.self],
+                                     options: [.urlReadingFileURLsOnly: true]) as? [URL],
+           !urls.isEmpty {
+            return .files(urls)
+        }
+        return nil
+    }
+
     private func updateTarget(_ sender: NSDraggingInfo) -> NSDragOperation {
-        guard let id = windowID else { return [] }
-        let inside = FileDropRouter.canAccept(swiftUIPoint(sender), in: id)
+        guard let id = windowID, let load = payload(sender) else { return [] }
+        let pt = swiftUIPoint(sender)
+        let inside = FileDropRouter.canAccept(pt, payload: load, in: id)
+        // 位置一直在变，命中的区也可能从素材区切到时间轴，所以不能只在
+        // inside 翻转时才更新——但也不必每帧都推：区没变时 setTargeted 是幂等的
         if inside != wasInsideZone {
             wasInsideZone = inside
-            FileDropRouter.setTargeted(inside, in: id)
         }
+        FileDropRouter.setTargeted(inside, at: pt, payload: load, in: id)
         return inside ? .copy : []
     }
 
     private func clearTarget() {
-        guard wasInsideZone, let id = windowID else { return }
+        guard let id = windowID else { return }
         wasInsideZone = false
-        FileDropRouter.setTargeted(false, in: id)
+        FileDropRouter.setTargeted(false, at: .zero, payload: .files([]), in: id)
     }
 
     override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
@@ -152,15 +227,20 @@ final class GatedHostingView<Content: View>: NSHostingView<Content> {
     override func draggingEnded(_ sender: NSDraggingInfo) { clearTarget() }
 
     override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
-        clearTarget()
-        guard let id = windowID else { return false }
-        // readObjects 直接给 [URL]，不用自己解 pasteboard 的 data 表示
-        let urls = sender.draggingPasteboard.readObjects(forClasses: [NSURL.self]) as? [URL] ?? []
         let pt = swiftUIPoint(sender)
-        let accepted = !urls.isEmpty && FileDropRouter.deliver(urls, at: pt, in: id)
+        let load = payload(sender)
+        clearTarget()
+        guard let id = windowID, let load else { return false }
+        let accepted = FileDropRouter.deliver(load, at: pt, in: id)
         // 留一条：拖入这条链路排查过一整轮（SwiftUI onDrop / 内嵌 NSView 都收不到），
         // 万一以后又不灵，这一行能直接分清是「没触发」还是「落点没落进接收区」
-        DiagLog.log("[拖入] 落点=\(pt) 文件=\(urls.count) 接收=\(accepted)")
+        let what: String
+        switch load {
+        case .files(let urls): what = "文件=\(urls.count)"
+        case .asset(let id):   what = "素材=\(id.uuidString.prefix(8))"
+        case .shape(let t):    what = "图形=\(t.rawValue)"
+        }
+        DiagLog.log("[拖入] 落点=\(pt) \(what) 接收=\(accepted)")
         return accepted
     }
 }

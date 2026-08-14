@@ -270,6 +270,13 @@ final class ProjectState: ObservableObject {
     var audioSpeedCache: [String: URL] = [:]
     /// 倒放视频临时文件缓存：key = "path|trimStart|srcDurSec"
     var reversedVideoCache: [String: URL] = [:]
+    /// 本项目起的 ffmpeg 子进程的归属标记 —— 关窗时按它只收自己的
+    let ffmpegOwnerID = UUID()
+    /// 关窗收掉后置位：让正在跑的生成流程认出"这是被取消的"，而不是"失败了要重试"
+    var ffmpegCancelled = false
+    /// 窗口已关。关窗后这个对象还会被残留的 Task 持有一阵子，@Published 一变
+    /// 又会调度新的预览重建、重建里再唤起倒放 —— 所有会起后台活儿的入口都查它
+    var isShutDown = false
     @Published var snapEnabled: Bool = true
     @Published var showImageTracks: Bool = true
     var timelineVisibleWidth: Double = 800  // 由 GeometryReader 更新
@@ -871,17 +878,21 @@ final class ProjectState: ObservableObject {
     @Published var nativeSizeCache: [URL: CGSize] = [:]
     private var loadingNativeSizes: Set<URL> = []
 
+    /// 片段素材的原始尺寸。**不看 clip.rotation** —— 手动旋转是画布**内**的操作，
+    /// 不该反过来把画布也翻过来（表现：分割后把后半段转 90°，16:9 的画布变成 9:16）。
+    /// 素材自身的竖拍方向另有 preferredTransform 处理，见 loadNativeSize
+    /// 片段画面**转正后**的尺寸（含 preferredTransform，不含用户旋转）。
+    /// 预览上的裁剪框要用它 —— clip.videoWidth 存的是未转正的 naturalSize，
+    /// 竖拍视频拿它画框会是横的，跟画面对不上
+    func orientedSize(for clip: VideoClip) -> CGSize? { nativeSize(for: clip) }
+
     private func nativeSize(for clip: VideoClip) -> CGSize? {
         guard let url = clip.url ?? mediaAssets.first(where: { $0.id == clip.assetID })?.url else { return nil }
-        if let cached = nativeSizeCache[url] { return applyRotation(cached, clip.rotation) }
+        if let cached = nativeSizeCache[url] { return cached }
         loadNativeSize(url)
         // 缓存未就绪时先用片段上的值顶着，加载完会刷新
         guard clip.videoWidth > 0, clip.videoHeight > 0 else { return nil }
-        return applyRotation(CGSize(width: clip.videoWidth, height: clip.videoHeight), clip.rotation)
-    }
-
-    private func applyRotation(_ size: CGSize, _ rotation: Int) -> CGSize {
-        abs(rotation % 180) == 90 ? CGSize(width: size.height, height: size.width) : size
+        return CGSize(width: clip.videoWidth, height: clip.videoHeight)
     }
 
     private func loadNativeSize(_ url: URL) {
@@ -905,23 +916,21 @@ final class ProjectState: ObservableObject {
         }
     }
 
-    /// 「原始」预览用的源尺寸。选中片段优先 —— selectedVideoClipID 是 @Published，
-    /// 选中即刻重绘；currentTime 走独立的 PlaybackClock，不触发本对象刷新，只能兜底
+    /// 「原始」比例下画布用的源尺寸 —— 取**时间轴上第一个视频片段**。
+    ///
+    /// 以前是"选中片段优先"，于是画布会跟着选中和旋转到处变：把一个片段分成两半、
+    /// 后半段转 90°，选中它画布就从 16:9 翻成 9:16，导出尺寸也就不固定了。
+    /// 画布该由素材定、由项目定，不该由"现在选中谁"定。
+    /// 导出那边同样取第一个可见视频片段（firstVideoClipID），两边对齐。
     var nativeVideoSize: CGSize? {
-        let allClips = videoTracks.flatMap(\.clips)
-
-        if let id = selectedVideoClipID,
-           let clip = allClips.first(where: { $0.id == id }),
-           let s = nativeSize(for: clip) { return s }
-
-        // 播放头命中的片段，多轨重叠时取上层（videoTracks 靠后的轨道压在上面）
-        let t = currentTime
-        for track in videoTracks.reversed() {
-            for clip in track.clips where clip.startTime <= t && clip.endTime > t {
-                if let s = nativeSize(for: clip) { return s }
-            }
-        }
-        for clip in allClips {
+        // 多轨重叠时取上层（videoTracks 靠后的轨道压在上面），与导出一致只认可见轨
+        let firstClip = videoTracks
+            .filter(\.isVisible)
+            .flatMap(\.clips)
+            .min { $0.startTime < $1.startTime }
+        if let c = firstClip, let s = nativeSize(for: c) { return s }
+        // 可见轨里没有可用尺寸时，兜底扫一遍全部片段
+        for clip in videoTracks.flatMap(\.clips) {
             if let s = nativeSize(for: clip) { return s }
         }
         return nil

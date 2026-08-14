@@ -207,6 +207,16 @@ final class WindowManager: NSObject {
         willCloseHandlers[id] = handler
     }
 
+    /// 关窗时停掉这个窗口的预览播放。
+    ///
+    /// 不能指望视图销毁自动停：窗口关了、项目关了，AVPlayer 还在后台出声。
+    /// SwiftUI 也不保证 `@StateObject` 何时释放，所以关窗这条路必须显式停一次。
+    private var stopPlaybackHandlers: [WindowID: () -> Void] = [:]
+
+    func setStopPlayback(_ handler: @escaping () -> Void, for id: WindowID) {
+        stopPlaybackHandlers[id] = handler
+    }
+
     func setOpenedURL(_ url: URL?, for id: WindowID) {
         openedURLs[id] = url
     }
@@ -250,6 +260,9 @@ extension WindowManager: NSWindowDelegate {
         // 不会出现"存了但用户又取消关闭"的错位
         willCloseHandlers[id]?()
         willCloseHandlers[id] = nil
+        // 先停播再拆窗口：否则项目关了声音还在后台响
+        stopPlaybackHandlers[id]?()
+        stopPlaybackHandlers[id] = nil
         if let m = escMonitors[id] { NSEvent.removeMonitor(m); escMonitors[id] = nil }
         ExportManager.shared.unregisterHandlers(for: id)
         windows[id] = nil

@@ -353,6 +353,20 @@ private struct SubtitleInspector: View {
 
 // MARK: - Translator (Google Translate public endpoint)
 
+/// 翻译失败的原因回传。
+///
+/// 各引擎失败时一律"返回原文"（不这么做的话一批里坏一条就整批丢），
+/// 上层只能看到"结果==原文"，于是不管什么原因都笼统报「可能被限流」——
+/// Apple 缺语言包、DeepL 拒收目标语言、有道签名错，全被抹成同一句话。
+/// 这里留个通道把真实原因带上去。
+@MainActor
+enum TranslateDiagnostics {
+    /// 本轮翻译中最后一次失败的可读原因。开始翻译前清空
+    static var lastFailureHint: String?
+    static func reset() { lastFailureHint = nil }
+    static func record(_ hint: String) { lastFailureHint = hint }
+}
+
 enum Translator {
     /// Bilingual-aware translation:
     ///  • Splits the source by newline into lines
@@ -400,6 +414,103 @@ enum Translator {
     }
 
     /// 精确语言匹配，区分简繁体中文
+    /// 这段文字是不是已经是目标语言了。
+    ///
+    /// 调用方据此**提前退出**：不建翻译轨、不亮进度卡片、也不占一次撤销栈 ——
+    /// 光在 translate 里挡住网络请求不够，那时轨道和占位都已经建好了
+    /// 目标语言是不是中文（简繁都算）。简繁之间最容易被引擎静默降级，
+    /// 译文语言校验只在这个范围内做，别的语言不碰，免得误伤
+    /// 按引擎给并发上限。DeepL 免费版限流很严 —— 实测 4 路并发整轨翻译直接一片 429
+    /// （返回原文，看起来像"翻出来还是原文/简中"），压到 1 路串行
+    static var recommendedConcurrency: Int {
+        // DeepL 走真批量后请求数已经很少，2 路足够快又不至于撞限流；
+        // 其余引擎维持 4 路
+        AppSettings.shared.translateProvider == .deepL ? 2 : 4
+    }
+
+    static func isChineseTarget(_ lang: String) -> Bool {
+        lang == "中文（简体）" || lang == "中文（繁体）"
+    }
+
+    /// 这段文字是不是中文（简繁不限）。
+    ///
+    /// 不走 NLLanguageRecognizer：字幕大量是三五个字的短句，短文本上它很不稳。
+    /// 改成数字形——先用假名/谚文把日文韩文排掉（它们也含汉字），再看汉字在字母里的占比。
+    static func isChineseText(_ s: String) -> Bool {
+        let trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+        var han = 0, letters = 0
+        for u in trimmed.unicodeScalars {
+            switch u.value {
+            case 0x3040...0x30FF,          // 平假名 / 片假名
+                 0xAC00...0xD7AF,          // 谚文音节
+                 0x1100...0x11FF:          // 谚文字母
+                return false
+            case 0x4E00...0x9FFF,          // CJK 基本区
+                 0x3400...0x4DBF,          // 扩展 A
+                 0xF900...0xFAFF,          // 兼容汉字
+                 0x20000...0x2FA1F:        // 扩展 B~F
+                han += 1; letters += 1
+            default:
+                if u.properties.isAlphabetic { letters += 1 }
+            }
+        }
+        guard letters > 0 else { return false }
+        return Double(han) / Double(letters) >= 0.5
+    }
+
+    /// 整批文本的主语言（多数决），拿不准返回 nil。
+    ///
+    /// 逐条检测在字幕这种短句上很不稳 —— 实测一条英文字幕被判成**土耳其语**，
+    /// 而 Apple 的 `installedSource:` 要求那对语言包已装好，于是整轨翻完
+    /// 孤零零剩一条没翻、还提示"缺少语言包"。字幕整轨本来就是同一种语言，
+    /// 按整批投票定一次，个别短句的误判就被淹掉了。
+    static func dominantLanguage(of texts: [String]) -> String? {
+        var votes: [String: Int] = [:]
+        let recognizer = NLLanguageRecognizer()
+        for t in texts {
+            let trimmed = t.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard trimmed.count >= 4 else { continue }   // 太短的不投票
+            recognizer.reset()
+            recognizer.processString(trimmed)
+            guard let lang = recognizer.dominantLanguage?.rawValue else { continue }
+            votes[lang, default: 0] += 1
+        }
+        return votes.max { $0.value < $1.value }?.key
+    }
+
+    /// 中文内部的简繁转换 —— 能本地转就返回结果，转不了返回 nil（该走翻译引擎）。
+    ///
+    /// **简繁互转不是翻译，是字形转换**，本来就不该花 API 额度：
+    /// 各家对 zh-Hant 的支持还参差不齐 —— DeepL 收下 `ZH-HANT` 照样回简体、
+    /// 免费版翻十来条就 429；Apple 要用户另外去系统里下繁中语言包；
+    /// 有道 `from=auto` 是中英互译逻辑，压根不看 `to`。
+    /// 本地转一次是瞬时的，不限流、不耗额度，词组准确度还比 API 高。
+    static func localChineseConvert(_ text: String, to lang: String) -> String? {
+        guard isChineseTarget(lang), isChineseText(text) else { return nil }
+        return lang == "中文（繁体）" ? OpenCC.toTraditional(text) : OpenCC.toSimplified(text)
+    }
+
+    /// 送给翻译引擎的目标语言。
+    ///
+    /// 目标是繁中时一律改成简中 —— 简中是每家引擎都稳的，繁体最后本地转
+    /// （见 `localChineseConvert`）。这样"翻不出繁体"这条失败路径整个消失。
+    static func engineLanguage(for lang: String) -> String {
+        lang == "中文（繁体）" ? "中文（简体）" : lang
+    }
+
+    static func isAlreadyTarget(_ text: String, lang: String) -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return true }
+        // 太短的识别不可靠：一条 "OK"、纯数字、单个专有名词都会被判成英文，
+        // 一条就足以把整轨拖进翻译流程。这类本来也不值得翻，当作"已是目标语言"
+        guard trimmed.count >= 4 else { return true }
+        let recognizer = NLLanguageRecognizer()
+        recognizer.processString(trimmed)
+        guard let detected = recognizer.dominantLanguage?.rawValue else { return true }
+        return isExactMatch(detected: detected, target: languageCode(lang))
+    }
+
     private static func isExactMatch(detected: String, target: String) -> Bool {
         // 中文特殊处理：zh-Hans = zh-CN（简体），zh-Hant = zh-TW（繁体）
         let normalizedDetected = normalizeChineseLang(detected)
@@ -431,14 +542,48 @@ enum Translator {
     ///
     /// 误判的代价可以接受：本来就翻不动的内容（纯数字、专名）无非多发两次请求，
     /// 而 translateSmart 已经把「本来就是目标语言」的行挑走了，不会走到这儿。
-    static func translate(_ text: String, to lang: String) async -> String {
+    ///
+    /// - Parameter sourceHint: 整批算出来的源语言。只有 Apple 用得上（它要求显式指定
+    ///   源语言），批量翻译时由 `translateBatch` 投票产生，见 `dominantLanguage(of:)`
+    static func translate(_ text: String, to lang: String, sourceHint: String? = nil) async -> String {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return text }
 
+        // 中文之间只是简繁差异 —— 本地转完就走，一个请求都不发。
+        // 要排在 isAlreadyTarget 前面：那个函数对 4 字以下一律返回"已是目标"，
+        // 排在后面的话一整轨短句会原样留在简体
+        if let converted = localChineseConvert(text, to: lang) { return converted }
+
+        // 原文已经是目标语言就别送去翻 —— 各家引擎在"源=目标"时行为不一致，
+        // 有的会**擅自翻成英文**：
+        //
+        // - **有道**（实测踩到）：请求带 `from=auto`，它的 auto 是中英互译逻辑，
+        //   检测到中文就翻英文，不管 `to=zh-CHS`。中文字幕选简中，翻出来整条是英文
+        // - **Apple**：`TranslationSession(installedSource:target:)` 两边相同时行为未定义
+        // - **Google**：规矩地返回原文，但下面的重试会把"结果==原文"当成失败，
+        //   白白重试 3 次、发 3 个请求
+        //
+        // 统一在这里挡掉，各引擎行为一致：已经是目标语言就原样返回
+        if isAlreadyTarget(text, lang: lang) { return text }
+
+        let engineLang = engineLanguage(for: lang)
+
         var delay: UInt64 = 400_000_000   // 0.4s 起步，每次翻倍
         for attempt in 1...3 {
-            let result = await translateOnce(text, to: lang)
-            if result != text { return result }
+            let result = await translateOnce(text, to: engineLang, sourceHint: sourceHint)
+            if result != text {
+                // 校验译文**确实是目标语言**：有的引擎会静默降级，
+                // 既没报错也没翻对，用户拿到一条"翻译过却还是原文语言的轨"。
+                // 只在中文目标上校验（这是已知会降级的场景），太短的不查
+                if isChineseTarget(engineLang), result.count >= 4,
+                   !isAlreadyTarget(result, lang: engineLang) {
+                    DiagLog.log("[翻译] 引擎未按目标语言返回 目标=\(engineLang)，译文=\(result.prefix(30))")
+                    await TranslateDiagnostics.record("该引擎不支持这个目标语言，请换一个翻译引擎")
+                    return text
+                }
+                // 目标是繁中的话，引擎给的是简中，最后本地补一步字形转换
+                return engineLang == lang ? result : OpenCC.toTraditional(result)
+            }
             guard attempt < 3 else { break }
             try? await Task.sleep(nanoseconds: delay)
             delay *= 2
@@ -446,11 +591,13 @@ enum Translator {
         return text
     }
 
-    private static func translateOnce(_ text: String, to lang: String) async -> String {
+    private static func translateOnce(_ text: String, to lang: String,
+                                      sourceHint: String? = nil) async -> String {
         switch AppSettings.shared.translateProvider {
         case .google:   return await translateGoogle(text, to: lang)
         case .deepL:    return await translateDeepL(text, to: lang)
-        case .apple:    return await translateApple(text, to: lang)
+        // 只有 Apple 要显式源语言，其余几家都是 auto
+        case .apple:    return await translateApple(text, to: lang, sourceHint: sourceHint)
         case .youdao:   return await translateYoudao(text, to: lang)
         case .volcano:  return await translateVolcano(text, to: lang)
         }
@@ -475,11 +622,61 @@ enum Translator {
             let joined = parts.joined()
             return joined.isEmpty ? text : joined
         } catch {
+            DiagLog.log("[翻译] Google 请求失败 目标=\(code)：\(error.localizedDescription)")
             return text
         }
     }
 
     // MARK: - DeepL 翻译
+
+    /// DeepL 的**真批量**：一次请求带多条 text，返回等长的 translations。
+    ///
+    /// 之前是逐条发（batchSize 只是把多条拼成一个长字符串再当成一条发），
+    /// 整轨几十条就是几十个请求，DeepL 免费版直接一片 429 —— 返回原文，
+    /// 表现成"翻出来还是原文"。改成一次发一批后请求数少一个数量级。
+    /// - Returns: 失败返回 nil，让调用方回退到逐条路径
+    static func translateDeepLBatch(_ texts: [String], to lang: String) async -> [String]? {
+        let key = AppSettings.shared.deeplAPIKey
+        guard !key.isEmpty, !texts.isEmpty else { return nil }
+        let targetCode = deeplLanguageCode(lang)
+        let base = key.hasSuffix(":fx") ? "https://api-free.deepl.com" : "https://api.deepl.com"
+        guard let url = URL(string: "\(base)/v2/translate") else { return nil }
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("DeepL-Auth-Key \(key)", forHTTPHeaderField: "Authorization")
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = try? JSONSerialization.data(
+            withJSONObject: ["text": texts, "target_lang": targetCode])
+        do {
+            let (data, resp) = try await URLSession.shared.data(for: req)
+            if let http = resp as? HTTPURLResponse, http.statusCode != 200 {
+                DiagLog.log("[翻译] DeepL 批量 HTTP \(http.statusCode) \(texts.count) 条 目标=\(targetCode)："
+                            + (String(data: data, encoding: .utf8)?.prefix(200).description ?? ""))
+                let hint: String
+                switch http.statusCode {
+                case 429: hint = "DeepL 请求过于频繁被限流，稍后再试"
+                case 456: hint = "DeepL 本月额度用尽"
+                case 400: hint = "DeepL 不支持该目标语言"
+                case 401, 403: hint = "DeepL API Key 无效"
+                default:  hint = "DeepL 拒绝了请求（HTTP \(http.statusCode)）"
+                }
+                await TranslateDiagnostics.record(hint)
+                return nil
+            }
+            guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let arr = json["translations"] as? [[String: Any]] else { return nil }
+            let out = arr.compactMap { $0["text"] as? String }
+            // 条数对不上就别用，交给逐条路径，免得整批错位
+            guard out.count == texts.count else {
+                DiagLog.log("[翻译] DeepL 批量条数不符：发 \(texts.count) 回 \(out.count)")
+                return nil
+            }
+            return out
+        } catch {
+            DiagLog.log("[翻译] DeepL 批量请求失败 目标=\(targetCode)：\(error.localizedDescription)")
+            return nil
+        }
+    }
 
     private static func translateDeepL(_ text: String, to lang: String) async -> String {
         let key = AppSettings.shared.deeplAPIKey
@@ -493,12 +690,31 @@ enum Translator {
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.httpBody = try? JSONSerialization.data(withJSONObject: ["text": [text], "target_lang": targetCode])
         do {
-            let (data, _) = try await URLSession.shared.data(for: req)
+            let (data, resp) = try await URLSession.shared.data(for: req)
+            if let http = resp as? HTTPURLResponse, http.statusCode != 200 {
+                DiagLog.log("[翻译] DeepL HTTP \(http.statusCode) 目标=\(targetCode)："
+                            + (String(data: data, encoding: .utf8)?.prefix(200).description ?? ""))
+                let hint: String
+                switch http.statusCode {
+                case 429: hint = "DeepL 请求过于频繁被限流，稍后再试"
+                case 456: hint = "DeepL 本月额度用尽"
+                case 400: hint = "DeepL 不支持该目标语言"
+                case 401, 403: hint = "DeepL API Key 无效"
+                default:  hint = "DeepL 拒绝了请求（HTTP \(http.statusCode)）"
+                }
+                await TranslateDiagnostics.record(hint)
+                return text
+            }
             if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
                let arr = json["translations"] as? [[String: Any]],
                let t = arr.first?["text"] as? String { return t }
+            DiagLog.log("[翻译] DeepL 响应解析不出译文 目标=\(targetCode)："
+                        + (String(data: data, encoding: .utf8)?.prefix(200).description ?? ""))
             return text
-        } catch { return text }
+        } catch {
+            DiagLog.log("[翻译] DeepL 请求失败 目标=\(targetCode)：\(error.localizedDescription)")
+            return text
+        }
     }
 
     private static func deeplLanguageCode(_ label: String) -> String {
@@ -521,27 +737,61 @@ enum Translator {
 
     // MARK: - Apple 翻译
 
-    private static func translateApple(_ text: String, to lang: String) async -> String {
+    private static func translateApple(_ text: String, to lang: String,
+                                       sourceHint: String? = nil) async -> String {
         #if canImport(Translation)
         if #available(macOS 26, *) {
             let code = appleLanguageCode(lang)
             let target = Locale.Language(identifier: code)
             let recognizer = NLLanguageRecognizer()
             recognizer.processString(text)
-            let detected = recognizer.dominantLanguage?.rawValue ?? "en"
-            let source = Locale.Language(identifier: detected)
+
+            // 源语言优先用整批投票的结果 —— 单条检测在短句上会离谱到把英文判成
+            // 土耳其语（实测 tr→zh-Hans），而这里检测错就等于报"缺少语言包"
+            let detected = sourceHint ?? recognizer.dominantLanguage?.rawValue ?? "en"
+
+            // source == target 时 TranslationSession 的行为未定义，直接给回原文。
+            // 上层 translate 已经挡过一道，这里防的是别处直接调进来
+            if isExactMatch(detected: detected, target: code) { return text }
+
             do {
-                let session = TranslationSession(installedSource: source, target: target)
-                try await session.prepareTranslation()
-                let resp = try await session.translate(text)
-                return resp.targetText
+                return try await appleTranslate(text, from: detected, to: target)
             } catch {
+                // 再给一次机会：正确答案通常还在候选里，只是没排第一
+                let alternatives = recognizer.languageHypotheses(withMaximum: 3)
+                    .sorted { $0.value > $1.value }
+                    .map(\.key.rawValue)
+                    .filter { $0 != detected && !isExactMatch(detected: $0, target: code) }
+                for alt in alternatives {
+                    if let retried = try? await appleTranslate(text, from: alt, to: target) {
+                        DiagLog.log("[翻译] Apple \(detected)→\(code) 失败，改用 \(alt) 成功")
+                        return retried
+                    }
+                }
+                // Apple 走的是**本地语言包**：`installedSource:` 要求该语言对已经装好，
+                // 没装就直接抛错。上层只看到"结果==原文"，会误报成"可能被限流"，
+                // 所以这里必须留下真实原因
+                DiagLog.log("[翻译] Apple 失败 \(detected)→\(code)：\(error.localizedDescription)"
+                            + "（候选 \(alternatives) 也都失败，多半是系统里没装这对语言包，"
+                            + "去 系统设置 → 语言与地区 → 翻译语言 下载）")
+                await TranslateDiagnostics.record("缺少该语言包，请在系统中下载")
                 return text
             }
         }
         #endif
         return text
     }
+
+    #if canImport(Translation)
+    @available(macOS 26, *)
+    private static func appleTranslate(_ text: String, from source: String,
+                                       to target: Locale.Language) async throws -> String {
+        let session = TranslationSession(installedSource: Locale.Language(identifier: source),
+                                         target: target)
+        try await session.prepareTranslation()
+        return try await session.translate(text).targetText
+    }
+    #endif
 
     private static func appleLanguageCode(_ label: String) -> String {
         switch label {
@@ -598,8 +848,16 @@ enum Translator {
             if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
                let arr = json["translation"] as? [String],
                let first = arr.first { return first }
+            // 有道把失败塞在 errorCode 里（101 缺参数 / 108 appKey 无效 /
+            // 202 签名错 / 411 频率受限 / 412 长请求过多…），不记就只剩"返回原文"
+            DiagLog.log("[翻译] 有道未返回译文 目标=\(targetCode)："
+                        + (String(data: data, encoding: .utf8)?.prefix(200).description ?? ""))
+            await TranslateDiagnostics.record("有道未返回译文，请检查 Key 与语言支持")
             return text
-        } catch { return text }
+        } catch {
+            DiagLog.log("[翻译] 有道请求失败 目标=\(targetCode)：\(error.localizedDescription)")
+            return text
+        }
     }
 
     private static func youdaoLanguageCode(_ label: String) -> String {
@@ -666,8 +924,14 @@ enum Translator {
             if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
                let list = json["TranslationList"] as? [[String: Any]],
                let t = list.first?["Translation"] as? String { return t }
+            DiagLog.log("[翻译] 火山未返回译文 目标=\(targetCode)："
+                        + (String(data: data, encoding: .utf8)?.prefix(200).description ?? ""))
+            await TranslateDiagnostics.record("火山未返回译文，请检查密钥与语言支持")
             return text
-        } catch { return text }
+        } catch {
+            DiagLog.log("[翻译] 火山请求失败 目标=\(targetCode)：\(error.localizedDescription)")
+            return text
+        }
     }
 
     private static func volcanoLanguageCode(_ label: String) -> String {
@@ -698,15 +962,63 @@ enum Translator {
         Data(HMAC<SHA256>.authenticationCode(for: msg, using: SymmetricKey(data: key)))
     }
 
-    /// 批量翻译：多条文本用 \n 拼接成一次请求，翻译后按行还原。
-    /// 如果行数不匹配则回退到逐条翻译。
-    static func translateBatch(_ texts: [String], to lang: String) async -> [String] {
+    /// 批量翻译。先把「本地就能出结果」的挑走（已是目标语言、或只差简繁），
+    /// 剩下真需要引擎的才发请求 —— 一整轨中文转繁体因此是零请求。
+    static func translateBatch(_ texts: [String], to lang: String,
+                               sourceHint: String? = nil) async -> [String] {
         guard !texts.isEmpty else { return texts }
-        if texts.count == 1 { return [await translate(texts[0], to: lang)] }
+
+        var output = Array(repeating: "", count: texts.count)
+        var pendingIndices: [Int] = []
+        for (i, t) in texts.enumerated() {
+            if let converted = localChineseConvert(t, to: lang) {
+                output[i] = converted
+            } else if isAlreadyTarget(t, lang: lang) {
+                output[i] = t
+            } else {
+                pendingIndices.append(i)
+            }
+        }
+        guard !pendingIndices.isEmpty else { return output }
+
+        let pending = pendingIndices.map { texts[$0] }
+        // 只拿真要送引擎的那些投票：已是目标语言的条目留在里面会带偏结果
+        let hint = sourceHint ?? dominantLanguage(of: pending)
+        let engineLang = engineLanguage(for: lang)
+        var translated = await translateEngineBatch(pending, to: engineLang, sourceHint: hint)
+        if engineLang != lang {
+            translated = translated.map { OpenCC.toTraditional($0) }
+        }
+        for (k, i) in pendingIndices.enumerated() where k < translated.count {
+            output[i] = translated[k]
+        }
+        return output
+    }
+
+    /// 真正送去翻译引擎的那部分：多条文本用 \n 拼接成一次请求，翻译后按行还原。
+    /// 如果行数不匹配则回退到逐条翻译。
+    private static func translateEngineBatch(_ texts: [String], to lang: String,
+                                             sourceHint: String? = nil) async -> [String] {
+        guard !texts.isEmpty else { return texts }
+
+        // DeepL 有真批量接口：一次请求带走整批，请求数少一个数量级，
+        // 是躲开它那个很严的频率限制的正路（串行降并发只会让整轨翻译慢好几倍）
+        if AppSettings.shared.translateProvider == .deepL,
+           let batched = await translateDeepLBatch(texts, to: lang) {
+            // 逐条过一遍语言校验：引擎收下了目标语言却回原文语言时要当失败
+            return zip(texts, batched).map { src, out in
+                if isChineseTarget(lang), out.count >= 4, !isAlreadyTarget(out, lang: lang) {
+                    return src
+                }
+                return out
+            }
+        }
+
+        if texts.count == 1 { return [await translate(texts[0], to: lang, sourceHint: sourceHint)] }
 
         let lineCounts = texts.map { $0.components(separatedBy: "\n").count }
         let combined = texts.joined(separator: "\n")
-        let result = await translate(combined, to: lang)
+        let result = await translate(combined, to: lang, sourceHint: sourceHint)
         let allLines = result.components(separatedBy: "\n")
 
         let expectedTotal = lineCounts.reduce(0, +)
@@ -723,7 +1035,7 @@ enum Translator {
 
         var results: [String] = []
         for text in texts {
-            results.append(await translate(text, to: lang))
+            results.append(await translate(text, to: lang, sourceHint: sourceHint))
         }
         return results
     }
@@ -746,6 +1058,10 @@ enum Translator {
             batches.append((i, Array(texts[i..<end])))
         }
 
+        // 源语言在**整轨**范围内投一次票再分批：每批各自投票的话，某一批恰好
+        // 短句偏多就可能投出个离谱结果（实测单条英文字幕被判成土耳其语）
+        let hint = dominantLanguage(of: texts)
+
         var results = Array(repeating: "", count: texts.count)
         var completed = 0
 
@@ -753,7 +1069,7 @@ enum Translator {
             var launched = 0
             for batch in batches.prefix(concurrency) {
                 let b = batch
-                group.addTask { (b.offset, await translateBatch(b.texts, to: lang)) }
+                group.addTask { (b.offset, await translateBatch(b.texts, to: lang, sourceHint: hint)) }
                 launched += 1
             }
             for await (offset, translated) in group {
@@ -766,7 +1082,7 @@ enum Translator {
 
                 if launched < batches.count {
                     let b = batches[launched]
-                    group.addTask { (b.offset, await translateBatch(b.texts, to: lang)) }
+                    group.addTask { (b.offset, await translateBatch(b.texts, to: lang, sourceHint: hint)) }
                     launched += 1
                 }
             }
@@ -932,6 +1248,19 @@ private struct TextInspector: View {
         }
         .onAppear { syncAll() }
         .onChange(of: clip.id) { _ in syncAll() }
+        // 只认 id 变化不够：应用文字模板改的是**同一个片段**的内容，id 没变，
+        // 面板就一直显示旧值。这里监听整个 clip —— 自己写入引起的回流由
+        // syncing 标志挡住（write 里 guard !syncing）
+        // 只认 id 变化不够：应用文字模板改的是**同一个片段**的内容，id 没变，
+        // 面板就一直显示旧值。
+        //
+        // 必须用闭包参数里的新值 —— 闭包里的 `clip` 是视图**本次求值时**的旧快照，
+        // 拿它去 syncAll 等于把旧值原样写回（实测：模板已把字号改成 32，
+        // 这里读到的仍是 64）。自己写入引起的回流由 syncing 标志挡住
+        .onChange(of: clip) { newClip in
+            guard !syncing else { return }
+            syncAll(from: newClip)
+        }
     }
 
     private func write(_ mutate: (inout TextClip) -> Void) {
@@ -939,15 +1268,19 @@ private struct TextInspector: View {
         project.updateTextClip(id: clip.id, mutate)
         project.pushUndoThrottled()
     }
-    private func syncAll() {
+    /// 把片段的值同步进面板。
+    /// - Parameter src: 数据源。onChange 必须传闭包给的**新值**——
+    ///   视图属性 `clip` 在闭包里是旧快照
+    private func syncAll(from src: TextClip? = nil) {
+        let c = src ?? clip
         syncing = true
-        text = clip.text; startTime = clip.startTime; endTime = clip.endTime
-        fontName = clip.fontName; fontSize = Double(clip.fontSize)
-        bold = clip.bold; italic = clip.italic
-        textColor = clip.textColor; strokeColor = clip.strokeColor; strokeWidth = clip.strokeWidth
-        bgColor = clip.bgColor; bgOpacity = clip.bgOpacity
-        alignment = clip.alignment; posX = clip.posX; posY = clip.posY
-        rotation = clip.rotation; opacity = clip.opacity; animation = clip.animation
+        text = c.text; startTime = c.startTime; endTime = c.endTime
+        fontName = c.fontName; fontSize = Double(c.fontSize)
+        bold = c.bold; italic = c.italic
+        textColor = c.textColor; strokeColor = c.strokeColor; strokeWidth = c.strokeWidth
+        bgColor = c.bgColor; bgOpacity = c.bgOpacity
+        alignment = c.alignment; posX = c.posX; posY = c.posY
+        rotation = c.rotation; opacity = c.opacity; animation = c.animation
         DispatchQueue.main.async { syncing = false }
     }
 
@@ -2027,11 +2360,16 @@ private struct VideoInspector: View {
             hasPushedUndo = true
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { hasPushedUndo = false }
         }
-        project.updateVideoClip(id: clip.id) {
-            $0.colorAdjust.brightness = brightness
-            $0.colorAdjust.contrast   = contrast
-            $0.colorAdjust.saturation = saturation
-            $0.colorAdjust.hue        = hue
+        let adj = ColorAdjust(brightness: brightness, contrast: contrast,
+                              saturation: saturation, hue: hue)
+        project.updateVideoClip(id: clip.id) { $0.colorAdjust = adj }
+        // 视频的色调在 compositor 里逐帧算，光改 clip 要等 rebuild 才可见（防抖 0.15s，
+        // 表现就是"松手才变"）。这里照位移滑块的做法把值直接喂给 compositor
+        // 并逼播放器重绘当前帧，拖动过程就是实时的。
+        // rebuild 仍然照常跑：它会 clearStore 把这份覆盖清掉，届时 entries 里已是同样的真值
+        if let trackID = project.videoClipTrackIDMap[clip.id] {
+            ColorCompositor.setLiveColorAdjust(trackID: trackID, adj)
+            project.clock.refreshSeekRequest &+= 1
         }
         project.rebuildTimelinePreviewDebounced()
     }
