@@ -567,6 +567,10 @@ extension ProjectState {
         cancelFlag: ClarityCancelFlag,
         useSystemSR: Bool = false,
         proModel: ClarityProModel? = nil,
+        /// - Important: 推理阶段这个回调是在 `DispatchQueue.concurrentPerform` 的闭包里
+        ///   调的（每帧一次），**会从多个线程同时进来**。调用方要么立刻派发到主线程
+        ///   （生产侧就是这么做的），要么自己加锁 —— 直接往数组之类的共享结构写
+        ///   会撞成 EXC_BAD_ACCESS。
         onStateChange: @escaping (ClarityEnhanceState) -> Void
     ) throws -> URL {
         func checkCancelled() throws {

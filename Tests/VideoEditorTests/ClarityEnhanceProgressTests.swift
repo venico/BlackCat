@@ -101,7 +101,12 @@ extension ClarityEnhanceProgressTests {
             .appendingPathComponent("clarity_pipeline_out_\(UUID().uuidString).mp4")
         defer { try? FileManager.default.removeItem(at: outputURL) }
 
-        var observedStates: [ProjectState.ClarityEnhanceState] = []
+        // onStateChange 是在 DispatchQueue.concurrentPerform 的闭包里调的（推理阶段
+        // 每帧回调一次），**会从多个线程同时进来**。直接往数组 append 会撞成
+        // EXC_BAD_ACCESS —— 实测三次全量里崩过一次，栈就停在 Array.append。
+        // 生产侧的调用方一进回调就 DispatchQueue.main.async 派发，所以不受影响，
+        // 只有这里图省事直接收集。
+        let collector = StateCollector()
         let cancelFlag = ClarityCancelFlag()
 
         let start = Date()
@@ -109,9 +114,10 @@ extension ClarityEnhanceProgressTests {
             sourceURL: video, trimStart: 0, duration: 2,
             model: .x2, workDir: workDir, outputURL: outputURL,
             cancelFlag: cancelFlag,
-            onStateChange: { state in observedStates.append(state) }
+            onStateChange: { state in collector.append(state) }
         )
         let elapsed = Date().timeIntervalSince(start)
+        let observedStates = collector.snapshot()
 
         XCTAssertEqual(result, outputURL)
         XCTAssertTrue(FileManager.default.fileExists(atPath: outputURL.path), "应该生成输出视频文件")
@@ -140,5 +146,21 @@ extension ClarityEnhanceProgressTests {
             XCTAssertGreaterThanOrEqual(ph, lastPhase, "阶段顺序应该是 extractingFrames -> inferring -> encoding，不应倒退")
             lastPhase = ph
         }
+    }
+}
+
+/// 线程安全的状态收集器：onStateChange 会从 concurrentPerform 的多个线程同时回调
+private final class StateCollector: @unchecked Sendable {
+    private let lock = NSLock()
+    private var states: [ProjectState.ClarityEnhanceState] = []
+
+    func append(_ s: ProjectState.ClarityEnhanceState) {
+        lock.lock(); defer { lock.unlock() }
+        states.append(s)
+    }
+
+    func snapshot() -> [ProjectState.ClarityEnhanceState] {
+        lock.lock(); defer { lock.unlock() }
+        return states
     }
 }
