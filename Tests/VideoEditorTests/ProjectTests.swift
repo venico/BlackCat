@@ -779,13 +779,15 @@ final class UndoRedoTests: XCTestCase {
         XCTAssertEqual(p.subtitleTracks[0].clips[0].text, "orig", "撤销应恢复原文")
     }
 
-    // TC-UR-005: 撤销栈上限 50
+    // TC-UR-005: 撤销栈上限 30
     func testUR005_UndoStackLimit() {
         let p = ProjectState()
         for _ in 0..<60 {
             p.pushUndo()
         }
-        XCTAssertLessThanOrEqual(p.undoCount, 50, "撤销栈不应超过50")
+        // 实现里是 `undoStack.count > 30 { removeFirst() }`（19 处一致）。
+        // 断言曾写 50 —— 30 <= 50 恒成立，等于没测到真实上限，改回 50 也发现不了
+        XCTAssertLessThanOrEqual(p.undoCount, 30, "撤销栈不应超过 30")
     }
 
     // TC-UR-006: 撤销添加素材到时间轴

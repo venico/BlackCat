@@ -639,12 +639,16 @@ struct SettingsView: View {
                 }
 
                 if settings.translateProvider == .apple {
-                    if #available(macOS 15, *) {
+                    // 版本门槛必须跟 Translator.translateApple 里的 #available 一致。
+                    // TranslationSession 类本身是 macOS 15，但我们用的
+                    // init(installedSource:target:) 初始化器标的是 macOS 26 —— 这里写 15
+                    // 会让 15~25 的用户看到"可用"，点翻译却静默返回原文、不报任何错
+                    if #available(macOS 26, *) {
                         Text("使用系统内置翻译，无需 API Key（需先在系统设置中下载语言包）")
                             .font(.system(size: 10))
                             .foregroundColor(Color.labelSecondary)
                     } else {
-                        Text("Apple 翻译需要 macOS 15 或更高版本")
+                        Text("Apple 翻译需要 macOS 26 或更高版本")
                             .font(.system(size: 10))
                             .foregroundColor(.orange.opacity(0.8))
                     }

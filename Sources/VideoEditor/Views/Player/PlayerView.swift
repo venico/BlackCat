@@ -1235,6 +1235,13 @@ private struct PreviewToolbar: View {
         guard let item = project.playerItem else { return }
         let asset = item.asset
         let gen = AVAssetImageGenerator(asset: asset)
+        // 必须把 videoComposition 交给 generator —— 预览画面是 playerItem 走
+        // ColorCompositor 渲染出来的，图片/文字/图形这些 overlay、色调、旋转、裁剪
+        // 全在 videoComposition 里。不设的话 generator 只从 composition 的视频轨抽帧，
+        // 播放头处若没有视频片段（画面全靠 overlay）截出来就是纯黑
+        gen.videoComposition = item.videoComposition
+        // 有 videoComposition 时 appliesPreferredTrackTransform 会被忽略，
+        // 方向由 compositor 自己处理（见 ColorCompositor 的 sourceTransform）
         gen.appliesPreferredTrackTransform = true
         gen.requestedTimeToleranceBefore = .zero
         gen.requestedTimeToleranceAfter = .zero
@@ -1658,8 +1665,10 @@ private struct VideoTransformOverlay: View {
                 .frame(width: isHorizontal ? length : 3,
                        height: isHorizontal ? 3 : length)
                 .shadow(color: .black.opacity(0.4), radius: 2, x: 0, y: 1)
-                .frame(width: isHorizontal ? length + 16 : 28,
-                       height: isHorizontal ? 28 : length + 16)
+                // 跟图形边条同宽（10pt）。原来 28 等于向外各吃掉 12pt，
+                // 压着下层图层时会把人家露出来的窄区抢掉
+                .frame(width: isHorizontal ? length + 16 : 10,
+                       height: isHorizontal ? 10 : length + 16)
                 .contentShape(Rectangle())
                 .onHover { h in
                     if h { (isHorizontal ? NSCursor.resizeUpDown : NSCursor.resizeLeftRight).set() }
@@ -2053,8 +2062,10 @@ private struct ImageTransformOverlay: View {
                 .frame(width: isHorizontal ? length : 3,
                        height: isHorizontal ? 3 : length)
                 .shadow(color: .black.opacity(0.4), radius: 2, x: 0, y: 1)
-                .frame(width: isHorizontal ? length + 16 : 28,
-                       height: isHorizontal ? 28 : length + 16)
+                // 跟图形边条同宽（10pt）。原来 28 等于向外各吃掉 12pt，
+                // 压着下层图层时会把人家露出来的窄区抢掉
+                .frame(width: isHorizontal ? length + 16 : 10,
+                       height: isHorizontal ? 10 : length + 16)
                 .contentShape(Rectangle())
                 .onHover { h in
                     if h { (isHorizontal ? NSCursor.resizeUpDown : NSCursor.resizeLeftRight).set() }
@@ -2634,8 +2645,17 @@ private struct ShapeTransformOverlay: View {
         RoundedRectangle(cornerRadius: 1.5).fill(Color.orange)
             .frame(width: horizontal ? length : 3, height: horizontal ? 3 : length)
             .shadow(color: .black.opacity(0.4), radius: 2, y: 1)
-            .frame(width: horizontal ? length + 16 : 28, height: horizontal ? 28 : length + 16)
+            // 热区比视觉宽是为了好抓，但别宽过头：边条盖在别的图层上时，会把
+            // 露在外面那一溜窄区也吃掉，导致点不中下层（图形压着文字最明显）
+            .frame(width: horizontal ? length + 8 : 10, height: horizontal ? 10 : length + 8)
             .contentShape(Rectangle())
+            .onHover { h in
+                guard h else { NSCursor.arrow.set(); return }
+                // 转了 90°/270° 之后，横条实际是在左右拉，光标要跟着换
+                let quarter = Int((rot / 90).rounded()) % 2 != 0
+                let vertical = horizontal != quarter
+                (vertical ? NSCursor.resizeUpDown : NSCursor.resizeLeftRight).set()
+            }
             .rotationEffect(.degrees(rot))
     }
 
