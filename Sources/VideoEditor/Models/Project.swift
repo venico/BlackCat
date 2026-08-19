@@ -12,13 +12,15 @@ final class ProjectState: ObservableObject {
     @Published var mediaAssets: [MediaAsset] = []
 
     // Tracks
+    // 六种类型各留一条空轨。空项目就能看到完整的轨道结构，
+    // 第一个素材直接落在对应的空轨上，不用先凭空多出一条轨道来
     @Published var videoTracks: [Track<VideoClip>]    = [Track(label: "视频")]
-    @Published var audioTracks: [Track<AudioClip>]    = []
-    @Published var imageTracks: [Track<ImageClip>]       = []
-    @Published var subtitleTracks: [Track<SubtitleClip>] = []
-    @Published var textTracks: [Track<TextClip>] = []
+    @Published var audioTracks: [Track<AudioClip>]    = [Track(label: "音频")]
+    @Published var imageTracks: [Track<ImageClip>]       = [Track(label: "图片")]
+    @Published var subtitleTracks: [Track<SubtitleClip>] = [ProjectState.makeEmptySubtitleTrack()]
+    @Published var textTracks: [Track<TextClip>] = [Track(label: "文字")]
     @Published var textTemplates: [TextTemplate] = []  // 文字样式模板
-    @Published var shapeTracks: [Track<ShapeClip>] = []  // 图形图层
+    @Published var shapeTracks: [Track<ShapeClip>] = [Track(label: "图形")]  // 图形图层
     @Published var compoundTracks: [Track<CompoundClip>] = []
     @Published var selectedMarkerID: UUID? = nil
 
@@ -1048,8 +1050,24 @@ final class ProjectState: ObservableObject {
     /// 正在访问安全范围的 URL（app 退出时需要 stop）
     var accessedURLs: [URL] = []
 
+    /// 字幕轨道要带样式，单独造一条
+    static func makeEmptySubtitleTrack() -> Track<SubtitleClip> {
+        var t = Track<SubtitleClip>(label: "字幕")
+        t.subtitleStyle = SubtitleStyle()
+        return t
+    }
+
+    /// 把默认那几条空轨排进各自的顺序表。
+    /// 顺序表初始是空的，不排一遍这些轨道就没有稳定的上下位置
+    func seedDefaultTrackOrder() {
+        syncVideoSectionOrder()
+        syncAudioSectionOrder()
+        syncOverlayOrder()
+    }
+
     init() {
         loadSavedMediaLibrary()
+        seedDefaultTrackOrder()
         $mediaAssets
             .dropFirst()
             .debounce(for: .milliseconds(500), scheduler: RunLoop.main)

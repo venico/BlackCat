@@ -10,12 +10,17 @@ extension ProjectState {
         let fileURL = directory.appendingPathComponent("\(name).bcj")
         projectFileURL = fileURL
         // 重置到空项目状态（素材库保留，不清空）
+        // 跟冷启动保持一致：六种类型各留一条空轨
         videoTracks = [Track(label: "视频")]
-        audioTracks = []
-        imageTracks = []
-        subtitleTracks = []
-        textTracks = []
-        shapeTracks = []
+        audioTracks = [Track(label: "音频")]
+        imageTracks = [Track(label: "图片")]
+        subtitleTracks = [ProjectState.makeEmptySubtitleTrack()]
+        textTracks = [Track(label: "文字")]
+        shapeTracks = [Track(label: "图形")]
+        overlayTrackOrder.removeAll()
+        videoSectionOrder.removeAll()
+        audioSectionOrder.removeAll()
+        seedDefaultTrackOrder()
         subtitleBottomMargin = 5
         subtitleLineSpacing = 6
         undoStack.removeAll(); redoStack.removeAll()

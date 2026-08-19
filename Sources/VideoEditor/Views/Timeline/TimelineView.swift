@@ -543,7 +543,11 @@ struct TimelineView: View {
     /// "+" 添加轨道菜单：放在固定顶条左角，不随竖滑动
     private var addTrackMenu: some View {
         Menu {
-            Button("添加视频轨道") { project.videoTracks.append(Track(label: "视频")); project.syncVideoSectionOrder() }
+            // 这个 + 就是"新建空轨"，任何时候都该可用，不做置灰
+            Button("添加视频轨道") {
+                project.videoTracks.append(Track(label: "视频"))
+                project.syncVideoSectionOrder()
+            }
             Button("添加图片轨道") { project.imageTracks.append(Track(label: "图片")); project.syncOverlayOrder() }
             Button("添加音频轨道") { project.audioTracks.append(Track(label: "音频")); project.syncAudioSectionOrder() }
             Button("添加字幕轨道") {
