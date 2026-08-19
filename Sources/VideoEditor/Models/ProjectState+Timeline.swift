@@ -3,6 +3,9 @@ import AVFoundation
 
 // MARK: - Timeline Track Operations
 
+/// 新建字幕 / 文字 / 图形片段的默认时长（秒）。三者统一，改这里就够了
+let kNewClipDuration: Double = 5.0
+
 extension ProjectState {
 
     // MARK: - Cross-track move
@@ -732,11 +735,14 @@ extension ProjectState {
     }
 
     /// Insert a new subtitle clip into the active subtitle track at the playhead.
-    func insertSubtitleAtPlayhead() {
+    /// 在播放头插入字幕。`text` 留空用默认占位文案 ——
+    /// 聊天面板右键「添加到字幕」会把选中的文字带进来
+    func insertSubtitleAtPlayhead(text: String? = nil) {
         let snap = currentSnapshot()
 
         let start = currentTime
-        let end   = min(currentTime + 2.0, max(duration, currentTime + 2.0))
+        let end   = min(currentTime + kNewClipDuration,
+                        max(duration, currentTime + kNewClipDuration))
 
         let trackIdx: Int
         if let sid = selectedSubtitleClipID,
@@ -763,7 +769,7 @@ extension ProjectState {
             trackIdx = subtitleTracks.count - 1
         }
 
-        let clip  = SubtitleClip(text: "新字幕", startTime: start, endTime: end)
+        let clip  = SubtitleClip(text: text ?? "新字幕", startTime: start, endTime: end)
         subtitleTracks[trackIdx].clips.append(clip)
         subtitleTracks[trackIdx].clips.sort { $0.startTime < $1.startTime }
         selectedSubtitleClipID = clip.id
@@ -781,10 +787,10 @@ extension ProjectState {
     // MARK: - 文字/标题图层
 
     /// 在播放头插入文字图层（选中文字则在其轨道，否则用最后一条文字轨道，无则新建）
-    func addTextAtPlayhead() {
+    func addTextAtPlayhead(text: String? = nil) {
         let snap = currentSnapshot()
         let start = currentTime
-        let end   = currentTime + 3.0
+        let end   = currentTime + kNewClipDuration
 
         let trackIdx: Int
         if let tid = selectedTextClipID,
@@ -809,7 +815,7 @@ extension ProjectState {
             trackIdx = textTracks.count - 1
         }
 
-        let clip  = TextClip(text: "标题文字", startTime: start, endTime: end)
+        let clip  = TextClip(text: text ?? "标题文字", startTime: start, endTime: end)
         textTracks[trackIdx].clips.append(clip)
         textTracks[trackIdx].clips.sort { $0.startTime < $1.startTime }
         // 选中新建的文字，清其他选中
@@ -866,7 +872,7 @@ extension ProjectState {
     func addShape(type: ShapeType, at time: Double) {
         let snap = currentSnapshot()
         let start = max(0, time)
-        let end   = start + 2.0
+        let end   = start + kNewClipDuration
         let trackIdx: Int
         if shapeTracks.isEmpty {
             let newTrack = Track<ShapeClip>(label: "图形")

@@ -543,6 +543,14 @@ final class ProjectState: ObservableObject {
     @Published var showWhisperModelPicker = false
     /// 识别前问「直接识别 / 识别+AI校对」的弹窗
     @Published var showTranscribeOptions = false
+
+    /// 翻译的触发器。
+    ///
+    /// 翻译那两百来行逻辑长在工具栏的 TranslateToolGroup 里，依赖它自己的一堆私有辅助，
+    /// 右键菜单够不着。这里放两个计数器当信号：右键菜单 +1，工具栏那边 onChange 收到就执行。
+    /// 比把整套逻辑搬进 ProjectState 风险小得多
+    @Published var translateSelectedTick = 0
+    @Published var translateTrackTick = 0
     /// 校对用哪个文字模型（AIVideoService.Provider 的 rawValue）。
     /// 跟「AI 生成」共用配置，不再单独一套 Key
     @Published var transcribeAIModel = "deepseek-ai"

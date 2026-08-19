@@ -32,9 +32,43 @@ struct AIChatPanel: View {
         nonmutating set { service.imageMode = newValue }
     }
 
-    private let durations = ["4", "5", "6", "7", "8", "9", "10"]
+    /// 时长按供应商/子模型给 —— 各家上限差很多，列出人家不收的档位等于挖坑
+    private var durations: [String] {
+        switch service.selectedProvider {
+        case .seedance:
+            // 2.5 单次能出到 30s，2.0 上限 15s
+            return currentSubModel == "2.5"
+                ? ["5", "10", "15", "20", "25", "30"]
+                : ["5", "10", "15"]
+        case .minimax:
+            return ["4", "6", "8", "10", "12", "15"]      // 官方 4~15s
+        default:
+            return ["4", "5", "6", "7", "8", "9", "10"]
+        }
+    }
+
+    /// 当前时长；换供应商后原来的档位这家不收时，退回它支持的第一档
+    private var currentDuration: String {
+        durations.contains(settings.aiDuration) ? settings.aiDuration : (durations.first ?? "5")
+    }
     private let ratios = ["21:9", "16:9", "4:3", "1:1", "3:4", "9:16"]
-    private let resolutions = ["480P", "720P", "1080P", "4K"]
+
+    /// 分辨率按供应商给 —— 列出人家不认的档位，选了也是白选（会被静默换掉）
+    private var resolutions: [String] {
+        switch service.selectedProvider {
+        case .minimax: return ["768P", "2K"]        // H3 只有这两档
+        case .seedance:
+            // 2.5 目前只开放到 720P，1080P/4K 还没上
+            return currentSubModel == "2.5" ? ["480P", "720P"] : ["480P", "720P", "1080P"]
+        default:       return ["480P", "720P", "1080P", "4K"]
+        }
+    }
+
+    /// 当前分辨率；上一个供应商选的档位这家不认时，退回它支持的第一档
+    private var currentResolution: String {
+        let list = resolutions
+        return list.contains(settings.aiResolution) ? settings.aiResolution : (list.first ?? "")
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -84,8 +118,11 @@ struct AIChatPanel: View {
                 .textCase(.uppercase)
             Spacer()
             Button { service.newConversation() } label: {
-                Image(systemName: "square.and.pencil")
-                    .font(.system(size: 12, weight: .medium))
+                Image(nsImage: SidebarSVGIcon.load("newChat", size: 14))
+                    .renderingMode(.template)
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .frame(width: 14, height: 14)
                     .foregroundColor(Color.labelSecondary)
             }
             .buttonStyle(.plain)
@@ -186,25 +223,32 @@ struct AIChatPanel: View {
 
     // MARK: - 消息列表
 
+    @ViewBuilder
     private var messageList: some View {
+        // 空状态放在 ScrollView **外面**：PositionedAtOneThird 靠 GeometryReader 读高度，
+        // 而 ScrollView 内容高度是自适应的，塞进去会塌陷成 0，三分之一定位就失效了
+        if service.messages.isEmpty {
+            emptyHint
+        } else {
+            messageScrollView
+        }
+    }
+
+    private var messageScrollView: some View {
         ScrollViewReader { proxy in
             ScrollView(showsIndicators: false) {
-                if service.messages.isEmpty {
-                    emptyHint
-                } else {
-                    LazyVStack(spacing: 12) {
-                        ForEach(service.messages) { msg in
-                            MessageBubble(message: msg, onInsertToTimeline: { url in
-                                insertMediaToTimeline(url)
-                            }, onRestoreAttachment: { att in
-                                restoreAttachment(att)
-                            })
-                            .id(msg.id)
-                        }
+                LazyVStack(spacing: 12) {
+                    ForEach(service.messages) { msg in
+                        MessageBubble(message: msg, onInsertToTimeline: { url in
+                            insertMediaToTimeline(url)
+                        }, onRestoreAttachment: { att in
+                            restoreAttachment(att)
+                        })
+                        .id(msg.id)
                     }
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 10)
                 }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 10)
             }
             .onChange(of: service.messages.count) { _ in scrollToLast(proxy) }
             // 生成完成时消息条数**没变**：同一条 assistant 消息的 status 从 .generating
@@ -227,19 +271,44 @@ struct AIChatPanel: View {
     }
 
     private var emptyHint: some View {
-        VStack(spacing: 12) {
-            Image(systemName: "sparkles")
-                .font(.system(size: 32, weight: .ultraLight))
-                .foregroundColor(Color.labelSecondary.opacity(0.3))
+        // 跟素材库空状态同一套：44pt 图标 0.30、11pt 文字 0.45、间距 10、
+        // 摆在上方三分之一处。图标按当前选的生成类型走素材库对应的那张
+        VStack(spacing: 10) {
+            Image(nsImage: SidebarSVGIcon.load(emptyHintIcon, size: 44))
+                .renderingMode(.template)
+                .resizable()
+                .aspectRatio(contentMode: .fit)
+                .frame(width: 44, height: 44)
+                .foregroundColor(Color.labelSecondary.opacity(0.30))
             Text(emptyHintText)
-                .font(.system(size: 12))
-                .foregroundColor(Color.labelSecondary.opacity(0.5))
+                .font(.system(size: 11))
+                .foregroundColor(Color.labelSecondary.opacity(0.45))
+                .multilineTextAlignment(.center)
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .padding(.top, 60)
+        .modifier(PositionedAtOneThird())
+    }
+
+    /// 生成类型 → 素材库同款图标
+    private var emptyHintIcon: String {
+        switch service.selectedProvider.category {
+        case .video: return "video"
+        case .image: return "image"
+        case .audio: return "audio"
+        case .text:  return "ai"      // 文字对话用 AI 生成自己的图标
+        }
     }
 
     // MARK: - 输入区域
+
+    /// 输入框高度，可以拖上边缘调。30 是一行的高度，上限给到 300 够写长提示词了
+    @State private var inputHeight: CGFloat = 50
+    @State private var dragStartHeight: CGFloat? = nil
+    @State private var isResizing = false
+
+    /// 正文行距。目标是 1.4 倍行高（12pt 字 → 16.8pt 行高），
+    /// 而 lineSpacing 加的是行间额外间距，默认单行已占约 14.3pt，所以补 2.5。
+    /// 模型回复、用户气泡、输入框三处共用这一个值
+    static let bodyLineSpacing: CGFloat = 2.5
 
     private var inputArea: some View {
         VStack(spacing: 0) {
@@ -249,35 +318,48 @@ struct AIChatPanel: View {
                         imagePreviewArea
                     }
                     Spacer()
-                    Button { showProviderMenu() } label: {
-                        HStack(spacing: 3) {
-                            Text(service.selectedProvider.displayName)
-                                .font(.system(size: 10))
-                                .lineLimit(1)
-                                .truncationMode(.tail)
-                            Image(systemName: "chevron.down")
-                                .font(.system(size: 7, weight: .bold))
+                    // 子模型紧挨着供应商下拉左边：先选哪一家，再选它下面哪个型号，
+                    // 从左往右读正好是「Seedance2.0 → Seedance」这个层级。
+                    // 外层 HStack 是 .top 对齐（迁就参考图区），这两个下拉要单独居中对齐
+                    HStack(alignment: .center, spacing: 0) {
+                        if !service.selectedProvider.subModels.isEmpty {
+                            capsuleMenu(label: currentSubModelLabel) {
+                                ForEach(service.selectedProvider.subModels, id: \.id) { m in
+                                    Button(m.label) {
+                                        settings.setProviderModel(m.id, for: service.selectedProvider.rawValue)
+                                    }
+                                }
+                            }
                         }
-                        .foregroundColor(Color.labelSecondary)
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 3)
+                        Button { showProviderMenu() } label: {
+                            HStack(spacing: 3) {
+                                Text(service.selectedProvider.displayName)
+                                    .font(.system(size: 10))
+                                    .lineLimit(1)
+                                    .truncationMode(.tail)
+                                Image(systemName: "chevron.down")
+                                    .font(.system(size: 7, weight: .bold))
+                            }
+                            .foregroundColor(Color.labelSecondary)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 3)
+                        }
+                        .buttonStyle(.plain)
                     }
-                    .buttonStyle(.plain)
                 }
                 .padding(.horizontal, 8)
                 .padding(.top, 8)
 
-                TextEditor(text: $inputText)
-                    .font(.system(size: 12))
-                    .foregroundColor(Color.labelPrimary)
-                    .scrollContentBackground(.hidden)
-                    .frame(minHeight: 30, maxHeight: 50)
+                ChatInputTextView(
+                    text: $inputText,
+                    onAddSubtitle: { project.insertSubtitleAtPlayhead(text: $0) },
+                    onAddTitle: { project.addTextAtPlayhead(text: $0) },
+                    onSubmit: { sendMessage() }
+                )
+                    .frame(height: inputHeight)
+                    .animation(nil, value: inputHeight)
                     .padding(.horizontal, 6)
                     .padding(.top, 2)
-                    .onKeyPress(.return) {
-                        sendMessage()
-                        return .handled
-                    }
                     .overlay(alignment: .topLeading) {
                         if inputText.isEmpty {
                             Text(inputPlaceholder)
@@ -301,7 +383,7 @@ struct AIChatPanel: View {
                                 imageMode = .frames
                             } label: { Text("首尾帧") }
                         }
-                        capsuleMenu(label: settings.aiDuration + "s") {
+                        capsuleMenu(label: currentDuration + "s") {
                             ForEach(durations, id: \.self) { d in
                                 Button(d + "s") { settings.aiDuration = d }
                             }
@@ -311,7 +393,7 @@ struct AIChatPanel: View {
                                 Button(r) { settings.aiRatio = r }
                             }
                         }
-                        capsuleMenu(label: settings.aiResolution) {
+                        capsuleMenu(label: currentResolution) {
                             ForEach(resolutions, id: \.self) { r in
                                 Button(r) { settings.aiResolution = r }
                             }
@@ -329,8 +411,11 @@ struct AIChatPanel: View {
                             service.webSearchEnabled.toggle()
                         } label: {
                             HStack(spacing: 2) {
-                                Image(systemName: "globe")
-                                    .font(.system(size: 9))
+                                Image(nsImage: SidebarSVGIcon.load("webSearch", size: 11))
+                                    .renderingMode(.template)
+                                    .resizable()
+                                    .aspectRatio(contentMode: .fit)
+                                    .frame(width: 11, height: 11)
                                 Text("联网")
                                     .font(.system(size: 10))
                             }
@@ -343,25 +428,40 @@ struct AIChatPanel: View {
                         .buttonStyle(.plain)
                     }
 
+                    // 推理强度：挨着联网放。只有一档清单的时候没必要再套一层级联菜单
+                    if !service.selectedProvider.reasoningLevels.isEmpty {
+                        capsuleMenu(label: currentReasoningLabel) {
+                            ForEach(service.selectedProvider.reasoningLevels, id: \.value) { lv in
+                                Button(lv.label) {
+                                    settings.setProviderReasoning(lv.value, for: service.selectedProvider.rawValue)
+                                }
+                            }
+                        }
+                    }
+
                     Spacer()
 
                     if service.isGenerating {
+                        // 停止用通知卡片那套图标，跟别处保持一致
                         Button { service.cancelGeneration() } label: {
-                            ZStack {
-                                Circle()
-                                    .fill(Color.accent)
-                                    .frame(width: 20, height: 20)
-                                RoundedRectangle(cornerRadius: 2)
-                                    .fill(Color.black)
-                                    .frame(width: 8, height: 8)
-                            }
+                            Image(nsImage: SidebarSVGIcon.load("toastStop", size: 16))
+                                .renderingMode(.template)
+                                .resizable()
+                                .aspectRatio(contentMode: .fit)
+                                .frame(width: 16, height: 16)
+                                .foregroundColor(Color.labelSecondary)
                         }
                         .buttonStyle(.plain)
                     } else {
                         Button { sendMessage() } label: {
-                            Image(systemName: "arrow.up.circle.fill")
-                                .font(.system(size: 20))
-                                .foregroundColor(canSend ? Color.accent : Color.labelSecondary.opacity(0.3))
+                            Image(nsImage: SidebarSVGIcon.load("send", size: 16))
+                                .renderingMode(.template)
+                                .resizable()
+                                .aspectRatio(contentMode: .fit)
+                                .frame(width: 16, height: 16)
+                                // 跟素材区左侧那排图标同一个默认灰；不可发送时再压暗
+                                .foregroundColor(canSend ? Color.labelSecondary
+                                                         : Color.labelSecondary.opacity(0.3))
                         }
                         .buttonStyle(.plain)
                         .disabled(!canSend)
@@ -373,6 +473,41 @@ struct AIChatPanel: View {
             }
             .background(Color.white.opacity(0.06))
             .clipShape(RoundedRectangle(cornerRadius: 10))
+            // 拖动热区：跨在输入框上边缘，上下各 8pt。
+            //
+            // 必须挂在这一层（气泡本体）而不是外层容器 —— 外层还有 8pt 的
+            // top padding，挂那儿热区会落在气泡上方的空白里，跟看到的边缘错开，
+            // 表现就是"有时能拖有时拖不动"。
+            // 放在 clipShape 之后，超出边界的那一半才不会被裁掉
+            .overlay(alignment: .top) {
+                Color.clear
+                    .frame(height: 16)
+                    .contentShape(Rectangle())
+                    .offset(y: -8)
+                    .onHover { hovering in
+                        // 拖动中鼠标会甩出热区，这时不能把光标改回箭头，否则一路闪
+                        if hovering || isResizing { NSCursor.resizeUpDown.set() }
+                        else { NSCursor.arrow.set() }
+                    }
+                    .gesture(
+                        // .global 坐标系：热区会随输入框变高而上移，
+                        // 局部坐标系下参考点跟着漂，拖起来不跟手
+                        DragGesture(minimumDistance: 0, coordinateSpace: .global)
+                            .onChanged { v in
+                                if !isResizing {
+                                    isResizing = true
+                                    dragStartHeight = inputHeight
+                                    NSCursor.resizeUpDown.set()
+                                }
+                                let start = dragStartHeight ?? inputHeight
+                                inputHeight = min(300, max(30, start - v.translation.height))
+                            }
+                            .onEnded { _ in
+                                isResizing = false
+                                dragStartHeight = nil
+                            }
+                    )
+            }
             .padding(.horizontal, 8)
             .padding(.top, 8)
             .padding(.bottom, 8)
@@ -398,7 +533,7 @@ struct AIChatPanel: View {
     // MARK: - 图片预览区
 
     private var imagePreviewArea: some View {
-        HStack(spacing: 6) {
+        HStack(spacing: 2) {
             if imageMode == .reference || service.selectedProvider.category != .video {
                 refContentSlot
             } else {
@@ -426,8 +561,11 @@ struct AIChatPanel: View {
                 lastFrameImage = tmp
             }
         } label: {
-            Image(systemName: "arrow.left.arrow.right")
-                .font(.system(size: 10))
+            Image(nsImage: SidebarSVGIcon.load("swapFrame", size: 14))
+                .renderingMode(.template)
+                .resizable()
+                .aspectRatio(contentMode: .fit)
+                .frame(width: 14, height: 14)
                 .foregroundColor(Color.labelSecondary.opacity(enabled ? (swapHovering ? 0.9 : 0.55) : 0.25))
                 .frame(width: 20, height: 20)
                 .contentShape(Rectangle())
@@ -673,6 +811,42 @@ struct AIChatPanel: View {
         }
     }
 
+    /// 当前选中的子模型（发给 API 的那个名字）；没选过就用清单第一项
+    private var currentSubModel: String {
+        let saved = settings.providerModel(for: service.selectedProvider.rawValue)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if !saved.isEmpty {
+            // 旧配置存的是显示名，换算成 id（勾选状态才对得上）
+            let list = service.selectedProvider.subModels
+            return list.first { $0.label == saved }?.id ?? saved
+        }
+        return service.selectedProvider.subModels.first?.id ?? ""
+    }
+
+    /// 界面上显示的子模型名。
+    /// 早期版本把显示名当 API 名存了（"Opus5"），这里按 label 兜一次底，
+    /// 让旧配置也能对上，不至于显示成一串陌生的 id
+    private var currentSubModelLabel: String {
+        let v = currentSubModel
+        let list = service.selectedProvider.subModels
+        return list.first { $0.id == v }?.label
+            ?? list.first { $0.label == v }?.label
+            ?? v
+    }
+
+    /// 当前推理强度取值；没选过就用该家默认（清单第一项）
+    private var currentReasoningValue: String {
+        let saved = settings.providerReasoning(for: service.selectedProvider.rawValue)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if !saved.isEmpty { return saved }
+        return service.selectedProvider.reasoningLevels.first?.value ?? ""
+    }
+
+    private var currentReasoningLabel: String {
+        let v = currentReasoningValue
+        return service.selectedProvider.reasoningLevels.first { $0.value == v }?.label ?? v
+    }
+
     private var emptyHintText: String {
         switch service.selectedProvider.category {
         case .video: return "描述你想生成的视频"
@@ -749,7 +923,9 @@ struct AIChatPanel: View {
         let refAudioURLs = referenceContents.filter { $0.type == .audio }.map(\.url)
         let firstURL = firstFrameImage?.url
         let lastURL = lastFrameImage?.url
-        service.sendPrompt(text, duration: settings.aiDuration, aspectRatio: settings.aiRatio, resolution: settings.aiResolution, imageRatio: settings.aiImageRatio, referenceImages: refImageURLs, referenceVideos: refVideoURLs, referenceAudios: refAudioURLs, firstFrame: firstURL, lastFrame: lastURL)
+        // 发的是校正过的值：换供应商后旧档位这家可能不收，
+        // 界面上已经退回到合法档，这里不能再把原始值发出去
+        service.sendPrompt(text, duration: currentDuration, aspectRatio: settings.aiRatio, resolution: currentResolution, imageRatio: settings.aiImageRatio, referenceImages: refImageURLs, referenceVideos: refVideoURLs, referenceAudios: refAudioURLs, firstFrame: firstURL, lastFrame: lastURL)
         referenceContents.removeAll()
         firstFrameImage = nil
         lastFrameImage = nil
@@ -764,10 +940,10 @@ struct AIChatPanel: View {
 
         if ["mp3", "wav", "m4a", "aac", "flac", "ogg"].contains(ext) {
             project.addToTimelineAt(asset, time: playhead, skipUndo: true)
-            project.showSuccessToast(icon: "waveform", iconColor: .blue, title: "AI 音频", subtitle: "已插入音频轨道")
+            project.showSuccessToast(icon: "audio", iconColor: .accent, title: "AI 音频", subtitle: "已插入时间轨道并导入素材库")
         } else if ["png", "jpg", "jpeg", "gif", "webp", "bmp", "tiff"].contains(ext) {
             project.addToTimelineAt(asset, time: playhead, skipUndo: true)
-            project.showSuccessToast(icon: "photo", iconColor: .green, title: "AI 图片", subtitle: "已插入图片轨道")
+            project.showSuccessToast(icon: "image", iconColor: .accent, title: "AI 图片", subtitle: "已插入时间轨道并导入素材库")
         } else {
             let hasClipAtPlayhead = project.videoTracks.contains { track in
                 track.clips.contains { $0.startTime <= playhead && $0.endTime > playhead }
@@ -776,7 +952,7 @@ struct AIChatPanel: View {
                 project.videoTracks.append(Track(label: "视频"))
             }
             project.addToTimelineAt(asset, time: playhead, skipUndo: true)
-            project.showSuccessToast(icon: "sparkles", iconColor: .purple, title: "AI 视频", subtitle: "已插入视频轨道")
+            project.showSuccessToast(icon: "video", iconColor: .accent, title: "AI 视频", subtitle: "已插入时间轨道并导入素材库")
         }
     }
 }
@@ -784,6 +960,7 @@ struct AIChatPanel: View {
 // MARK: - 消息气泡
 
 private struct MessageBubble: View {
+    @EnvironmentObject var project: ProjectState
     let message: AIVideoService.ChatMessage
     var onInsertToTimeline: (URL) -> Void
     var onRestoreAttachment: (AIVideoService.Attachment) -> Void = { _ in }
@@ -802,10 +979,13 @@ private struct MessageBubble: View {
 
     private var userBubble: some View {
         VStack(alignment: .trailing, spacing: 5) {
-            Text(message.content)
-                .font(.system(size: 12))
-                .foregroundColor(.black)
-                .textSelection(.enabled)
+            // 跟回复区共用同一个 NSTextView，右键菜单才一致 ——
+            // 用 SwiftUI 的 Text 弹出来的是系统全套（字体/拼写/朗读/共享…），改不了
+            SelectableMarkdownView(
+                attributed: userAttributed(),
+                onAddSubtitle: { project.insertSubtitleAtPlayhead(text: $0) },
+                onAddTitle: { project.addTextAtPlayhead(text: $0) }
+            )
                 .padding(.horizontal, 10)
                 .padding(.vertical, 7)
                 .background(Color.accent)
@@ -827,6 +1007,17 @@ private struct MessageBubble: View {
     }
 
     @ViewBuilder
+    /// 用户发的那条：气泡是黄底，字用黑色
+    private func userAttributed() -> NSAttributedString {
+        let para = NSMutableParagraphStyle()
+        para.lineSpacing = AIChatPanel.bodyLineSpacing
+        return NSAttributedString(string: message.content, attributes: [
+            .font: NSFont.systemFont(ofSize: 12),
+            .foregroundColor: NSColor.black,
+            .paragraphStyle: para
+        ])
+    }
+
     private var assistantBubble: some View {
         VStack(alignment: .leading, spacing: 6) {
             switch message.status {
@@ -853,9 +1044,12 @@ private struct MessageBubble: View {
                     VideoThumbnailView(url: message.resolvedVideoURL() ?? url)
 
                     HStack(spacing: 4) {
-                        Image(systemName: "checkmark.circle.fill")
-                            .foregroundColor(.green)
-                            .font(.system(size: 12))
+                        Image(nsImage: SidebarSVGIcon.load("toastSuccess", size: 14))
+                            .renderingMode(.template)
+                            .resizable()
+                            .aspectRatio(contentMode: .fit)
+                            .frame(width: 14, height: 14)
+                            .foregroundColor(Color(hex: "#30D158"))
                         Text("已生成")
                             .font(.system(size: 12))
                             .foregroundColor(Color.labelPrimary)
@@ -878,9 +1072,12 @@ private struct MessageBubble: View {
                     ImageThumbnailView(url: message.resolvedImageURL() ?? url)
 
                     HStack(spacing: 4) {
-                        Image(systemName: "checkmark.circle.fill")
-                            .foregroundColor(.green)
-                            .font(.system(size: 12))
+                        Image(nsImage: SidebarSVGIcon.load("toastSuccess", size: 14))
+                            .renderingMode(.template)
+                            .resizable()
+                            .aspectRatio(contentMode: .fit)
+                            .frame(width: 14, height: 14)
+                            .foregroundColor(Color(hex: "#30D158"))
                         Text("已生成")
                             .font(.system(size: 12))
                             .foregroundColor(Color.labelPrimary)
@@ -903,9 +1100,12 @@ private struct MessageBubble: View {
                     AudioWaveformView(url: message.resolvedAudioURL() ?? url)
 
                     HStack(spacing: 4) {
-                        Image(systemName: "checkmark.circle.fill")
-                            .foregroundColor(.green)
-                            .font(.system(size: 12))
+                        Image(nsImage: SidebarSVGIcon.load("toastSuccess", size: 14))
+                            .renderingMode(.template)
+                            .resizable()
+                            .aspectRatio(contentMode: .fit)
+                            .frame(width: 14, height: 14)
+                            .foregroundColor(Color(hex: "#30D158"))
                         Text("已生成")
                             .font(.system(size: 12))
                             .foregroundColor(Color.labelPrimary)
@@ -1325,14 +1525,134 @@ private struct AudioWaveformView: View {
 
 private struct MarkdownContentView: View {
     let text: String
+    @EnvironmentObject var project: ProjectState
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            ForEach(Array(parseBlocks().enumerated()), id: \.offset) { _, block in
-                blockView(block)
+        // 整段用一个 NSTextView 渲染。
+        //
+        // 两个原因不能用 SwiftUI 的 Text：它的 textSelection 只能在单个 Text
+        // 内部选（每段一个 Text 就成了"一次只能选一段"），而且右键弹的是系统
+        // 那套菜单，一项都改不了、也拿不到选中范围
+        SelectableMarkdownView(
+            attributed: nsAttributed(),
+            onAddSubtitle: { project.insertSubtitleAtPlayhead(text: $0) },
+            onAddTitle: { project.addTextAtPlayhead(text: $0) }
+        )
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    /// 把解析出的块拼成 NSAttributedString。
+    /// 行距按 1.4 倍行高走段落样式，比逐段设 lineSpacing 更准
+    private func nsAttributed() -> NSAttributedString {
+        let out = NSMutableAttributedString()
+        let para = NSMutableParagraphStyle()
+        para.lineSpacing = AIChatPanel.bodyLineSpacing
+
+        func append(_ str: String, size: CGFloat, weight: NSFont.Weight = .regular,
+                    alpha: CGFloat = 0.7, mono: Bool = false, bg: Bool = false) {
+            var attrs: [NSAttributedString.Key: Any] = [
+                .font: mono ? NSFont.monospacedSystemFont(ofSize: size, weight: weight)
+                            : NSFont.systemFont(ofSize: size, weight: weight),
+                .foregroundColor: NSColor.white.withAlphaComponent(alpha),
+                .paragraphStyle: para
+            ]
+            if bg { attrs[.backgroundColor] = NSColor.white.withAlphaComponent(0.08) }
+            out.append(NSAttributedString(string: str, attributes: attrs))
+        }
+
+        /// 行内 markdown（粗体/斜体/链接）交给系统解析，再补上字号和颜色
+        func appendInline(_ text: String, size: CGFloat = 12, alpha: CGFloat = 0.7) {
+            guard let a = try? NSAttributedString(
+                markdown: text,
+                options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)
+            ) else {
+                append(text, size: size, alpha: alpha)
+                return
+            }
+            let m = NSMutableAttributedString(attributedString: a)
+            let full = NSRange(location: 0, length: m.length)
+            m.addAttribute(.paragraphStyle, value: para, range: full)
+            // 逐段铺色，跳过链接 —— 整段无脑上色会把链接的蓝色盖掉
+            m.enumerateAttributes(in: full) { attrs, range, _ in
+                let isBold = (attrs[.font] as? NSFont)?.fontDescriptor
+                    .symbolicTraits.contains(.bold) ?? false
+                m.addAttribute(.font,
+                               value: NSFont.systemFont(ofSize: size, weight: isBold ? .semibold : .regular),
+                               range: range)
+                if attrs[.link] == nil {
+                    m.addAttribute(.foregroundColor,
+                                   value: NSColor.white.withAlphaComponent(alpha), range: range)
+                }
+            }
+            out.append(m)
+        }
+
+        for (i, block) in parseBlocks().enumerated() {
+            if i > 0 { append("\n\n", size: 12) }
+            switch block {
+            case .heading(let level, let t):
+                appendInline(t, size: level == 1 ? 15 : level == 2 ? 13.5 : 12.5, alpha: 0.9)
+            case .code(let code, _):
+                append(code, size: 11, mono: true, bg: true)
+            case .bullet(let t):
+                append("•  ", size: 12, alpha: 0.5)
+                appendInline(t)
+            case .numbered(let n, let t):
+                append("\(n).  ", size: 12, alpha: 0.5)
+                appendInline(t)
+            case .paragraph(let t):
+                appendInline(t)
             }
         }
-        .textSelection(.enabled)
+        return out
+    }
+
+    private func combinedText() -> AttributedString {
+        var out = AttributedString()
+        for (i, block) in parseBlocks().enumerated() {
+            if i > 0 { out += AttributedString("\n\n") }
+            switch block {
+            case .heading(let level, let t):
+                var a = inlineAttr(t)
+                a.font = .system(size: level == 1 ? 15 : level == 2 ? 13.5 : 12.5, weight: .semibold)
+                a.foregroundColor = .white.opacity(0.9)
+                out += a
+            case .code(let code, _):
+                var a = AttributedString(code)
+                a.font = .system(size: 11, design: .monospaced)
+                a.foregroundColor = .white.opacity(0.7)
+                a.backgroundColor = .white.opacity(0.08)
+                out += a
+            case .bullet(let t):
+                var dot = AttributedString("•  ")
+                dot.font = .system(size: 12)
+                dot.foregroundColor = .white.opacity(0.5)
+                out += dot + inlineAttr(t)
+            case .numbered(let n, let t):
+                var num = AttributedString("\(n).  ")
+                num.font = .system(size: 12)
+                num.foregroundColor = .white.opacity(0.5)
+                out += num + inlineAttr(t)
+            case .paragraph(let t):
+                out += inlineAttr(t)
+            }
+        }
+        return out
+    }
+
+    /// 行内 markdown（粗体、斜体、链接）交给系统解析，再统一铺一层基础字号和颜色
+    private func inlineAttr(_ s: String) -> AttributedString {
+        var a = (try? AttributedString(
+            markdown: s,
+            options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)
+        )) ?? AttributedString(s)
+        a.font = .system(size: 12)
+        // 逐段上色，跳过链接：整段无脑铺颜色会把链接的蓝色盖掉，
+        // 看着就跟普通文字一样，用户会以为链接失效了
+        for run in a.runs where a[run.range].link == nil {
+            a[run.range].foregroundColor = .white.opacity(0.7)
+        }
+        return a
     }
 
     private enum Block {
@@ -1408,9 +1728,11 @@ private struct MarkdownContentView: View {
             HStack(alignment: .top, spacing: 0) {
                 Text("•")
                     .font(.system(size: 12))
+                    .lineSpacing(AIChatPanel.bodyLineSpacing)
                     .foregroundColor(Color.white.opacity(0.5))
                 inlineMarkdown(text)
                     .font(.system(size: 12))
+                    .lineSpacing(AIChatPanel.bodyLineSpacing)
                     .foregroundColor(Color.white.opacity(0.7))
             }
             .padding(.leading, 12)
@@ -1419,9 +1741,11 @@ private struct MarkdownContentView: View {
             HStack(alignment: .top, spacing: 2) {
                 Text("\(n).")
                     .font(.system(size: 12).monospacedDigit())
+                    .lineSpacing(AIChatPanel.bodyLineSpacing)
                     .foregroundColor(Color.white.opacity(0.5))
                 inlineMarkdown(text)
                     .font(.system(size: 12))
+                    .lineSpacing(AIChatPanel.bodyLineSpacing)
                     .foregroundColor(Color.white.opacity(0.7))
             }
             .padding(.leading, 8)
@@ -1429,6 +1753,7 @@ private struct MarkdownContentView: View {
         case .paragraph(let text):
             inlineMarkdown(text)
                 .font(.system(size: 12))
+                .lineSpacing(AIChatPanel.bodyLineSpacing)
                 .foregroundColor(Color.white.opacity(0.7))
         }
     }
@@ -1478,4 +1803,250 @@ private struct HoverIconButton: View {
 
 private extension NSImage {
     func thumbnailImage(maxSize: CGFloat) -> NSImage { aiThumbnail(maxSize: maxSize) }
+}
+
+// MARK: - 可选中文本视图（自定义右键菜单）
+
+/// 用 NSTextView 渲染模型回复。
+///
+/// 换掉 SwiftUI 的 `Text` 是为了两件 `Text` 做不到的事：
+/// ① 右键菜单可控 —— `Text` 弹的是系统那套（查字典、翻译、字体、拼写、朗读…），
+///    一项都改不了；
+/// ② 拿得到选中范围 —— 「添加到字幕」这类操作必须知道用户选了哪一段。
+struct SelectableMarkdownView: NSViewRepresentable {
+    let attributed: NSAttributedString
+    /// 右键菜单里两个自定义项的回调，参数是当前选中的文字
+    var onAddSubtitle: (String) -> Void
+    var onAddTitle: (String) -> Void
+
+    // 只读，不需要滚动，直接放 NSTextView。
+    // 套 NSScrollView 反而量不准尺寸（滚动视图的固有尺寸是不确定的）
+    func makeNSView(context: Context) -> ChatTextView {
+        let tv = ChatTextView()
+        tv.onAddSubtitle = onAddSubtitle
+        tv.onAddTitle = onAddTitle
+        tv.isEditable = false
+        tv.isSelectable = true
+        tv.drawsBackground = false
+        tv.textContainerInset = .zero
+        tv.textContainer?.lineFragmentPadding = 0
+        tv.isAutomaticLinkDetectionEnabled = true
+        tv.textStorage?.setAttributedString(attributed)
+        tv.setContentHuggingPriority(.defaultHigh, for: .horizontal)
+        return tv
+    }
+
+    func updateNSView(_ tv: ChatTextView, context: Context) {
+        if tv.textStorage?.string != attributed.string {
+            tv.textStorage?.setAttributedString(attributed)
+        }
+        tv.onAddSubtitle = onAddSubtitle
+        tv.onAddTitle = onAddTitle
+    }
+
+    /// 报真实尺寸给 SwiftUI。
+    ///
+    /// 直接用 NSAttributedString 量，不问 textContainer —— 那边设了
+    /// widthTracksTextView，usedRect 的宽度永远等于容器宽度，
+    /// 量出来「阿斯达」也是满宽，气泡就撑满整行了
+    func sizeThatFits(_ proposal: ProposedViewSize, nsView: ChatTextView, context: Context) -> CGSize? {
+        let maxWidth = proposal.width ?? 300
+        let rect = attributed.boundingRect(
+            with: NSSize(width: maxWidth, height: .greatestFiniteMagnitude),
+            options: [.usesLineFragmentOrigin, .usesFontLeading]
+        )
+        return CGSize(width: min(maxWidth, ceil(rect.width) + 1), height: ceil(rect.height))
+    }
+}
+
+/// 只为了改右键菜单而存在的子类。
+/// 回复区（只读）和输入框（可编辑）共用同一套菜单规则，区别只在剪切要不要留
+class ChatTextView: NSTextView, NSMenuDelegate {
+    var onAddSubtitle: ((String) -> Void)?
+    var onAddTitle: ((String) -> Void)?
+    /// 输入框要留着剪切，只读的回复区不留
+    var keepCut = false
+
+    override func menu(for event: NSEvent) -> NSMenu? {
+        guard let menu = super.menu(for: event) else { return nil }
+
+        // ① 粘贴之后的全砍掉。
+        //    那后面除了「共享…」，还会混进响应链上别处的菜单
+        //    （打开 / 在访达中显示 / 作为语音轨道添加到"音乐"…），
+        //    它们的 action 五花八门，逐个认不现实；而系统文本菜单里
+        //    「粘贴」永远是最后一个标准项，以它为界最省事。
+        //    paste: 是公开 selector，不像查字典、翻译那些是私有的
+        if let pasteIdx = menu.items.firstIndex(where: { $0.action == #selector(NSText.paste(_:)) }) {
+            while menu.items.count > pasteIdx + 1 { menu.removeItem(at: pasteIdx + 1) }
+        }
+        // ② 粘贴之前还剩的带子菜单项（字体/拼写/替换/朗读）一并清掉
+        for item in menu.items.reversed() where item.hasSubmenu {
+            menu.removeItem(item)
+        }
+        // ③ 只读文本里剪切永远是灰的，占位置；可编辑的输入框留着
+        if !keepCut {
+            for item in menu.items.reversed() where item.action == #selector(NSText.cut(_:)) {
+                menu.removeItem(item)
+            }
+        }
+        // 图标去不掉：macOS 26 是按 action 自动画的，不走 item.image，
+        // 置空无效。想彻底去掉只能不用系统项、全部自己重建，
+        // 但「翻译」那项自己实现代价太大，就这样了
+        // 清掉筛完后可能留在头尾的多余分隔线
+        while let f = menu.items.first, f.isSeparatorItem { menu.removeItem(f) }
+        while let l = menu.items.last, l.isSeparatorItem { menu.removeItem(l) }
+
+        let picked = (string as NSString).substring(with: selectedRange())
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        menu.addItem(.separator())
+        for (title, sel) in [("添加到字幕", #selector(addToSubtitle)),
+                             ("添加到标题文字", #selector(addToTitle))] {
+            let item = NSMenuItem(title: title, action: sel, keyEquivalent: "")
+            item.target = self
+            item.isEnabled = !picked.isEmpty      // 没选中就置灰
+            menu.addItem(item)
+        }
+
+        // 「自动填充」「服务」这类项，以及标准项左边的图标，都是系统在菜单
+        // 即将弹出时才补上的 —— 在这里清完它们随后又会加回来。
+        // 挂个 delegate，等真正要显示的那一刻再清一次才拦得住
+        menu.delegate = self
+        return menu
+    }
+
+    func menuWillOpen(_ menu: NSMenu) { prune(menu) }
+
+    /// AppKit 专门留的定制点，比 delegate 的 menuWillOpen 更靠后 ——
+    /// 「自动填充」就是在 menuWillOpen 跑完之后才被系统塞进来的，
+    /// 只有在这里才拦得住
+    override func willOpenMenu(_ menu: NSMenu, with event: NSEvent) {
+        super.willOpenMenu(menu, with: event)
+        prune(menu)
+    }
+
+    /// 系统后补的项（自动填充、服务）都带子菜单，按这个筛
+    private func prune(_ menu: NSMenu) {
+        for item in menu.items.reversed() where item.hasSubmenu {
+            menu.removeItem(item)
+        }
+        while let l = menu.items.last, l.isSeparatorItem { menu.removeItem(l) }
+    }
+
+    /// 关掉「服务」子菜单。
+    ///
+    /// 它不是 menu(for:) 里的项 —— 系统是在菜单即将弹出时才追加的，
+    /// 所以在 menu(for:) 里怎么删都删不掉。服务菜单的入口就是这个方法，
+    /// 返回 nil 等于告诉系统「本控件不参与服务」，那一项自然就不出现了
+    override func validRequestor(forSendType sendType: NSPasteboard.PasteboardType?,
+                                 returnType: NSPasteboard.PasteboardType?) -> Any? {
+        nil
+    }
+
+    /// 菜单项的 target 是自己，得自己决定启用状态，否则系统会按响应链判断而变灰
+    override func validateUserInterfaceItem(_ item: NSValidatedUserInterfaceItem) -> Bool {
+        if item.action == #selector(addToSubtitle) || item.action == #selector(addToTitle) {
+            return selectedRange().length > 0
+        }
+        return super.validateUserInterfaceItem(item)
+    }
+
+    private var selectedText: String {
+        (string as NSString).substring(with: selectedRange())
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    @objc private func addToSubtitle() {
+        let t = selectedText
+        guard !t.isEmpty else { return }
+        onAddSubtitle?(t)
+    }
+
+    @objc private func addToTitle() {
+        let t = selectedText
+        guard !t.isEmpty else { return }
+        onAddTitle?(t)
+    }
+}
+
+/// 聊天输入框。换掉 SwiftUI 的 TextEditor 只为一件事：
+/// 右键菜单要跟回复区一致（去掉字体/拼写/朗读/共享那堆，加上添加到字幕/标题文字）
+struct ChatInputTextView: NSViewRepresentable {
+    @Binding var text: String
+    var onAddSubtitle: (String) -> Void
+    var onAddTitle: (String) -> Void
+    /// 回车发送（Shift+回车换行）
+    var onSubmit: () -> Void
+
+    func makeNSView(context: Context) -> NSScrollView {
+        let tv = ChatInputInner()
+        tv.keepCut = true
+        tv.onAddSubtitle = onAddSubtitle
+        tv.onAddTitle = onAddTitle
+        tv.onSubmit = onSubmit
+        tv.delegate = context.coordinator
+        tv.isEditable = true
+        tv.isSelectable = true
+        tv.drawsBackground = false
+        tv.font = .systemFont(ofSize: 12)
+        tv.textColor = .labelColor
+        tv.textContainerInset = NSSize(width: 0, height: 2)
+        tv.textContainer?.lineFragmentPadding = 0
+        tv.isRichText = false
+        // 「自动填充」那一项跟着这些自动化功能走，一并关掉
+        tv.isAutomaticTextCompletionEnabled = false
+        tv.isAutomaticTextReplacementEnabled = false
+        tv.isAutomaticDashSubstitutionEnabled = false
+        tv.isAutomaticQuoteSubstitutionEnabled = false
+        tv.isAutomaticSpellingCorrectionEnabled = false
+        tv.string = text
+        // 行距对齐回复区的 1.4 倍行高
+        let para = NSMutableParagraphStyle()
+        para.lineSpacing = AIChatPanel.bodyLineSpacing
+        tv.defaultParagraphStyle = para
+        tv.typingAttributes = [
+            .font: NSFont.systemFont(ofSize: 12),
+            .foregroundColor: NSColor.labelColor,
+            .paragraphStyle: para
+        ]
+
+        let scroll = NSScrollView()
+        scroll.documentView = tv
+        scroll.drawsBackground = false
+        scroll.hasVerticalScroller = true
+        scroll.autohidesScrollers = true
+        return scroll
+    }
+
+    func updateNSView(_ scroll: NSScrollView, context: Context) {
+        guard let tv = scroll.documentView as? ChatInputInner else { return }
+        if tv.string != text { tv.string = text }
+        tv.onAddSubtitle = onAddSubtitle
+        tv.onAddTitle = onAddTitle
+        tv.onSubmit = onSubmit
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator(text: $text) }
+
+    final class Coordinator: NSObject, NSTextViewDelegate {
+        let text: Binding<String>
+        init(text: Binding<String>) { self.text = text }
+        func textDidChange(_ notification: Notification) {
+            guard let tv = notification.object as? NSTextView else { return }
+            text.wrappedValue = tv.string
+        }
+    }
+}
+
+private final class ChatInputInner: ChatTextView {
+    var onSubmit: (() -> Void)?
+
+    /// 回车发送，Shift+回车换行 —— 跟原来 TextEditor 上挂的 onKeyPress 行为一致
+    override func keyDown(with event: NSEvent) {
+        if event.keyCode == 36 && !event.modifierFlags.contains(.shift) {
+            onSubmit?()
+            return
+        }
+        super.keyDown(with: event)
+    }
 }

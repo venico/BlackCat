@@ -29,7 +29,18 @@ final class AppSettings: ObservableObject {
         static let separateKeepStems = "settings.audio.separateKeepStems"
         static let seedanceApiKey = "settings.ai.seedance.apiKey"
         static let seedanceEndpoint = "settings.ai.seedance.endpoint"
+        static let llmBaseURL = "settings.llm.baseurl"
+        /// 自定义 Base URL 的 key 前缀（按供应商存），留空表示走官方端点
+        static func providerBaseURL(_ provider: String) -> String { "settings.ai.baseurl.\(provider)" }
+        /// 自定义模型名（按供应商存），留空表示用该家的默认模型
+        static func providerModel(_ provider: String) -> String { "settings.ai.model.\(provider)" }
+        /// 推理强度（按供应商存），留空表示用该家默认
+        static func providerReasoning(_ provider: String) -> String { "settings.ai.reasoning.\(provider)" }
         static let seedance15Endpoint = "settings.ai.seedance15.endpoint"
+        static let seedance25Endpoint = "settings.ai.seedance25.endpoint"
+        static let nanobananaEndpoint = "settings.ai.nanobanana.endpoint"
+        static let nanobananaProEndpoint = "settings.ai.nanobananapro.endpoint"
+        static let minimaxGroupID = "settings.ai.minimax.groupid"
         static let seedreamEndpoint = "settings.ai.seedream.endpoint"
         static let llmProvider = "settings.llm.provider"
         static let llmAPIKey = "settings.llm.apiKey"
@@ -37,6 +48,8 @@ final class AppSettings: ObservableObject {
         static let bingSearchKey = "settings.ai.bing.searchKey"
         static let googleSearchKey = "settings.ai.google.searchKey"
         static let googleSearchCX = "settings.ai.google.searchCX"
+        static let braveSearchKey = "settings.ai.brave.searchKey"
+        static let tavilySearchKey = "settings.ai.tavily.searchKey"
         static let fishVoices = "settings.ai.fish.voices"
         static let fishSelectedVoice = "settings.ai.fish.selectedVoice"
         static let bgRemovalEngine = "settings.image.bgRemovalEngine"
@@ -186,18 +199,25 @@ final class AppSettings: ObservableObject {
 
     // MARK: - 大模型分析
 
+    /// 跟 AI 生成面板的文字类模型保持同一组（Claude / GPT / DeepSeek / 通义千问 / 智谱 GLM）
     enum LLMProvider: String, CaseIterable {
-        case openai = "OpenAI"
         case claude = "Claude"
+        case openai = "OpenAI"
         case deepseek = "DeepSeek"
+        case qwen = "Qwen"
         case glm = "GLM"
+        case grok = "Grok"
+        case kimi = "Kimi"
 
         var displayName: String {
             switch self {
-            case .openai: return "OpenAI"
+            case .openai: return "Chatgpt"
             case .claude: return "Claude"
             case .deepseek: return "DeepSeek"
-            case .glm: return "智谱 GLM"
+            case .qwen: return "Qwen"
+            case .glm: return "Glm"
+            case .grok: return "Grok"
+            case .kimi: return "Kimi"
             }
         }
 
@@ -206,16 +226,38 @@ final class AppSettings: ObservableObject {
             case .openai: return "gpt-4o-mini"
             case .claude: return "claude-sonnet-4-20250514"
             case .deepseek: return "deepseek-chat"
+            case .qwen: return "qwen-max"
             case .glm: return "glm-4-flash"
+            case .grok: return "grok-4.6"
+            case .kimi: return "kimi-k3"
             }
         }
 
+        /// 官方端点。实际请求走 `AppSettings.shared.effectiveLLMBaseURL`，
+        /// 设置里填了自定义地址时以那个为准
         var baseURL: String {
             switch self {
             case .openai: return "https://api.openai.com/v1/chat/completions"
             case .claude: return "https://api.anthropic.com/v1/messages"
             case .deepseek: return "https://api.deepseek.com/chat/completions"
+            case .qwen: return "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
             case .glm: return "https://open.bigmodel.cn/api/paas/v4/chat/completions"
+            case .grok: return "https://api.x.ai/v1/chat/completions"
+            case .kimi: return "https://api.moonshot.cn/v1/chat/completions"
+            }
+        }
+
+        /// 对应 AI 生成面板里的供应商 key。两套配置共用同一份
+        /// API Key / 接口地址 / 模型名 —— 在任一处填写，另一处自动生效
+        var sharedProviderKey: String {
+            switch self {
+            case .claude:   return "claude"
+            case .openai:   return "gpt-5.6"
+            case .deepseek: return "deepseek-ai"
+            case .qwen:     return "qwen"
+            case .glm:      return "glm"
+            case .grok:     return "grok"
+            case .kimi:     return "kimi"
             }
         }
 
@@ -224,17 +266,52 @@ final class AppSettings: ObservableObject {
             case .openai: return "sk-..."
             case .claude: return "sk-ant-..."
             case .deepseek: return "sk-..."
+            case .qwen: return "sk-..."
             case .glm: return "输入 API Key"
+            case .grok: return "xai-..."
+            case .kimi: return "sk-..."
             }
         }
+    }
+
+    /// 「视频分析」这套 LLM 的自定义接口地址（留空走官方）。
+    /// 跟 AI 生成面板是两套独立配置，互不影响
+    /// 同上，跟 AI 生成面板共享
+    var llmModel: String {
+        get { providerModel(for: llmProvider.sharedProviderKey) }
+        set { setProviderModel(newValue, for: llmProvider.sharedProviderKey) }
+    }
+
+    /// 实际请求用的模型名
+    var effectiveLLMModel: String {
+        let custom = llmModel.trimmingCharacters(in: .whitespacesAndNewlines)
+        return custom.isEmpty ? llmProvider.defaultModel : custom
+    }
+
+    /// 同上，跟 AI 生成面板共享
+    var llmBaseURL: String {
+        get { providerBaseURL(for: llmProvider.sharedProviderKey) }
+        set { setProviderBaseURL(newValue, for: llmProvider.sharedProviderKey) }
+    }
+
+    /// 实际发请求用的地址
+    var effectiveLLMBaseURL: String {
+        // 用户可能只填 base（https://api.apikey.fun）—— 补上该家的标准路径，
+        // 否则请求打到根路径，返回的不是 JSON，报「数据格式不正确」
+        let path = llmProvider == .claude ? "/v1/messages" : "/v1/chat/completions"
+        let custom = AIVideoService.normalizedEndpoint(llmBaseURL, defaultPath: path)
+        return custom.isEmpty ? llmProvider.baseURL : custom
     }
 
     @Published var llmProvider: LLMProvider {
         didSet { ud.set(llmProvider.rawValue, forKey: K.llmProvider) }
     }
 
-    @Published var llmAPIKey: String {
-        didSet { ud.set(llmAPIKey, forKey: K.llmAPIKey) }
+    /// 「视频分析」的 API Key —— 实际读写的是**按供应商共享**的那份，
+    /// 跟 AI 生成面板同一个存储位置：任一处填写，另一处自动生效
+    var llmAPIKey: String {
+        get { providerAPIKey(for: llmProvider.sharedProviderKey) }
+        set { setProviderAPIKey(newValue, for: llmProvider.sharedProviderKey) }
     }
 
     // MARK: - AI 视频生成
@@ -270,8 +347,55 @@ final class AppSettings: ObservableObject {
     @Published var seedanceApiKey: String {
         didSet { ud.set(seedanceApiKey, forKey: K.seedanceApiKey) }
     }
+    /// 推理强度。留空 = 用该家默认（各家档位见 Provider.reasoningLevels）
+    func providerReasoning(for provider: String) -> String {
+        ud.string(forKey: K.providerReasoning(provider)) ?? ""
+    }
+
+    func setProviderReasoning(_ level: String, for provider: String) {
+        ud.set(level, forKey: K.providerReasoning(provider))
+        objectWillChange.send()
+    }
+
+    /// 供应商的自定义模型名。留空 = 用该家的默认模型。
+    /// 用来切子模型（claude-opus-5 / claude-sonnet-5 …），
+    /// 也用于中转站 —— 它们暴露的模型名常跟官方不一致
+    func providerModel(for provider: String) -> String {
+        ud.string(forKey: K.providerModel(provider)) ?? ""
+    }
+
+    func setProviderModel(_ model: String, for provider: String) {
+        ud.set(model, forKey: K.providerModel(provider))
+        objectWillChange.send()
+    }
+
+    /// 供应商的自定义 Base URL。留空 = 用官方端点。
+    /// 给第三方中转/代理用 —— 它们基本都兼容 OpenAI 的 Chat Completions 格式，
+    /// 填个 `https://xxx/v1/chat/completions` 就能走通
+    func providerBaseURL(for provider: String) -> String {
+        ud.string(forKey: K.providerBaseURL(provider)) ?? ""
+    }
+
+    func setProviderBaseURL(_ url: String, for provider: String) {
+        ud.set(url, forKey: K.providerBaseURL(provider))
+        objectWillChange.send()
+    }
+
     @Published var seedanceEndpoint: String {
         didSet { ud.set(seedanceEndpoint, forKey: K.seedanceEndpoint) }
+    }
+    @Published var seedance25Endpoint: String {
+        didSet { ud.set(seedance25Endpoint, forKey: K.seedance25Endpoint) }
+    }
+    @Published var nanobananaEndpoint: String {
+        didSet { ud.set(nanobananaEndpoint, forKey: K.nanobananaEndpoint) }
+    }
+    @Published var nanobananaProEndpoint: String {
+        didSet { ud.set(nanobananaProEndpoint, forKey: K.nanobananaProEndpoint) }
+    }
+    /// MiniMax 的 GroupId —— TTS 接口要它，视频接口不用
+    @Published var minimaxGroupID: String {
+        didSet { ud.set(minimaxGroupID, forKey: K.minimaxGroupID) }
     }
     @Published var seedance15Endpoint: String {
         didSet { ud.set(seedance15Endpoint, forKey: K.seedance15Endpoint) }
@@ -283,12 +407,18 @@ final class AppSettings: ObservableObject {
     // MARK: - 联网搜索
 
     enum SearchEngine: String, CaseIterable {
-        case bing = "Bing"
-        case google = "Google"
+        case brave = "Brave"
+        case tavily = "Tavily"
     }
 
-    @Published var searchEngine: SearchEngine = .bing {
+    @Published var searchEngine: SearchEngine = .brave {
         didSet { ud.set(searchEngine.rawValue, forKey: K.searchEngine) }
+    }
+    @Published var braveSearchKey: String {
+        didSet { ud.set(braveSearchKey, forKey: K.braveSearchKey) }
+    }
+    @Published var tavilySearchKey: String {
+        didSet { ud.set(tavilySearchKey, forKey: K.tavilySearchKey) }
     }
     @Published var bingSearchKey: String {
         didSet { ud.set(bingSearchKey, forKey: K.bingSearchKey) }
@@ -315,6 +445,12 @@ final class AppSettings: ObservableObject {
         didSet { ud.set(ttsProvider.rawValue, forKey: K.ttsProvider) }
     }
 
+    /// 当前 TTS 供应商；存量配置指向已隐藏的那家时退回可选清单的第一项，
+    /// 否则界面显示着一个下拉里根本没有的名字，选不回来
+    var effectiveTTSProvider: AIVideoService.Provider {
+        Self.ttsProviders.contains(ttsProvider) ? ttsProvider : (Self.ttsProviders.first ?? ttsProvider)
+    }
+
     /// 语速倍率。三家 TTS 都支持，只是参数路径不同：
     /// Fish Audio 是 prosody.speed，OpenAI 是 speed，ElevenLabs 是 voice_settings.speed
     @Published var ttsSpeed: Double {
@@ -327,8 +463,9 @@ final class AppSettings: ObservableObject {
     }
 
     /// 可选的语音模型
+    /// 跟「AI 设置」里声音生成那栏用同一份清单 —— 那边隐藏掉的，这里也不该还能选
     static var ttsProviders: [AIVideoService.Provider] {
-        AIVideoService.Provider.allCases.filter { $0.category == .audio }
+        AIVideoService.Provider.providers(for: .audio)
     }
 
     /// 图片去背使用的模型
@@ -520,6 +657,10 @@ final class AppSettings: ObservableObject {
         seedanceApiKey = ud.string(forKey: K.seedanceApiKey) ?? ""
         seedanceEndpoint = ud.string(forKey: K.seedanceEndpoint) ?? ""
         seedance15Endpoint = ud.string(forKey: K.seedance15Endpoint) ?? ""
+        seedance25Endpoint = ud.string(forKey: K.seedance25Endpoint) ?? ""
+        nanobananaEndpoint = ud.string(forKey: K.nanobananaEndpoint) ?? ""
+        nanobananaProEndpoint = ud.string(forKey: K.nanobananaProEndpoint) ?? ""
+        minimaxGroupID = ud.string(forKey: K.minimaxGroupID) ?? ""
         seedreamEndpoint = ud.string(forKey: K.seedreamEndpoint) ?? ""
 
         if let raw = ud.string(forKey: K.llmProvider),
@@ -528,16 +669,17 @@ final class AppSettings: ObservableObject {
         } else {
             llmProvider = .deepseek
         }
-        llmAPIKey = ud.string(forKey: K.llmAPIKey) ?? ""
 
         if let raw = ud.string(forKey: K.searchEngine),
            let eng = SearchEngine(rawValue: raw) {
             searchEngine = eng
         } else {
-            searchEngine = .bing
+            searchEngine = .brave
         }
         bingSearchKey = ud.string(forKey: K.bingSearchKey) ?? ""
         googleSearchKey = ud.string(forKey: K.googleSearchKey) ?? ""
+        braveSearchKey = ud.string(forKey: K.braveSearchKey) ?? ""
+        tavilySearchKey = ud.string(forKey: K.tavilySearchKey) ?? ""
         googleSearchCX = ud.string(forKey: K.googleSearchCX) ?? ""
     }
 }

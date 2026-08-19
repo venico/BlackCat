@@ -183,7 +183,7 @@ struct MediaLibraryView: View {
 
     private func registerDropZone(_ rect: CGRect) {
         FileDropRouter.register(windowID, rect: rect,
-                                onFiles: { urls in urls.forEach { project.importFile($0) } },
+                                onFiles: { urls in project.importFiles(urls) },
                                 onTargetChange: { isDragOver = $0 })
     }
 
@@ -280,25 +280,17 @@ struct MediaLibraryView: View {
     }
 
     /// 把内容摆到容器高度 1/3 的位置（水平居中）
-    private struct PositionedAtOneThird: ViewModifier {
-        func body(content: Content) -> some View {
-            GeometryReader { g in
-                content.position(x: g.size.width / 2, y: g.size.height / 3)
-            }
-        }
-    }
-
     // 导入/导出合并菜单按钮
     private var importExportMenuBtn: some View {
         Button {
             let menu = NSMenu()
             let importItem = NSMenuItem(title: "导入素材", action: #selector(NSApp.sendAction(_:to:from:)), keyEquivalent: "")
-            importItem.image = NSImage(systemSymbolName: "square.and.arrow.down", accessibilityDescription: nil)
+            importItem.image = SidebarSVGIcon.load("importFile", size: 14)
             importItem.isEnabled = project.projectFileURL != nil
             importItem.target = nil
             importItem.representedObject = "import" as NSString
             let exportItem = NSMenuItem(title: "导出 MP4", action: #selector(NSApp.sendAction(_:to:from:)), keyEquivalent: "")
-            exportItem.image = NSImage(systemSymbolName: "square.and.arrow.up", accessibilityDescription: nil)
+            exportItem.image = SidebarSVGIcon.load("exportFile", size: 14)
             exportItem.isEnabled = project.projectFileURL != nil
             exportItem.representedObject = "export" as NSString
             menu.addItem(importItem)
@@ -342,7 +334,7 @@ private class ImportExportMenuHandler: NSObject {
         panel.allowedContentTypes = []
         panel.begin { r in
             guard r == .OK else { return }
-            panel.urls.forEach { project.importFile($0) }
+            project.importFiles(panel.urls)
         }
     }
 
@@ -478,9 +470,12 @@ private struct AssetRow: View {
                         .fill(Color.black.opacity(0.5))
                         .overlay(
                             VStack(spacing: 4) {
-                                Image(systemName: "exclamationmark.triangle.fill")
-                                    .font(.system(size: 16))
-                                    .foregroundColor(.orange)
+                                Image(nsImage: SidebarSVGIcon.load("toastWarn", size: 16))
+                                    .renderingMode(.template)
+                                    .resizable()
+                                    .aspectRatio(contentMode: .fit)
+                                    .frame(width: 16, height: 16)
+                                    .foregroundColor(Color(hex: "#FF9230"))
                                 Text("素材丢失")
                                     .font(.system(size: 10))
                                     .foregroundColor(.orange)
@@ -494,7 +489,7 @@ private struct AssetRow: View {
                         if asset.fileExists {
                             videoMiniBtn(icon: "plus.circle") { project.addToTimeline(asset) }
                         } else {
-                            videoMiniBtn(icon: "arrow.triangle.2.circlepath") { relinkAsset() }
+                            videoMiniBtn(icon: "arrow.triangle.2.circlepath", svgName: "relink") { relinkAsset() }
                         }
                         videoMiniBtn(icon: "trash") { confirmDeleteAsset() }
                     }
@@ -524,19 +519,19 @@ private struct AssetRow: View {
     // MARK: Normal asset row — audio / subtitle
 
     private var normalAssetRow: some View {
-        HStack(spacing: 10) {
-            if asset.fileExists {
-                Image(nsImage: SidebarSVGIcon.load(asset.type.svgIcon))
+        // spacing 0：名字长到撑满时 Spacer 压到 0，行内不再有任何死间距，
+        // 名字能一直排到按钮跟前（按钮自己的 padding 就是视觉间隔）
+        HStack(spacing: 0) {
+            // 正常状态不再放类型图标：音频/字幕列表本来就按标签页分好了类，
+            // 图标提供不了额外信息，却白占宽度，名字长的素材少显示好几个字。
+            // 丢失状态仍要图标——那是必须看见的警示
+            if !asset.fileExists {
+                Image(nsImage: SidebarSVGIcon.load("toastWarn", size: 14))
                     .renderingMode(.template)
                     .resizable()
                     .aspectRatio(contentMode: .fit)
                     .frame(width: 14, height: 14)
-                    .foregroundColor(asset.type.color)
-                    .frame(width: 20)
-            } else {
-                Image(systemName: "exclamationmark.triangle.fill")
-                    .font(.system(size: 14, weight: .medium))
-                    .foregroundColor(.orange)
+                    .foregroundColor(Color(hex: "#FF9230"))
                     .frame(width: 20)
             }
 
@@ -555,7 +550,7 @@ private struct AssetRow: View {
                 if !asset.fileExists {
                     Text("素材丢失")
                         .font(.system(size: 10))
-                        .foregroundColor(.orange)
+                        .foregroundColor(Color(hex: "#FF9230"))
                 } else if asset.duration > 0 {
                     Text(fmtDur(asset.duration))
                         .font(.system(size: 10).monospacedDigit())
@@ -570,7 +565,7 @@ private struct AssetRow: View {
                     if asset.fileExists {
                         miniBtn(icon: "plus.circle") { project.addToTimeline(asset) }
                     } else {
-                        miniBtn(icon: "arrow.triangle.2.circlepath") { relinkAsset() }
+                        miniBtn(icon: "arrow.triangle.2.circlepath", svgName: "relink") { relinkAsset() }
                     }
                     miniBtn(icon: "trash") { confirmDeleteAsset() }
                 }
@@ -621,27 +616,41 @@ private struct AssetRow: View {
     }
 
     @ViewBuilder
-    private func miniBtn(icon: String, action: @escaping () -> Void) -> some View {
-        MiniBtnView(icon: icon, action: action)
+    private func miniBtn(icon: String, svgName: String? = nil,
+                         action: @escaping () -> Void) -> some View {
+        MiniBtnView(icon: icon, svgName: svgName, action: action)
     }
 
     @ViewBuilder
-    private func videoMiniBtn(icon: String, action: @escaping () -> Void) -> some View {
-        VideoMiniBtnView(icon: icon, action: action)
+    private func videoMiniBtn(icon: String, svgName: String? = nil,
+                              action: @escaping () -> Void) -> some View {
+        VideoMiniBtnView(icon: icon, svgName: svgName, action: action)
     }
 }
 
 private struct MiniBtnView: View {
     let icon: String
+    /// 传了就用自绘 SVG，否则退回 SF Symbol
+    var svgName: String? = nil
     let action: () -> Void
     @State private var hovering = false
 
     var body: some View {
         Button(action: action) {
-            Image(systemName: icon)
-                .font(.system(size: 12, weight: .light))
+            Group {
+                if let svgName {
+                    Image(nsImage: SidebarSVGIcon.load(svgName, size: 12))
+                        .renderingMode(.template)
+                        .resizable()
+                        .aspectRatio(contentMode: .fit)
+                        .frame(width: 12, height: 12)
+                } else {
+                    Image(systemName: icon)
+                        .font(.system(size: 12, weight: .light))
+                }
+            }
                 .foregroundColor(Color.labelSecondary)
-                .frame(width: 26, height: 26)
+                .padding(4)          // 原来是固定 26×26；12pt 图标 + 4 内边距 = 20pt
                 .background(hovering ? Color.white.opacity(0.12) : Color.clear)
                 .clipShape(RoundedRectangle(cornerRadius: 5))
         }
@@ -652,13 +661,25 @@ private struct MiniBtnView: View {
 
 private struct VideoMiniBtnView: View {
     let icon: String
+    /// 传了就用自绘 SVG，否则退回 SF Symbol
+    var svgName: String? = nil
     let action: () -> Void
     @State private var hovering = false
 
     var body: some View {
         Button(action: action) {
-            Image(systemName: icon)
-                .font(.system(size: 12, weight: hovering ? .medium : .light))
+            Group {
+                if let svgName {
+                    Image(nsImage: SidebarSVGIcon.load(svgName, size: 13))
+                        .renderingMode(.template)
+                        .resizable()
+                        .aspectRatio(contentMode: .fit)
+                        .frame(width: 13, height: 13)
+                } else {
+                    Image(systemName: icon)
+                        .font(.system(size: 12, weight: hovering ? .medium : .light))
+                }
+            }
                 .foregroundColor(Color.white.opacity(hovering ? 1.0 : 0.80))
                 .frame(width: 26, height: 26)
                 .shadow(color: .black.opacity(0.6), radius: 3, x: 0, y: 1)
@@ -700,7 +721,7 @@ private struct ImportButton: View {
         panel.allowedContentTypes = []  // 不限制，由 importFile 做格式过滤
         panel.begin { r in
             guard r == .OK else { return }
-            panel.urls.forEach { project.importFile($0) }
+            project.importFiles(panel.urls)
         }
     }
 }
@@ -796,6 +817,8 @@ struct SpeechOverlay: View {
 }
 
 private struct SpeechBubble: View {
+    /// 卡片出现即开始计时，用于估算剩余时间
+    @State private var startedAt = Date()
     let done: Int
     let total: Int
     let onCancel: () -> Void
@@ -809,16 +832,27 @@ private struct SpeechBubble: View {
         HStack(spacing: 10) {
             ZStack {
                 Circle().fill(Color.accent.opacity(0.2)).frame(width: 28, height: 28)
-                Image(systemName: "waveform.circle")
-                    .font(.system(size: 12, weight: .semibold))
+                Image(nsImage: SidebarSVGIcon.load("toSpeech", size: 14))
+                    .renderingMode(.template)
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .frame(width: 14, height: 14)
                     .foregroundColor(Color.accent)
             }
 
             VStack(alignment: .leading, spacing: 3) {
-                Text("转换成语音")
-                    .font(.system(size: 11, weight: .medium))
-                    .foregroundColor(Color.labelPrimary)
-                    .lineLimit(1)
+                HStack(spacing: 6) {
+                    Text("转换成语音")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundColor(Color.labelPrimary)
+                        .lineLimit(1)
+                    if let eta = TaskETA.text(progress: progress, startedAt: startedAt) {
+                        Text(eta)
+                            .font(.system(size: 10).monospacedDigit())
+                            .foregroundColor(Color.labelSecondary)
+                            .fixedSize()
+                    }
+                }
 
                 GeometryReader { geo in
                     HStack(spacing: 6) {
@@ -897,6 +931,8 @@ struct ClarityEnhanceOverlay: View {
 }
 
 private struct RemoveBackgroundBubble: View {
+    /// 卡片出现即开始计时，用于估算剩余时间
+    @State private var startedAt = Date()
     let state: ProjectState.RemoveBackgroundState
     let onCancel: () -> Void
     @State private var xHovering = false
@@ -905,16 +941,27 @@ private struct RemoveBackgroundBubble: View {
         HStack(spacing: 10) {
             ZStack {
                 Circle().fill(Color.accent.opacity(0.2)).frame(width: 28, height: 28)
-                Image(systemName: "scissors")
-                    .font(.system(size: 12, weight: .semibold))
+                Image(nsImage: SidebarSVGIcon.load("removeBg", size: 14))
+                    .renderingMode(.template)
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .frame(width: 14, height: 14)
                     .foregroundColor(Color.accent)
             }
 
             VStack(alignment: .leading, spacing: 3) {
-                Text("去除背景中")
-                    .font(.system(size: 11, weight: .medium))
-                    .foregroundColor(Color.labelPrimary)
-                    .lineLimit(1)
+                HStack(spacing: 6) {
+                    Text("去除背景")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundColor(Color.labelPrimary)
+                        .lineLimit(1)
+                    if let eta = TaskETA.text(progress: state.progress, startedAt: startedAt) {
+                        Text(eta)
+                            .font(.system(size: 10).monospacedDigit())
+                            .foregroundColor(Color.labelSecondary)
+                            .fixedSize()
+                    }
+                }
                     .truncationMode(.tail)
                     .fixedSize(horizontal: false, vertical: true)
 
@@ -969,11 +1016,11 @@ private struct ClarityEnhanceBubble: View {
     private var etaText: String? {
         if let stage = state.cloudStage { return stage }
         guard let s = etaSeconds, s.isFinite, s > 0 else { return nil }
-        if s < 60 { return "还需不到 1 分钟" }
-        let totalMinutes = Int((s / 60).rounded())
-        if totalMinutes < 60 { return "还需约 \(totalMinutes) 分钟" }
-        let h = totalMinutes / 60, m = totalMinutes % 60
-        return m == 0 ? "还需约 \(h) 小时" : "还需约 \(h) 小时 \(m) 分"
+        // 统一成倒计时形式：不足 1 小时「约 MM:SS」，超过则「约 H:MM:SS」
+        let total = Int(s.rounded())
+        let h = total / 3600, m = (total % 3600) / 60, sec = total % 60
+        return h > 0 ? String(format: "约 %d:%02d:%02d", h, m, sec)
+                     : String(format: "约 %02d:%02d", m, sec)
     }
     @State private var xHovering = false
 
@@ -981,14 +1028,17 @@ private struct ClarityEnhanceBubble: View {
         HStack(spacing: 10) {
             ZStack {
                 Circle().fill(Color.accent.opacity(0.2)).frame(width: 28, height: 28)
-                Image(systemName: "sparkles")
-                    .font(.system(size: 12, weight: .semibold))
+                Image(nsImage: SidebarSVGIcon.load("clarity", size: 14))
+                    .renderingMode(.template)
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .frame(width: 14, height: 14)
                     .foregroundColor(Color.accent)
             }
 
             VStack(alignment: .leading, spacing: 3) {
                 HStack(spacing: 6) {
-                    Text("清晰度提升中…")
+                    Text("清晰度提升")
                         .font(.system(size: 11, weight: .medium))
                         .foregroundColor(Color.labelPrimary)
                         .lineLimit(1)
@@ -1045,6 +1095,8 @@ private struct ClarityEnhanceBubble: View {
 }
 
 private struct SeparateBubble: View {
+    /// 卡片出现即开始计时，用于估算剩余时间
+    @State private var startedAt = Date()
     let state: ProjectState.SeparateState
     let onCancel: () -> Void
     @State private var xHovering = false
@@ -1057,28 +1109,31 @@ private struct SeparateBubble: View {
         }
     }
 
-    private var stageText: String {
-        switch state {
-        case .downloading: return "下载分离模型…"
-        case .running(_, let stage): return stage
-        default: return ""
-        }
-    }
-
     var body: some View {
         HStack(spacing: 10) {
             ZStack {
                 Circle().fill(Color.accent.opacity(0.2)).frame(width: 28, height: 28)
-                Image(systemName: "waveform.path.ecg")
-                    .font(.system(size: 12, weight: .semibold))
+                Image(nsImage: SidebarSVGIcon.load("separateAudio", size: 14))
+                    .renderingMode(.template)
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .frame(width: 14, height: 14)
                     .foregroundColor(Color.accent)
             }
 
             VStack(alignment: .leading, spacing: 3) {
-                Text("分离音轨 · \(stageText)")
-                    .font(.system(size: 11, weight: .medium))
-                    .foregroundColor(Color.labelPrimary)
-                    .lineLimit(1)
+                HStack(spacing: 6) {
+                    Text("分离音轨")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundColor(Color.labelPrimary)
+                        .lineLimit(1)
+                    if let eta = TaskETA.text(progress: progressValue, startedAt: startedAt) {
+                        Text(eta)
+                            .font(.system(size: 10).monospacedDigit())
+                            .foregroundColor(Color.labelSecondary)
+                            .fixedSize()
+                    }
+                }
                     .truncationMode(.tail)
                     .fixedSize(horizontal: false, vertical: true)
 
@@ -1124,6 +1179,8 @@ private struct SeparateBubble: View {
 }
 
 private struct TranscribeBubble: View {
+    /// 卡片出现即开始计时，用于估算剩余时间
+    @State private var startedAt = Date()
     let state: ProjectState.TranscribeState
     let onCancel: () -> Void
     @State private var xHovering = false
@@ -1140,16 +1197,27 @@ private struct TranscribeBubble: View {
         HStack(spacing: 10) {
             ZStack {
                 Circle().fill(Color.accent.opacity(0.2)).frame(width: 28, height: 28)
-                Image(systemName: "waveform")
-                    .font(.system(size: 12, weight: .semibold))
+                Image(nsImage: TimelineSVGIcon.load("whisper", size: 14))
+                    .renderingMode(.template)
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .frame(width: 14, height: 14)
                     .foregroundColor(Color.accent)
             }
 
             VStack(alignment: .leading, spacing: 3) {
-                Text("语音识别")
-                    .font(.system(size: 11, weight: .medium))
-                    .foregroundColor(Color.labelPrimary)
-                    .lineLimit(1)
+                HStack(spacing: 6) {
+                    Text("语音识别")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundColor(Color.labelPrimary)
+                        .lineLimit(1)
+                    if let eta = TaskETA.text(progress: progressValue, startedAt: startedAt) {
+                        Text(eta)
+                            .font(.system(size: 10).monospacedDigit())
+                            .foregroundColor(Color.labelSecondary)
+                            .fixedSize()
+                    }
+                }
 
                 GeometryReader { geo in
                     HStack(spacing: 6) {
@@ -1245,6 +1313,8 @@ private struct TranscribeFailBubble: View {
 // MARK: - SceneDetect Bubble (右下角浮层)
 
 struct SceneDetectBubble: View {
+    /// 卡片出现即开始计时，用于估算剩余时间
+    @State private var startedAt = Date()
     let progress: Double
     let onCancel: () -> Void
     @State private var xHovering = false
@@ -1253,16 +1323,27 @@ struct SceneDetectBubble: View {
         HStack(spacing: 10) {
             ZStack {
                 Circle().fill(Color.accent.opacity(0.2)).frame(width: 28, height: 28)
-                Image(systemName: "rectangle.split.3x1")
-                    .font(.system(size: 12, weight: .semibold))
+                Image(nsImage: TimelineSVGIcon.load("smartAnalysis", size: 14))
+                    .renderingMode(.template)
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .frame(width: 14, height: 14)
                     .foregroundColor(Color.accent)
             }
 
             VStack(alignment: .leading, spacing: 3) {
-                Text("智能分割")
-                    .font(.system(size: 11, weight: .medium))
-                    .foregroundColor(Color.labelPrimary)
-                    .lineLimit(1)
+                HStack(spacing: 6) {
+                    Text("智能分割")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundColor(Color.labelPrimary)
+                        .lineLimit(1)
+                    if let eta = TaskETA.text(progress: progress, startedAt: startedAt) {
+                        Text(eta)
+                            .font(.system(size: 10).monospacedDigit())
+                            .foregroundColor(Color.labelSecondary)
+                            .fixedSize()
+                    }
+                }
 
                 GeometryReader { geo in
                     HStack(spacing: 6) {
@@ -1308,26 +1389,45 @@ struct SceneDetectBubble: View {
 // MARK: - Reverse Video Bubble (右下角浮层)
 
 struct ReverseVideoBubble: View {
+    let onCancel: () -> Void
+    @State private var xHovering = false
+
     var body: some View {
         HStack(spacing: 10) {
             ZStack {
-                Circle().fill(Color.orange.opacity(0.2)).frame(width: 28, height: 28)
-                Image(systemName: "arrow.counterclockwise")
-                    .font(.system(size: 12, weight: .semibold))
-                    .foregroundColor(.orange)
+                Circle().fill(Color.accent.opacity(0.2)).frame(width: 28, height: 28)
+                Image(nsImage: TimelineSVGIcon.load("reverse", size: 14))
+                    .renderingMode(.template)
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .frame(width: 14, height: 14)
+                    .foregroundColor(Color.accent)
             }
 
             VStack(alignment: .leading, spacing: 3) {
-                Text("正在生成倒放视频...")
+                Text("生成倒放视频")
                     .font(.system(size: 11, weight: .medium))
                     .foregroundColor(Color.labelPrimary)
                     .lineLimit(1)
 
+                // ffmpeg 的 reverse 滤镜要把整段读进内存再倒着写，中途拿不到进度，
+                // 所以这里是不确定进度条，也就没有倒计时可估
                 ProgressView()
                     .progressViewStyle(.linear)
-                    .tint(.orange)
+                    .tint(Color.accent)
                     .frame(height: 14)
             }
+
+            Button(action: onCancel) {
+                Image(systemName: "xmark")
+                    .font(.system(size: 9, weight: .bold))
+                    .foregroundColor(xHovering ? Color.labelPrimary : Color.labelSecondary)
+                    .frame(width: 18, height: 18)
+                    .background(xHovering ? Color.white.opacity(0.12) : Color.clear)
+                    .clipShape(Circle())
+            }
+            .buttonStyle(.plain)
+            .onHover { xHovering = $0 }
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 10)
@@ -1347,6 +1447,8 @@ struct ReverseVideoBubble: View {
 // MARK: - LLM Analyze Bubble (右下角浮层)
 
 struct LLMAnalyzeBubble: View {
+    /// 卡片出现即开始计时，用于估算剩余时间
+    @State private var startedAt = Date()
     let progress: Double
     let onCancel: () -> Void
     @State private var xHovering = false
@@ -1354,23 +1456,34 @@ struct LLMAnalyzeBubble: View {
     var body: some View {
         HStack(spacing: 10) {
             ZStack {
-                Circle().fill(Color.purple.opacity(0.2)).frame(width: 28, height: 28)
-                Image(systemName: "brain")
-                    .font(.system(size: 12, weight: .semibold))
-                    .foregroundColor(.purple)
+                Circle().fill(Color.accent.opacity(0.2)).frame(width: 28, height: 28)
+                Image(nsImage: TimelineSVGIcon.load("smartAnalysis", size: 14))
+                    .renderingMode(.template)
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .frame(width: 14, height: 14)
+                    .foregroundColor(Color.accent)
             }
 
             VStack(alignment: .leading, spacing: 3) {
-                Text("大模型分析")
-                    .font(.system(size: 11, weight: .medium))
-                    .foregroundColor(Color.labelPrimary)
-                    .lineLimit(1)
+                HStack(spacing: 6) {
+                    Text("AI 剪辑")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundColor(Color.labelPrimary)
+                        .lineLimit(1)
+                    if let eta = TaskETA.text(progress: progress, startedAt: startedAt) {
+                        Text(eta)
+                            .font(.system(size: 10).monospacedDigit())
+                            .foregroundColor(Color.labelSecondary)
+                            .fixedSize()
+                    }
+                }
 
                 GeometryReader { geo in
                     HStack(spacing: 6) {
                         ProgressView(value: progress)
                             .progressViewStyle(.linear)
-                            .tint(.purple)
+                            .tint(Color.accent)
                         Text("\(Int(progress * 100))%")
                             .font(.system(size: 10).monospacedDigit())
                             .foregroundColor(Color.labelSecondary)
@@ -1438,8 +1551,11 @@ private struct TranscodeTaskBubble: View {
                 Circle()
                     .fill(Color.accent.opacity(0.2))
                     .frame(width: 28, height: 28)
-                Image(systemName: "arrow.triangle.2.circlepath")
-                    .font(.system(size: 12, weight: .semibold))
+                Image(nsImage: SidebarSVGIcon.load("importFile", size: 14))
+                    .renderingMode(.template)
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .frame(width: 14, height: 14)
                     .foregroundColor(Color.accent)
             }
 
@@ -1549,16 +1665,21 @@ private struct TextLayerPanel: View {
     var body: some View {
         VStack(spacing: 0) {
             if project.textTemplates.isEmpty {
+                // 跟其他标签页的空状态一致：44pt 图标 0.30、11pt 文字 0.45、
+                // 间距 10、摆在上方三分之一处。图标复用右键菜单那个「保存为文字模板」
                 VStack(spacing: 10) {
-                    Text("T")
-                        .font(.system(size: 32, weight: .bold, design: .serif))
+                    Image(nsImage: SidebarSVGIcon.load("saveTextTemplate", size: 44))
+                        .renderingMode(.template)
+                        .resizable()
+                        .aspectRatio(contentMode: .fit)
+                        .frame(width: 44, height: 44)
                         .foregroundColor(Color.labelSecondary.opacity(0.30))
                     Text("右键文字片段\n「保存为文字模板」")
                         .font(.system(size: 11))
                         .foregroundColor(Color.labelSecondary.opacity(0.45))
                         .multilineTextAlignment(.center)
                 }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .modifier(PositionedAtOneThird())
             } else {
                 ScrollView(showsIndicators: false) {
                     VStack(alignment: .leading, spacing: 6) {
@@ -1996,6 +2117,60 @@ enum SidebarSVGIcon {
     static var cache: [String: NSImage] = [:]
 
     static let svgs: [String: String] = [
+        "relink": """
+        <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path fill-rule="evenodd" d="M12.7716286,11.4720826 L12.7282337,11.3760569 C12.5585888,11.0390069 12.1795714,10.6685796 10.8709017,9.53097035 L10.5690179,9.26854674 C9.13571297,8.02259378 8.76892283,7.75287247 8.38226638,7.65646819 C7.97245372,7.55429042 7.54081339,7.58447365 7.1492094,7.74269194 C6.77973274,7.89197019 6.45405012,8.21011392 5.20809717,9.64341883 L4.94567356,9.94530266 C3.69972061,11.3786076 3.4299993,11.7453977 3.33359502,12.1320542 C3.15165093,12.861792 3.3944681,13.6319097 3.96206841,14.1253171 L5.62242949,15.568647 C7.0557344,16.8145999 7.42252455,17.0843213 7.809181,17.1807255 C8.21899365,17.2829033 8.65063399,17.2527201 9.04223798,17.0945018 C9.35104719,16.9697348 9.55713818,16.8344442 9.67123214,16.7031941 L11.1806513,18.0153121 C10.839671,18.4075651 10.3730305,18.7138962 9.79145116,18.9488695 C9.00824318,19.2653061 8.14496252,19.3256725 7.32533721,19.121317 C6.48901984,18.9127996 6.04708395,18.5878195 4.31031143,17.0780662 L2.64995035,15.6347363 C1.51474974,14.6479214 1.0291154,13.1076861 1.39300356,11.6482104 C1.6015209,10.811893 1.92650108,10.3699571 3.4362544,8.63318461 L3.69867801,8.33130077 C5.20843133,6.59452825 5.60083783,6.21120517 6.39999621,5.88832423 C7.18320419,5.57188766 8.04648486,5.5115212 8.86611017,5.71587674 C9.70242753,5.92439408 10.1443634,6.24937425 11.8811359,7.75912758 L12.1830198,8.02155119 C13.9197923,9.53130451 14.3031154,9.92371101 14.6259963,10.7228694 C15.1894629,12.1174981 14.9229141,13.7103313 13.9360992,14.8455319 L12.4266801,13.5334138 C12.9200875,12.9658135 13.0533619,12.169397 12.7716286,11.4720826 Z M19.2814936,7.56856006 L20.3983169,8.53939973 C21.7918124,9.76233653 22.1385748,10.1531138 22.4345489,10.8856757 C22.7509855,11.6688836 22.811352,12.5321643 22.6069964,13.3517896 C22.3984791,14.188107 22.0734989,14.6300429 20.5637456,16.3668154 L20.301322,16.6686992 C18.7915687,18.4054718 18.3991622,18.7887948 17.6000038,19.1116758 C16.8167958,19.4281123 15.9535151,19.4884788 15.1338898,19.2841233 C14.2975725,19.0756059 13.8556366,18.7506257 12.1188641,17.2408724 L11.8169802,16.9784488 C10.0802077,15.4686955 9.69688462,15.076289 9.37400368,14.2771306 C8.81053708,12.8825019 9.07708593,11.2896687 10.0639008,10.1544681 L11.5733199,11.4665862 C11.0799125,12.0341865 10.9466381,12.830603 11.2283714,13.5279174 C11.3776496,13.8973941 11.6957934,14.2230767 13.1290983,15.4690297 L13.4309821,15.7314533 C14.864287,16.9774062 15.2310772,17.2471275 15.6177336,17.3435318 C16.0275463,17.4457096 16.4591866,17.4155263 16.8507906,17.2573081 C17.2202673,17.1080298 17.5459499,16.7898861 18.7919028,15.3565812 L19.0543264,15.0546973 C20.3002794,13.6213924 20.5700007,13.2546023 20.666405,12.8679458 C20.7685828,12.4581332 20.7383995,12.0264928 20.5801812,11.6348888 C20.430903,11.2654122 20.1127593,10.9397296 18.6794543,9.69377662 L18.3775705,9.43135301 C16.9442656,8.18540006 16.5774755,7.91567875 16.190819,7.81927447 C15.4610811,7.63733038 14.6909635,7.88014755 14.1975561,8.44774786 L12.6881369,7.1356298 C13.6749517,6.00042919 15.2151871,5.51479485 16.6746628,5.87868301 C17.441287,6.06982391 17.8765213,6.35882593 19.2814936,7.56856006 Z" fill="black"/></svg>
+        """,
+        "newChat": """
+        <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path fill-rule="evenodd" d="M12,3 C12.5522847,3 13,3.44771525 13,4 C13,4.55228475 12.5522847,5 12,5 L10.4,5 C7.80078673,5 7.1802615,5.05069892 6.6380285,5.32698043 C6.07354222,5.61460055 5.61460055,6.07354222 5.32698043,6.6380285 C5.05069892,7.1802615 5,7.80078673 5,10.4 L5,13.6 C5,16.1992133 5.05069892,16.8197385 5.32698043,17.3619715 C5.61460055,17.9264578 6.07354222,18.3853994 6.6380285,18.6730196 C7.1802615,18.9493011 7.80078673,19 10.4,19 L13.6,19 C16.1992133,19 16.8197385,18.9493011 17.3619715,18.6730196 C17.9264578,18.3853994 18.3853994,17.9264578 18.6730196,17.3619715 C18.9493011,16.8197385 19,16.1992133 19,13.6 L19,12 C19,11.4477153 19.4477153,11 20,11 C20.5522847,11 21,11.4477153 21,12 L21,13.6 C21,16.6013118 20.9417054,17.3148033 20.4550326,18.2699525 C19.9756657,19.210763 19.210763,19.9756657 18.2699525,20.4550326 C17.3148033,20.9417054 16.6013118,21 13.6,21 L10.4,21 C7.39868821,21 6.68519669,20.9417054 5.7300475,20.4550326 C4.78923704,19.9756657 4.02433425,19.210763 3.54496738,18.2699525 C3.05829456,17.3148033 3,16.6013118 3,13.6 L3,10.4 C3,7.39868821 3.05829456,6.68519669 3.54496738,5.7300475 C4.02433425,4.78923704 4.78923704,4.02433425 5.7300475,3.54496738 C6.68519669,3.05829456 7.39868821,3 10.4,3 L12,3 Z M20.1601089,3.38235931 C20.5506332,3.7728836 20.5506332,4.40604858 20.1601089,4.79657288 L13.0890411,11.8676407 C12.6985168,12.258165 12.0653518,12.258165 11.6748276,11.8676407 C11.2843033,11.4771164 11.2843033,10.8439514 11.6748276,10.4534271 L18.7458954,3.38235931 C19.1364197,2.99183502 19.7695846,2.99183502 20.1601089,3.38235931 Z" fill="black"/></svg>
+        """,
+        "swapFrame": """
+        <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path fill-rule="evenodd" d="M15.7808688,5.87534178 L17.7808688,8.37534178 C18.3046795,9.03010512 17.8385062,10.0000368 17,10.0000368 L7,10.0000368 C6.44771525,10.0000368 6,9.55232157 6,9.00003682 C6,8.44775207 6.44771525,8.00003682 7,8.00003682 L14.9193752,8.00003682 L14.2191312,7.12473187 C13.8741216,6.69346994 13.944043,6.06417756 14.375305,5.71916801 C14.8065669,5.37415847 15.4358593,5.44407984 15.7808688,5.87534178 Z M18,15.0000368 C18,15.5523216 17.5522847,16.0000368 17,16.0000368 L9.08062486,16.0000368 L9.78086881,16.8753418 C10.1258784,17.3066037 10.055957,17.9358961 9.62469505,18.2809056 C9.19343311,18.6259152 8.56414074,18.5559938 8.21913119,18.1247319 L6.21913119,15.6247319 C5.69532051,14.9699685 6.16149379,14.0000368 7,14.0000368 L17,14.0000368 C17.5522847,14.0000368 18,14.4477521 18,15.0000368 Z" fill="black"/></svg>
+        """,
+        "webSearch": """
+        <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path fill-rule="evenodd" d="M12,2 C17.5228475,2 22,6.4771525 22,12 C22,17.5228475 17.5228475,22 12,22 C7.54921732,22 3.77756275,19.0923069 2.48100447,15.0728889 C2.46562412,15.0593056 2.45096323,15.0453902 2.43640086,15.0314336 L2.45996971,15.0068921 C2.16113287,14.0578486 2,13.0477416 2,12 C2,6.4771525 6.4771525,2 12,2 Z M12.9997408,17.9764167 L13,19.4 C13,19.6180471 13,19.7936477 12.9935677,19.9394259 C14.0803745,19.8043655 15.1001795,19.4515088 16.0071561,18.9255979 C16,18.7831865 16,18.6115754 16,18.4 L15.9999598,17.6059673 C15.0498315,17.8010967 14.0412955,17.9270742 12.9997408,17.9764167 Z M7.99891046,17.6057362 L8,18.4 C8,18.6115754 8,18.7831865 7.99412362,18.9263665 C8.89879241,19.4510878 9.91859845,19.8040988 11.0060723,19.9388611 C11,19.7936477 11,19.6180471 11,19.4 L10.9991726,17.9763713 C9.95713681,17.9269614 8.94866009,17.8008705 7.99891046,17.6057362 Z M7.99883516,12.6057565 L7.99907056,15.5582912 C8.92704846,15.7744451 9.93947364,15.9178939 10.9994843,15.9737501 L10.9990244,12.9763582 C9.95793174,12.9269776 8.94934286,12.8010144 7.99883516,12.6057565 Z M12.9998008,12.9764139 L12.9999368,15.9738158 C14.0589495,15.9181129 15.0713992,15.7750056 16.0003003,15.558625 L16.00022,12.6059503 C15.049633,12.8011708 14.0409666,12.9270885 12.9998008,12.9764139 Z M4.03961375,11.1958208 L4.02761567,11.3305133 C4.00932682,11.5512539 4,11.7745378 4,12 C4,12.6694495 4.08222833,13.3196936 4.23713589,13.9411831 C4.71720588,14.3110842 5.31351368,14.6427745 5.9985635,14.9265793 L5.99950728,12.0631324 C5.28728417,11.8173897 4.62898561,11.526861 4.03961375,11.1958208 Z M17.9999888,12.0633061 L18.0005019,14.9266648 C18.6833851,14.6435258 19.2793558,14.3122115 19.763247,13.9423374 C19.9177717,13.3196936 20,12.6694495 20,12 C20,11.7279377 19.9864193,11.4590473 19.9598988,11.1939698 C19.3706551,11.5270362 18.7122869,11.8175675 17.9999888,12.0633061 Z M7.99851645,7.60051154 L7.99905151,10.5586233 C8.9288561,10.775334 9.94122047,10.9181718 10.999131,10.9738022 L10.9994099,7.95704495 C9.96218752,7.89767976 8.95495283,7.77744841 7.99851645,7.60051154 Z M12.9999648,7.99553646 L13.0001362,10.9738406 C14.0579333,10.9182572 15.0702004,10.7754855 15.9999382,10.5588582 L16.0003871,7.76537496 C15.0350416,7.89875516 14.0284825,7.97673729 12.9999648,7.99553646 Z M5.72153061,7.04125985 L5.6039813,7.19392554 C5.15795351,7.7865665 4.79238021,8.44319156 4.52348749,9.14757465 L4.31033638,8.9973581 C4.7825041,9.34561522 5.35247874,9.65775303 5.99910782,9.92615114 L5.99907592,7.12571078 C5.90579682,7.09817374 5.81327321,7.07002173 5.72153061,7.04125985 Z M18.000781,7.39570128 L17.99997,9.92653546 C18.5519487,9.69748631 19.0480868,9.43657132 19.4752309,9.1485304 C19.2205657,8.47710436 18.8770237,7.84990414 18.45988,7.27996746 C18.308395,7.32147074 18.1554057,7.35936963 18.000781,7.39570128 Z M12.9929236,4.06101454 C13,4.20555068 13,4.38145507 13,4.6 L12.999,5.994 L13.0220344,5.99472857 C14.0500782,5.97348791 15.0507987,5.88835207 15.9998904,5.7446783 L16,5.6 C16,5.38792678 16,5.2160061 16.005918,5.0726233 C15.1001795,4.54849116 14.0803745,4.19563445 12.9929236,4.06101454 Z M11.0064764,4.0595761 L10.7741848,4.0933267 C9.77354428,4.24719382 8.8340358,4.58647389 7.99184478,5.07498152 C7.99950043,5.20736717 7.9999694,5.36697959 7.99999813,5.56147618 C8.94245371,5.75631269 9.95143293,5.88845003 10.9988069,5.95345962 L11,4.6 C11,4.38145507 11,4.20555068 11.0064764,4.0595761 Z" fill="black"/></svg>
+        """,
+        "send": """
+        <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path fill-rule="evenodd" d="M14.6923077,4.30769231 C17.4537314,4.30769231 19.6923077,6.54626856 19.6923077,9.30769231 L19.6923077,13.0769231 C19.6923077,15.8383468 17.4537314,18.0769231 14.6923077,18.0769231 L6.721,18.076 L7.6301837,18.9852009 C8.020708,19.3757252 8.020708,20.0088902 7.6301837,20.3994145 C7.23965941,20.7899388 6.60649443,20.7899388 6.21597014,20.3994145 L3.60058553,17.7840299 C3.21006123,17.3935056 3.21006123,16.7603406 3.60058553,16.3698163 L6.21597014,13.7544317 C6.60649443,13.3639074 7.23965941,13.3639074 7.6301837,13.7544317 C8.020708,14.144956 8.020708,14.778121 7.6301837,15.1686452 L6.722,16.076 L14.6923077,16.0769231 C16.3491619,16.0769231 17.6923077,14.7337773 17.6923077,13.0769231 L17.6923077,9.30769231 C17.6923077,7.65083806 16.3491619,6.30769231 14.6923077,6.30769231 L12.1538462,6.30769231 C11.6015614,6.30769231 11.1538462,5.85997706 11.1538462,5.30769231 C11.1538462,4.75540756 11.6015614,4.30769231 12.1538462,4.30769231 L14.6923077,4.30769231 Z" fill="black"/></svg>
+        """,
+        "importFile": """
+        <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path fill-rule="evenodd" d="M19.9696672,4.390028 C20.6660443,4.73499367 21.2341519,5.28732059 21.5914495,5.96907766 C21.959113,6.67061409 22,7.15714634 22,9.2 L22,14.8 C22,16.8428537 21.959113,17.3293859 21.5914495,18.0309223 C21.2341519,18.7126794 20.6660443,19.2650063 19.9696672,19.609972 C19.2616185,19.9607195 18.7671113,20 16.68,20 L7.32,20 C5.23288865,20 4.73838149,19.9607195 4.0303328,19.609972 C3.33395574,19.2650063 2.76584806,18.7126794 2.40855055,18.0309223 C2.04088701,17.3293859 2,16.8428537 2,14.8 L2,9.2 C2,7.15714634 2.04088701,6.67061409 2.40855055,5.96907766 C2.76584806,5.28732059 3.33395574,4.73499367 4.0303328,4.390028 C4.52522405,4.14487275 5.12515027,4.34732378 5.37030552,4.84221503 C5.61546077,5.33710628 5.41300975,5.9370325 4.9181185,6.18218775 C4.59842026,6.34055729 4.34043294,6.5913783 4.18001422,6.89747222 C4.03268359,7.17859284 4,7.56750909 4,9.2 L4,14.8 C4,16.4324909 4.03268359,16.8214072 4.18001422,17.1025278 C4.34043294,17.4086217 4.59842026,17.6594427 4.9181185,17.8178123 C5.22080279,17.9677536 5.62675693,18 7.32,18 L16.68,18 C18.3732431,18 18.7791972,17.9677536 19.0818815,17.8178123 C19.4015797,17.6594427 19.6595671,17.4086217 19.8199858,17.1025278 C19.9673164,16.8214072 20,16.4324909 20,14.8 L20,9.2 C20,7.56750909 19.9673164,7.17859284 19.8199858,6.89747222 C19.6595671,6.5913783 19.4015797,6.34055729 19.0818815,6.18218775 C18.5869903,5.9370325 18.3845392,5.33710628 18.6296945,4.84221503 C18.8748497,4.34732378 19.4747759,4.14487275 19.9696672,4.390028 Z M12,2 C12.5522847,2 13,2.44771525 13,3 L13,12.13 L14.4452998,11.1679497 C14.9048285,10.8615972 15.5256978,10.9857711 15.8320503,11.4452998 C16.1384028,11.9048285 16.0142289,12.5256978 15.5547002,12.8320503 L12.5547002,14.8320503 L12.5301119,14.8482178 L12.503,14.863 L12.5547002,14.8320503 L12.4739482,14.8807773 L12.4941822,14.8694068 L12.503,14.863 L12.4941822,14.8694068 C12.4737332,14.881058 12.4530206,14.891911 12.4320831,14.9019733 C12.4138926,14.9106891 12.3958384,14.9186586 12.377585,14.9260817 C12.3601704,14.9333116 12.3424375,14.9399776 12.3245953,14.9461122 C12.3064164,14.9521315 12.2880643,14.9578309 12.2695717,14.9629985 C12.2525627,14.9680297 12.235207,14.9723901 12.2177904,14.9762714 C12.2008105,14.9797763 12.1841533,14.9830436 12.1674219,14.985888 C12.1486117,14.9893245 12.129524,14.9919882 12.1104106,14.994095 C12.0903823,14.9961486 12.0700712,14.9977974 12.0497114,14.9988267 C12.0326363,14.9997436 12.0159408,15.0001325 11.9992618,15.0001049 C11.9833914,15.0001168 11.9670298,14.9997274 11.9506679,14.998935 C11.9295931,14.9977804 11.908948,14.996094 11.8883846,14.9937739 C11.86981,14.9918951 11.8510562,14.9892682 11.8323509,14.9860989 C11.8155066,14.9829858 11.7985124,14.9796433 11.781614,14.9758641 C11.7637925,14.9721478 11.7464364,14.967768 11.7291607,14.962905 C11.7109341,14.9575299 11.692578,14.9518083 11.6743883,14.9455594 C11.6565641,14.9396127 11.6388232,14.9329219 11.6212139,14.9256945 C11.6031624,14.918229 11.5850995,14.9102319 11.5672635,14.9016929 C11.5527593,14.8946687 11.5387017,14.8874819 11.5247593,14.8799308 C11.5060229,14.8699935 11.4872837,14.8591051 11.4688748,14.8475845 L11.4452998,14.8320503 L8.4452998,12.8320503 C7.98577112,12.5256978 7.86159725,11.9048285 8.16794971,11.4452998 C8.47430216,10.9857711 9.09517151,10.8615972 9.5547002,11.1679497 L11,12.131 L11,3 C11,2.44771525 11.4477153,2 12,2 Z" fill="black"/></svg>
+        """,
+        "exportFile": """
+        <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path fill-rule="evenodd" d="M19.9696672,4.390028 C20.6660443,4.73499367 21.2341519,5.28732059 21.5914495,5.96907766 C21.959113,6.67061409 22,7.15714634 22,9.2 L22,14.8 C22,16.8428537 21.959113,17.3293859 21.5914495,18.0309223 C21.2341519,18.7126794 20.6660443,19.2650063 19.9696672,19.609972 C19.2616185,19.9607195 18.7671113,20 16.68,20 L7.32,20 C5.23288865,20 4.73838149,19.9607195 4.0303328,19.609972 C3.33395574,19.2650063 2.76584806,18.7126794 2.40855055,18.0309223 C2.04088701,17.3293859 2,16.8428537 2,14.8 L2,9.2 C2,7.15714634 2.04088701,6.67061409 2.40855055,5.96907766 C2.76584806,5.28732059 3.33395574,4.73499367 4.0303328,4.390028 C4.52522405,4.14487275 5.12515027,4.34732378 5.37030552,4.84221503 C5.61546077,5.33710628 5.41300975,5.9370325 4.9181185,6.18218775 C4.59842026,6.34055729 4.34043294,6.5913783 4.18001422,6.89747222 C4.03268359,7.17859284 4,7.56750909 4,9.2 L4,14.8 C4,16.4324909 4.03268359,16.8214072 4.18001422,17.1025278 C4.34043294,17.4086217 4.59842026,17.6594427 4.9181185,17.8178123 C5.22080279,17.9677536 5.62675693,18 7.32,18 L16.68,18 C18.3732431,18 18.7791972,17.9677536 19.0818815,17.8178123 C19.4015797,17.6594427 19.6595671,17.4086217 19.8199858,17.1025278 C19.9673164,16.8214072 20,16.4324909 20,14.8 L20,9.2 C20,7.56750909 19.9673164,7.17859284 19.8199858,6.89747222 C19.6595671,6.5913783 19.4015797,6.34055729 19.0818815,6.18218775 C18.5869903,5.9370325 18.3845392,5.33710628 18.6296945,4.84221503 C18.8748497,4.34732378 19.4747759,4.14487275 19.9696672,4.390028 Z M11.9751491,2.0002847 L11.9992618,2.00000137 C12.0159408,1.99997376 12.0326363,2.00036265 12.0497114,2.00127953 C12.0700712,2.0023089 12.0903823,2.00395771 12.1104106,2.00601124 C12.129524,2.00811805 12.1486117,2.01078178 12.1674219,2.01421824 C12.1841533,2.01706266 12.2008105,2.02033001 12.2177904,2.0238349 C12.235207,2.02771613 12.2525627,2.03207661 12.2695717,2.03710781 C12.2880643,2.04227541 12.3064164,2.04797476 12.3245953,2.05399404 C12.3424375,2.06012869 12.3601704,2.06679464 12.377585,2.07402458 C12.3958384,2.08144765 12.4138926,2.08941716 12.4320831,2.098133 L12.4739482,2.119329 L12.4941822,2.13069949 C12.4922506,2.12934273 12.4831337,2.1242615 12.4739482,2.119329 L12.5547002,2.16805598 L12.5012951,2.1345719 C12.5109855,2.14017458 12.5205927,2.14594709 12.5301119,2.15188848 L12.5547002,2.16805598 L15.5547002,4.16805598 C16.0142289,4.47440843 16.1384028,5.09527778 15.8320503,5.55480647 C15.5256978,6.01433515 14.9048285,6.13850902 14.4452998,5.83215656 L13,4.87010627 L13,14.0001063 C13,14.552391 12.5522847,15.0001063 12,15.0001063 C11.4477153,15.0001063 11,14.552391 11,14.0001063 L11,4.86910627 L9.5547002,5.83215656 C9.09517151,6.13850902 8.47430216,6.01433515 8.16794971,5.55480647 C7.86159725,5.09527778 7.98577112,4.47440843 8.4452998,4.16805598 L11.4452998,2.16805598 L11.4688748,2.15252177 C11.4872837,2.14100113 11.5060229,2.13011275 11.5247593,2.12017545 C11.5387017,2.11262434 11.5527593,2.10543756 11.5672635,2.09841333 C11.5850995,2.08987434 11.6031624,2.08187731 11.6212139,2.07441172 C11.6388232,2.06718441 11.6565641,2.06049359 11.6743883,2.05454685 C11.692578,2.04829802 11.7109341,2.04257637 11.7291607,2.03720131 C11.7464364,2.03233825 11.7637925,2.0279585 11.781614,2.02424215 C11.7985124,2.020463 11.8155066,2.01712047 11.8323509,2.01400733 C11.8510562,2.01083805 11.86981,2.00821117 11.8883846,2.00633238 C11.908948,2.00401225 11.9295931,2.00232587 11.9506679,2.00117131 C11.9670298,2.00037882 11.9833914,1.99998948 11.9992618,2.00000137 Z" fill="black"/></svg>
+        """,
+        "toastSuccess": """
+        <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path fill-rule="evenodd" d="M12,2 C17.5228475,2 22,6.4771525 22,12 C22,17.5228475 17.5228475,22 12,22 C6.4771525,22 2,17.5228475 2,12 C2,6.4771525 6.4771525,2 12,2 Z M12,4 C7.581722,4 4,7.581722 4,12 C4,16.418278 7.581722,20 12,20 C16.418278,20 20,16.418278 20,12 C20,7.581722 16.418278,4 12,4 Z M16.7071068,9.29289322 C17.0976311,9.68341751 17.0976311,10.3165825 16.7071068,10.7071068 L12.4142136,15 C11.633165,15.7810486 10.366835,15.7810486 9.58578644,15 L7.29289322,12.7071068 C6.90236893,12.3165825 6.90236893,11.6834175 7.29289322,11.2928932 C7.68341751,10.9023689 8.31658249,10.9023689 8.70710678,11.2928932 L11,13.5857864 L15.2928932,9.29289322 C15.6834175,8.90236893 16.3165825,8.90236893 16.7071068,9.29289322 Z" fill="black"/></svg>
+        """,
+        "toastFail": """
+        <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path fill-rule="evenodd" d="M12,2 C17.5228475,2 22,6.4771525 22,12 C22,17.5228475 17.5228475,22 12,22 C6.4771525,22 2,17.5228475 2,12 C2,6.4771525 6.4771525,2 12,2 Z M12,4 C7.581722,4 4,7.581722 4,12 C4,16.418278 7.581722,20 12,20 C16.418278,20 20,16.418278 20,12 C20,7.581722 16.418278,4 12,4 Z M15.8492424,8.77817459 C16.1151421,9.04407424 16.2093945,9.43666413 16.0931921,9.79429837 C16.0190037,10.0226268 15.8209953,10.2206353 15.4249783,10.6166522 L13.7279221,12.3137085 L15.4249783,14.0107648 C15.8209953,14.4067817 16.0190037,14.6047902 16.0931921,14.8331186 C16.2093945,15.1907529 16.1151421,15.5833428 15.8492424,15.8492424 C15.5833428,16.1151421 15.1907529,16.2093945 14.8331186,16.0931921 C14.6047902,16.0190037 14.4067817,15.8209953 14.0107648,15.4249783 L12.3137085,13.7279221 L10.6166522,15.4249783 C10.2206353,15.8209953 10.0226268,16.0190037 9.79429837,16.0931921 C9.43666413,16.2093945 9.04407424,16.1151421 8.77817459,15.8492424 C8.51227494,15.5833428 8.41802245,15.1907529 8.53422486,14.8331186 C8.60841327,14.6047902 8.80642174,14.4067817 9.20243866,14.0107648 L10.8994949,12.3137085 L9.20243866,10.6166522 C8.80642174,10.2206353 8.60841327,10.0226268 8.53422486,9.79429837 C8.41802245,9.43666413 8.51227494,9.04407424 8.77817459,8.77817459 C9.04407424,8.51227494 9.43666413,8.41802245 9.79429837,8.53422486 C10.0226268,8.60841327 10.2206353,8.80642174 10.6166522,9.20243866 L12.3137085,10.8994949 L14.0107648,9.20243866 C14.4067817,8.80642174 14.6047902,8.60841327 14.8331186,8.53422486 C15.1907529,8.41802245 15.5833428,8.51227494 15.8492424,8.77817459 Z" fill="black"/></svg>
+        """,
+        "toastWarn": """
+        <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path fill-rule="evenodd" d="M13.563665,2.76881202 C14.6359857,3.22423968 15.381057,4.31821318 16.7413485,6.45101075 L17.021889,6.89153984 L20.3345724,12.0971853 C21.978932,14.6811788 22.8011117,15.9731756 22.7022035,17.2978379 C22.6160018,18.4523235 22.0338378,19.5128361 21.1061223,20.2053762 C20.0416571,21 18.510241,21 15.4474089,21 L8.55259112,21 C5.48975897,21 3.9583429,21 2.89387772,20.2053762 C1.9661622,19.5128361 1.38399818,18.4523235 1.2977965,17.2978379 C1.19888828,15.9731756 2.02106803,14.6811788 3.66542755,12.0971853 L6.97811101,6.89153984 C8.52105454,4.46691429 9.2925263,3.25460152 10.436335,2.76881202 C11.4355842,2.3444187 12.5644158,2.3444187 13.563665,2.76881202 Z M11.2181675,4.60966453 C11.0961997,4.66146574 10.9698952,4.74965404 10.8038397,4.91370633 C10.3675039,5.3447783 9.94892437,5.94837737 8.66543399,7.96529082 L5.35275053,13.1709363 C3.61845664,15.8962552 3.26932785,16.5949508 3.29052458,17.1190604 C3.29120937,17.133906 3.29120937,17.133906 3.29224458,17.1489189 C3.33534542,17.7261618 3.62642743,18.2564181 4.09028519,18.6026881 C4.50987626,18.9159131 5.2707345,19 8.55259112,19 L15.4474089,19 C18.7292655,19 19.4901237,18.9159131 19.9097148,18.6026881 C20.3735726,18.2564181 20.6646546,17.7261618 20.7077554,17.1489189 C20.7467431,16.6267633 20.4091979,15.9397123 18.6472495,13.1709363 L15.3349196,7.96584621 L15.055121,7.52648125 C13.6739937,5.36101522 13.2042427,4.78906731 12.7818325,4.60966455 L12.5916893,4.54003752 C12.1421163,4.40078344 11.655339,4.42399245 11.2181675,4.60966453 Z M12.25,15.5 C12.9403559,15.5 13.5,16.0596441 13.5,16.75 C13.5,17.4403559 12.9403559,18 12.25,18 C11.5596441,18 11,17.4403559 11,16.75 C11,16.0596441 11.5596441,15.5 12.25,15.5 Z M12.25,7 C12.6260389,7 12.9702884,7.21095639 13.1410065,7.5460095 C13.25,7.75992124 13.25,8.03994749 13.25,8.6 L13.25,12.4 C13.25,12.9600525 13.25,13.2400788 13.1410065,13.4539905 C12.9702884,13.7890436 12.6260389,14 12.25,14 C11.8739611,14 11.5297116,13.7890436 11.3589935,13.4539905 C11.25,13.2400788 11.25,12.9600525 11.25,12.4 L11.25,8.6 C11.25,8.03994749 11.25,7.75992124 11.3589935,7.5460095 C11.5297116,7.21095639 11.8739611,7 12.25,7 Z" fill="black"/></svg>
+        """,
+        "toastStop": """
+        <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path fill-rule="evenodd" d="M9.8,5 L14.2,5 C15.8801575,5 16.7202363,5 17.3619715,5.32698043 C17.9264578,5.61460055 18.3853994,6.07354222 18.6730196,6.6380285 C19,7.27976372 19,8.11984248 19,9.8 L19,14.2 C19,15.8801575 19,16.7202363 18.6730196,17.3619715 C18.3853994,17.9264578 17.9264578,18.3853994 17.3619715,18.6730196 C16.7202363,19 15.8801575,19 14.2,19 L9.8,19 C8.11984248,19 7.27976372,19 6.6380285,18.6730196 C6.07354222,18.3853994 5.61460055,17.9264578 5.32698043,17.3619715 C5,16.7202363 5,15.8801575 5,14.2 L5,9.8 C5,8.11984248 5,7.27976372 5.32698043,6.6380285 C5.61460055,6.07354222 6.07354222,5.61460055 6.6380285,5.32698043 C7.27976372,5 8.11984248,5 9.8,5 Z" fill="black"/></svg>
+        """,
+        "saveTextTemplate": """
+        <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path fill-rule="evenodd" d="M14.3211917,4.11039691 L20.9284767,20.6286093 C21.1335901,21.1413928 20.8841742,21.7233633 20.3713907,21.9284767 C19.8586072,22.1335901 19.2766367,21.8841742 19.0715233,21.3713907 L16.5594454,15.0881928 C16.5089415,15.0883009 16.4558638,15.0883009 16.4,15.0883009 L7.6,15.0883009 L7.44173223,15.0873214 L4.92847669,21.3713907 C4.72336328,21.8841742 4.14139284,22.1335901 3.62860932,21.9284767 C3.11582581,21.7233633 2.8664099,21.1413928 3.07152331,20.6286093 L9.67880827,4.11039691 C10.516954,2.0150325 13.483046,2.0150325 14.3211917,4.11039691 Z M11.5357617,4.85317827 L8.24173223,13.0873214 L15.7577322,13.0873214 L12.4642383,4.85317827 C12.2966092,4.43410538 11.7033908,4.43410538 11.5357617,4.85317827 Z" fill="black"/></svg>
+        """,
+        "info": """
+        <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path fill-rule="evenodd" d="M12,2 C17.5228475,2 22,6.4771525 22,12 C22,17.5228475 17.5228475,22 12,22 C6.4771525,22 2,17.5228475 2,12 C2,6.4771525 6.4771525,2 12,2 Z M12,4 C7.581722,4 4,7.581722 4,12 C4,16.418278 7.581722,20 12,20 C16.418278,20 20,16.418278 20,12 C20,7.581722 16.418278,4 12,4 Z M12,10.5 C12.3760389,10.5 12.7202884,10.7109564 12.8910065,11.0460095 C13,11.2599212 13,11.5399475 13,12.1 L13,15.9 C13,16.4600525 13,16.7400788 12.8910065,16.9539905 C12.7202884,17.2890436 12.3760389,17.5 12,17.5 C11.6239611,17.5 11.2797116,17.2890436 11.1089935,16.9539905 C11,16.7400788 11,16.4600525 11,15.9 L11,12.1 C11,11.5399475 11,11.2599212 11.1089935,11.0460095 C11.2797116,10.7109564 11.6239611,10.5 12,10.5 Z M12,6.5 C12.6903559,6.5 13.25,7.05964406 13.25,7.75 C13.25,8.44035594 12.6903559,9 12,9 C11.3096441,9 10.75,8.44035594 10.75,7.75 C10.75,7.05964406 11.3096441,6.5 12,6.5 Z" fill="black"/></svg>
+        """,
+        "recentFiles": """
+        <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path d="M15.7656375,2.18866999 C16.9901571,2.48265113 18.1095301,3.10953014 19,4 C19.8904699,4.89046986 20.5173489,6.00984288 20.81133,7.23436247 C21,8.02022952 21,8.97247143 21,10.8769553 L21,15.6 C21,17.84021 21,18.960315 20.5640261,19.815962 C20.1805326,20.5686104 19.5686104,21.1805326 18.815962,21.5640261 C17.960315,22 16.84021,22 14.6,22 L9.4,22 C7.15978998,22 6.03968496,22 5.184038,21.5640261 C4.43138963,21.1805326 3.8194674,20.5686104 3.4359739,19.815962 C3,18.960315 3,17.84021 3,15.6 L3,8.4 C3,6.15978998 3,5.03968496 3.4359739,4.184038 C3.8194674,3.43138963 4.43138963,2.8194674 5.184038,2.4359739 C5.98620703,2.02724837 7.02080989,2.00170302 8.99287796,2.00010645 L9.40000002,2 L12.1230447,2 C14.0275286,2 14.9797705,2 15.7656375,2.18866999 Z M9.40052294,3.99999993 L8.99449715,4.00010579 C6.99384943,4.00172551 6.40667202,4.05766323 6.092019,4.21798695 C5.71569481,4.4097337 5.4097337,4.71569481 5.21798695,5.092019 C5.04690109,5.42779391 5,6.001836 5,8.4 L5,15.6 C5,17.998164 5.04690109,18.5722061 5.21798695,18.907981 C5.4097337,19.2843052 5.71569481,19.5902663 6.092019,19.782013 C6.42779391,19.9530989 7.001836,20 9.4,20 L14.6,20 C16.998164,20 17.5722061,19.9530989 17.907981,19.782013 C18.2843052,19.5902663 18.5902663,19.2843052 18.782013,18.907981 C18.9530989,18.5722061 19,17.998164 19,15.6 L19,10.8769553 C19,8.69756004 18.978175,8.16603735 18.8665902,7.7012532 C18.6587141,6.83538709 18.2154437,6.04387084 17.5857864,5.41421356 C16.9561292,4.78455629 16.1646129,4.34128589 15.2987468,4.13340983 L15.2104317,4.11352298 C14.7610853,4.01918215 14.1662278,4 12.1230447,4 L9.40052294,3.99999993 Z M15.4539905,15.1089935 C15.7890436,15.2797116 16,15.6239611 16,16 C16,16.3760389 15.7890436,16.7202884 15.4539905,16.8910065 C15.2400788,17 14.9600525,17 14.4,17 L9.6,17 C9.03994749,17 8.75992124,17 8.5460095,16.8910065 C8.21095639,16.7202884 8,16.3760389 8,16 C8,15.6239611 8.21095639,15.2797116 8.5460095,15.1089935 C8.75992124,15 9.03994749,15 9.6,15 L14.4,15 C14.9600525,15 15.2400788,15 15.4539905,15.1089935 Z M15.4539905,11.1089935 C15.7890436,11.2797116 16,11.6239611 16,12 C16,12.3760389 15.7890436,12.7202884 15.4539905,12.8910065 C15.2400788,13 14.9600525,13 14.4,13 L9.6,13 C9.03994749,13 8.75992124,13 8.5460095,12.8910065 C8.21095639,12.7202884 8,12.3760389 8,12 C8,11.6239611 8.21095639,11.2797116 8.5460095,11.1089935 C8.75992124,11 9.03994749,11 9.6,11 L14.4,11 C14.9600525,11 15.2400788,11 15.4539905,11.1089935 Z M15.4539905,7.10899348 C15.7890436,7.27971156 16,7.62396111 16,8 C16,8.37603889 15.7890436,8.72028844 15.4539905,8.89100652 C15.2400788,9 14.9600525,9 14.4,9 L9.6,9 C9.03994749,9 8.75992124,9 8.5460095,8.89100652 C8.21095639,8.72028844 8,8.37603889 8,8 C8,7.62396111 8.21095639,7.27971156 8.5460095,7.10899348 C8.75992124,7 9.03994749,7 9.6,7 L14.4,7 C14.9600525,7 15.2400788,7 15.4539905,7.10899348 Z" fill="black"/></svg>
+        """,
+        "toSpeech": """
+        <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path d="M19.815962,4.4359739 C20.5686104,4.8194674 21.1805326,5.43138963 21.5640261,6.184038 C22,7.03968496 22,8.15978998 22,10.4 L22,13.6 C22,15.84021 22,16.960315 21.5640261,17.815962 C21.1805326,18.5686104 20.5686104,19.1805326 19.815962,19.5640261 C18.960315,20 17.84021,20 15.6,20 L3.6,20 C3.03994749,20 2.75992124,20 2.5460095,19.8910065 C2.35784741,19.7951331 2.20486685,19.6421526 2.10899348,19.4539905 C2,19.2400788 2,18.9600525 2,18.4 L2,10.4 C2,8.15978998 2,7.03968496 2.4359739,6.184038 C2.8194674,5.43138963 3.43138963,4.8194674 4.184038,4.4359739 C4.98620703,4.02724837 6.02080989,4.00170302 7.99287797,4.00010644 L8.40000001,4.00000001 L15.6,4 C17.84021,4 18.960315,4 19.815962,4.4359739 Z M8.40052284,5.99999994 L7.99449716,6.00010578 C5.99384942,6.00172551 5.40667202,6.05766323 5.092019,6.21798695 C4.71569481,6.4097337 4.4097337,6.71569481 4.21798695,7.092019 C4.04690109,7.42779391 4,8.001836 4,10.4 L4,18 L15.6,18 C17.998164,18 18.5722061,17.9530989 18.907981,17.782013 C19.2843052,17.5902663 19.5902663,17.2843052 19.782013,16.907981 C19.9530989,16.5722061 20,15.998164 20,13.6 L20,10.4 C20,8.001836 19.9530989,7.42779391 19.782013,7.092019 C19.5902663,6.71569481 19.2843052,6.4097337 18.907981,6.21798697 L18.8418438,6.18734479 C18.4933254,6.04122166 17.8482788,6 15.6,6 L8.40052284,5.99999994 Z M12,8 C12.3760389,8 12.7202884,8.21095639 12.8910065,8.5460095 C13,8.75992124 13,9.03994749 13,9.6 L13,14.4 C13,14.9600525 13,15.2400788 12.8910065,15.4539905 C12.7202884,15.7890436 12.3760389,16 12,16 C11.6239611,16 11.2797116,15.7890436 11.1089935,15.4539905 C11,15.2400788 11,14.9600525 11,14.4 L11,9.6 C11,9.03994749 11,8.75992124 11.1089935,8.5460095 C11.2797116,8.21095639 11.6239611,8 12,8 Z M8,10 C8.37603889,10 8.72028844,10.2109564 8.89100652,10.5460095 C9,10.7599212 9,11.0399475 9,11.6 L9,12.4 C9,12.9600525 9,13.2400788 8.89100652,13.4539905 C8.72028844,13.7890436 8.37603889,14 8,14 C7.62396111,14 7.27971156,13.7890436 7.10899348,13.4539905 C7,13.2400788 7,12.9600525 7,12.4 L7,11.6 C7,11.0399475 7,10.7599212 7.10899348,10.5460095 C7.27971156,10.2109564 7.62396111,10 8,10 Z M16,10 C16.3760389,10 16.7202884,10.2109564 16.8910065,10.5460095 C17,10.7599212 17,11.0399475 17,11.6 L17,12.4 C17,12.9600525 17,13.2400788 16.8910065,13.4539905 C16.7202884,13.7890436 16.3760389,14 16,14 C15.6239611,14 15.2797116,13.7890436 15.1089935,13.4539905 C15,13.2400788 15,12.9600525 15,12.4 L15,11.6 C15,11.0399475 15,10.7599212 15.1089935,10.5460095 C15.2797116,10.2109564 15.6239611,10 16,10 Z" fill="black"/></svg>
+        """,
+        "removeBg": """
+        <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path d="M18.6468037,6.76740982 L6.76740982,18.6468037 C6.37139289,19.0428207 6.17338443,19.2408291 5.94505596,19.3150175 C5.58742173,19.43122 5.19483184,19.3369675 4.92893219,19.0710678 C4.66303254,18.8051682 4.56878005,18.4125783 4.68498245,18.054944 C4.75917087,17.8266156 4.95717933,17.6286071 5.35319626,17.2325902 L17.2325902,5.35319626 C17.6286071,4.95717933 17.8266156,4.75917087 18.054944,4.68498245 C18.4125783,4.56878005 18.8051682,4.66303254 19.0710678,4.92893219 C19.3369675,5.19483184 19.43122,5.58742173 19.3150175,5.94505596 C19.2408291,6.17338443 19.0428207,6.37139289 18.6468037,6.76740982 Z M13.461354,6.2960053 L6.2960053,13.461354 C5.89998837,13.8573709 5.70197991,14.0553794 5.47365144,14.1295678 C5.11601721,14.2457702 4.72342732,14.1515177 4.45752767,13.8856181 C4.19162802,13.6197184 4.09737552,13.2271285 4.21357793,12.8694943 C4.28776635,12.6411658 4.48577481,12.4431574 4.88179174,12.0471405 L12.0471405,4.88179174 C12.4431574,4.48577481 12.6411658,4.28776635 12.8694943,4.21357793 C13.2271285,4.09737552 13.6197184,4.19162802 13.8856181,4.45752767 C14.1515177,4.72342732 14.2457702,5.11601721 14.1295678,5.47365144 C14.0553794,5.70197991 13.8573709,5.89998837 13.461354,6.2960053 Z M8.27590429,5.82460078 L5.82460078,8.27590429 C5.42858385,8.67192121 5.23057539,8.86992967 5.00224692,8.94411809 C4.64461268,9.0603205 4.2520228,8.966068 3.98612315,8.70016835 C3.7202235,8.4342687 3.625971,8.04167882 3.74217341,7.68404458 C3.81636183,7.45571611 4.01437029,7.25770765 4.41038722,6.86169072 L6.86169072,4.41038722 C7.25770765,4.01437029 7.45571611,3.81636183 7.68404458,3.74217341 C8.04167882,3.625971 8.4342687,3.7202235 8.70016835,3.98612315 C8.966068,4.2520228 9.0603205,4.64461268 8.94411809,5.00224692 C8.86992967,5.23057539 8.67192121,5.42858385 8.27590429,5.82460078 Z M19.1182083,11.9528595 L11.9528595,19.1182083 C11.5568426,19.5142252 11.3588342,19.7122337 11.1305057,19.7864221 C10.7728715,19.9026245 10.3802816,19.808372 10.1143819,19.5424723 C9.84848227,19.2765727 9.75422977,18.8839828 9.87043218,18.5263486 C9.9446206,18.2980201 10.1426291,18.1000116 10.538646,17.7039947 L17.7039947,10.538646 C18.1000116,10.1426291 18.2980201,9.9446206 18.5263486,9.87043218 C18.8839828,9.75422977 19.2765727,9.84848227 19.5424723,10.1143819 C19.808372,10.3802816 19.9026245,10.7728715 19.7864221,11.1305057 C19.7122337,11.3588342 19.5142252,11.5568426 19.1182083,11.9528595 Z M19.5896128,17.1383093 L17.1383093,19.5896128 C16.7422924,19.9856297 16.5442839,20.1836382 16.3159554,20.2578266 C15.9583212,20.374029 15.5657313,20.2797765 15.2998316,20.0138769 C15.033932,19.7479772 14.9396795,19.3553873 15.0558819,18.9977531 C15.1300703,18.7694246 15.3280788,18.5714161 15.7240957,18.1753992 L18.1753992,15.7240957 C18.5714161,15.3280788 18.7694246,15.1300703 18.9977531,15.0558819 C19.3553873,14.9396795 19.7479772,15.033932 20.0138769,15.2998316 C20.2797765,15.5657313 20.374029,15.9583212 20.2578266,16.3159554 C20.1836382,16.5442839 19.9856297,16.7422924 19.5896128,17.1383093 Z" fill="black"/></svg>
+        """,
+        "clarity": """
+        <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path fill-rule="evenodd" d="M12,2 C17.5228475,2 22,6.4771525 22,12 C22,17.5228475 17.5228475,22 12,22 C6.4771525,22 2,17.5228475 2,12 C2,6.4771525 6.4771525,2 12,2 Z M4,12 C4,16.0796344 7.05371356,19.4460359 11.0000487,19.9381123 L11.0000487,4.06188768 C7.05371356,4.55396414 4,7.92036556 4,12 Z M19.6741326,14.267414 L14.3878884,19.5532371 L14.267414,19.6741326 C16.862514,18.9085818 18.9085818,16.862514 19.6741326,14.267414 Z M19.378937,8.90410887 L13.4450793,14.8391919 C13.2618245,15.0224468 13.1209697,15.1633015 12.9998903,15.2691074 L13,18.112 L19.1962145,11.9164839 C19.5617235,11.5509749 19.7585568,11.3541416 19.9662345,11.2676543 C19.8914369,10.4363058 19.6889233,9.64206683 19.378937,8.90410887 Z M16.6034896,6.02392736 L13.2093771,9.41803991 C13.1323738,9.4950432 13.0628569,9.56456006 12.9991479,9.6271359 L13,12.454 L18.2534055,7.20243866 L18.3379069,7.11766361 C17.9283612,6.58680551 17.453608,6.10883226 16.9256429,5.69573947 C16.8374838,5.78993315 16.730703,5.896714 16.6034896,6.02392736 Z M13.0009551,4.06201291 L13,6.797 L15.1530349,4.64532969 C14.4784582,4.3557501 13.7560513,4.15626425 13.0009551,4.06201291 Z" fill="black"/></svg>
+        """,
+        "separateAudio": """
+        <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path d="M12.9988039,18.7342304 C12.9946176,19.0812437 12.9757792,19.2876147 12.8910065,19.4539905 C12.7202884,19.7890436 12.3760389,20 12,20 C11.6239611,20 11.2797116,19.7890436 11.1089935,19.4539905 C11,19.2400788 11,18.9600525 11,18.4 L11,5.6 C11,5.03994749 11,4.75992124 11.1089935,4.5460095 C11.2797116,4.21095639 11.6239611,4 12,4 C12.3760389,4 12.7202884,4.21095639 12.8910065,4.5460095 C12.9757792,4.7123853 12.9946176,4.9187563 12.9988039,5.26576958 L12.9988039,18.7342304 Z M18.2908885,9.29289322 C17.9003642,9.68341751 17.9003642,10.3165825 18.2908885,10.7071068 L18.5837817,11 L16,11 C15.4477153,11 15,11.4477153 15,12 C15,12.5522847 15.4477153,13 16,13 L20.9979952,13 C21.8889001,13 22.3350669,11.9228581 21.705102,11.2928932 L19.705102,9.29289322 C19.3145777,8.90236893 18.6814128,8.90236893 18.2908885,9.29289322 Z M5.70911154,14.7071068 C6.09963583,14.3165825 6.09963583,13.6834175 5.70911154,13.2928932 L5.41621832,13 L8,13 C8.55228475,13 9,12.5522847 9,12 C9,11.4477153 8.55228475,11 8,11 L3.00200475,11 C2.1110999,11 1.66493311,12.0771419 2.29489797,12.7071068 L4.29489797,14.7071068 C4.68542227,15.0976311 5.31858724,15.0976311 5.70911154,14.7071068 Z" fill="black"/></svg>
+        """,
         "newFile": """
         <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path fill-rule="evenodd" d="M18.815962,3.4359739 C19.5686104,3.8194674 20.1805326,4.43138963 20.5640261,5.184038 C21,6.03968496 21,7.15978998 21,9.4 L21,14.6 C21,16.84021 21,17.960315 20.5640261,18.815962 C20.1805326,19.5686104 19.5686104,20.1805326 18.815962,20.5640261 C17.960315,21 16.84021,21 14.6,21 L9.4,21 C7.15978998,21 6.03968496,21 5.184038,20.5640261 C4.43138963,20.1805326 3.8194674,19.5686104 3.4359739,18.815962 C3,17.960315 3,16.84021 3,14.6 L3,9.4 C3,7.15978998 3,6.03968496 3.4359739,5.184038 C3.8194674,4.43138963 4.43138963,3.8194674 5.184038,3.4359739 C6.03968496,3 7.15978998,3 9.4,3 L14.6,3 C16.84021,3 17.960315,3 18.815962,3.4359739 Z M6.092019,5.21798695 C5.71569481,5.4097337 5.4097337,5.71569481 5.21798695,6.092019 C5.04690109,6.42779391 5,7.001836 5,9.4 L5,14.6 C5,16.998164 5.04690109,17.5722061 5.21798695,17.907981 C5.4097337,18.2843052 5.71569481,18.5902663 6.092019,18.782013 C6.42779391,18.9530989 7.001836,19 9.4,19 L14.6,19 C16.998164,19 17.5722061,18.9530989 17.907981,18.782013 C18.2843052,18.5902663 18.5902663,18.2843052 18.782013,17.907981 C18.9530989,17.5722061 19,16.998164 19,14.6 L19,9.4 C19,7.001836 18.9530989,6.42779391 18.782013,6.092019 C18.5902663,5.71569481 18.2843052,5.4097337 17.907981,5.21798696 L17.8418438,5.18734478 C17.4933254,5.04122166 16.8482788,5 14.6,5 L9.4,5 C7.001836,5 6.42779391,5.04690109 6.092019,5.21798695 Z M12,7 C12.3760389,7 12.7202884,7.21095639 12.8910065,7.5460095 C13,7.75992124 13,8.03994749 13,8.6 L13,11 L15.4,11 C15.9600525,11 16.2400788,11 16.4539905,11.1089935 C16.7890436,11.2797116 17,11.6239611 17,12 C17,12.3760389 16.7890436,12.7202884 16.4539905,12.8910065 C16.2400788,13 15.9600525,13 15.4,13 L13,13 L13,15.4 C13,15.9600525 13,16.2400788 12.8910065,16.4539905 C12.7202884,16.7890436 12.3760389,17 12,17 C11.6239611,17 11.2797116,16.7890436 11.1089935,16.4539905 C11,16.2400788 11,15.9600525 11,15.4 L11,13 L8.6,13 C8.03994749,13 7.75992124,13 7.5460095,12.8910065 C7.21095639,12.7202884 7,12.3760389 7,12 C7,11.6239611 7.21095639,11.2797116 7.5460095,11.1089935 C7.75992124,11 8.03994749,11 8.6,11 L11,11 L11,8.6 C11,8.03994749 11,7.75992124 11.1089935,7.5460095 C11.2797116,7.21095639 11.6239611,7 12,7 Z" fill="black"/></svg>
         """,
@@ -2133,5 +2308,44 @@ enum SidebarSVGIcon {
         if let s = size { img.size = NSSize(width: s, height: s) }
         cache[key] = img
         return img
+    }
+}
+
+/// 把内容摆在容器上方三分之一处，而不是居中。
+/// 居中的话整组图文会掉到视觉重心以下，在又高又窄的空白区里看着像沉在底下。
+/// 素材库空状态和欢迎页「还没有最近文件」共用这一套。
+struct PositionedAtOneThird: ViewModifier {
+    func body(content: Content) -> some View {
+        GeometryReader { g in
+            content.position(x: g.size.width / 2, y: g.size.height / 3)
+        }
+    }
+}
+
+/// 进度气泡共用的倒计时估算。
+///
+/// 各任务后端只报进度、不报剩余时间，所以按「已用时间 / 已完成比例」外推。
+/// 卡片出现即开始计时（`@State private var startedAt = Date()`），进度一变 body
+/// 重算，倒计时跟着刷新。
+enum TaskETA {
+    /// - Parameters:
+    ///   - progress: 0~1
+    ///   - startedAt: 任务开始时间
+    /// - Returns: 「约 MM:SS」/「约 H:MM:SS」；进度太小或刚起步时返回 nil ——
+    ///   前几秒的样本外推出来的数字会乱跳，不如先不显示
+    static func text(progress: Double, startedAt: Date) -> String? {
+        guard progress > 0.03, progress < 1 else { return nil }
+        let elapsed = Date().timeIntervalSince(startedAt)
+        guard elapsed > 2 else { return nil }
+        let remain = elapsed / progress - elapsed
+        guard remain.isFinite, remain > 0 else { return nil }
+        return format(remain)
+    }
+
+    static func format(_ seconds: Double) -> String {
+        let total = Int(seconds.rounded())
+        let h = total / 3600, m = (total % 3600) / 60, sec = total % 60
+        return h > 0 ? String(format: "约 %d:%02d:%02d", h, m, sec)
+                     : String(format: "约 %02d:%02d", m, sec)
     }
 }

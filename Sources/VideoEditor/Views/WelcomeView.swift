@@ -21,7 +21,6 @@ struct WelcomeView: View {
     @State private var renameText = ""
     /// 正在走 esc 取消。挡住紧随其后的失焦回调，别把取消又变成确认
     @State private var cancelingRename = false
-    @State private var errorMessage: String?
 
     private var filtered: [RecentProject] {
         let q = search.trimmingCharacters(in: .whitespaces).lowercased()
@@ -102,14 +101,6 @@ struct WelcomeView: View {
 
             Spacer()
 
-            if let err = errorMessage {
-                Text(err)
-                    .font(.system(size: 10))
-                    .foregroundColor(.red.opacity(0.85))
-                    .padding(.horizontal, 16)
-                    .padding(.bottom, 8)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
 
             updateCard
 
@@ -340,15 +331,20 @@ struct WelcomeView: View {
     }
 
     private func emptyState(text: String) -> some View {
+        // 样式与素材库空状态完全一致：44pt 图标 0.30、11pt 文字 0.45、间距 10、
+        // 摆在上方三分之一处（PositionedAtOneThird）
         VStack(spacing: 10) {
-            Image(systemName: "clock.arrow.circlepath")
-                .font(.system(size: 30, weight: .thin))
-                .foregroundColor(Color.labelSecondary.opacity(0.5))
+            Image(nsImage: SidebarSVGIcon.load("recentFiles", size: 44))
+                .renderingMode(.template)
+                .resizable()
+                .aspectRatio(contentMode: .fit)
+                .frame(width: 44, height: 44)
+                .foregroundColor(Color.labelSecondary.opacity(0.30))
             Text(text)
-                .font(.system(size: 12))
-                .foregroundColor(Color.labelSecondary)
+                .font(.system(size: 11))
+                .foregroundColor(Color.labelSecondary.opacity(0.45))
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .modifier(PositionedAtOneThird())
     }
 
     // MARK: - 两种视图
@@ -446,10 +442,12 @@ struct WelcomeView: View {
 
     private func open(_ item: RecentProject) {
         guard item.exists else {
-            errorMessage = "文件已不在原位置：\(item.url.lastPathComponent)"
+            project.showSuccessToast(icon: "exclamationmark.triangle", iconColor: .orange,
+                                     title: "无法打开项目",
+                                     subtitle: "文件已不在原位置：\(item.url.lastPathComponent)",
+                                     autoCountdown: false)
             return
         }
-        errorMessage = nil
         openInWindow(item.url)
     }
 
@@ -459,9 +457,8 @@ struct WelcomeView: View {
         guard !cancelingRename else { return }
         defer { renaming = nil }
         if let err = RecentProjects.shared.rename(item.url, to: renameText) {
-            errorMessage = err
-        } else {
-            errorMessage = nil
+            project.showSuccessToast(icon: "exclamationmark.triangle", iconColor: .orange,
+                                     title: "重命名失败", subtitle: err, autoCountdown: false)
         }
     }
 
@@ -566,17 +563,25 @@ private struct RecentCard: View {
                     Image(nsImage: img)
                         .resizable()
                         .aspectRatio(contentMode: .fill)
-                } else {
-                    Image(systemName: "film")
-                        .font(.system(size: 22, weight: .thin))
+                } else if item.exists {
+                    // 文件丢了就不画缺省封面 —— 下面那层警告图标会盖在同一个位置，
+                    // 两个图标叠在一起谁也看不清
+                    Image(nsImage: SidebarSVGIcon.load("video", size: 26))
+                        .renderingMode(.template)
+                        .resizable()
+                        .aspectRatio(contentMode: .fit)
+                        .frame(width: 26, height: 26)
                         .foregroundColor(Color.labelSecondary.opacity(0.45))
                 }
                 if !item.exists {
                     // 文件被移走/删掉了，标出来，省得点了才发现打不开
                     Color.black.opacity(0.45)
-                    Image(systemName: "questionmark.circle")
-                        .font(.system(size: 20, weight: .light))
-                        .foregroundColor(.white.opacity(0.8))
+                    Image(nsImage: SidebarSVGIcon.load("toastWarn", size: 20))
+                        .renderingMode(.template)
+                        .resizable()
+                        .aspectRatio(contentMode: .fit)
+                        .frame(width: 20, height: 20)
+                        .foregroundColor(Color(hex: "#FF9230"))
                 }
             }
             // 裁剪必须加在**定好尺寸的容器**上：.fill 会让图片撑出容器，
@@ -639,8 +644,11 @@ private struct RecentRow: View {
                 if let img = thumbnail {
                     Image(nsImage: img).resizable().aspectRatio(contentMode: .fill)
                 } else {
-                    Image(systemName: "film")
-                        .font(.system(size: 10, weight: .thin))
+                    Image(nsImage: SidebarSVGIcon.load("video", size: 14))
+                        .renderingMode(.template)
+                        .resizable()
+                        .aspectRatio(contentMode: .fit)
+                        .frame(width: 14, height: 14)
                         .foregroundColor(Color.labelSecondary.opacity(0.45))
                 }
             }

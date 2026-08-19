@@ -828,6 +828,10 @@ extension ProjectState {
               let ci = compoundTracks[ti].clips.firstIndex(where: { $0.id == compoundID }) else { return }
         let compound = compoundTracks[ti].clips[ci]
         let offset = compound.startTime
+        // 解除前的轨道数。里面的图层会散到多条新轨道上，很容易落在可视区外，
+        // 所以收尾时按增量报一句「展开为 N 条轨道」
+        let beforeTrackCount = videoTracks.count + audioTracks.count + imageTracks.count
+            + subtitleTracks.count + textTracks.count + shapeTracks.count
 
         // 记录复合轨道在 section order 中的位置（释放后新轨道插到这里）
         let compoundTrackUUID = compoundTracks[ti].id
@@ -962,6 +966,15 @@ extension ProjectState {
         }
 
         syncOverlayOrder()
+
+        let afterTrackCount = videoTracks.count + audioTracks.count + imageTracks.count
+            + subtitleTracks.count + textTracks.count + shapeTracks.count
+        let addedTracks = max(0, afterTrackCount - beforeTrackCount)
+        showSuccessToast(icon: "square.on.square", iconColor: .accentColor,
+                         title: "已解除复合片段",
+                         subtitle: addedTracks > 0 ? "展开为 \(addedTracks) 条新轨道"
+                                                   : "内容已并入现有轨道",
+                         autoCountdown: true)
 
         undoStack.append(snap)
         if undoStack.count > 30 { undoStack.removeFirst() }

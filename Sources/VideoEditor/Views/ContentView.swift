@@ -41,10 +41,10 @@ struct ContentView: View {
     @State private var topHeight: CGFloat = 420
     @State private var isDraggingH = false
     @State private var sidebarVisible = true
-    @State private var sidebarWidth: CGFloat = 220
+    @State private var sidebarWidth: CGFloat = 260
     @State private var inspectorWidth: CGFloat = 280
     // Drag origin tracking (prevents cumulative translation bug)
-    @State private var dragOriginSidebar: CGFloat = 220
+    @State private var dragOriginSidebar: CGFloat = 260
     @State private var isDraggingSidebar = false
     @State private var dragOriginInspector: CGFloat = 280
     @State private var isDraggingInspector = false
@@ -234,7 +234,7 @@ struct ContentView: View {
                         .environmentObject(project)
                 }
                 if project.isReversingVideo {
-                    ReverseVideoBubble()
+                    ReverseVideoBubble(onCancel: { project.cancelReverseVideo() })
                         .transition(.asymmetric(
                             insertion: .move(edge: .trailing).combined(with: .opacity),
                             removal: .opacity))
@@ -331,6 +331,26 @@ struct ContentView: View {
                     WelcomeView()
                         .environmentObject(project)
                 }
+            }
+        }
+        // 通知卡片要盖在欢迎页**之上**：上面那句 .opacity 会把主界面连同
+        // 卡片一起藏起来，欢迎页触发的提示就看不见了
+        .overlay(alignment: .bottomTrailing) {
+            if project.showWelcome {
+                VStack(alignment: .trailing, spacing: 8) {
+                    ForEach(project.successToasts) { toast in
+                        SuccessToastBubble(toast: toast,
+                            onTap: { project.dismissSuccessToast(toast.id) },
+                            onDismiss: { project.dismissSuccessToast(toast.id) })
+                        .transition(.asymmetric(
+                            insertion: .move(edge: .trailing).combined(with: .opacity),
+                            removal: .opacity))
+                    }
+                }
+                .animation(.spring(response: 0.35, dampingFraction: 0.8),
+                           value: project.successToasts.count)
+                .padding(.trailing, 16)
+                .padding(.bottom, 16)
             }
         }
         .overlay {
@@ -430,7 +450,7 @@ struct ContentView: View {
         // 不过滤的话多窗口下按一次保存会把所有打开的项目都存一遍
         .onReceive(NotificationCenter.default.publisher(for: MenuCommand.importFiles.notificationName)) { note in
             guard note.isFor(windowID), let urls = note.object as? [URL] else { return }
-            urls.forEach { project.importFile($0) }
+            project.importFiles(urls)
         }
         .onReceive(NotificationCenter.default.publisher(for: MenuCommand.newProject.notificationName)) { note in
             guard note.isFor(windowID) else { return }
@@ -623,6 +643,24 @@ extension Comparable {
 // MARK: - Success Toast Bubble (右下角，带倒计时)
 
 private struct SuccessToastBubble: View {
+    /// 成功 / 失败 / 警告 / 停止 四种状态换成自绘 SVG，并锁定各自的标准色。
+    /// 调用处传的仍是 SF Symbol 名（散在几十处，不逐个改），在这里统一映射；
+    /// 表里没有的图标（waveform / sparkles / photo 之类的功能图标）照旧走 SF Symbol
+    static let statusSVG: [String: (key: String, color: Color)] = [
+        "checkmark":                     ("toastSuccess", Color(hex: "#30D158")),
+        "checkmark.circle.fill":         ("toastSuccess", Color(hex: "#30D158")),
+        "xmark.circle":                  ("toastFail",    Color(hex: "#FF4245")),
+        "xmark.circle.fill":             ("toastFail",    Color(hex: "#FF4245")),
+        "exclamationmark.triangle":      ("toastWarn",    Color(hex: "#FF9230")),
+        "exclamationmark.triangle.fill": ("toastWarn",    Color(hex: "#FF9230")),
+        "exclamationmark.circle.fill":   ("toastWarn",    Color(hex: "#FF9230")),
+        "stop.fill":                     ("toastStop",    Color(hex: "#FF9230")),
+        // AI 生成完的插入提示：用素材库侧边栏那套图标，颜色跟其他通知一样走主题黄
+        "video":                         ("video",        Color.accent),
+        "image":                         ("image",        Color.accent),
+        "audio":                         ("audio",        Color.accent),
+    ]
+
     let toast: ProjectState.SuccessToastItem
     let onTap: () -> Void
     let onDismiss: () -> Void
@@ -632,11 +670,20 @@ private struct SuccessToastBubble: View {
             HStack(spacing: 10) {
                 ZStack {
                     Circle()
-                        .fill(toast.iconColor.opacity(0.2))
+                        .fill((SuccessToastBubble.statusSVG[toast.icon]?.color ?? toast.iconColor).opacity(0.2))
                         .frame(width: 28, height: 28)
-                    Image(systemName: toast.icon)
-                        .font(.system(size: 12, weight: .semibold))
-                        .foregroundColor(toast.iconColor)
+                    if let sv = SuccessToastBubble.statusSVG[toast.icon] {
+                        Image(nsImage: SidebarSVGIcon.load(sv.key, size: 16))
+                            .renderingMode(.template)
+                            .resizable()
+                            .aspectRatio(contentMode: .fit)
+                            .frame(width: 16, height: 16)
+                            .foregroundColor(sv.color)
+                    } else {
+                        Image(systemName: toast.icon)
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundColor(toast.iconColor)
+                    }
                 }
 
                 VStack(alignment: .leading, spacing: 3) {
@@ -644,10 +691,18 @@ private struct SuccessToastBubble: View {
                         .font(.system(size: 11, weight: .medium))
                         .foregroundColor(Color.labelPrimary)
                         .lineLimit(1)
-                    Text(toast.subtitle + (toast.revealURL != nil ? " · 点击查看" : ""))
-                        .font(.system(size: 10))
-                        .foregroundColor(toast.revealURL != nil ? Color.accent : toast.iconColor)
-                        .lineLimit(1)
+                    // 没有副标题就整行不渲染 —— `Text("")` 照样占一行高度，
+                    // 只有标题的卡片会因此显得标题贴在上半部分
+                    if !toast.subtitle.isEmpty || toast.revealURL != nil {
+                        Text(toast.subtitle + (toast.revealURL != nil ? " · 点击查看" : ""))
+                            .font(.system(size: 10))
+                            // 副标题跟状态色走（成功 #30D158 / 失败 #FF4245 / 警告·停止 #FF9230）；
+                            // 可点击的那种仍用主题色，提示"这行能点"
+                            .foregroundColor(toast.revealURL != nil
+                                             ? Color.accent
+                                             : (SuccessToastBubble.statusSVG[toast.icon]?.color ?? toast.iconColor))
+                            .lineLimit(1)
+                    }
                 }
 
                 Spacer(minLength: 4)
@@ -689,6 +744,13 @@ private struct SuccessToastBubble: View {
 struct TranslationBubble: View {
     @EnvironmentObject private var project: ProjectState
     @State private var xHovering = false
+    /// 卡片出现即开始计时，用于估算剩余时间
+    @State private var startedAt = Date()
+
+    private var progressValue: Double {
+        project.translationTotal > 0
+            ? Double(project.translationDone) / Double(project.translationTotal) : 0
+    }
 
     var body: some View {
         HStack(spacing: 10) {
@@ -696,16 +758,27 @@ struct TranslationBubble: View {
                 Circle()
                     .fill(Color.accent.opacity(0.2))
                     .frame(width: 28, height: 28)
-                Image(systemName: "translate")
-                    .font(.system(size: 12, weight: .semibold))
+                Image(nsImage: TimelineSVGIcon.load("translate", size: 14))
+                    .renderingMode(.template)
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .frame(width: 14, height: 14)
                     .foregroundColor(Color.accent)
             }
 
             VStack(alignment: .leading, spacing: 3) {
-                Text("翻译")
-                    .font(.system(size: 11, weight: .medium))
-                    .foregroundColor(Color.labelPrimary)
-                    .lineLimit(1)
+                HStack(spacing: 6) {
+                    Text("翻译")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundColor(Color.labelPrimary)
+                        .lineLimit(1)
+                    if let eta = TaskETA.text(progress: progressValue, startedAt: startedAt) {
+                        Text(eta)
+                            .font(.system(size: 10).monospacedDigit())
+                            .foregroundColor(Color.labelSecondary)
+                            .fixedSize()
+                    }
+                }
 
                 GeometryReader { geo in
                     HStack(spacing: 6) {

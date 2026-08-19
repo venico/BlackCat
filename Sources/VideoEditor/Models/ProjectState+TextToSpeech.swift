@@ -33,7 +33,7 @@ extension ProjectState {
             return
         }
 
-        let provider = AppSettings.shared.ttsProvider
+        let provider = AppSettings.shared.effectiveTTSProvider
         guard !AppSettings.shared.providerAPIKey(for: provider.rawValue).isEmpty else {
             showSuccessToast(icon: "exclamationmark.triangle", iconColor: .red,
                              title: "转换成语音",

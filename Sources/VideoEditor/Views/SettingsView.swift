@@ -27,7 +27,7 @@ struct SettingsView: View {
     @State private var separatedFiles: [URL] = []
     @State private var separatedBytes: Int64 = 0
     @State private var cleanHint: String? = nil
-    private let tabs = ["通用", "视频", "图片", "音频", "字幕", "AI 生成"]
+    private let tabs = ["通用", "视频", "图片", "音频", "字幕", "AI 设置"]
     /// 「AI 生成」在 tabs 里的位置。别处要跳过来，写死下标容易随改动失效
     static let aiTabIndex = 5
 
@@ -136,10 +136,7 @@ struct SettingsView: View {
                     Text(title)
                         .font(.system(size: 12, weight: .semibold))
                         .foregroundColor(Color.labelPrimary)
-                    Image(systemName: "info.circle")
-                        .font(.system(size: 10))
-                        .foregroundColor(Color.labelSecondary.opacity(0.7))
-                        .help(infoText)
+                    InfoBadge(text: infoText)
                 }
                 Text(detail)
                     .font(.system(size: 10))
@@ -543,27 +540,9 @@ struct SettingsView: View {
                 .foregroundColor(Color.labelSecondary)
 
             TTSProviderPicker(selection: Binding(
-                get: { settings.ttsProvider },
+                get: { settings.effectiveTTSProvider },
                 set: { settings.ttsProvider = $0 }
             ))
-
-            apiKeyField(
-                label: "API Key",
-                placeholder: "输入 \(settings.ttsProvider.displayName) API Key",
-                text: Binding(
-                    get: { settings.providerAPIKey(for: settings.ttsProvider.rawValue) },
-                    set: { settings.setProviderAPIKey($0, for: settings.ttsProvider.rawValue) }
-                )
-            )
-
-            if settings.ttsProvider == .fishAudio {
-                fishVoiceSection
-            }
-
-            ICapsuleSlider(label: "语速", value: Binding(
-                get: { settings.ttsSpeed },
-                set: { settings.ttsSpeed = $0 }
-            ), range: 0.5...2.0, decimals: 2, unit: "x", labelWidth: 28)
 
             Button {
                 settings.ttsAutoFit.toggle()
@@ -591,7 +570,7 @@ struct SettingsView: View {
             .buttonStyle(.plain)
 
 
-            Text("生成的语音常比字幕长。语速调到 1.1~1.3 可缓解，剩下的交给自动对齐；需压到 1.6 倍以上的不强压。")
+            Text("模型设置可在AI设置里进行设置")
                 .font(.system(size: 10))
                 .foregroundColor(Color.labelSecondary.opacity(0.6))
         }
@@ -777,15 +756,10 @@ struct SettingsView: View {
                     }
                 ), options: AppSettings.LLMProvider.allCases.map { ($0.displayName, $0.displayName) }, height: 32)
 
-                apiKeyField(
-                    label: "API Key",
-                    placeholder: settings.llmProvider.keyPlaceholder,
-                    text: Binding(
-                        get: { settings.llmAPIKey },
-                        set: { settings.llmAPIKey = $0 }
-                    )
-                )
-
+                // Key 和接口地址跟「AI 设置」是同一份，那边填就行，这里不再重复一遍
+                Text("模型设置可在AI设置里进行设置")
+                    .font(.system(size: 10))
+                    .foregroundColor(Color.labelSecondary.opacity(0.6))
             }
         }
     }
@@ -890,7 +864,51 @@ struct SettingsView: View {
             }
 
             if let provider = AIVideoService.Provider(rawValue: settings.aiProvider) {
-                if provider == .seedream {
+                if provider == .minimaxTTS {
+                    apiKeyField(
+                        label: "API Key",
+                        placeholder: "输入 MiniMax API Key",
+                        text: Binding(
+                            get: { settings.providerAPIKey(for: provider.rawValue) },
+                            set: { settings.setProviderAPIKey($0, for: provider.rawValue) }
+                        )
+                    )
+                    ttsSpeedSlider
+                    endpointField(
+                        label: "接口地址（选填）",
+                        placeholder: "国内留空；海外账号填 https://api.minimax.io",
+                        text: Binding(
+                            get: { settings.providerBaseURL(for: provider.rawValue) },
+                            set: { settings.setProviderBaseURL($0, for: provider.rawValue) }
+                        )
+                    )
+
+                        .font(.system(size: 10))
+                        .foregroundColor(Color.labelSecondary.opacity(0.6))
+                } else if provider == .nanobanana2 {
+                    apiKeyField(
+                        label: "API Key",
+                        placeholder: "输入 Google AI API Key",
+                        text: Binding(
+                            get: { settings.providerAPIKey(for: provider.rawValue) },
+                            set: { settings.setProviderAPIKey($0, for: provider.rawValue) }
+                        )
+                    )
+                    // 两个型号是两个模型名，聊天框那排的子模型下拉切的就是用哪一栏
+                    endpointField(
+                        label: "Nanobanana 2 接入点 / 模型名",
+                        placeholder: "gemini-3.1-flash-image",
+                        text: Binding(get: { settings.nanobananaEndpoint }, set: { settings.nanobananaEndpoint = $0 })
+                    )
+                    endpointField(
+                        label: "Nanobanana Pro 接入点 / 模型名",
+                        placeholder: "gemini-3-pro-image",
+                        text: Binding(get: { settings.nanobananaProEndpoint }, set: { settings.nanobananaProEndpoint = $0 })
+                    )
+                    Text("留空用括号里的默认名；走中转站时填它给的模型名")
+                        .font(.system(size: 10))
+                        .foregroundColor(Color.labelSecondary.opacity(0.6))
+                } else if provider == .seedream {
                     apiKeyField(
                         label: "API Key",
                         placeholder: "输入火山方舟 API Key",
@@ -911,10 +929,17 @@ struct SettingsView: View {
                         text: Binding(get: { settings.seedanceApiKey }, set: { settings.seedanceApiKey = $0 })
                     )
                     if provider == .seedance {
+                        // 2.0 和 2.5 在火山方舟是两个模型，各自要建接入点，
+                        // 聊天框那排的子模型下拉切的就是用哪一个
                         endpointField(
-                            label: "接入点 ID",
+                            label: "Seedance 2.0 接入点 ID",
                             placeholder: "ep-xxxxx...",
                             text: Binding(get: { settings.seedanceEndpoint }, set: { settings.seedanceEndpoint = $0 })
+                        )
+                        endpointField(
+                            label: "Seedance 2.5 接入点 ID",
+                            placeholder: "留空用 doubao-seedance-2-5-260628",
+                            text: Binding(get: { settings.seedance25Endpoint }, set: { settings.seedance25Endpoint = $0 })
                         )
                     } else {
                         endpointField(
@@ -928,6 +953,14 @@ struct SettingsView: View {
                         .foregroundColor(Color.labelSecondary.opacity(0.6))
                 } else if provider == .kling {
                     apiKeyField(
+                        label: "API Key",
+                        placeholder: "适用于所有模型，推荐填这个",
+                        text: Binding(
+                            get: { settings.providerAPIKey(for: provider.rawValue) },
+                            set: { settings.setProviderAPIKey($0, for: provider.rawValue) }
+                        )
+                    )
+                    apiKeyField(
                         label: "Access Key",
                         placeholder: "输入 Access Key",
                         text: Binding(get: { settings.aiAccessKey }, set: { settings.aiAccessKey = $0 })
@@ -937,6 +970,20 @@ struct SettingsView: View {
                         placeholder: "输入 Secret Key",
                         text: Binding(get: { settings.aiSecretKey }, set: { settings.aiSecretKey = $0 })
                     )
+                    endpointField(
+                        label: "接口地址（选填）",
+                        placeholder: "https://api.klingai.com",
+                        text: Binding(
+                            get: { settings.providerBaseURL(for: provider.rawValue) },
+                            set: { settings.setProviderBaseURL($0, for: provider.rawValue) }
+                        )
+                    )
+                    Text("Access Key / Secret Key 只对旧版 API 有效，新模型请用上面的 API Key；"
+                         + "接口地址留空走官方。子模型的 model_name 只核实到 kling-v3，"
+                         + "Turbo / Omni 是按命名规律推的")
+                        .font(.system(size: 10))
+                        .foregroundColor(Color.labelSecondary.opacity(0.6))
+                        .fixedSize(horizontal: false, vertical: true)
                 } else if provider == .runway {
                     apiKeyField(
                         label: "API Key",
@@ -953,6 +1000,7 @@ struct SettingsView: View {
                         )
                     )
                     fishVoiceSection
+                    ttsSpeedSlider
                 } else {
                     apiKeyField(
                         label: "API Key",
@@ -962,10 +1010,22 @@ struct SettingsView: View {
                             set: { settings.setProviderAPIKey($0, for: provider.rawValue) }
                         )
                     )
-                    if provider.category == .text {
-                        Text("文字生成使用标准 Chat Completions 接口")
+                    // Grok 的图片/视频也常走中转，一并放开接口地址
+                    if provider.category == .text || provider == .grokImage
+                        || provider == .grokVideo || provider == .gptImage2 || provider == .minimax {
+                        endpointField(
+                            label: "接口地址（选填）",
+                            placeholder: defaultEndpointHint(provider),
+                            text: Binding(
+                                get: { settings.providerBaseURL(for: provider.rawValue) },
+                                set: { settings.setProviderBaseURL($0, for: provider.rawValue) }
+                            )
+                        )
+                        Text("接口地址留空用官方，用第三方中转时填它的完整地址；"
+                             + "Apikey和接口地址与「视频分析」共用，在任一处填写，另一处自动生效")
                             .font(.system(size: 10))
                             .foregroundColor(Color.labelSecondary.opacity(0.6))
+                            .fixedSize(horizontal: false, vertical: true)
                     }
                 }
             }
@@ -978,22 +1038,17 @@ struct SettingsView: View {
                     set: { settings.searchEngine = $0 }
                 ))
 
-                if settings.searchEngine == .bing {
+                if settings.searchEngine == .brave {
                     apiKeyField(
-                        label: "Bing Search Key",
-                        placeholder: "输入 Bing Web Search API Key",
-                        text: Binding(get: { settings.bingSearchKey }, set: { settings.bingSearchKey = $0 })
+                        label: "Brave Search Key",
+                        placeholder: "输入 Brave Search API Key",
+                        text: Binding(get: { settings.braveSearchKey }, set: { settings.braveSearchKey = $0 })
                     )
                 } else {
                     apiKeyField(
-                        label: "Google API Key",
-                        placeholder: "输入 Google Custom Search API Key",
-                        text: Binding(get: { settings.googleSearchKey }, set: { settings.googleSearchKey = $0 })
-                    )
-                    apiKeyField(
-                        label: "搜索引擎 ID (CX)",
-                        placeholder: "输入 Google CX ID",
-                        text: Binding(get: { settings.googleSearchCX }, set: { settings.googleSearchCX = $0 })
+                        label: "Tavily API Key",
+                        placeholder: "tvly-...",
+                        text: Binding(get: { settings.tavilySearchKey }, set: { settings.tavilySearchKey = $0 })
                     )
                 }
 
@@ -1002,6 +1057,21 @@ struct SettingsView: View {
                     .foregroundColor(Color.labelSecondary.opacity(0.6))
             }
 
+        }
+    }
+
+    /// 语速。原来在「字幕」页的字幕转语音那栏，挪到这边跟音色放一起；
+    /// 存的还是同一个 ttsSpeed，两处都生效
+    private var ttsSpeedSlider: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            ICapsuleSlider(label: "语速", value: Binding(
+                get: { settings.ttsSpeed },
+                set: { settings.ttsSpeed = $0 }
+            ), range: 0.5...2.0, decimals: 2, unit: "x", labelWidth: 28)
+            Text("生成的语音常比字幕长，调到 1.1~1.3 可缓解，剩下的交给「自动对齐字幕时长」")
+                .font(.system(size: 10))
+                .foregroundColor(Color.labelSecondary.opacity(0.6))
+                .fixedSize(horizontal: false, vertical: true)
         }
     }
 
@@ -1243,6 +1313,22 @@ struct SettingsView: View {
         }
     }
 
+    /// 输入框占位符里直接摆出官方地址，用户一看就知道该填什么形状的 URL
+    private func defaultEndpointHint(_ provider: AIVideoService.Provider) -> String {
+        switch provider {
+        case .claude:      return "https://api.anthropic.com/v1/messages"
+        case .gpt56:       return "https://api.openai.com/v1/chat/completions"
+        case .deepseek_ai: return "https://api.deepseek.com/chat/completions"
+        case .qwen:        return "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
+        case .glm:         return "https://open.bigmodel.cn/api/paas/v4/chat/completions"
+        case .grok:        return "https://api.x.ai/v1/chat/completions"
+        case .kimi:        return "https://api.moonshot.ai/v1/chat/completions"
+        case .gptImage2:   return "https://api.openai.com"
+        case .minimax:     return "国内留空；海外账号填 https://api.minimax.io"
+        default:           return "https://.../v1/chat/completions"
+        }
+    }
+
     private func endpointField(label: String, placeholder: String, text: Binding<String>) -> some View {
         VStack(alignment: .leading, spacing: 4) {
             Text(label)
@@ -1277,6 +1363,7 @@ private struct APIKeyField: View {
     let text: Binding<String>
     @State private var draft: String = ""
     @State private var loaded = false
+    @State private var revealed = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
@@ -1287,7 +1374,21 @@ private struct APIKeyField: View {
             // 后者在这个面板里会出现「不显示 placeholder 且点不动」，而同一个面板里
             // 另一个同样写法的框却正常（实测换成 TextField 立刻可输入，
             // 说明是 SecureField 自身在这套窗口/宿主配置下的问题，不是绑定写错）
-            SecureKeyField(text: $draft, placeholder: placeholder)
+            HStack(spacing: 6) {
+                // revealed 变了要换控件类（明文 / 圆点），NSViewRepresentable 不能中途换
+                // 实例，靠 .id 强制重建
+                SecureKeyField(text: $draft, placeholder: placeholder, revealed: revealed)
+                    .id(revealed)
+                Button { revealed.toggle() } label: {
+                    Image(systemName: revealed ? "eye.slash" : "eye")
+                        .font(.system(size: 11))
+                        .foregroundColor(Color.labelSecondary)
+                        .frame(width: 18, height: 18)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help(revealed ? "隐藏" : "显示")
+            }
                 .padding(.horizontal, 10)
                 .frame(height: 32)
                 .background(Color.white.opacity(0.06))
@@ -1301,9 +1402,17 @@ private struct APIKeyField: View {
                     guard loaded, v != text.wrappedValue else { return }
                     text.wrappedValue = v
                 }
-                // 切换模型时把草稿换成新模型的 Key
+                // 切换模型时把草稿换成新模型的 Key。
+                //
+                // 这里不能加 `&& !v.isEmpty`：切到一个没填过 Key 的供应商时新值就是空串，
+                // 一屏蔽草稿就留着上一家的 Key 不放，界面上看着像「通义千问自带了
+                // DeepSeek 的 Key」。更糟的是此时在框里敲一个字，就把上一家的 Key
+                // 真写进这一家的存储了。
+                //
+                // 之所以非靠这条 onChange 不可：切供应商时 SwiftUI 复用同一个输入框实例，
+                // onAppear 不会再走，@State draft 不会自己复位
                 .onChange(of: text.wrappedValue) { _, v in
-                    if v != draft && !v.isEmpty { draft = v }
+                    if v != draft { draft = v }
                 }
         }
     }
@@ -1314,9 +1423,11 @@ private struct APIKeyField: View {
 private struct SecureKeyField: NSViewRepresentable {
     @Binding var text: String
     let placeholder: String
+    /// true = 明文显示（眼睛按钮打开）
+    var revealed: Bool = false
 
-    func makeNSView(context: Context) -> NSSecureTextField {
-        let f = NSSecureTextField()
+    func makeNSView(context: Context) -> NSTextField {
+        let f: NSTextField = revealed ? NSTextField() : NSSecureTextField()
         f.isBordered = false
         f.drawsBackground = false          // 背景/圆角交给 SwiftUI 外层
         f.focusRingType = .none
@@ -1329,7 +1440,7 @@ private struct SecureKeyField: NSViewRepresentable {
         return f
     }
 
-    func updateNSView(_ v: NSSecureTextField, context: Context) {
+    func updateNSView(_ v: NSTextField, context: Context) {
         context.coordinator.text = $text
         v.placeholderString = placeholder
         // 只在外部真的换了值时回写，否则会把光标顶到末尾
@@ -1718,5 +1829,33 @@ private struct InstalledBadge: View {
         .buttonStyle(.plain)
         .onHover { hovering = $0 }
         .help(hovering ? "点击卸载" : "")
+    }
+}
+
+/// 设置里的「说明」徽标。只认点击 —— 系统 tooltip 有约 1s 延迟、位置也不受控，
+/// 划过去还会误触，不如统一走点击弹 popover。
+private struct InfoBadge: View {
+    let text: String
+    @State private var showPopover = false
+
+    var body: some View {
+        Button { showPopover.toggle() } label: {
+            Image(nsImage: SidebarSVGIcon.load("info", size: 12))
+                .renderingMode(.template)
+                .resizable()
+                .aspectRatio(contentMode: .fit)
+                .frame(width: 12, height: 12)
+                .foregroundColor(Color.labelSecondary.opacity(showPopover ? 1.0 : 0.7))
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .popover(isPresented: $showPopover, arrowEdge: .bottom) {
+            Text(text)
+                .font(.system(size: 11))
+                .foregroundColor(Color.labelPrimary)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: 260, alignment: .leading)
+                .padding(12)
+        }
     }
 }

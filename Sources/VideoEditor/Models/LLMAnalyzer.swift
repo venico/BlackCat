@@ -192,7 +192,7 @@ enum LLMAnalyzer {
     private static func callOpenAICompatible(provider: AppSettings.LLMProvider,
                                               apiKey: String,
                                               prompt: String) async throws -> Data {
-        guard let url = URL(string: provider.baseURL) else {
+        guard let url = URL(string: AppSettings.shared.effectiveLLMBaseURL) else {
             throw NSError(domain: "LLM", code: 4, userInfo: [NSLocalizedDescriptionKey: "无效的 API 地址"])
         }
 
@@ -203,7 +203,7 @@ enum LLMAnalyzer {
         req.timeoutInterval = 120
 
         let body: [String: Any] = [
-            "model": provider.defaultModel,
+            "model": AppSettings.shared.effectiveLLMModel,
             "messages": [
                 ["role": "system", "content": "你是专业视频剪辑助手，只返回 JSON 数组。"],
                 ["role": "user", "content": prompt]
@@ -236,7 +236,7 @@ enum LLMAnalyzer {
         req.timeoutInterval = 120
 
         let body: [String: Any] = [
-            "model": AppSettings.LLMProvider.claude.defaultModel,
+            "model": AppSettings.shared.effectiveLLMModel,
             "max_tokens": 4096,
             "system": "你是专业视频剪辑助手，只返回 JSON 数组。",
             "messages": [

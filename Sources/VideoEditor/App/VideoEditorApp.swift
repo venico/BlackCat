@@ -3,6 +3,9 @@ import AppKit
 import UniformTypeIdentifiers
 
 public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
+    /// Command+` 打开设置的本地事件监听
+    private var shortcutMonitor: Any?
+
     private var isCleaningMenus = false
     private var cleanupTimer: Timer?
     /// Finder 双击 bcj 冷启动时暂存 URL，交给 `createWindow()` 开窗。
@@ -21,6 +24,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate 
         // 启动即写一条，保证诊断日志文件必然存在（版本/构建时间在 header 里）
         DiagLog.log("[启动] app 启动完成")
         setupMenuBar()
+        installShortcutMonitor()
         createWindow()
 
         // 系统会在启动后异步注入菜单项，用定时器持续清理
@@ -293,6 +297,24 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate 
         Task { @MainActor in MenuCommand.exportVideo.postToActive() }
     }
 
+    /// Command+` 也能开设置。
+    ///
+    /// 一个 NSMenuItem 只认一个 keyEquivalent，菜单里那条已经占了 Command+,（系统惯例，
+    /// 不动它），所以第二个快捷键走本地事件监听。隐藏菜单项的办法不行 ——
+    /// performKeyEquivalent 会跳过 isHidden 的项。
+    ///
+    /// 匹配 keyCode 50（反引号键）而不是字符：中文输入法下这个键出的是「·」，
+    /// 按字符匹配会漏。
+    private func installShortcutMonitor() {
+        shortcutMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] ev in
+            guard ev.keyCode == 50,
+                  ev.modifierFlags.intersection(.deviceIndependentFlagsMask) == .command
+            else { return ev }
+            self?.showSettings()
+            return nil          // 吞掉，不让它再触发系统的「切换窗口」
+        }
+    }
+
     @objc private func showSettings() {
         NotificationCenter.default.post(name: .showSettings, object: nil)
     }
@@ -304,7 +326,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate 
     @objc private func showAbout() {
         NSApp.orderFrontStandardAboutPanel(options: [
             .applicationName: "黑猫剪辑",
-            .applicationVersion: "4.6.6",
+            .applicationVersion: "4.6.8",
             .version: "",
             .credits: NSAttributedString(string: "")
         ])

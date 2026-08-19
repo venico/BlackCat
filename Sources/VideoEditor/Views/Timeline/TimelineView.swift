@@ -12,6 +12,115 @@ private struct VScrollOffsetKey: PreferenceKey {
 }
 
 struct TimelineView: View {
+    /// 按片段类型显示的那几组功能（识别/分析/分离音轨/清晰度/转语音/翻译/去背景）。
+    /// 全摊在 contextMenu 里会让 ViewBuilder 的类型推断炸掉，必须抽出来
+    @ViewBuilder
+    private var clipTypeMenuItems: some View {
+        if project.selectedVideoClipID != nil || project.selectedAudioClipID != nil {
+            Divider()
+            transcribeAndAnalyzeItems
+            Button { project.removeBackgroundMusicForSelection() } label: {
+                Image(nsImage: SidebarSVGIcon.load("separateAudio", size: 14))
+                Text("分离音轨")
+            }
+            .disabled(!project.canRemoveBackgroundMusic)
+        }
+        // 清晰度提升只对视频有意义（音频没有清晰度概念），单独用
+        // selectedVideoClipID 分支包裹，不复用上面分离音轨的 OR 条件——
+        // 跟下面「去除背景」（仅图片，canRemoveImageBackground 同样是
+        // `guard !isXxx else return false; return selectedImageClipID != nil`
+        // 的形状）保持同一套模式：只对单一片段类型有意义的功能，用自己的
+        // if 分支控制显隐，而不是挂在别的功能的 OR 分支下用 .disabled 兜底
+        // ——否则右键音频片段时会看到一个永远灰着的「清晰度提升」，容易让人
+        // 误以为是 bug。canEnhanceClarity 内部仍会检查 selectedVideoClipID，
+        // .disabled 在这里只负责处理"任务进行中不能重复触发"这一种状态。
+        if project.selectedVideoClipID != nil {
+            Divider()
+            Menu {
+                // 系统超分只有 4 倍这一档（VTSuperResolutionScaler
+                // 的硬限制），选了它就不摆一个点了会直接报错的 2 倍
+                if AppSettings.shared.clarityEngine.supportsX2 {
+                    Button { project.enhanceClaritySelection(scale: .x2) } label: {
+                        Text("提升 2 倍")
+                    }
+                }
+                Button { project.enhanceClaritySelection(scale: .x4) } label: {
+                    Text("提升 4 倍")
+                }
+            } label: {
+                Image(nsImage: SidebarSVGIcon.load("clarity", size: 14))
+                Text("清晰度提升")
+            }
+            .disabled(!project.canEnhanceClarity)
+        }
+        if !project.selectedSubtitleClipsForTTS.isEmpty {
+            Divider()
+            Button { project.convertSelectedSubtitlesToSpeech() } label: {
+                Image(nsImage: SidebarSVGIcon.load("toSpeech", size: 14))
+                Text("转换成语音")
+            }
+            .disabled(!project.canConvertSubtitleToSpeech)
+            Button { project.translateSelectedTick += 1 } label: {
+                Image(nsImage: TimelineSVGIcon.load("translate", size: 14))
+                Text("翻译选中字幕")
+            }
+            .disabled(project.selectedSubtitleClipID == nil)
+            Button { project.translateTrackTick += 1 } label: {
+                Image(nsImage: TimelineSVGIcon.load("translateTrack", size: 14))
+                Text("翻译整条轨道")
+            }
+            .disabled(project.subtitleTracks.allSatisfy { $0.clips.isEmpty })
+        }
+        if project.selectedImageClipID != nil {
+            Divider()
+            // BiRefNet 一个模型全包，不用分方式；系统内置才需要在语义分割和色键之间选
+            if AppSettings.shared.bgRemovalEngine == .biRefNet {
+                Button { project.removeBackgroundForSelection(mode: .subject) } label: {
+                    Image(nsImage: SidebarSVGIcon.load("removeBg", size: 14))
+                    Text("去除背景")
+                }
+                .disabled(!project.canRemoveImageBackground)
+            } else {
+                Menu {
+                    Button { project.removeBackgroundForSelection(mode: .subject) } label: {
+                        Text("智能识别主体")
+                    }
+                    Button { project.removeBackgroundForSelection(mode: .solid) } label: {
+                        Text("纯色背景")
+                    }
+                } label: {
+                    Image(nsImage: SidebarSVGIcon.load("removeBg", size: 14))
+                    Text("去除背景")
+                }
+                .disabled(!project.canRemoveImageBackground)
+            }
+        }
+    }
+
+    /// 视频/音频片段右键里的「语音识别字幕 / 视频分析」。
+    /// 抽出来是因为 contextMenu 的 ViewBuilder 嵌套一深，类型就推断不出来了
+    @ViewBuilder
+    private var transcribeAndAnalyzeItems: some View {
+        Button { project.showTranscribeOptions = true } label: {
+            Image(nsImage: TimelineSVGIcon.load("whisper", size: 14))
+            Text("语音识别字幕")
+        }
+        .disabled(project.isTranscribing)
+        // 视频分析只对视频有意义，音频片段不显示
+        if project.selectedVideoClipID != nil {
+            Menu {
+                Button { project.sceneDetectSelectedClip() } label: { Text("智能分割") }
+                    .disabled(!SceneDetector.isInstalled)
+                Button { project.llmAnalyzeSelectedClip() } label: { Text("AI 剪辑") }
+                    .disabled(AppSettings.shared.llmAPIKey.isEmpty)
+            } label: {
+                Image(nsImage: TimelineSVGIcon.load("smartAnalysis", size: 14))
+                Text("视频智能剪辑")
+            }
+            .disabled(project.isDetectingScenes || project.isLLMAnalyzing)
+        }
+    }
+
     @EnvironmentObject private var project: ProjectState
     @EnvironmentObject private var clock: PlaybackClock
     /// 本视图属于哪个窗口。键盘快捷键要按窗口隔离，见 setupMonitors
@@ -949,7 +1058,10 @@ struct TimelineView: View {
                         if let textID = project.selectedTextClipID, project.selectedClipIDs.isEmpty {
                             Button {
                                 project.saveTextTemplateFromClip(textID)
-                            } label: { Label("保存为文字模板", systemImage: "square.and.arrow.down") }
+                            } label: {
+                                Image(nsImage: SidebarSVGIcon.load("saveTextTemplate", size: 14))
+                                Text("保存为文字模板")
+                            }
                             Divider()
                         }
                         Button { project.copySelected() } label: {
@@ -967,69 +1079,7 @@ struct TimelineView: View {
                             Text("粘贴")
                         }
                             .disabled(project.clipboard.isEmpty)
-                        if project.selectedVideoClipID != nil || project.selectedAudioClipID != nil {
-                            Divider()
-                            Button { project.removeBackgroundMusicForSelection() } label: {
-                                Label("分离音轨", systemImage: "waveform")
-                            }
-                            .disabled(!project.canRemoveBackgroundMusic)
-                        }
-                        // 清晰度提升只对视频有意义（音频没有清晰度概念），单独用
-                        // selectedVideoClipID 分支包裹，不复用上面分离音轨的 OR 条件——
-                        // 跟下面「去除背景」（仅图片，canRemoveImageBackground 同样是
-                        // `guard !isXxx else return false; return selectedImageClipID != nil`
-                        // 的形状）保持同一套模式：只对单一片段类型有意义的功能，用自己的
-                        // if 分支控制显隐，而不是挂在别的功能的 OR 分支下用 .disabled 兜底
-                        // ——否则右键音频片段时会看到一个永远灰着的「清晰度提升」，容易让人
-                        // 误以为是 bug。canEnhanceClarity 内部仍会检查 selectedVideoClipID，
-                        // .disabled 在这里只负责处理"任务进行中不能重复触发"这一种状态。
-                        if project.selectedVideoClipID != nil {
-                            Divider()
-                            Menu {
-                                // 系统超分只有 4 倍这一档（VTSuperResolutionScaler
-                                // 的硬限制），选了它就不摆一个点了会直接报错的 2 倍
-                                if AppSettings.shared.clarityEngine.supportsX2 {
-                                    Button { project.enhanceClaritySelection(scale: .x2) } label: {
-                                        Text("放大 2 倍")
-                                    }
-                                }
-                                Button { project.enhanceClaritySelection(scale: .x4) } label: {
-                                    Text("放大 4 倍")
-                                }
-                            } label: {
-                                Label("清晰度提升", systemImage: "sparkles")
-                            }
-                            .disabled(!project.canEnhanceClarity)
-                        }
-                        if !project.selectedSubtitleClipsForTTS.isEmpty {
-                            Divider()
-                            Button { project.convertSelectedSubtitlesToSpeech() } label: {
-                                Label("转换成语音", systemImage: "waveform.circle")
-                            }
-                            .disabled(!project.canConvertSubtitleToSpeech)
-                        }
-                        if project.selectedImageClipID != nil {
-                            Divider()
-                            // BiRefNet 一个模型全包，不用分方式；系统内置才需要在语义分割和色键之间选
-                            if AppSettings.shared.bgRemovalEngine == .biRefNet {
-                                Button { project.removeBackgroundForSelection(mode: .subject) } label: {
-                                    Label("去除背景", systemImage: "scissors")
-                                }
-                                .disabled(!project.canRemoveImageBackground)
-                            } else {
-                                Menu {
-                                    Button { project.removeBackgroundForSelection(mode: .subject) } label: {
-                                        Text("智能识别主体")
-                                    }
-                                    Button { project.removeBackgroundForSelection(mode: .solid) } label: {
-                                        Text("纯色背景")
-                                    }
-                                } label: {
-                                    Label("去除背景", systemImage: "scissors")
-                                }
-                                .disabled(!project.canRemoveImageBackground)
-                            }
-                        }
+                        clipTypeMenuItems
                         if selID != nil {
                             Divider()
                             Button { project.createCompoundFromSelected() } label: {
@@ -3407,9 +3457,9 @@ private struct VideoClipView: View {
 
     var body: some View {
         let w = max(clip.duration*pps, 4)
-        // 标题前有 8pt 图标 + 3pt 间距
+        // 标题前不再放类型图标（轨道左侧标签已表明类型），只留文字
         let showDurRight = TimelineClipMetrics.fitsOnOneLine(
-            title: clip.name, duration: durationText, clipWidth: w, leading: stickyTitleX + 11)
+            title: clip.name, duration: durationText, clipWidth: w, leading: stickyTitleX)
         let showDuration = w > TimelineClipMetrics.labelMinWidth
         ZStack(alignment:.leading) {
             // Thumbnail strip or solid color —— 窄到画不下内容时只铺纯色
@@ -3435,13 +3485,6 @@ private struct VideoClipView: View {
             // Name label — sticky to viewport left edge，太窄就整行不画
             if w > TimelineClipMetrics.labelMinWidth {
                 HStack(spacing: 3) {
-                    Image(nsImage: SidebarSVGIcon.load("video"))
-                        .renderingMode(.template)
-                        .resizable()
-                        .aspectRatio(contentMode: .fit)
-                        .frame(width: 8, height: 8)
-                        .foregroundColor(.white.opacity(0.7))
-                        .fixedSize()
                     if isRenaming {
                         TextField("", text: $editName)
                             .textFieldStyle(.plain)
@@ -3675,13 +3718,6 @@ private struct ImageClipView: View {
                 .stroke(sel ? Color.white : Color.clear, lineWidth: sel ? 2 : 0)
             if w > TimelineClipMetrics.labelMinWidth {
                 HStack(spacing: 3) {
-                    Image(nsImage: SidebarSVGIcon.load("image"))
-                        .renderingMode(.template)
-                        .resizable()
-                        .aspectRatio(contentMode: .fit)
-                        .frame(width: 8, height: 8)
-                        .foregroundColor(.white.opacity(0.7))
-                        .fixedSize()
                     if isRenaming {
                         TextField("", text: $editName)
                             .textFieldStyle(.plain)
@@ -3759,9 +3795,9 @@ private struct AudioClipView: View {
 
     var body: some View {
         let w = max(clip.duration*pps, 4)
-        // 标题前有 8pt 图标 + 3pt 间距
+        // 标题前不再放类型图标（轨道左侧标签已表明类型），只留文字
         let showDurRight = TimelineClipMetrics.fitsOnOneLine(
-            title: clip.name, duration: durationText, clipWidth: w, leading: stickyTitleX + 11)
+            title: clip.name, duration: durationText, clipWidth: w, leading: stickyTitleX)
         let showDuration = w > TimelineClipMetrics.labelMinWidth
         ZStack(alignment: .leading) {
             RoundedRectangle(cornerRadius:6).fill(Color(hex:"#5DB85D").opacity(0.78))
@@ -3777,13 +3813,6 @@ private struct AudioClipView: View {
             RoundedRectangle(cornerRadius:6).stroke(sel ? Color.white : Color.clear, lineWidth: sel ? 2 : 0)
             if w > TimelineClipMetrics.labelMinWidth {
                 HStack(spacing: 3) {
-                    Image(nsImage: SidebarSVGIcon.load("audio"))
-                        .renderingMode(.template)
-                        .resizable()
-                        .aspectRatio(contentMode: .fit)
-                        .frame(width: 8, height: 8)
-                        .foregroundColor(.white.opacity(0.7))
-                        .fixedSize()
                     if isRenaming {
                         TextField("", text: $editName)
                             .textFieldStyle(.plain)
@@ -3947,13 +3976,6 @@ private struct SubtitleClipView: View {
                     .stroke(sel ? Color.white : Color(hex:"#9B8FD4").opacity(0.4), lineWidth: 1))
             if !isPlaceholder && w > TimelineClipMetrics.labelMinWidth {
                 HStack(spacing: 3) {
-                    Image(nsImage: SidebarSVGIcon.load("subtitle"))
-                        .renderingMode(.template)
-                        .resizable()
-                        .aspectRatio(contentMode: .fit)
-                        .frame(width: 8, height: 8)
-                        .foregroundColor(.white.opacity(0.6))
-                        .fixedSize()
                     Text(clip.text.components(separatedBy:"\n").first ?? clip.text)
                         .font(.system(size:8, weight:.medium))
                         .foregroundColor(.white.opacity(0.9))
@@ -4007,12 +4029,6 @@ private struct TextClipView: View {
                     .stroke(sel ? Color.white : Color(hex:"#E088A8").opacity(0.4), lineWidth: 1))
             if w > TimelineClipMetrics.labelMinWidth {
                 HStack(spacing: 3) {
-                    Image(nsImage: SidebarSVGIcon.load("text"))
-                        .renderingMode(.template)
-                        .resizable()
-                        .aspectRatio(contentMode: .fit)
-                        .frame(width: 8, height: 8)
-                        .foregroundColor(.white.opacity(0.6))
                     Text(clip.text.components(separatedBy:"\n").first ?? clip.text)
                         .font(.system(size:8, weight:.medium))
                         .foregroundColor(.white.opacity(0.9)).lineLimit(1)
@@ -4056,12 +4072,6 @@ private struct ShapeTimelineClipView: View {
                     .stroke(sel ? Color.white : Color(hex:"#8AB4FF").opacity(0.4), lineWidth: 1))
             if w > TimelineClipMetrics.labelMinWidth {
                 HStack(spacing: 3) {
-                    Image(nsImage: SidebarSVGIcon.load("shape"))
-                        .renderingMode(.template)
-                        .resizable()
-                        .aspectRatio(contentMode: .fit)
-                        .frame(width: 8, height: 8)
-                        .foregroundColor(.white.opacity(0.6))
                     Text(clip.type.label)
                         .font(.system(size:8, weight:.medium))
                         .foregroundColor(.white.opacity(0.9)).lineLimit(1)
@@ -4130,19 +4140,12 @@ private struct CompoundClipView: View {
         let clipH = h - 4
         // 复合片段标题前还有 8pt 图标 + 3pt 间距
         let showDurRight = TimelineClipMetrics.fitsOnOneLine(
-            title: clip.name, duration: durationText, clipWidth: w, leading: stickyTitleX + 11)
+            title: clip.name, duration: durationText, clipWidth: w, leading: stickyTitleX)
         let showDuration = w > TimelineClipMetrics.labelMinWidth
         ZStack(alignment: .leading) {
             contentBackground(w: w, clipH: clipH)
             if w > TimelineClipMetrics.labelMinWidth {
             HStack(spacing: 3) {
-                Image(nsImage: SidebarSVGIcon.load("compound"))
-                    .renderingMode(.template)
-                    .resizable()
-                    .aspectRatio(contentMode: .fit)
-                    .frame(width: 8, height: 8)
-                    .foregroundColor(.white)
-                    .fixedSize()
                 if isRenaming {
                     TextField("", text: $editName)
                         .textFieldStyle(.plain)
@@ -4619,9 +4622,9 @@ struct TimelineToolbar: View {
                 SplitBtn(style: .keepLeft, help: "裁掉右边", enabled: canSplit) { project.splitKeepLeft() }
                 SplitBtn(style: .keepRight, help: "裁掉左边", enabled: canSplit) { project.splitKeepRight() }
                 TBtn(icon:"delete",            help:"删除选中片段", enabled: hasSelection)   { project.deleteSelected() }
-                TBtn(icon:"alignPlayhead",   help:"将选中片段对齐到播放头", enabled: hasSelection) { project.alignSelectedToPlayhead() }
-                TBtn(icon:"subtitle", help:"在当前字幕轨道插入字幕") { project.insertSubtitleAtPlayhead() }
-                TBtn(icon:"text", help:"添加文字/标题图层") { project.addTextAtPlayhead() }
+                TBtn(icon:"alignPlayhead",   help:"对齐到播放头", enabled: hasSelection) { project.alignSelectedToPlayhead() }
+                TBtn(icon:"subtitle", help:"新建字幕") { project.insertSubtitleAtPlayhead() }
+                TBtn(icon:"text", help:"新建标题文字") { project.addTextAtPlayhead() }
 
                 Divider().frame(height:16).padding(.horizontal,4)
 
@@ -4641,7 +4644,9 @@ struct TimelineToolbar: View {
 
                 Divider().frame(height:16).padding(.horizontal,4)
 
-                AnalyzeMenuBtn()
+                // 语音识别、视频分析、去背景、分离音轨、转语音、清晰度提升
+                // 都收在这一个下拉里
+                AIToolsMenuBtn()
                     .environmentObject(project)
             }.padding(.leading,8)
 
@@ -4734,6 +4739,25 @@ private struct TranslationProgressBubble: View {
 
 private struct TranslateToolGroup: View {
     @EnvironmentObject private var project: ProjectState
+    @State private var langHov = false
+
+    /// 语音识别只能对视频/音频做。选中图片、图形、字幕、文字时按钮该置灰 ——
+    /// 此前只判断 `!isTranscribing`，点下去要走到 `startTranscribe` 才弹
+    /// 「请先选择一个视频或音频片段」，等于让人白点一次。
+    /// 无选中时实现会退回「时间轴第一个视频片段」，所以那种情况仍可用
+    private var canTranscribe: Bool {
+        if project.isTranscribing { return false }
+        if project.selectedVideoClipID != nil || project.selectedAudioClipID != nil { return true }
+        if let c = project.selectedCompoundClip,
+           c.videoTracks.contains(where: { !$0.clips.isEmpty }) { return true }
+        // 选中的是图片/图形/字幕/文字 —— 这些没有音轨可识别
+        if project.selectedImageClipID != nil || project.selectedShapeClipID != nil
+            || project.selectedSubtitleClipID != nil || project.selectedTextClipID != nil {
+            return false
+        }
+        // 什么都没选：退回时间轴上第一个视频片段
+        return project.videoTracks.contains { !$0.clips.isEmpty }
+    }
 
     /// 选中字幕所在轨道的 index（没选中则 nil）
     private var selectedTrackIndex: Int? {
@@ -4743,6 +4767,8 @@ private struct TranslateToolGroup: View {
 
     /// "翻译整条轨道"按钮是否可用
     private var translateAllEnabled: Bool {
+        // 选中的是标题文字：翻译整条轨道对它没有意义（它不在字幕轨道上）
+        if project.selectedTextClipID != nil { return false }
         let count = project.subtitleTracks.count
         if count == 0 { return false }
         if count == 1 {
@@ -4755,36 +4781,38 @@ private struct TranslateToolGroup: View {
 
     var body: some View {
         HStack(spacing: 2) {
-            // 目标语言下拉
+            // 目标语言下拉。悬停反馈跟 AI 工具那个下拉保持一致
             Button { showLangMenu() } label: {
                 HStack(spacing: 3) {
                     Text(shortLang(project.translationTargetLang))
                         .font(.system(size: 10, weight: .medium))
-                        .foregroundColor(Color.labelSecondary)
                     Image(systemName: "chevron.down")
                         .font(.system(size: 7, weight: .semibold))
-                        .foregroundColor(Color.labelSecondary)
                 }
+                .foregroundColor(langHov ? Color.labelPrimary : Color.labelSecondary)
                 .padding(.horizontal, 6)
                 .frame(height: 28)
+                .background(langHov ? Color.white.opacity(0.08) : Color.clear)
+                .cornerRadius(5)
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
+            .onHover { langHov = $0 }
 
             TBtn(icon: "translate", help: "翻译选中字幕",
                  enabled: project.selectedSubtitleClipID != nil) { translateCurrent() }
             TBtn(icon: "translateTrack", help: "翻译整条轨道",
                  enabled: translateAllEnabled) { translateAll() }
-            TBtn(icon: "whisper",
-                 help: project.isTranscribing ? "正在识别字幕…" : "自动识别字幕（按当前翻译目标语言生成）",
-                 enabled: !project.isTranscribing) { project.showTranscribeOptions = true }
         }
+        // 片段右键菜单里的那两项走这两个计数器转发过来
+        .onChange(of: project.translateSelectedTick) { _, _ in translateCurrent() }
+        .onChange(of: project.translateTrackTick) { _, _ in translateAll() }
     }
 
     private func shortLang(_ lang: String) -> String {
         switch lang {
-        case "中文（简体）": return "简中"
-        case "中文（繁体）": return "繁中"
+        case "中文（简体）": return "SC"
+        case "中文（繁体）": return "TC"
         case "English":   return "EN"
         case "日本語":     return "JP"
         case "한국어":     return "KR"
@@ -5134,7 +5162,7 @@ private struct AnalyzeMenuBtn: View {
         .buttonStyle(.plain)
         .disabled(!enabled)
         .onHover { hov = $0 }
-        .help(busy ? "正在分析…" : "视频分析")
+        .help(busy ? "正在分析…" : "视频智能剪辑")
     }
 
     private func showMenu() {
@@ -5623,5 +5651,138 @@ private struct TimelineScrollBar: View {
             .animation(.easeInOut(duration: show ? 0.15 : 0.4), value: show)
         }
         .frame(height: hitH)
+    }
+}
+
+// MARK: - AI 工具（工具栏合集）
+
+/// 把散在各处的 AI 功能收进一个下拉。
+///
+/// 这些功能原本只在片段右键菜单里，工具栏上只有语音识别和视频分析两个孤零零的按钮。
+/// 收成一个入口后，用户不用记"哪个功能要右键哪种片段"，
+/// 每一项按当前选中的片段类型自动置灰。片段右键菜单保留原样，多个入口并存
+private struct AIToolsMenuBtn: View {
+    @EnvironmentObject private var project: ProjectState
+    @State private var hov = false
+
+    var body: some View {
+        Button { showMenu() } label: {
+            HStack(spacing: 2) {
+                Image(nsImage: TimelineSVGIcon.load("aiTools"))
+                    .renderingMode(.template)
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .frame(width: 14, height: 14)
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 7, weight: .semibold))
+            }
+            .foregroundColor(hov ? Color.labelPrimary : Color.labelSecondary)
+            .frame(height: 28)
+            .padding(.horizontal, 5)
+            .background(hov ? Color.white.opacity(0.08) : Color.clear)
+            .cornerRadius(5)
+        }
+        .buttonStyle(.plain)
+        .onHover { hov = $0 }
+        .help("AI 工具")
+    }
+
+    // MARK: 各项的可用条件
+
+    private var canTranscribe: Bool {
+        if project.isTranscribing { return false }
+        if project.selectedVideoClipID != nil || project.selectedAudioClipID != nil { return true }
+        if let c = project.selectedCompoundClip,
+           c.videoTracks.contains(where: { !$0.clips.isEmpty }) { return true }
+        if project.selectedImageClipID != nil || project.selectedShapeClipID != nil
+            || project.selectedSubtitleClipID != nil || project.selectedTextClipID != nil {
+            return false
+        }
+        return project.videoTracks.contains { !$0.clips.isEmpty }
+    }
+
+    private var canAnalyze: Bool {
+        !(project.isDetectingScenes || project.isLLMAnalyzing) && project.selectedVideoClipID != nil
+    }
+
+    private func showMenu() {
+        let h = AIToolsMenuHandler.shared
+        h.project = project
+
+        let menu = NSMenu()
+        menu.autoenablesItems = false      // 自己控制置灰，别让系统按响应链猜
+
+        func add(_ title: String, _ sel: Selector, enabled: Bool) {
+            let item = NSMenuItem(title: title, action: sel, keyEquivalent: "")
+            item.target = h
+            item.isEnabled = enabled
+            menu.addItem(item)
+        }
+
+        add("语音识别字幕", #selector(AIToolsMenuHandler.transcribe(_:)), enabled: canTranscribe)
+
+        // 视频分析：二级菜单
+        let analyze = NSMenuItem(title: "视频智能剪辑", action: nil, keyEquivalent: "")
+        analyze.isEnabled = canAnalyze
+        let sub = NSMenu()
+        sub.autoenablesItems = false
+        let auto = NSMenuItem(title: "智能分割", action: #selector(AIToolsMenuHandler.autoDetect(_:)), keyEquivalent: "")
+        auto.target = h
+        auto.isEnabled = canAnalyze && SceneDetector.isInstalled
+        sub.addItem(auto)
+        let llm = NSMenuItem(title: "AI 剪辑", action: #selector(AIToolsMenuHandler.llmAnalyze(_:)), keyEquivalent: "")
+        llm.target = h
+        llm.isEnabled = canAnalyze && !AppSettings.shared.llmAPIKey.isEmpty
+        sub.addItem(llm)
+        analyze.submenu = sub
+        menu.addItem(analyze)
+
+        menu.addItem(.separator())
+        add("去除背景", #selector(AIToolsMenuHandler.removeBg(_:)),
+            enabled: project.canRemoveImageBackground)
+        add("分离音轨", #selector(AIToolsMenuHandler.separateAudio(_:)),
+            enabled: project.canRemoveBackgroundMusic)
+        add("转换成语音", #selector(AIToolsMenuHandler.toSpeech(_:)),
+            enabled: project.canConvertSubtitleToSpeech)
+
+        // 清晰度提升：二级菜单
+        let clarity = NSMenuItem(title: "清晰度提升", action: nil, keyEquivalent: "")
+        clarity.isEnabled = project.canEnhanceClarity
+        let csub = NSMenu()
+        csub.autoenablesItems = false
+        // 系统超分只有 4 倍这一档，选了它就不摆一个点下去会报错的 2 倍
+        if AppSettings.shared.clarityEngine.supportsX2 {
+            let x2 = NSMenuItem(title: "提升 2 倍", action: #selector(AIToolsMenuHandler.clarityX2(_:)), keyEquivalent: "")
+            x2.target = h
+            x2.isEnabled = project.canEnhanceClarity
+            csub.addItem(x2)
+        }
+        let x4 = NSMenuItem(title: "提升 4 倍", action: #selector(AIToolsMenuHandler.clarityX4(_:)), keyEquivalent: "")
+        x4.target = h
+        x4.isEnabled = project.canEnhanceClarity
+        csub.addItem(x4)
+        clarity.submenu = csub
+        menu.addItem(clarity)
+
+        if let event = NSApp.currentEvent {
+            NSMenu.popUpContextMenu(menu, with: event, for: NSApp.keyWindow?.contentView ?? NSView())
+        }
+    }
+}
+
+private final class AIToolsMenuHandler: NSObject {
+    static let shared = AIToolsMenuHandler()
+    weak var project: ProjectState?
+
+    @objc func transcribe(_ s: NSMenuItem)    { project?.showTranscribeOptions = true }
+    @objc func autoDetect(_ s: NSMenuItem)    { project?.sceneDetectSelectedClip() }
+    @objc func llmAnalyze(_ s: NSMenuItem)    { project?.llmAnalyzeSelectedClip() }
+    @objc func separateAudio(_ s: NSMenuItem) { project?.removeBackgroundMusicForSelection() }
+    @objc func toSpeech(_ s: NSMenuItem)      { project?.convertSelectedSubtitlesToSpeech() }
+    @objc func clarityX2(_ s: NSMenuItem)     { project?.enhanceClaritySelection(scale: .x2) }
+    @objc func clarityX4(_ s: NSMenuItem)     { project?.enhanceClaritySelection(scale: .x4) }
+    /// 去背景：BiRefNet 一个模型全包，系统内置那套才需要在语义分割和色键之间选
+    @objc func removeBg(_ s: NSMenuItem) {
+        project?.removeBackgroundForSelection(mode: .subject)
     }
 }

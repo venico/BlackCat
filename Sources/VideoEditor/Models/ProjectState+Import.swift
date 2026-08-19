@@ -45,6 +45,31 @@ extension ProjectState {
     }
 
     /// 导入文件或文件夹（文件夹会递归扫描）
+    /// 批量导入时收集结果、抑制逐条提示；nil = 单文件模式（照旧逐条弹）。
+    /// 拖十个重复文件会弹十张卡，这就是它存在的理由
+    private static var batchStats: (added: Int, skipped: Int, unsupported: Int)?
+
+    /// 批量导入入口。单个文件走原路径（逐条提示更具体），多个才汇总
+    func importFiles(_ urls: [URL]) {
+        guard !urls.isEmpty else { return }
+        guard urls.count > 1 else { importFile(urls[0]); return }
+
+        Self.batchStats = (0, 0, 0)
+        for u in urls { importFile(u) }
+        let st = Self.batchStats ?? (0, 0, 0)
+        Self.batchStats = nil
+
+        var parts: [String] = []
+        if st.skipped > 0 { parts.append("跳过 \(st.skipped) 个重复") }
+        if st.unsupported > 0 { parts.append("\(st.unsupported) 个格式不支持") }
+        let ok = st.added > 0
+        showSuccessToast(icon: ok ? "checkmark.circle.fill" : "exclamationmark.circle.fill",
+                         iconColor: ok ? .green : .orange,
+                         title: ok ? "已导入 \(st.added) 个素材" : "没有导入任何素材",
+                         subtitle: parts.joined(separator: "，"),
+                         autoCountdown: true)
+    }
+
     func importFile(_ url: URL) {
         // 确保沙盒环境下有访问权限
         if url.startAccessingSecurityScopedResource() {
@@ -59,9 +84,12 @@ extension ProjectState {
         }
 
         guard !mediaAssets.contains(where: { $0.url == url }) else {
-            showSuccessToast(icon: "exclamationmark.circle.fill", iconColor: .orange,
-                             title: "已跳过重复素材",
-                             subtitle: url.lastPathComponent.truncatedFileName())
+            if Self.batchStats != nil { Self.batchStats?.skipped += 1 }
+            else {
+                showSuccessToast(icon: "exclamationmark.circle.fill", iconColor: .orange,
+                                 title: "已跳过重复素材",
+                                 subtitle: url.lastPathComponent.truncatedFileName())
+            }
             return
         }
         let ext = url.pathExtension.lowercased()
@@ -69,6 +97,7 @@ extension ProjectState {
             // 这里原本是静默 return——扩展名不认识时用户看到的就是「完全没反应」，
             // 跟"拖拽根本没触发"从表现上分不开。留一行日志，至少排查时能区分
             DiagLog.log("[导入] 不支持的扩展名 .\(ext)，已忽略：\(url.lastPathComponent)")
+            if Self.batchStats != nil { Self.batchStats?.unsupported += 1 }
             return
         }
 
@@ -119,6 +148,7 @@ extension ProjectState {
         asset.fileSize = fSize
         let aid = asset.id
         mediaAssets.append(asset)
+        if Self.batchStats != nil { Self.batchStats?.added += 1 }
         // Trigger thumbnail / waveform generation
         if type == .video {
             loadMediaThumbnail(assetID: aid, url: url)
@@ -396,13 +426,23 @@ extension ProjectState {
     // 表现是「关掉软件/关掉窗口，倒放还在后台生成」。
     // owner 是发起项目的标记：关一个窗口只收它自己的，别的窗口的任务不能误杀
     private static let ffmpegProcLock = NSLock()
-    private static var liveFFmpegProcs: [(proc: Process, owner: UUID?)] = []
+    private static var liveFFmpegProcs: [(proc: Process, owner: UUID?, tag: String)] = []
 
     /// 退出 app 时把所有在跑的 ffmpeg 一起收掉
     static func killAllFFmpeg() {
         ffmpegProcLock.lock()
         let procs = liveFFmpegProcs.map(\.proc)
         liveFFmpegProcs.removeAll()
+        ffmpegProcLock.unlock()
+        for p in procs where p.isRunning { p.terminate() }
+    }
+
+    /// 只收某个项目里某一类任务（tag）的进程 —— 取消倒放时不能把同项目在跑的
+    /// 转码/变速也一起杀了
+    static func killFFmpeg(owner: UUID, tag: String) {
+        ffmpegProcLock.lock()
+        let procs = liveFFmpegProcs.filter { $0.owner == owner && $0.tag == tag }.map(\.proc)
+        liveFFmpegProcs.removeAll { $0.owner == owner && $0.tag == tag }
         ffmpegProcLock.unlock()
         for p in procs where p.isRunning { p.terminate() }
     }
@@ -414,6 +454,15 @@ extension ProjectState {
         liveFFmpegProcs.removeAll { $0.owner == owner }
         ffmpegProcLock.unlock()
         for p in procs where p.isRunning { p.terminate() }
+    }
+
+    /// 用户点了倒放卡片上的 ✕。只收倒放这一类进程，其余任务不受影响。
+    /// ffmpegCancelled 置位是为了让生成流程认出「被取消」而不是「失败要重试」——
+    /// 否则它会紧接着起一个无音频版本重试，看着像没停
+    func cancelReverseVideo() {
+        ffmpegCancelled = true
+        Self.killFFmpeg(owner: ffmpegOwnerID, tag: "reverse")
+        isReversingVideo = false
     }
 
     /// 关窗时收掉本项目所有后台活儿。
@@ -434,7 +483,8 @@ extension ProjectState {
         isReversingVideo = false
     }
 
-    static func runFFmpegSync(ffmpeg: URL, arguments: [String], owner: UUID? = nil) -> Bool {
+    static func runFFmpegSync(ffmpeg: URL, arguments: [String], owner: UUID? = nil,
+                              tag: String = "") -> Bool {
         let proc = Process()
         proc.executableURL = ffmpeg
         proc.arguments = arguments
@@ -443,7 +493,7 @@ extension ProjectState {
         do {
             try proc.run()
             ffmpegProcLock.lock()
-            liveFFmpegProcs.append((proc, owner))
+            liveFFmpegProcs.append((proc, owner, tag))
             ffmpegProcLock.unlock()
             proc.waitUntilExit()
             ffmpegProcLock.lock()
@@ -537,7 +587,7 @@ extension ProjectState {
         let ownerID = ffmpegOwnerID
         ffmpegCancelled = false
         var ok = await Task.detached(priority: .userInitiated) {
-            Self.runFFmpegSync(ffmpeg: ffmpeg, arguments: args, owner: ownerID)
+            Self.runFFmpegSync(ffmpeg: ffmpeg, arguments: args, owner: ownerID, tag: "reverse")
         }.value
         // 被关窗收掉的，别当成"生成失败"去重试
         if ffmpegCancelled {
@@ -552,7 +602,7 @@ extension ProjectState {
                  "-c:v", "libx264", "-preset", "ultrafast", "-crf", "18",
                  tmpURL.path]
             ok = await Task.detached(priority: .userInitiated) {
-                Self.runFFmpegSync(ffmpeg: ffmpeg, arguments: argsNoAudio, owner: ownerID)
+                Self.runFFmpegSync(ffmpeg: ffmpeg, arguments: argsNoAudio, owner: ownerID, tag: "reverse")
             }.value
         }
         DispatchQueue.main.async { [weak self] in self?.isReversingVideo = false }
@@ -675,17 +725,25 @@ extension ProjectState {
         return h * 3600 + m * 60 + s
     }
 
-    /// 递归扫描文件夹，导入所有支持的素材
+    /// 递归扫描文件夹，导入所有支持的素材。
+    /// 走 importFiles 汇总提示 —— 一个文件夹几十个素材，逐条弹卡会刷屏
     func importFolder(_ folderURL: URL) {
         let fm = FileManager.default
         guard let enumerator = fm.enumerator(at: folderURL,
                                               includingPropertiesForKeys: [.isDirectoryKey],
                                               options: [.skipsHiddenFiles]) else { return }
+        var found: [URL] = []
         for case let fileURL as URL in enumerator {
             let ext = fileURL.pathExtension.lowercased()
             if Self.supportedExtensions.contains(ext) {
-                importFile(fileURL)
+                found.append(fileURL)
             }
+        }
+        // 已经在批量模式里（比如拖进来的就是文件夹）就直接逐个走，别嵌套开一层统计
+        if Self.batchStats != nil {
+            for u in found { importFile(u) }
+        } else {
+            importFiles(found)
         }
     }
 }
