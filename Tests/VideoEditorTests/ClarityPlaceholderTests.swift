@@ -4,6 +4,12 @@ import XCTest
 /// 「清晰度提升」点下去立刻插的那条呼吸占位轨道的生命周期
 final class ClarityPlaceholderTests: XCTestCase {
 
+    override func setUp() {
+        super.setUp()
+        // 素材库是全局单例，不清一遍的话上个用例导入的素材会串到下个用例
+        MediaLibrary.shared.resetForTesting()
+    }
+
     /// 取消时必须把占位轨道整条撤掉，不能在时间轴上留一条空轨道
     @MainActor
     func testCancelRemovesPlaceholderTrack() {

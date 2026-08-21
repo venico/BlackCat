@@ -4,6 +4,12 @@ import XCTest
 
 final class ClarityEnhanceProgressTests: XCTestCase {
 
+    override func setUp() {
+        super.setUp()
+        // 素材库是全局单例，不清一遍的话上个用例导入的素材会串到下个用例
+        MediaLibrary.shared.resetForTesting()
+    }
+
     func testProgressIsMonotonicAcrossStages() {
         let stages: [ProjectState.ClarityEnhanceState] = [
             .downloadingModel(1.0), .extractingFrames(1.0), .inferring(1.0), .encoding

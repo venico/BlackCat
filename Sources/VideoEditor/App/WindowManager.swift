@@ -48,7 +48,8 @@ final class WindowManager: NSObject {
         return windows.keys.first
     }
 
-    private func id(of window: NSWindow) -> WindowID? {
+    /// 窗口 → WindowID。画布的空格监听要靠它判断按键来自哪个窗口
+    func id(of window: NSWindow) -> WindowID? {
         windows.first(where: { $0.value === window })?.key
     }
 
@@ -232,6 +233,21 @@ final class WindowManager: NSObject {
     /// 那个窗口的 ProjectState 不放。绑到窗口生命周期上才两头都对
     private var escMonitors: [WindowID: Any] = [:]
 
+    /// 画布的空格键监听，跟 esc 监听同一套：进程级 monitor 绑到窗口生命周期上
+    private var canvasSpaceMonitors: [WindowID: Any] = [:]
+
+    func setCanvasSpaceMonitor(_ monitor: Any?, for id: WindowID) {
+        if let old = canvasSpaceMonitors[id] { NSEvent.removeMonitor(old) }
+        canvasSpaceMonitors[id] = monitor
+    }
+
+    private var canvasScrollMonitors: [WindowID: Any] = [:]
+
+    func setCanvasScrollMonitor(_ monitor: Any?, for id: WindowID) {
+        if let old = canvasScrollMonitors[id] { NSEvent.removeMonitor(old) }
+        canvasScrollMonitors[id] = monitor
+    }
+
     func setEscMonitor(_ monitor: Any?, for id: WindowID) {
         // 同一个窗口重复注册时先撤掉旧的，避免一个窗口挂两个
         if let old = escMonitors[id] { NSEvent.removeMonitor(old) }
@@ -264,6 +280,8 @@ extension WindowManager: NSWindowDelegate {
         stopPlaybackHandlers[id]?()
         stopPlaybackHandlers[id] = nil
         if let m = escMonitors[id] { NSEvent.removeMonitor(m); escMonitors[id] = nil }
+        if let m = canvasSpaceMonitors[id] { NSEvent.removeMonitor(m); canvasSpaceMonitors[id] = nil }
+        if let m = canvasScrollMonitors[id] { NSEvent.removeMonitor(m); canvasScrollMonitors[id] = nil }
         ExportManager.shared.unregisterHandlers(for: id)
         windows[id] = nil
         order.removeAll { $0 == id }

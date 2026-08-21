@@ -6,6 +6,12 @@ import Foundation
 
 final class ProjectManagementTests: XCTestCase {
 
+    override func setUp() {
+        super.setUp()
+        // 素材库是全局单例，不清一遍的话上个用例导入的素材会串到下个用例
+        MediaLibrary.shared.resetForTesting()
+    }
+
     // TC-PM-001: 新建项目 — 正常流程
     func testPM001_CreateNewProject() {
         let p = ProjectState()
@@ -149,13 +155,12 @@ final class ProjectManagementTests: XCTestCase {
         let sub = SubtitleClip(text: "Hello", startTime: 1, endTime: 3)
         let img = ImageClip(assetID: UUID(), name: "i1", startTime: 0, endTime: 5)
 
-        // audioTracks / subtitleTracks 默认为空，得先建轨道
-        p.audioTracks.append(Track(label: "音频"))
-        p.subtitleTracks.append(Track(label: "字幕"))
+        // v5.0.0 起六种类型各有一条默认空轨，直接往 [0] 里放；
+        // 再 append 新轨会让 [0] 停在那条空轨上，后面按 [0] 断言就取不到片段
         p.videoTracks[0].clips.append(vid)
         p.audioTracks[0].clips.append(aud)
         p.subtitleTracks[0].clips.append(sub)
-        p.imageTracks.append(Track(clips: [img], label: "图片"))
+        p.imageTracks[0].clips.append(img)
 
         let vidID = vid.id
         let audID = aud.id
@@ -190,6 +195,12 @@ final class ProjectManagementTests: XCTestCase {
 // MARK: - TC-ML: 素材库
 
 final class MediaLibraryTests: XCTestCase {
+
+    override func setUp() {
+        super.setUp()
+        // 素材库是全局单例，不清一遍的话上个用例导入的素材会串到下个用例
+        MediaLibrary.shared.resetForTesting()
+    }
 
     // TC-ML-001/002/003: 导入文件相关
     func testML001_ImportFileTypeDetection() {
@@ -327,6 +338,12 @@ final class MediaLibraryTests: XCTestCase {
 // MARK: - TC-TL: 时间轴编辑器
 
 final class TimelineEditorTests: XCTestCase {
+
+    override func setUp() {
+        super.setUp()
+        // 素材库是全局单例，不清一遍的话上个用例导入的素材会串到下个用例
+        MediaLibrary.shared.resetForTesting()
+    }
 
     private func makeProject() -> ProjectState {
         let p = ProjectState()
@@ -583,6 +600,12 @@ final class TimelineEditorTests: XCTestCase {
 
 final class InspectorTests: XCTestCase {
 
+    override func setUp() {
+        super.setUp()
+        // 素材库是全局单例，不清一遍的话上个用例导入的素材会串到下个用例
+        MediaLibrary.shared.resetForTesting()
+    }
+
     // TC-IN-001/002: 选中显示属性 + 修改音量
     func testIN001_002_SelectAndModifyVolume() {
         let p = ProjectState()
@@ -636,7 +659,7 @@ final class InspectorTests: XCTestCase {
         let p = ProjectState()
         let aid = UUID()
         let clip = ImageClip(assetID: aid, name: "img", startTime: 0, endTime: 5)
-        p.imageTracks.append(Track(clips: [clip], label: "图片"))
+        p.imageTracks[0].clips = [clip]   // v5.0.0 起默认已有一条空图片轨
         p.updateImageClip(id: clip.id) { $0.offsetX = 0.2; $0.offsetY = -0.1 }
         let updated = p.imageTracks[0].clips[0]
         XCTAssertEqual(updated.offsetX, 0.2, accuracy: 0.01)
@@ -712,6 +735,12 @@ final class InspectorTests: XCTestCase {
 // MARK: - TC-UR: 撤销/重做
 
 final class UndoRedoTests: XCTestCase {
+
+    override func setUp() {
+        super.setUp()
+        // 素材库是全局单例，不清一遍的话上个用例导入的素材会串到下个用例
+        MediaLibrary.shared.resetForTesting()
+    }
 
     // TC-UR-001: 撤销片段移动
     func testUR001_UndoMove() {
@@ -887,6 +916,12 @@ final class UndoRedoTests: XCTestCase {
 
 final class SubtitleSystemTests: XCTestCase {
 
+    override func setUp() {
+        super.setUp()
+        // 素材库是全局单例，不清一遍的话上个用例导入的素材会串到下个用例
+        MediaLibrary.shared.resetForTesting()
+    }
+
     // TC-ST-001: SRT 解析
     func testST001_ParseSRT() {
         let p = ProjectState()
@@ -980,6 +1015,12 @@ final class SubtitleSystemTests: XCTestCase {
 
 final class TranslationTests: XCTestCase {
 
+    override func setUp() {
+        super.setUp()
+        // 素材库是全局单例，不清一遍的话上个用例导入的素材会串到下个用例
+        MediaLibrary.shared.resetForTesting()
+    }
+
     // TC-TR-001: 选择目标语言
     func testTR001_SelectTargetLang() {
         let p = ProjectState()
@@ -1001,6 +1042,12 @@ final class TranslationTests: XCTestCase {
 // MARK: - TC-TB: 时间轴工具栏
 
 final class ToolbarTests: XCTestCase {
+
+    override func setUp() {
+        super.setUp()
+        // 素材库是全局单例，不清一遍的话上个用例导入的素材会串到下个用例
+        MediaLibrary.shared.resetForTesting()
+    }
 
     // TC-TB-001/002: 轨道可见性切换
     func testTB001_002_TrackToggle() {
@@ -1058,6 +1105,12 @@ final class ToolbarTests: XCTestCase {
 
 final class ExportTests: XCTestCase {
 
+    override func setUp() {
+        super.setUp()
+        // 素材库是全局单例，不清一遍的话上个用例导入的素材会串到下个用例
+        MediaLibrary.shared.resetForTesting()
+    }
+
     // TC-EX-005: 导出分辨率
     func testEX005_ExportResolutions() {
         // v4.2.0 起分辨率只定短边，具体尺寸由「分辨率 × 画面比例」算出，标签不再带固定像素
@@ -1085,6 +1138,12 @@ final class ExportTests: XCTestCase {
 
 final class LayoutTests: XCTestCase {
 
+    override func setUp() {
+        super.setUp()
+        // 素材库是全局单例，不清一遍的话上个用例导入的素材会串到下个用例
+        MediaLibrary.shared.resetForTesting()
+    }
+
     // TC-LI-004: 预览区/时间轴比例 (contentEndTime)
     func testLI004_ContentEndTime() {
         let p = ProjectState()
@@ -1102,6 +1161,12 @@ final class LayoutTests: XCTestCase {
 // MARK: - TC-PF: 性能 + TC-CM: 兼容性 (验证配置)
 
 final class CompatibilityTests: XCTestCase {
+
+    override func setUp() {
+        super.setUp()
+        // 素材库是全局单例，不清一遍的话上个用例导入的素材会串到下个用例
+        MediaLibrary.shared.resetForTesting()
+    }
 
     // TC-CM-004: Retina 支持
     func testCM004_HighResCapable() {
@@ -1121,6 +1186,12 @@ final class CompatibilityTests: XCTestCase {
 // MARK: - TC-PV: 预览播放器 (model-level)
 
 final class PlayerModelTests: XCTestCase {
+
+    override func setUp() {
+        super.setUp()
+        // 素材库是全局单例，不清一遍的话上个用例导入的素材会串到下个用例
+        MediaLibrary.shared.resetForTesting()
+    }
 
     // TC-PV-003: 播放头超出范围
     func testPV003_LastVideoEndTime() {
@@ -1152,6 +1223,12 @@ final class PlayerModelTests: XCTestCase {
 // MARK: - Transform helpers
 
 final class TransformTests: XCTestCase {
+
+    override func setUp() {
+        super.setUp()
+        // 素材库是全局单例，不清一遍的话上个用例导入的素材会串到下个用例
+        MediaLibrary.shared.resetForTesting()
+    }
 
     func testImageTransform() {
         let clip = ImageClip(assetID: UUID(), startTime: 0, endTime: 5,

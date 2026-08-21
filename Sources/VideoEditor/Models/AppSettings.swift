@@ -348,6 +348,17 @@ final class AppSettings: ObservableObject {
         didSet { ud.set(seedanceApiKey, forKey: K.seedanceApiKey) }
     }
     /// 推理强度。留空 = 用该家默认（各家档位见 Provider.reasoningLevels）
+    /// 画布上每种节点类型各记各的模型 —— 选中图片卡片时列的就该是图片模型，
+    /// 用一个全局 selectedProvider 的话，切个卡片类型模型就串了
+    func canvasProvider(for category: String) -> String {
+        UserDefaults.standard.string(forKey: "settings.canvas.provider.\(category)") ?? ""
+    }
+
+    func setCanvasProvider(_ raw: String, for category: String) {
+        UserDefaults.standard.set(raw, forKey: "settings.canvas.provider.\(category)")
+        objectWillChange.send()
+    }
+
     func providerReasoning(for provider: String) -> String {
         ud.string(forKey: K.providerReasoning(provider)) ?? ""
     }

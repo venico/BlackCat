@@ -118,16 +118,18 @@ extension ProjectState {
         projectFPS         = doc.projectFPS         ?? 30
         projectBitrate     = doc.projectBitrate     ?? 5000
 
-        // 恢复媒体资源（以项目文件为准，完全替换）
-        mediaAssets.removeAll()
-        mediaThumbnails.removeAll()
-        for asset in doc.mediaAssets {
-            if asset.url.startAccessingSecurityScopedResource() {
-                accessedURLs.append(asset.url)
-            }
-            mediaAssets.append(asset)
+        // 素材库是全局的，打开项目**不能**清空它 —— 那会连带端掉别的项目的素材。
+        // 项目文件里带的素材并进全局库；同一个文件全局库已有时不新增，
+        // 而是把这个项目里引用旧 id 的片段重映射到全局那条上（改全局的 id 会让别的项目失效）
+        let remap = MediaLibrary.shared.merge(doc.mediaAssets)
+        if !remap.isEmpty {
+            remapAssetIDs(remap)
+            DiagLog.log("[素材库] 打开项目重映射了 \(remap.count) 条素材引用")
+        }
+        for asset in MediaLibrary.shared.assets where mediaThumbnails[asset.id] == nil {
             loadMediaResources(asset)
         }
+        reportMissingAssetReferences()
 
         // 重建时间轴缩略图和波形
         for track in videoTracks {
@@ -201,7 +203,10 @@ extension ProjectState {
             textTracks: textTracks,
             textTemplates: textTemplates.isEmpty ? nil : textTemplates,
             shapeTracks: shapeTracks.isEmpty ? nil : shapeTracks,
-            mediaAssets: mediaAssets,
+            // 素材库已全局化（v5.1.0），项目文件不再存素材清单。
+            // 字段留着写空数组、不改成 optional —— 老版本 app 那边它是必需字段，
+            // 省掉这个键会让旧版本直接解析失败、项目打不开
+            mediaAssets: [],
             exportSettings: exportSettings,
             previewResolution: previewResolution,
             previewAspectRatio: previewAspectRatio,

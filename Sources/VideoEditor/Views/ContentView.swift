@@ -313,6 +313,16 @@ struct ContentView: View {
             }
         }
         .animation(.easeOut(duration: 0.2), value: project.showExportSheet)
+        // AI 画布：全屏弹层，从下方升起，顶部留一条露出底层界面。
+        // 同样挂 overlay 不用 .sheet（材质原因见 CanvasOverlay 顶部注释）
+        .overlay {
+            if project.showCanvas {
+                CanvasOverlay(canvas: project.canvas)
+                    .environmentObject(project)
+            }
+        }
+
+        .canvasKeyMonitor(canvas: project.canvas, windowID: windowID, isActive: project.showCanvas)
         .onReceive(NotificationCenter.default.publisher(for: .showSettings)) { note in
             // object 带了标签下标就定位过去（字幕校对弹窗跳「AI 生成」用）
             SettingsView.pendingTab = (note.object as? Int) ?? 0
@@ -507,7 +517,13 @@ struct ContentView: View {
             Button("取消", role: .cancel) {}
         } message: {
             let label = project.currentLibraryAssetType?.label ?? ""
-            Text("将移除全部\(label)素材，并同时删除时间轴上引用它们的片段，此操作可撤销。")
+            let count = project.currentLibraryAssetType.map { t in
+                project.mediaAssets.filter { $0.type == t }.count
+            } ?? 0
+            // 素材库 v5.1.0 起是全 app 一份，清空影响的不止当前项目 —— 这句必须说清楚
+            Text("将从素材库移除 \(count) 个\(label)素材。素材库是所有项目共用的，"
+                 + "别的项目里引用这些素材的片段会变成「文件丢失」。\n"
+                 + "当前项目时间轴上引用它们的片段会一并删除，此操作可撤销。")
         }
         .alert("确认移除素材", isPresented: $project.showAssetDeleteConfirm) {
             Button("移除", role: .destructive) {
@@ -521,10 +537,14 @@ struct ContentView: View {
             if let id = project.pendingDeleteAssetID {
                 let count = project.clipCountForAsset(id)
                 let name = project.mediaAssets.first(where: { $0.id == id })?.name ?? ""
+                // 素材库全 app 一份：这里删的是全局那条，别的项目也会受影响
                 if count > 0 {
-                    Text("「\(name)」在时间轴上有 \(count) 个片段引用，移除素材将同时删除这些片段。")
+                    Text("「\(name)」将从素材库移除（所有项目共用一个素材库）。\n"
+                         + "当前项目时间轴上有 \(count) 个片段引用它，会一并删除；"
+                         + "别的项目里的引用会变成「文件丢失」。")
                 } else {
-                    Text("确定要移除「\(name)」吗？")
+                    Text("「\(name)」将从素材库移除。素材库是所有项目共用的，"
+                         + "别的项目里引用它的片段会变成「文件丢失」。")
                 }
             } else {
                 Text("确定要移除该素材吗？")
@@ -568,6 +588,9 @@ struct ContentView: View {
             // 必须排在 showWelcome 前面——从欢迎页点新建时两个状态同时为真，
             // 顺序反了就成了「esc 关掉欢迎页、露出空主界面」，而表单还留在上面
             if project.showNewProjectSheet { return event }
+            // 画布是最上层，esc 先关它。不光靠 CanvasOverlay 的 onExitCommand ——
+            // 那个依赖 SwiftUI 焦点落在画布上，焦点跑到别处就不灵了
+            if project.showCanvas { project.showCanvas = false; return nil }
             if project.showExportSheet { project.showExportSheet = false; return nil }
             if project.showSettings { closeSettings(); return nil }
             // 欢迎页的 esc 一律不接管：交给 SwiftUI，让 WelcomeView 的 onExitCommand

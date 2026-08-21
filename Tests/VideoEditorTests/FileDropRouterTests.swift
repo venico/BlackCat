@@ -10,6 +10,12 @@ import XCTest
 @MainActor
 final class FileDropRouterTests: XCTestCase {
 
+    override func setUp() {
+        super.setUp()
+        // 素材库是全局单例，不清一遍的话上个用例导入的素材会串到下个用例
+        MediaLibrary.shared.resetForTesting()
+    }
+
     private let win = WindowID()
     /// 素材区在左边，时间轴在下方，两块不重叠
     private let libRect = CGRect(x: 0, y: 100, width: 200, height: 400)

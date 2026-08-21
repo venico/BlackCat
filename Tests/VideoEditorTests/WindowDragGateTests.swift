@@ -10,6 +10,12 @@ import AppKit
 
 final class WindowDragGateTests: XCTestCase {
 
+    override func setUp() {
+        super.setUp()
+        // 素材库是全局单例，不清一遍的话上个用例导入的素材会串到下个用例
+        MediaLibrary.shared.resetForTesting()
+    }
+
     override func tearDown() {
         WindowDragGate.resetForTesting()   // 别把状态漏给别的测试
         super.tearDown()

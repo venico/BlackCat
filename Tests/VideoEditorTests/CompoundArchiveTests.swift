@@ -8,6 +8,12 @@ import XCTest
 
 final class CompoundArchiveTests: XCTestCase {
 
+    override func setUp() {
+        super.setUp()
+        // 素材库是全局单例，不清一遍的话上个用例导入的素材会串到下个用例
+        MediaLibrary.shared.resetForTesting()
+    }
+
     private func tempDir(_ tag: String) -> URL {
         let dir = FileManager.default.temporaryDirectory
             .appendingPathComponent("\(tag)_\(UUID())")
@@ -151,6 +157,7 @@ final class CompoundArchiveTests: XCTestCase {
         p.imageTracks = [it]
         p.subtitleTracks = [st]
         p.textTracks = [tt]
+        p.shapeTracks = []   // v5.0.0 起默认带一条空图形轨，留着会被兜底补进清单
         // 顶到底：文字、字幕、图片
         p.overlayTrackOrder = [.text(tt.id), .subtitle(st.id), .image(it.id)]
 
@@ -181,6 +188,7 @@ final class CompoundArchiveTests: XCTestCase {
         p.subtitleTracks = [listed]
         p.imageTracks = [orphanImage]
         p.compoundTracks = [orphanCompound]
+        p.textTracks = []; p.shapeTracks = []   // v5.0.0 的默认空轨会一起被兜底补进来
         p.overlayTrackOrder = [.subtitle(listed.id)]   // 只登记了字幕轨
 
         let layers = p.overlayLayersBottomUp
@@ -197,6 +205,7 @@ final class CompoundArchiveTests: XCTestCase {
         var hidden = Track<ImageClip>()
         hidden.isVisible = false
         p.imageTracks = [hidden]
+        p.subtitleTracks = []; p.textTracks = []; p.shapeTracks = []   // 只留这条隐藏轨
         p.overlayTrackOrder = []
 
         XCTAssertTrue(p.overlayLayersBottomUp.isEmpty, "隐藏轨道不该被兜底补进渲染清单")

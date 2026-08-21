@@ -9,6 +9,12 @@ import Foundation
 
 final class BiRefNetDownloadTests: XCTestCase {
 
+    override func setUp() {
+        super.setUp()
+        // 素材库是全局单例，不清一遍的话上个用例导入的素材会串到下个用例
+        MediaLibrary.shared.resetForTesting()
+    }
+
     /// 下载源必须是可匿名访问的 —— 主仓库是私有的，早先挂在那儿的地址对外是 404。
     /// 这条只发 range 请求探一下头部，不拉整包，任何时候都该通过
     func testDownloadURLIsPubliclyReachable() async throws {

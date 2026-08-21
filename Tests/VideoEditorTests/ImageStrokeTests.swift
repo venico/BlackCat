@@ -8,6 +8,12 @@ import CoreImage
 
 final class ImageStrokeTests: XCTestCase {
 
+    override func setUp() {
+        super.setUp()
+        // 素材库是全局单例，不清一遍的话上个用例导入的素材会串到下个用例
+        MediaLibrary.shared.resetForTesting()
+    }
+
     /// 描边字段是后加的，旧 .bcj 里没有这两个 key。
     /// ImageClip 用自动合成的 Codable，非可选新字段会让旧文件直接解码失败，
     /// 所以这条断言是在守「老项目还能不能打开」

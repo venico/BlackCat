@@ -15,6 +15,7 @@ final class BackgroundRemoverTests: XCTestCase {
     private var savedEngine: BackgroundRemover.Engine!
 
     override func setUp() {
+        MediaLibrary.shared.resetForTesting()
         super.setUp()
         savedEngine = AppSettings.shared.bgRemovalEngine
         AppSettings.shared.bgRemovalEngine = .system

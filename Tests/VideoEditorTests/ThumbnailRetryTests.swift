@@ -10,6 +10,12 @@ import Foundation
 @MainActor
 final class ThumbnailRetryTests: XCTestCase {
 
+    override func setUp() {
+        super.setUp()
+        // 素材库是全局单例，不清一遍的话上个用例导入的素材会串到下个用例
+        MediaLibrary.shared.resetForTesting()
+    }
+
     /// 读不出时长的文件（这里用一个假 mp4）不能在缓存里留下空数组占位
     func testFailedGenerationDoesNotPoisonCache() async throws {
         let bogus = FileManager.default.temporaryDirectory

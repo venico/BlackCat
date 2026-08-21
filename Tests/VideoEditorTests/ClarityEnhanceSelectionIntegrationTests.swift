@@ -29,6 +29,12 @@ import Foundation
 @MainActor
 final class ClarityEnhanceSelectionIntegrationTests: XCTestCase {
 
+    override func setUp() {
+        super.setUp()
+        // 素材库是全局单例，不清一遍的话上个用例导入的素材会串到下个用例
+        MediaLibrary.shared.resetForTesting()
+    }
+
     /// 测试素材固定用这个时长：Int(0.28 * 30) = 8 帧，远离取整边界（不用 0.3
     /// 这种可能因为浮点误差落在 8/9 帧边界两侧的数字）。按实测最新的
     /// estimatedMsPerFrame 640x480 基准值（x2 333ms/帧、x4 940ms/帧）算，

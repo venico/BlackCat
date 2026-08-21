@@ -9,6 +9,12 @@ import XCTest
 
 final class ChineseConvertTests: XCTestCase {
 
+    override func setUp() {
+        super.setUp()
+        // 素材库是全局单例，不清一遍的话上个用例导入的素材会串到下个用例
+        MediaLibrary.shared.resetForTesting()
+    }
+
     // MARK: - 字形转换本身
 
     /// 一简对多繁的歧义字是这套方案的成败点：单字表反查只能二选一必然出错，

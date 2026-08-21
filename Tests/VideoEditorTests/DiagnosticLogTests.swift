@@ -10,6 +10,12 @@ import Foundation
 @MainActor
 final class DiagnosticLogTests: XCTestCase {
 
+    override func setUp() {
+        super.setUp()
+        // 素材库是全局单例，不清一遍的话上个用例导入的素材会串到下个用例
+        MediaLibrary.shared.resetForTesting()
+    }
+
     /// 造一个读不出时长的假 mp4，逼失败路径执行
     func testThumbnailFailureEmitsLog() async throws {
         let bogus = FileManager.default.temporaryDirectory

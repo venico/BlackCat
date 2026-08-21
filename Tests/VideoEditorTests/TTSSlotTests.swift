@@ -5,6 +5,12 @@ import XCTest
 /// 呼吸间隙），而不是字幕自己的时长。复现 fitDurations 里的那段算法来验证。
 final class TTSSlotTests: XCTestCase {
 
+    override func setUp() {
+        super.setUp()
+        // 素材库是全局单例，不清一遍的话上个用例导入的素材会串到下个用例
+        MediaLibrary.shared.resetForTesting()
+    }
+
     private struct Sub { let start: Double; let dur: Double }
 
     private func slots(_ subs: [Sub]) -> [Double] {

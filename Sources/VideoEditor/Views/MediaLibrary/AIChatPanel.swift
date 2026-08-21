@@ -7,7 +7,9 @@ struct AIChatPanel: View {
     @StateObject private var service = AIVideoService.shared
     @ObservedObject private var settings = AppSettings.shared
     @State private var inputText = ""
-    @State private var showHistory = false
+    /// 进面板默认就是历史列表 —— 用户过来多半是要找之前那条，
+    /// 而不是从空白开始
+    @State private var showHistory = true
     @State private var swapHovering = false
 
     // 输入区状态存在 service 上，切 tab 重建 View 时不丢失
@@ -73,9 +75,16 @@ struct AIChatPanel: View {
     var body: some View {
         VStack(spacing: 0) {
             header
-            historySection
-            messageList
-            inputArea
+            canvasEntry
+            // 历史会话展开时**替换**整个会话区。
+            // 用 ZStack 盖一层的话得给它一个不透明底色才挡得住下面的消息，
+            // 那块底色跟面板不搭；直接替换就没这问题
+            if showHistory {
+                historyOverlay
+            } else {
+                messageList
+                inputArea
+            }
         }
         .onChange(of: service.selectedProvider) { _ in
             pruneInputsForProvider()
@@ -117,16 +126,14 @@ struct AIChatPanel: View {
                 .foregroundColor(Color.labelSecondary)
                 .textCase(.uppercase)
             Spacer()
-            Button { service.newConversation() } label: {
-                Image(nsImage: SidebarSVGIcon.load("newChat", size: 14))
-                    .renderingMode(.template)
-                    .resizable()
-                    .aspectRatio(contentMode: .fit)
-                    .frame(width: 14, height: 14)
-                    .foregroundColor(Color.labelSecondary)
+            // 可点的图标一律用 HoverIconButton，hover 有底色
+            HoverIconButton(icon: "clock", svgName: "chatHistory", tip: "历史会话") {
+                withAnimation(.easeInOut(duration: 0.18)) { showHistory.toggle() }
             }
-            .buttonStyle(.plain)
-            .help("新建对话")
+            HoverIconButton(icon: "square.and.pencil", svgName: "newChat", tip: "新建对话") {
+                service.newConversation()
+                showHistory = false   // 建完直接进新会话，不留在列表里
+            }
         }
         .padding(.leading, 10)
         .padding(.trailing, 8)
@@ -136,29 +143,27 @@ struct AIChatPanel: View {
 
     // MARK: - 历史会话
 
-    private var historySection: some View {
-        VStack(spacing: 0) {
-            Button { withAnimation(.easeInOut(duration: 0.2)) { showHistory.toggle() } } label: {
-                HStack(spacing: 4) {
-                    Text("历史会话")
-                        .font(.system(size: 10, weight: .medium))
-                    if !service.history.isEmpty {
-                        Text("\(service.history.count)")
-                            .font(.system(size: 9))
-                            .foregroundColor(Color.labelSecondary.opacity(0.6))
-                    }
-                    Spacer()
-                    Image(systemName: showHistory ? "chevron.down" : "chevron.right")
-                        .font(.system(size: 8, weight: .bold))
-                }
-                .foregroundColor(Color.labelSecondary)
-                .padding(.horizontal, 10)
-                .padding(.vertical, 5)
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
+    /// 进画布的入口。原来这儿是「历史会话」折叠栏，历史挪到顶部图标了
+    private var canvasEntry: some View {
+        CanvasEntryButton {
+            let id = service.newCanvasConversation()
+            project.canvas.reset(conversationID: id)
+            project.showCanvas = true
+        }
+        .padding(.horizontal, 8)
+    }
 
-            if showHistory && !service.history.isEmpty {
+    /// 历史会话列表。展开时**铺满整个会话区** —— 之前限死 170pt，
+    /// 会话一多就挤在上面一小条里，得在那点高度里滚
+    private var historyOverlay: some View {
+        VStack(spacing: 0) {
+            if service.history.isEmpty {
+                Spacer()
+                Text("还没有历史会话")
+                    .font(.system(size: 12))
+                    .foregroundColor(Color.labelSecondary)
+                Spacer()
+            } else {
                 ScrollView(showsIndicators: false) {
                     VStack(spacing: 1) {
                         ForEach(service.history) { conv in
@@ -166,28 +171,47 @@ struct AIChatPanel: View {
                         }
                     }
                     .padding(.horizontal, 6)
-                    .padding(.vertical, 4)
+                    .padding(.vertical, 6)
                 }
-                .frame(maxHeight: 170)
             }
         }
-        .background(Color.white.opacity(0.03))
-        .clipShape(RoundedRectangle(cornerRadius: 10))
-        .padding(.horizontal, 8)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     @ViewBuilder
     private func historyRow(_ conv: AIVideoService.ConversationRecord) -> some View {
         let isActive = conv.id == service.currentConversationId
         Button {
-            service.loadConversation(conv.id)
+            if conv.isCanvas {
+                // 画布类记录：还原到画布里打开，不当聊天加载。
+                // **不收起历史列表** —— 画布是全屏盖上去的，关掉它应该退回原来那个列表，
+                // 而不是莫名其妙落到一个空对话界面
+                if let snap = conv.canvas {
+                    project.canvas.restore(from: snap, conversationID: conv.id, title: conv.title)
+                }
+                project.showCanvas = true
+            } else {
+                service.loadConversation(conv.id)
+                showHistory = false
+            }
         } label: {
             HStack(spacing: 6) {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(conv.title)
-                        .font(.system(size: 11))
-                        .foregroundColor(isActive ? .white : Color.labelPrimary)
-                        .lineLimit(1)
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack(spacing: 5) {
+                        Text(conv.title)
+                            .font(.system(size: 11))
+                            .foregroundColor(isActive ? .white : Color.labelPrimary)
+                            .lineLimit(1)
+                        // 画布类挂个小标签区分；普通对话什么都不加
+                        if conv.isCanvas {
+                            Text("画布")
+                                .font(.system(size: 9))
+                                .foregroundColor(Color.labelSecondary)
+                                .padding(.horizontal, 5)
+                                .padding(.vertical, 1)
+                                .background(Capsule().fill(Color.white.opacity(0.10)))
+                        }
+                    }
                     Text(formatDate(conv.createdAt))
                         .font(.system(size: 9))
                         .foregroundColor(Color.labelSecondary)
@@ -441,31 +465,20 @@ struct AIChatPanel: View {
 
                     Spacer()
 
-                    if service.isGenerating {
-                        // 停止用通知卡片那套图标，跟别处保持一致
-                        Button { service.cancelGeneration() } label: {
-                            Image(nsImage: SidebarSVGIcon.load("toastStop", size: 16))
-                                .renderingMode(.template)
-                                .resizable()
-                                .aspectRatio(contentMode: .fit)
-                                .frame(width: 16, height: 16)
-                                .foregroundColor(Color.labelSecondary)
-                        }
-                        .buttonStyle(.plain)
-                    } else {
-                        Button { sendMessage() } label: {
-                            Image(nsImage: SidebarSVGIcon.load("send", size: 16))
-                                .renderingMode(.template)
-                                .resizable()
-                                .aspectRatio(contentMode: .fit)
-                                .frame(width: 16, height: 16)
-                                // 跟素材区左侧那排图标同一个默认灰；不可发送时再压暗
-                                .foregroundColor(canSend ? Color.labelSecondary
-                                                         : Color.labelSecondary.opacity(0.3))
-                        }
-                        .buttonStyle(.plain)
-                        .disabled(!canSend)
+                    // 生成中也照常显示发送按钮 —— 多任务之后可以接着发下一条。
+                    // 停止只在每条生成中的消息气泡上，不在这里做全局停止
+                    Button { sendMessage() } label: {
+                        Image(nsImage: SidebarSVGIcon.load("send", size: 16))
+                            .renderingMode(.template)
+                            .resizable()
+                            .aspectRatio(contentMode: .fit)
+                            .frame(width: 16, height: 16)
+                            // 跟素材区左侧那排图标同一个默认灰；不可发送时再压暗
+                            .foregroundColor(canSend ? Color.labelSecondary
+                                                     : Color.labelSecondary.opacity(0.3))
                     }
+                    .buttonStyle(.plain)
+                    .disabled(!canSend)
                 }
                 .padding(.horizontal, 8)
                 .padding(.bottom, 6)
@@ -910,13 +923,15 @@ struct AIChatPanel: View {
         }
     }
 
+    /// 生成中也能继续发 —— 服务层是多任务的（v5.1.0），
+    /// 一边等图片一边发视频没问题，各自转各自的圈
     private var canSend: Bool {
-        !inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !service.isGenerating
+        !inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     private func sendMessage() {
         let text = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty, !service.isGenerating else { return }
+        guard !text.isEmpty else { return }
         inputText = ""
         let refImageURLs = referenceContents.filter { $0.type == .image }.map(\.url)
         let refVideoURLs = referenceContents.filter { $0.type == .video }.map(\.url)
@@ -961,6 +976,8 @@ struct AIChatPanel: View {
 
 private struct MessageBubble: View {
     @EnvironmentObject var project: ProjectState
+    /// 取消按钮要跟着任务的存亡显隐，得观察 service
+    @ObservedObject private var service = AIVideoService.shared
     let message: AIVideoService.ChatMessage
     var onInsertToTimeline: (URL) -> Void
     var onRestoreAttachment: (AIVideoService.Attachment) -> Void = { _ in }
@@ -1018,6 +1035,26 @@ private struct MessageBubble: View {
         ])
     }
 
+    /// 只停这一条。多任务之后输入区那个按钮停的是全部，
+    /// 想单独停某一条得从它自己的气泡上停
+    @ViewBuilder
+    private var cancelThisTaskButton: some View {
+        if service.runningTask(forMessage: message.id) != nil {
+            Button {
+                service.cancelTask(forMessage: message.id)
+            } label: {
+                Image(nsImage: SidebarSVGIcon.load("toastStop", size: 13))
+                    .renderingMode(.template)
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .frame(width: 13, height: 13)
+                    .foregroundColor(Color.labelSecondary)
+            }
+            .buttonStyle(.plain)
+            .help("停止这一条")
+        }
+    }
+
     private var assistantBubble: some View {
         VStack(alignment: .leading, spacing: 6) {
             switch message.status {
@@ -1028,6 +1065,7 @@ private struct MessageBubble: View {
                     Text(progress)
                         .font(.system(size: 11))
                         .foregroundColor(Color.labelSecondary)
+                    cancelThisTaskButton
                 }
 
             case .downloading(let progress):
@@ -1037,6 +1075,7 @@ private struct MessageBubble: View {
                     Text("下载中…")
                         .font(.system(size: 11))
                         .foregroundColor(Color.labelSecondary)
+                    cancelThisTaskButton
                 }
 
             case .completed(let url):
@@ -1372,16 +1411,43 @@ final class AIInlinePlayer: ObservableObject {
 
     @Published private(set) var playingURL: URL?
     @Published private(set) var player: AVPlayer?
+    /// 播放位置和总时长。画布卡片要拿它画进度指示线、显示倒数时长
+    @Published private(set) var currentTime: Double = 0
+    @Published private(set) var duration: Double = 0
+
     private var endObserver: NSObjectProtocol?
+    private var timeObserver: Any?
 
     private init() {}
 
-    func isPlaying(_ url: URL) -> Bool { playingURL == url }
+    /// 这个 URL 是当前这条（播放中或暂停中）
+    func isCurrent(_ url: URL) -> Bool { playingURL == url }
+    /// 真正在响
+    func isPlaying(_ url: URL) -> Bool { playingURL == url && !isPaused }
+
+    @Published private(set) var isPaused = false
+
+    /// 暂停 / 继续。**不销毁 player** —— 销毁的话进度回到 0，
+    /// 用户要的是「黄线停在当前位置，再点继续」
+    func togglePause() {
+        guard let p = player else { return }
+        if isPaused { p.play(); isPaused = false } else { p.pause(); isPaused = true }
+    }
 
     func toggle(_ url: URL) {
-        if playingURL == url { stop(); return }
+        if playingURL == url { togglePause(); return }
         stop()
         let p = AVPlayer(url: url)
+        isPaused = false
+        duration = AVURLAsset(url: url).duration.seconds
+        currentTime = 0
+        // 每 0.1 秒报一次位置，够画指示线了；再密只是白烧 CPU
+        timeObserver = p.addPeriodicTimeObserver(
+            // 0.1 秒一次线是一跳一跳的，30ms 才跟得上眼睛
+            forInterval: CMTime(seconds: 0.03, preferredTimescale: 600),
+            queue: .main) { [weak self] t in
+                self?.currentTime = t.seconds
+            }
         // 播完自动复位成播放态图标
         endObserver = NotificationCenter.default.addObserver(
             forName: AVPlayerItem.didPlayToEndTimeNotification,
@@ -1401,8 +1467,16 @@ final class AIInlinePlayer: ObservableObject {
             NotificationCenter.default.removeObserver(o)
             endObserver = nil
         }
+        // 时间观察器挂在 player 上，不摘就跟着 player 一起泄漏
+        if let t = timeObserver {
+            player?.removeTimeObserver(t)
+            timeObserver = nil
+        }
         player = nil
         playingURL = nil
+        isPaused = false
+        currentTime = 0
+        duration = 0
     }
 }
 
@@ -1429,7 +1503,8 @@ private struct InlinePlayButton: View {
 }
 
 /// 播放视频时盖在缩略图上的画面层
-private struct InlinePlayerLayer: NSViewRepresentable {
+/// 内嵌播放的画面层。AI 面板和画布卡片共用
+struct InlinePlayerLayer: NSViewRepresentable {
     let player: AVPlayer
 
     func makeNSView(context: Context) -> NSView {
@@ -2048,5 +2123,34 @@ private final class ChatInputInner: ChatTextView {
             return
         }
         super.keyDown(with: event)
+    }
+}
+
+
+/// 「新建自由画布」入口。可点的东西一律给 hover 反馈
+private struct CanvasEntryButton: View {
+    let action: () -> Void
+    @State private var hovering = false
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 6) {
+                Image(nsImage: SidebarSVGIcon.load("freeCanvas", size: 13))
+                    .renderingMode(.template)
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .frame(width: 13, height: 13)
+                Text("新建自由画布")
+                    .font(.system(size: 11, weight: .medium))
+            }
+            .frame(maxWidth: .infinity)
+            .foregroundColor(hovering ? .white : Color.labelPrimary)
+            .padding(.vertical, 8)
+            .background(RoundedRectangle(cornerRadius: 10)
+                .fill(Color.white.opacity(hovering ? 0.10 : 0.03)))
+            .contentShape(RoundedRectangle(cornerRadius: 10))
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering = $0 }
     }
 }

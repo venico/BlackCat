@@ -376,6 +376,52 @@ final class AIVideoService: ObservableObject {
         var title: String
         let createdAt: Date
         var entries: [Entry]
+        /// 画布类会话带这一份；聊天会话是 nil。
+        /// 一张画布 = 一条会话记录，历史列表里两种混排、各自打标
+        var canvas: CanvasSnapshot?
+
+        var isCanvas: Bool { canvas != nil }
+
+        /// 画布存盘的样子。节点/连线/视口都在里面
+        struct CanvasSnapshot: Codable {
+            var nodes: [CanvasNode] = []
+            var edges: [CanvasEdge] = []
+            var groups: [CanvasGroup] = []
+            var producedAssets: [CanvasState.ProducedAsset] = []
+            var zoom: CGFloat = 1
+            var offsetX: CGFloat = 0
+            var offsetY: CGFloat = 0
+
+            init() {}
+
+            init(nodes: [CanvasNode], edges: [CanvasEdge], groups: [CanvasGroup],
+                 producedAssets: [CanvasState.ProducedAsset],
+                 zoom: CGFloat, offsetX: CGFloat, offsetY: CGFloat) {
+                self.nodes = nodes
+                self.edges = edges
+                self.groups = groups
+                self.producedAssets = producedAssets
+                self.zoom = zoom
+                self.offsetX = offsetX
+                self.offsetY = offsetY
+            }
+
+            /// **手写解码，每个字段都 decodeIfPresent**。
+            /// 自动生成的 Codable 缺一个键就抛错，整条会话记录跟着解不出来 ——
+            /// 2026-08-21 加字段冲掉用户 21 条历史就是这么来的。
+            /// 往这个结构加字段，照着加一行就行
+            init(from decoder: Decoder) throws {
+                let c = try decoder.container(keyedBy: CodingKeys.self)
+                nodes = try c.decodeIfPresent([CanvasNode].self, forKey: .nodes) ?? []
+                edges = try c.decodeIfPresent([CanvasEdge].self, forKey: .edges) ?? []
+                groups = try c.decodeIfPresent([CanvasGroup].self, forKey: .groups) ?? []
+                producedAssets = try c.decodeIfPresent([CanvasState.ProducedAsset].self,
+                                                       forKey: .producedAssets) ?? []
+                zoom = try c.decodeIfPresent(CGFloat.self, forKey: .zoom) ?? 1
+                offsetX = try c.decodeIfPresent(CGFloat.self, forKey: .offsetX) ?? 0
+                offsetY = try c.decodeIfPresent(CGFloat.self, forKey: .offsetY) ?? 0
+            }
+        }
 
         struct Entry: Identifiable, Codable {
             let id: UUID
@@ -521,17 +567,50 @@ final class AIVideoService: ObservableObject {
         return img
     }
 
+    // MARK: - 生成任务
+
+    /// 任务来自哪儿。聊天面板一次只发一个、且要靠 `isGenerating` 锁输入框；
+    /// 画布会同时发一堆，不能让它把聊天面板锁住
+    enum TaskSource: Equatable {
+        case chat
+        case canvas
+    }
+
+    /// 一个在跑的生成任务
+    struct RunningGeneration: Identifiable {
+        let id: UUID
+        /// 结果要回填到哪个会话的哪条消息
+        let convId: UUID
+        let msgId: UUID
+        let source: TaskSource
+        let category: ProviderCategory
+        var handle: Task<Void, Never>?
+    }
+
+    /// 当前任务 id，沿 async 调用链自动传递。
+    ///
+    /// 各家 `generateWithXxx` 内部有 41 处 `updateAssistantStatus(...)` 报进度，
+    /// 它们都是无参调用、靠「最后一条还在跑的助手消息」定位 —— 并发时必然串台。
+    /// 用 TaskLocal 把任务 id 带下去，这 41 处一个都不用改签名
+    enum Context {
+        @TaskLocal static var taskID: UUID?
+    }
+
     @Published var messages: [ChatMessage] = []
     @Published var selectedProvider: Provider = .kling
-    @Published var isGenerating = false
+
+    /// 在跑的生成任务，按 id 存。画布上会同时跑很多个，
+    /// 原来那个 `isGenerating` 布尔 + 单个 generatingMessageId 只够伺候一个任务
+    @Published private(set) var runningTasks: [UUID: RunningGeneration] = [:]
+
+    /// 聊天面板照旧「一次只发一个」，所以这里只看聊天来源的任务 ——
+    /// 画布上那些任务不该把聊天输入框锁住
+    var isGenerating: Bool { runningTasks.values.contains { $0.source == .chat } }
     @Published var webSearchEnabled = false
     @Published var history: [ConversationRecord] = []
     @Published var currentConversationId: UUID? = nil
 
     private let settings = AppSettings.shared
-    private var generatingConversationId: UUID?
-    private var generatingMessageId: UUID?
-    private var generationTask: Task<Void, Never>?
 
     private init() {
         if let p = Provider(rawValue: settings.aiProvider) {
@@ -540,7 +619,10 @@ final class AIVideoService: ObservableObject {
         loadHistory()
     }
 
-    func sendPrompt(_ prompt: String, duration: String = "5", aspectRatio: String = "16:9", resolution: String = "720P", imageRatio: String = "1:1", referenceImages: [URL] = [], referenceVideos: [URL] = [], referenceAudios: [URL] = [], firstFrame: URL? = nil, lastFrame: URL? = nil) {
+    /// 发起一次生成，返回任务 id（画布要用它做取消/重试和依赖调度）。
+    /// `source` 默认 `.chat`，聊天面板的调用点一个字都不用改
+    @discardableResult
+    func sendPrompt(_ prompt: String, duration: String = "5", aspectRatio: String = "16:9", resolution: String = "720P", imageRatio: String = "1:1", referenceImages: [URL] = [], referenceVideos: [URL] = [], referenceAudios: [URL] = [], firstFrame: URL? = nil, lastFrame: URL? = nil, source: TaskSource = .chat) -> UUID {
         var userMsg = ChatMessage(role: .user, content: prompt)
         var atts: [Attachment] = []
         atts += referenceImages.map { Attachment(url: $0, kind: .image, bookmark: createBookmark(for: $0)) }
@@ -563,16 +645,20 @@ final class AIVideoService: ObservableObject {
         let assistantMsg = ChatMessage(role: .assistant, content: progressText, status: .generating(progress: "提交任务中"))
         let msgId = assistantMsg.id
         messages.append(assistantMsg)
-        isGenerating = true
 
         saveCurrentConversation()
         let convId = currentConversationId!
-        generatingConversationId = convId
-        generatingMessageId = msgId
+
+        let taskID = UUID()
+        // 先登记再启动：Task 体要等这段同步代码跑完才轮得到（都在主线程串行），
+        // 所以内部第一时间读 runningTasks 也能读到自己
+        runningTasks[taskID] = RunningGeneration(id: taskID, convId: convId, msgId: msgId,
+                                                 source: source, category: category, handle: nil)
 
         let provider = selectedProvider
         let useSearch = webSearchEnabled && provider.supportsWebSearch
-        generationTask = Task { @MainActor in
+        let handle = Task { @MainActor in
+            await Context.$taskID.withValue(taskID) {
             do {
                 switch category {
                 case .video:
@@ -593,16 +679,118 @@ final class AIVideoService: ObservableObject {
             } catch {
                 applyGenerationResult(convId: convId, msgId: msgId, content: "生成失败: \(error.localizedDescription)", mediaURL: nil, status: .failed(error: error.localizedDescription))
             }
-            isGenerating = false
-            generatingConversationId = nil
-            generatingMessageId = nil
-            generationTask = nil
+            runningTasks.removeValue(forKey: taskID)
+            }
         }
+        runningTasks[taskID]?.handle = handle
+        return taskID
     }
 
-    func cancelGeneration() {
-        generationTask?.cancel()
-        generationTask = nil
+    // MARK: - 画布生成
+
+    /// 画布节点的生成。跟 `sendPrompt` 的区别是**不碰 messages 和会话** ——
+    /// 产物要落到节点上，不该在聊天面板里冒出一条消息。
+    /// 进度和结果都通过回调给调用方，任务本身仍登记在 `runningTasks` 里（能取消、能查状态）。
+    @discardableResult
+    func generateForCanvas(prompt: String,
+                           provider: Provider,
+                           duration: String = "5",
+                           aspectRatio: String = "16:9",
+                           resolution: String = "720P",
+                           imageRatio: String = "1:1",
+                           referenceImages: [URL] = [],
+                           referenceVideos: [URL] = [],
+                           referenceAudios: [URL] = [],
+                           onFinish: @escaping (Result<URL, Error>) -> Void) -> UUID {
+        let taskID = UUID()
+        let category = provider.category
+        // convId/msgId 这里用不上，塞占位值 —— RunningGeneration 的字段是给聊天那条路用的
+        runningTasks[taskID] = RunningGeneration(id: taskID, convId: UUID(), msgId: UUID(),
+                                                 source: .canvas, category: category, handle: nil)
+
+        let handle = Task { @MainActor in
+            await Context.$taskID.withValue(taskID) {
+                do {
+                    let url: URL
+                    switch category {
+                    case .video:
+                        url = try await generateVideo(provider: provider, prompt: prompt,
+                                                      duration: duration, aspectRatio: aspectRatio,
+                                                      resolution: resolution,
+                                                      referenceImages: referenceImages,
+                                                      referenceVideos: referenceVideos,
+                                                      referenceAudios: referenceAudios,
+                                                      firstFrame: nil, lastFrame: nil)
+                    case .image:
+                        url = try await generateImage(provider: provider, prompt: prompt,
+                                                      referenceImages: referenceImages, ratio: imageRatio)
+                    case .audio:
+                        url = try await generateAudio(provider: provider, prompt: prompt)
+                    case .text:
+                        // 文本节点不走生成，它就是个提示词输入框
+                        throw AIError.apiError("文本节点不需要生成")
+                    }
+                    onFinish(.success(url))
+                } catch {
+                    onFinish(.failure(error))
+                }
+                runningTasks.removeValue(forKey: taskID)
+            }
+        }
+        runningTasks[taskID]?.handle = handle
+        return taskID
+    }
+
+    /// 画布上的文本节点生成。产出是文字，不是文件，所以单开一个入口
+    @discardableResult
+    func generateTextForCanvas(prompt: String, provider: Provider,
+                               onFinish: @escaping (Result<String, Error>) -> Void) -> UUID {
+        let taskID = UUID()
+        runningTasks[taskID] = RunningGeneration(id: taskID, convId: UUID(), msgId: UUID(),
+                                                 source: .canvas, category: .text, handle: nil)
+        let useSearch = webSearchEnabled && provider.supportsWebSearch
+        let handle = Task { @MainActor in
+            await Context.$taskID.withValue(taskID) {
+                do {
+                    let text = try await generateText(provider: provider, prompt: prompt, webSearch: useSearch)
+                    onFinish(.success(text))
+                } catch {
+                    onFinish(.failure(error))
+                }
+                runningTasks.removeValue(forKey: taskID)
+            }
+        }
+        runningTasks[taskID]?.handle = handle
+        return taskID
+    }
+
+    /// 某条消息对应的任务还在跑吗。消息气泡上的取消按钮靠它决定显不显示
+    func runningTask(forMessage msgId: UUID) -> RunningGeneration? {
+        runningTasks.values.first { $0.msgId == msgId }
+    }
+
+    /// 取消某条消息对应的那个任务
+    func cancelTask(forMessage msgId: UUID) {
+        guard let task = runningTask(forMessage: msgId) else { return }
+        cancel(taskID: task.id)
+    }
+
+    /// 仅供单元测试：直接塞一个在跑的任务，省得真去打 API
+    func testHook_insertRunningTask(_ task: RunningGeneration) {
+        assert(DiagLog.isUnitTesting, "testHook 只能在测试里用")
+        runningTasks[task.id] = task
+    }
+
+    /// 取消一个任务
+    func cancel(taskID: UUID) {
+        runningTasks[taskID]?.handle?.cancel()
+        runningTasks.removeValue(forKey: taskID)
+    }
+
+    /// 取消全部在跑的任务（关窗、退出时用）
+    func cancelAllGenerations() {
+        for (_, task) in runningTasks { task.handle?.cancel() }
+        runningTasks.removeAll()
     }
 
     private func applyGenerationResult(convId: UUID, msgId: UUID, content: String, mediaURL: URL?, status: TaskStatus) {
@@ -663,10 +851,41 @@ final class AIVideoService: ObservableObject {
         currentConversationId = nil
     }
 
+    // MARK: - 画布会话
+
+    /// 新建一张画布，返回它的会话 id
+    @discardableResult
+    func newCanvasConversation() -> UUID {
+        let id = UUID()
+        history.insert(ConversationRecord(id: id, title: "未命名画布", createdAt: Date(),
+                                          entries: [], canvas: .init()), at: 0)
+        saveHistoryToDisk()
+        return id
+    }
+
+    /// 保存一张画布的当前状态
+    func saveCanvas(_ snapshot: ConversationRecord.CanvasSnapshot, id: UUID, title: String) {
+        guard let i = history.firstIndex(where: { $0.id == id }) else { return }
+        history[i].canvas = snapshot
+        history[i].title = title
+        saveHistoryToDisk()
+    }
+
+    func canvasRecord(_ id: UUID) -> ConversationRecord? {
+        history.first { $0.id == id && $0.isCanvas }
+    }
+
+    /// 新建一条聊天会话。**立刻在历史里落一条** ——
+    /// 原来是等发了第一条消息才建，用户点「新建」后历史列表没反应，
+    /// 看着像没生效
     func newConversation() {
         saveCurrentConversation()
         messages.removeAll()
-        currentConversationId = nil
+        let id = UUID()
+        history.insert(ConversationRecord(id: id, title: "新对话", createdAt: Date(),
+                                          entries: [], canvas: nil), at: 0)
+        currentConversationId = id
+        saveHistoryToDisk()
     }
 
     func loadConversation(_ id: UUID) {
@@ -696,9 +915,19 @@ final class AIVideoService: ObservableObject {
                 }
             }
         }
-        if generatingConversationId == id, let msgId = generatingMessageId,
-           !messages.contains(where: { $0.id == msgId }) {
-            messages.append(ChatMessage(id: msgId, role: .assistant, content: "正在生成视频…", status: .generating(progress: "生成中，请等待…")))
+        // 切回一个还在生成的会话时，把它那条占位消息补回来。
+        // 多任务之后同一个会话可能挂着好几条，逐个补
+        for task in runningTasks.values where task.convId == id {
+            guard !messages.contains(where: { $0.id == task.msgId }) else { continue }
+            let text: String
+            switch task.category {
+            case .video: text = "正在生成视频…"
+            case .image: text = "正在生成图片…"
+            case .audio: text = "正在生成音频…"
+            case .text:  text = "正在生成回复…"
+            }
+            messages.append(ChatMessage(id: task.msgId, role: .assistant, content: text,
+                                        status: .generating(progress: "生成中，请等待…")))
         }
     }
 
@@ -769,15 +998,47 @@ final class AIVideoService: ObservableObject {
     }
 
     private func saveHistoryToDisk() {
-        if let data = try? JSONEncoder().encode(history) {
-            try? data.write(to: historyFileURL)
+        // 读失败过就别写了 —— 空列表写下去等于把用户的历史全抹了
+        guard !historyLoadFailed else {
+            DiagLog.log("[AI历史] 上次加载失败，拒绝写盘（避免覆盖已有记录）")
+            return
         }
+        guard let data = try? JSONEncoder().encode(history) else { return }
+        // 写之前留一份上一版。这个文件是用户几十条对话，值这点磁盘
+        let backup = historyFileURL.deletingPathExtension().appendingPathExtension("bak.json")
+        if let old = try? Data(contentsOf: historyFileURL), !old.isEmpty {
+            try? old.write(to: backup)
+        }
+        try? data.write(to: historyFileURL)
     }
 
+    /// 加载历史失败过。**失败之后一律不许写盘** ——
+    /// 2026-08-21 就是这么丢的：给 CanvasNode 加了几个字段，旧记录缺键、
+    /// 整个数组解不出来，`try?` 静默吞掉变成空列表，用户一操作就把 29 条覆盖成 1 条
+    private(set) var historyLoadFailed = false
+
     private func loadHistory() {
-        guard let data = try? Data(contentsOf: historyFileURL),
-              let h = try? JSONDecoder().decode([ConversationRecord].self, from: data) else { return }
-        history = h
+        guard let data = try? Data(contentsOf: historyFileURL) else { return }
+        do {
+            history = try JSONDecoder().decode([ConversationRecord].self, from: data)
+        } catch {
+            // 整条数组解不动时，退一步逐条解 —— 坏一条不该连累其余的
+            historyLoadFailed = true
+            DiagLog.log("[AI历史] 整体解码失败：\(error)")
+            if let raw = try? JSONSerialization.jsonObject(with: data) as? [Any] {
+                var salvaged: [ConversationRecord] = []
+                for item in raw {
+                    guard let d = try? JSONSerialization.data(withJSONObject: item),
+                          let rec = try? JSONDecoder().decode(ConversationRecord.self, from: d)
+                    else { continue }
+                    salvaged.append(rec)
+                }
+                history = salvaged
+                DiagLog.log("[AI历史] 逐条抢救回 \(salvaged.count)/\(raw.count) 条")
+                // 抢救到东西就允许继续写盘，否则宁可只读不写
+                historyLoadFailed = salvaged.isEmpty
+            }
+        }
     }
 
     // MARK: - API 调用
@@ -2882,8 +3143,18 @@ final class AIVideoService: ObservableObject {
 
     // MARK: - Helpers
 
+    /// 报进度。**按任务定位消息**，不能再用「最后一条还在跑的助手消息」——
+    /// 并发跑的时候那样会把 A 的进度写到 B 头上
     private func updateAssistantStatus(_ status: TaskStatus) {
-        guard generatingConversationId == nil || currentConversationId == generatingConversationId else { return }
+        if let tid = Context.taskID, let task = runningTasks[tid] {
+            // 会话被切走了就只更新数据、不动当前消息列表
+            guard currentConversationId == task.convId else { return }
+            if let idx = messages.firstIndex(where: { $0.id == task.msgId }) {
+                messages[idx].status = status
+            }
+            return
+        }
+        // 没有任务上下文（理论上不该走到这，留着兜底）
         if let idx = messages.lastIndex(where: { $0.role == .assistant && $0.status != .idle }) {
             messages[idx].status = status
         }

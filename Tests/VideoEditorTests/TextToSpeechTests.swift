@@ -11,6 +11,12 @@ import CoreMedia
 @MainActor
 final class TextToSpeechTests: XCTestCase {
 
+    override func setUp() {
+        super.setUp()
+        // 素材库是全局单例，不清一遍的话上个用例导入的素材会串到下个用例
+        MediaLibrary.shared.resetForTesting()
+    }
+
     private func makeProject(tracks: [[SubtitleClip]]) -> ProjectState {
         let p = ProjectState()
         for clips in tracks {
@@ -198,7 +204,9 @@ final class TextToSpeechTests: XCTestCase {
         // 配音**按轨道合成一个素材**：这 24 条互不重叠，全进同一条配音轨，
         // 所以素材库只多一条「配音」，而不是 24 条碎条目。
         // 时间轴上仍是 24 段独立片段，各自用 trimStart 偏移到自己那一段
-        XCTAssertEqual(p.mediaAssets.count, p.audioTracks.count,
+        // v5.0.0 起默认自带一条空音频轨，它不产生素材，按「有片段的轨」数
+        let voiceTracks = p.audioTracks.filter { !$0.clips.isEmpty }.count
+        XCTAssertEqual(p.mediaAssets.count, voiceTracks,
                        "每条配音轨该对应一个合成素材")
 
         let worst = gaps.max() ?? 0

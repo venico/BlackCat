@@ -5,6 +5,12 @@ import XCTest
 
 final class AppUpdaterTests: XCTestCase {
 
+    override func setUp() {
+        super.setUp()
+        // 素材库是全局单例，不清一遍的话上个用例导入的素材会串到下个用例
+        MediaLibrary.shared.resetForTesting()
+    }
+
     func testBasicOrdering() {
         XCTAssertTrue(AppUpdater.isNewer("4.3.6", than: "4.3.5"))
         XCTAssertFalse(AppUpdater.isNewer("4.3.5", than: "4.3.6"))
@@ -54,6 +60,12 @@ final class AppUpdaterTests: XCTestCase {
 /// tag 过滤。app 和模型包共用一个仓库，必须能分清哪个 tag 是 app 版本——
 /// 分不清的话更新检查会指到模型包上，而且不报任何错
 final class AppVersionTagTests: XCTestCase {
+
+    override func setUp() {
+        super.setUp()
+        // 素材库是全局单例，不清一遍的话上个用例导入的素材会串到下个用例
+        MediaLibrary.shared.resetForTesting()
+    }
 
     func testAcceptsPlainVersionTags() {
         XCTAssertTrue(AppUpdater.isAppVersionTag("v4.3.6"))

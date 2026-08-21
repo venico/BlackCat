@@ -9,7 +9,13 @@ import NaturalLanguage
 
 final class ProjectState: ObservableObject {
     // Media
-    @Published var mediaAssets: [MediaAsset] = []
+    /// 素材库转发口。数据本体在 `MediaLibrary.shared`，全 app 一份、多窗口共用。
+    /// 保留这个同名属性是为了让原有 80 处调用点不用改；
+    /// 变更通知靠 init 里订阅 `MediaLibrary.shared.$assets` 转发 objectWillChange
+    var mediaAssets: [MediaAsset] {
+        get { MediaLibrary.shared.assets }
+        set { MediaLibrary.shared.assets = newValue }
+    }
 
     // Tracks
     // 六种类型各留一条空轨。空项目就能看到完整的轨道结构，
@@ -647,6 +653,30 @@ final class ProjectState: ObservableObject {
         // 之前留着这个 case 是死代码，从没被赋值过，进度气泡里对应分支也永远
         // 渲染不到
 
+        /// 卡片上显示的阶段名。时间轴那边用通知卡片，画布上用这个 —— 同一个状态机
+        var canvasLabel: String {
+            switch self {
+            case .idle:                     return ""
+            case .downloadingModel:         return "下载模型中…"
+            case .extractingFrames:         return "抽帧中…"
+            case .inferring:                return "超分中…"
+            case .encoding:                 return "编码中…"
+            case .cloud(_, let stage):      return stage
+            }
+        }
+
+        /// 卡片上进度条的值
+        var canvasProgress: Double {
+            switch self {
+            case .idle:                          return 0
+            case .downloadingModel(let p):       return p
+            case .extractingFrames(let p):       return p
+            case .inferring(let p):              return p
+            case .encoding:                      return 0.95
+            case .cloud(let p, _):               return p
+            }
+        }
+
         /// 没有细粒度进度可报的阶段，按阶段给个近似值，让进度条别停着不动
         /// 各阶段在进度条上占的区间。这个分配必须反映**真实耗时占比**，不然进度条
         /// 就是在骗人——最早那版按"下载10% + 抽帧10% + 推理70% + 编码5%"分，是照
@@ -873,6 +903,11 @@ final class ProjectState: ObservableObject {
     // Export
     @Published var exportSettings  = ExportSettings()
     @Published var showExportSheet = false
+    /// AI 画布是否展开。每个窗口一份 —— 开关是界面状态，
+    /// 画布**内容**是全局的（跟会话走，B5 接）
+    @Published var showCanvas = false
+    /// 画布的视图状态（缩放/平移/撤销栈）
+    let canvas = CanvasState()
     @Published var showSettings = false
     /// 新建项目表单。菜单栏「新建项目」和欢迎页「新建项目」都开它——
     /// 菜单栏原来是把整个欢迎页调出来，等于让用户在已经打开项目的情况下
@@ -1046,7 +1081,6 @@ final class ProjectState: ObservableObject {
 
     var cancellables = Set<AnyCancellable>()
 
-    static let mediaLibraryKey = "savedMediaBookmarks"
     /// 正在访问安全范围的 URL（app 退出时需要 stop）
     var accessedURLs: [URL] = []
 
@@ -1066,15 +1100,24 @@ final class ProjectState: ObservableObject {
     }
 
     init() {
-        loadSavedMediaLibrary()
         seedDefaultTrackOrder()
-        $mediaAssets
+        // 素材库是全局的，加载和存盘都归 MediaLibrary 自己管。
+        // 这里只把它的变更转成本对象的 objectWillChange，
+        // 让所有读 project.mediaAssets 的视图照常刷新（另一个窗口改的也能收到）
+        MediaLibrary.shared.$assets
             .dropFirst()
-            .debounce(for: .milliseconds(500), scheduler: RunLoop.main)
-            .sink { [weak self] assets in
-                self?.saveMediaLibrary(assets)
+            .sink { [weak self] _ in
+                guard let self else { return }
+                self.objectWillChange.send()
+                // 别的窗口导入的素材，本窗口也得有缩略图 —— 缩略图缓存是
+                // ProjectState 级的，只补缺的那些，已有的直接跳过
+                DispatchQueue.main.async { self.refreshMediaLibrary() }
             }
             .store(in: &cancellables)
+        // 冷启动/新建项目时，全局库是从磁盘读回来的，缩略图缓存还是空的。
+        // 以前这一步由 loadSavedMediaLibrary() 顺带做，那条路已经并进 MediaLibrary，
+        // 缩略图得在这里补，否则素材库里一片没有封面
+        DispatchQueue.main.async { [weak self] in self?.refreshMediaLibrary() }
         syncVideoSectionOrder()
         syncAudioSectionOrder()
     }

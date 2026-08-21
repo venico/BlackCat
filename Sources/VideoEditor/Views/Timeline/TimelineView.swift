@@ -487,6 +487,11 @@ struct TimelineView: View {
                 project.redo()
                 return nil
             }
+            // 画布开着的时候，键盘归画布管。
+            // 光靠画布那层 monitor 吞不住 —— 多个 local monitor 谁先拿到事件
+            // 取决于注册顺序，时间轴这个装得早，空格照样会被它拿去播放/暂停
+            if project.showCanvas { return event }
+
             // ⌘Z → 撤销
             if event.modifierFlags.contains(.command)
                 && event.charactersIgnoringModifiers?.lowercased() == "z" {
@@ -507,6 +512,9 @@ struct TimelineView: View {
 
         // Command + scroll wheel → zoom timeline (pixelsPerSecond)，以播放头为中心
         scrollMonitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { [self] event in
+            // 画布开着时滚轮归画布（⌘+滚轮缩画布，普通滚轮平移画布）
+            if project.showCanvas { return event }
+
             // Shift + 滚轮 → 横向滚动时间轴（竖直滚轮不加修饰=纵向滚轨道，走 ScrollView 默认）
             if event.modifierFlags.contains(.shift) {
                 let d = event.scrollingDeltaY != 0 ? event.scrollingDeltaY : event.scrollingDeltaX
@@ -3890,7 +3898,8 @@ private struct AudioClipView: View {
 }
 
 /// Canvas-based audio waveform visualization
-private struct AudioWaveformCanvas: View {
+/// 波形绘制。时间轴和画布的音频卡片共用这一份
+struct AudioWaveformCanvas: View {
     let waveData: WaveformData
     let trimStart: Double
     let clipDuration: Double
@@ -3898,6 +3907,9 @@ private struct AudioWaveformCanvas: View {
     var clipStartX: CGFloat = 0      // 片段在内容坐标中的起始 x
     var scrollOffsetX: CGFloat = 0
     var vpWidth: CGFloat = 800
+    /// 波形颜色。时间轴里是半透明白，画布的音频卡片要绿色 ——
+    /// 写死在 Canvas 里的话外面套 foregroundColor 是不生效的
+    var barColor: Color = .white.opacity(0.30)
 
     var body: some View {
         Canvas { ctx, size in
@@ -3929,7 +3941,7 @@ private struct AudioWaveformCanvas: View {
                     let barH = max(1, CGFloat(peak) * size.height)
                     let rect = CGRect(x: CGFloat(x), y: size.height - barH,
                                       width: 1, height: barH)
-                    ctx.fill(Path(rect), with: .color(.white.opacity(0.30)))
+                    ctx.fill(Path(rect), with: .color(barColor))
                 }
             } else {
                 let midY = size.height / 2

@@ -6,6 +6,12 @@ import XCTest
 
 final class ClaritySystemSRGateTests: XCTestCase {
 
+    override func setUp() {
+        super.setUp()
+        // 素材库是全局单例，不清一遍的话上个用例导入的素材会串到下个用例
+        MediaLibrary.shared.resetForTesting()
+    }
+
     /// 这台机器支不支持系统超分。不支持时只有"版本/芯片不支持"那条分支会走到，
     /// 尺寸相关的断言就没有意义，跳过而不是假装通过
     private var systemSRAvailable: Bool {

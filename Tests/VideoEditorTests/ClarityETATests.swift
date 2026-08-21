@@ -3,6 +3,12 @@ import XCTest
 
 final class ClarityETATests: XCTestCase {
 
+    override func setUp() {
+        super.setUp()
+        // 素材库是全局单例，不清一遍的话上个用例导入的素材会串到下个用例
+        MediaLibrary.shared.resetForTesting()
+    }
+
     /// 前 3% 不该给出实测 ETA——样本太少，除出来的数会乱跳
     @MainActor
     func testETANotOverwrittenTooEarly() {
@@ -70,6 +76,12 @@ final class ClarityETATests: XCTestCase {
 // MARK: - 进度条真实性
 
 final class ClarityProgressRealismTests: XCTestCase {
+
+    override func setUp() {
+        super.setUp()
+        // 素材库是全局单例，不清一遍的话上个用例导入的素材会串到下个用例
+        MediaLibrary.shared.resetForTesting()
+    }
 
     /// 推理一开始不该已经是 20%——管道式下推理就是全部工作量，
     /// 前面那些阶段（下载 20KB 模型、启动进程）都是一瞬间的事

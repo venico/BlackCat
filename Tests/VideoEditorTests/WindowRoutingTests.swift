@@ -8,6 +8,12 @@ import XCTest
 
 final class WindowRoutingTests: XCTestCase {
 
+    override func setUp() {
+        super.setUp()
+        // 素材库是全局单例，不清一遍的话上个用例导入的素材会串到下个用例
+        MediaLibrary.shared.resetForTesting()
+    }
+
     func testEachWindowGetsItsOwnID() {
         let a = WindowID(), b = WindowID()
         XCTAssertNotEqual(a, b, "两个窗口不能共用 id，否则命令会串台")

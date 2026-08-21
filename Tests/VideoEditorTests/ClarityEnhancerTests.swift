@@ -5,6 +5,12 @@ import AppKit
 
 final class ClarityEnhancerTests: XCTestCase {
 
+    override func setUp() {
+        super.setUp()
+        // 素材库是全局单例，不清一遍的话上个用例导入的素材会串到下个用例
+        MediaLibrary.shared.resetForTesting()
+    }
+
     /// 画一张比 tileSize 大的棋盘格图（触发多 tile 拼接路径），
     /// 用棋盘格是为了让拼接错位在肉眼看时非常显眼（网格线不对齐会立刻看出来）
     private func makeCheckerboard(size: Int, cell: Int) throws -> CGImage {

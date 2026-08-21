@@ -10,6 +10,12 @@ import XCTest
 
 final class SubtitleLayoutTests: XCTestCase {
 
+    override func setUp() {
+        super.setUp()
+        // 素材库是全局单例，不清一遍的话上个用例导入的素材会串到下个用例
+        MediaLibrary.shared.resetForTesting()
+    }
+
     private let zh = "微软已经宣布了 Macintosh 版的 Multiplan，现在店里就有卖"
     private let en = "Microsoft has announced Multiplan for Macintosh, and it's in the stores now."
 

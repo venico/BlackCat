@@ -10,6 +10,12 @@ import XCTest
 
 final class TranslateSourceLanguageTests: XCTestCase {
 
+    override func setUp() {
+        super.setUp()
+        // 素材库是全局单例，不清一遍的话上个用例导入的素材会串到下个用例
+        MediaLibrary.shared.resetForTesting()
+    }
+
     private let brandLine = "Nike, Disney, Coke, Sony."
 
     /// 核心保证：一条检测不准的字幕不能带偏整轨的源语言

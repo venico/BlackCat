@@ -9,6 +9,12 @@ import XCTest
 /// 的问题肉眼很难看出来，用测试钉住。
 final class ClarityNewClipFieldsTests: XCTestCase {
 
+    override func setUp() {
+        super.setUp()
+        // 素材库是全局单例，不清一遍的话上个用例导入的素材会串到下个用例
+        MediaLibrary.shared.resetForTesting()
+    }
+
     /// 带 url 构造的片段才会触发缩略图加载
     func testVideoClipWithURLEnablesThumbnailLoading() {
         let url = URL(fileURLWithPath: "/tmp/whatever.mp4")

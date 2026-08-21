@@ -21,10 +21,12 @@ extension ProjectState {
         let alert = NSAlert()
         alert.alertStyle = .warning
         alert.messageText = "确定移除「\(assetName)」？"
+        // 素材库 v5.1.0 起全 app 一份，删的是全局那条
         if clipCount > 0 {
-            alert.informativeText = "时间轴上有 \(clipCount) 个片段使用了此素材，将一并移除。"
+            alert.informativeText = "素材库是所有项目共用的，移除后别的项目里引用它的片段会变成「文件丢失」。\n"
+                + "当前项目时间轴上有 \(clipCount) 个片段使用了此素材，将一并移除。"
         } else {
-            alert.informativeText = "素材将从素材库中移除。"
+            alert.informativeText = "素材库是所有项目共用的，移除后别的项目里引用它的片段会变成「文件丢失」。"
         }
         alert.addButton(withTitle: "移除")
         alert.addButton(withTitle: "取消")
@@ -69,44 +71,56 @@ extension ProjectState {
         rebuildTimelinePreview()
     }
 
-    func saveMediaLibrary(_ assets: [MediaAsset]) {
-        let bookmarks: [Data] = assets.compactMap { asset in
-            try? asset.url.bookmarkData(
-                options: .withSecurityScope,
-                includingResourceValuesForKeys: nil,
-                relativeTo: nil)
-        }
-        UserDefaults.standard.set(bookmarks, forKey: Self.mediaLibraryKey)
-    }
+    /// 把片段上的 `assetID` 按映射换成全局库里的 id。
+    ///
+    /// 打开项目时才用得上：项目文件里那份素材的 id 可能跟全局库对不上（同一个文件、
+    /// 两个 id），全局库那条不能改（别的项目在引用），所以改这边。
+    /// **复合片段内部也要换** —— 漏了的话复合里的片段会找不到源，而且不报错，
+    /// 表现为预览黑屏、导出少内容
+    func remapAssetIDs(_ map: [UUID: UUID]) {
+        guard !map.isEmpty else { return }
 
-    func loadSavedMediaLibrary() {
-        // 兼容旧版纯路径格式，自动迁移
-        if let paths = UserDefaults.standard.stringArray(forKey: "savedMediaAssetPaths") {
-            for path in paths {
-                let url = URL(fileURLWithPath: path)
-                importFileFromRestore(url)
+        func fix(_ tracks: inout [Track<VideoClip>]) {
+            for i in tracks.indices {
+                for j in tracks[i].clips.indices {
+                    if let n = map[tracks[i].clips[j].assetID] { tracks[i].clips[j].assetID = n }
+                }
             }
-            UserDefaults.standard.removeObject(forKey: "savedMediaAssetPaths")
-            saveMediaLibrary(mediaAssets)
-            return
+        }
+        func fixAudio(_ tracks: inout [Track<AudioClip>]) {
+            for i in tracks.indices {
+                for j in tracks[i].clips.indices {
+                    if let n = map[tracks[i].clips[j].assetID] { tracks[i].clips[j].assetID = n }
+                }
+            }
+        }
+        func fixImage(_ tracks: inout [Track<ImageClip>]) {
+            for i in tracks.indices {
+                for j in tracks[i].clips.indices {
+                    if let n = map[tracks[i].clips[j].assetID] { tracks[i].clips[j].assetID = n }
+                }
+            }
+        }
+        func fixSubtitle(_ tracks: inout [Track<SubtitleClip>]) {
+            for i in tracks.indices {
+                for j in tracks[i].clips.indices {
+                    if let old = tracks[i].clips[j].assetID, let n = map[old] {
+                        tracks[i].clips[j].assetID = n
+                    }
+                }
+            }
         }
 
-        guard let dataArray = UserDefaults.standard.array(forKey: Self.mediaLibraryKey) as? [Data] else { return }
-        for data in dataArray {
-            var isStale = false
-            guard let url = try? URL(resolvingBookmarkData: data,
-                                      options: .withSecurityScope,
-                                      relativeTo: nil,
-                                      bookmarkDataIsStale: &isStale) else {
-                DiagLog.log("[素材恢复] bookmark 解析失败，跳过一条")
-                continue
+        fix(&videoTracks); fixAudio(&audioTracks)
+        fixImage(&imageTracks); fixSubtitle(&subtitleTracks)
+
+        for ti in compoundTracks.indices {
+            for ci in compoundTracks[ti].clips.indices {
+                fix(&compoundTracks[ti].clips[ci].videoTracks)
+                fixAudio(&compoundTracks[ti].clips[ci].audioTracks)
+                fixImage(&compoundTracks[ti].clips[ci].imageTracks)
+                fixSubtitle(&compoundTracks[ti].clips[ci].subtitleTracks)
             }
-            guard url.startAccessingSecurityScopedResource() else {
-                DiagLog.log("[素材恢复] security-scoped 访问被拒 \(url.lastPathComponent)")
-                continue
-            }
-            accessedURLs.append(url)
-            importFileFromRestore(url)
         }
     }
 
@@ -124,10 +138,49 @@ extension ProjectState {
         }
     }
 
+    /// 打开项目后清点一遍：时间轴片段引用的素材，全局库里还在不在。
+    ///
+    /// v5.1.0 起项目文件不再存素材清单，片段能不能读到源文件全看全局库。
+    /// 换台机器、或者全局库被清过，这些引用就悬空了 —— 不吭声的话表现是
+    /// 预览黑屏、导出少内容，很难查。这里直接把条数报出来。
+    func reportMissingAssetReferences() {
+        var referenced = Set<UUID>()
+        for t in videoTracks { for c in t.clips { referenced.insert(c.assetID) } }
+        for t in audioTracks { for c in t.clips { referenced.insert(c.assetID) } }
+        for t in imageTracks { for c in t.clips { referenced.insert(c.assetID) } }
+        for ct in compoundTracks {
+            for c in ct.clips {
+                for t in c.videoTracks { for x in t.clips { referenced.insert(x.assetID) } }
+                for t in c.audioTracks { for x in t.clips { referenced.insert(x.assetID) } }
+                for t in c.imageTracks { for x in t.clips { referenced.insert(x.assetID) } }
+            }
+        }
+        guard !referenced.isEmpty else { return }
+
+        let known = Set(mediaAssets.map(\.id))
+        let missing = referenced.subtracting(known)
+        guard !missing.isEmpty else { return }
+
+        DiagLog.log("[素材库] 打开项目后有 \(missing.count) 条片段引用不在全局素材库里")
+        guard !DiagLog.isUnitTesting else { return }
+        showSuccessToast(icon: "exclamationmark.triangle", iconColor: .orange,
+                         title: "有素材不在素材库里",
+                         subtitle: "\(missing.count) 个片段的源素材没找到，可在素材库里重新链接",
+                         autoCountdown: false)
+    }
+
+    /// 给缺资源的素材补生成。**按类型判断缺不缺** —— 音频封面不进
+    /// `mediaThumbnails`（它出的是波形，进 `waveformCache`），只看 mediaThumbnails
+    /// 的话音频永远算「缺」，挂在素材变更回调上就是每导入一条素材重算一遍所有波形
     func refreshMediaLibrary() {
-        for asset in mediaAssets {
-            if asset.fileExists && mediaThumbnails[asset.id] == nil {
-                loadMediaResources(asset)
+        for asset in mediaAssets where asset.fileExists {
+            switch asset.type {
+            case .video, .image:
+                if mediaThumbnails[asset.id] == nil { loadMediaResources(asset) }
+            case .audio:
+                if waveformCache[asset.id] == nil { loadMediaResources(asset) }
+            case .subtitle:
+                break
             }
         }
     }

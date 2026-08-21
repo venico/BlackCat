@@ -13,6 +13,12 @@ import CoreMedia
 
 final class FFmpegThumbnailFallbackTests: XCTestCase {
 
+    override func setUp() {
+        super.setUp()
+        // 素材库是全局单例，不清一遍的话上个用例导入的素材会串到下个用例
+        MediaLibrary.shared.resetForTesting()
+    }
+
     /// 用 AVAssetWriter 造一个真实可解码的小视频（纯色帧 H.264）
     private func makeTestVideo(seconds: Double = 2.0, fps: Int = 10,
                                width: Int = 320, height: Int = 240) throws -> URL {

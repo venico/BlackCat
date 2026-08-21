@@ -6,6 +6,12 @@ import XCTest
 /// 同一条 track"——真那样会让后插入的覆盖掉前一段，直接静音。
 final class AudioLanePoolTests: XCTestCase {
 
+    override func setUp() {
+        super.setUp()
+        // 素材库是全局单例，不清一遍的话上个用例导入的素材会串到下个用例
+        MediaLibrary.shared.resetForTesting()
+    }
+
     private struct Seg { let start: Double; let end: Double; let key: String? }
 
     /// 返回每个片段落到的 lane 编号；nil key（有 fade）一律独占一条

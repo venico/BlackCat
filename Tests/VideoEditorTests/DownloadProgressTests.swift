@@ -7,6 +7,12 @@ import XCTest
 
 final class DownloadProgressTests: XCTestCase {
 
+    override func setUp() {
+        super.setUp()
+        // 素材库是全局单例，不清一遍的话上个用例导入的素材会串到下个用例
+        MediaLibrary.shared.resetForTesting()
+    }
+
     /// 用模型仓库里一个真实的小文件（2.5MB），够触发多次进度回调又不拖慢测试
     private let sampleURL = URL(string:
         "https://github.com/venico/blackcat-models/releases/download/clarity-pro-v1/RealCUGAN_up4x.mlmodelc.zip")!

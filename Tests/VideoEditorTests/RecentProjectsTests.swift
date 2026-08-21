@@ -8,6 +8,7 @@ final class RecentProjectsTests: XCTestCase {
     private var tmpDir: URL!
 
     override func setUp() async throws {
+        MediaLibrary.shared.resetForTesting()
         try await super.setUp()
         tmpDir = FileManager.default.temporaryDirectory
             .appendingPathComponent("recent-tests-\(UUID().uuidString)")
@@ -252,6 +253,12 @@ final class RecentProjectsTests: XCTestCase {
 /// 欢迎页列表的排序。UI 不好测，把排序规则本身钉住——
 /// 尤其是「文件10 不能排在 文件2 前面」这条，用普通字符串比较就会错
 final class RecentSortTests: XCTestCase {
+
+    override func setUp() {
+        super.setUp()
+        // 素材库是全局单例，不清一遍的话上个用例导入的素材会串到下个用例
+        MediaLibrary.shared.resetForTesting()
+    }
 
     private func make(_ name: String, _ daysAgo: Double) -> RecentProject {
         RecentProject(url: URL(fileURLWithPath: "/tmp/\(name).bcj"),

@@ -8,6 +8,12 @@ import XCTest
 
 final class WhisperVADAlignTests: XCTestCase {
 
+    override func setUp() {
+        super.setUp()
+        // 素材库是全局单例，不清一遍的话上个用例导入的素材会串到下个用例
+        MediaLibrary.shared.resetForTesting()
+    }
+
     private typealias Seg = (start: Double, end: Double, text: String)
 
     // TC-WH-010: 静音处不再挂字幕 —— 整条落在静音里的段落直接丢掉
@@ -99,6 +105,12 @@ final class WhisperVADAlignTests: XCTestCase {
 }
 
 final class SubtitleProofreadTests: XCTestCase {
+
+    override func setUp() {
+        super.setUp()
+        // 素材库是全局单例，不清一遍的话上个用例导入的素材会串到下个用例
+        MediaLibrary.shared.resetForTesting()
+    }
 
     private typealias Seg = (start: Double, end: Double, text: String)
 

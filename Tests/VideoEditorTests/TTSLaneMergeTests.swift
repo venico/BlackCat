@@ -5,6 +5,12 @@ import XCTest
 /// 这里验证偏移的计算契约——算错的话每句话会播成别的内容，比崩溃还难查。
 final class TTSLaneMergeTests: XCTestCase {
 
+    override func setUp() {
+        super.setUp()
+        // 素材库是全局单例，不清一遍的话上个用例导入的素材会串到下个用例
+        MediaLibrary.shared.resetForTesting()
+    }
+
     private struct Seg { let start: Double; let dur: Double }
 
     /// 合并文件从这条轨道的第一段开始，各段偏移 = 自己起点 − 轨道起点
