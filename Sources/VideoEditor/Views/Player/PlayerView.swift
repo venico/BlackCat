@@ -3117,7 +3117,6 @@ private struct PenEditOverlay: View {
 final class PlayerController: ObservableObject {
     let player = AVPlayer()
     @Published var isPlaying: Bool = false
-
     // 独立 Timer 驱动时间轴（不依赖 AVPlayer 时间观察器）
     private var timer: Timer?
     private var lastTick: Date?
@@ -3150,6 +3149,13 @@ final class PlayerController: ObservableObject {
     }
 
     func play() {
+        // 播放头已经停在末尾了，这次按播放就是"重播"：先回到开头。
+        // 不这么做的话 AVPlayer 在结尾原地起播，画面不动，看着像按了没反应
+        let dur = getDuration?() ?? 0
+        if dur > 0, (getTime?() ?? 0) >= dur - 0.001 {
+            onTime?(0)
+            seek(to: 0)
+        }
         isPlaying = true
         lastTick = Date()
         player.play()

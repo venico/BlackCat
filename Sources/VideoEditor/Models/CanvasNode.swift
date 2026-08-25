@@ -39,21 +39,35 @@ struct CanvasNode: Identifiable, Equatable, Codable {
             case .text:  return [.text, .image, .video, .audio]
             case .image: return [.image, .video]
             case .video: return [.video]
-            case .audio: return [.audio]
+            // 音频只往下接视频：拿一段音频去生成配套画面是成立的
+            // （视频模型收音频当参考，`video.acceptsContext` 里本来就有 audio）；
+            // 「音频再生成音频」没有实际用处，不列
+            case .audio: return [.video]
             }
         }
 
         /// **左边的 +**：这个节点能接什么类型的上下文（谁能当它的参考）。
         ///
-        /// 跟 `canGenerate` **不是**互为逆向 —— 两张表故意不对称：
-        /// 视频生成收音频当参考（Seedance 支持），但「从音频出发生成视频」
-        /// 不是个自然操作，所以 audio.canGenerate 里没有 video
+        /// 跟 `canGenerate` **不是**互为逆向，两张表各说各的事：
+        /// 视频能拿文字/图片/视频/音频当参考，但反过来「音频能派生出什么」
+        /// 只有音频和视频 —— 音频不会去生成图片或文字
         var acceptsContext: [Kind] {
             switch self {
             case .text:  return [.text]
             case .image: return [.text, .image]
             case .video: return [.text, .image, .video, .audio]
             case .audio: return [.text]
+            }
+        }
+
+        /// 这类节点对应哪一类生成模型 —— 选正确的 provider 要按这个查，
+        /// 不能直接拿 AI 面板顶部全局选中的那个（那个可能是任何类型）
+        var providerCategory: AIVideoService.ProviderCategory {
+            switch self {
+            case .text:  return .text
+            case .image: return .image
+            case .video: return .video
+            case .audio: return .audio
             }
         }
 
@@ -105,6 +119,10 @@ struct CanvasNode: Identifiable, Equatable, Codable {
 
     /// 所属分组。同一个 groupID 的卡片共用一块浅色底，选中、移动、删除都是整组一起
     var groupID: UUID?
+
+    /// 视频卡片：上游的图片是当参考图用，还是当首帧/尾帧用。
+    /// 存在节点上而不是全局 —— 每张视频卡片接的上游不同，用法本来就可以不一样
+    var usesFrameMode: Bool = false
 
     // MARK: 文字卡片的样式
 
@@ -168,6 +186,7 @@ struct CanvasNode: Identifiable, Equatable, Codable {
         progress = try c.decodeIfPresent(Double.self, forKey: .progress)
         displayName = try c.decodeIfPresent(String.self, forKey: .displayName) ?? ""
         groupID = try c.decodeIfPresent(UUID.self, forKey: .groupID)
+        usesFrameMode = try c.decodeIfPresent(Bool.self, forKey: .usesFrameMode) ?? false
     }
 
     /// 实际画多大。音频卡片高度**写死** —— 波形不需要那么高，
@@ -200,6 +219,8 @@ struct CanvasGroup: Identifiable, Equatable, Codable {
     /// 用户手动拉过的框（内容坐标）。没拉过就是 nil，框跟着成员自动算；
     /// 拉过之后取它和成员包围盒的并集 —— 拉得再小也不会把卡片切在外面
     var rect: CGRect?
+    /// 背景色（十六进制）。nil = 默认的浅灰白。画出来是半透明的，只带一点色调
+    var colorHex: String?
 
     init(id: UUID = UUID(), name: String) {
         self.id = id
@@ -212,6 +233,7 @@ struct CanvasGroup: Identifiable, Equatable, Codable {
         id = try c.decodeIfPresent(UUID.self, forKey: .id) ?? UUID()
         name = try c.decodeIfPresent(String.self, forKey: .name) ?? ""
         rect = try c.decodeIfPresent(CGRect.self, forKey: .rect)
+        colorHex = try c.decodeIfPresent(String.self, forKey: .colorHex)
     }
 }
 

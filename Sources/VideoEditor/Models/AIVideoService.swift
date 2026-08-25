@@ -33,6 +33,23 @@ final class AIVideoService: ObservableObject {
         case video = "视频生成"
     }
 
+    /// 某种类型该用哪个模型：优先读用户为这个类型单独记的那个（设置里存的，
+    /// 每种类型各记各的），没有/不匹配就退回该类型里随便一个能用的，
+    /// 实在没有才兜底成全局 selectedProvider。
+    ///
+    /// **需要「这个类型的模型」时必须走这个，不能直接用 `selectedProvider`**——
+    /// 那是 AI 面板顶部全局选的，可能是任何类型。画布「重试」按钮最初就是
+    /// 直接拿 selectedProvider，结果文字卡片重试时全局正好切到了图片模型，
+    /// 报错「Image2 不支持文字生成」
+    static func provider(for category: ProviderCategory, settings: AppSettings = .shared) -> Provider {
+        let saved = settings.canvasProvider(for: category.rawValue)
+        if let p = Provider(rawValue: saved), p.category == category, !p.isHidden {
+            return p
+        }
+        let matching = Provider.allCases.filter { !$0.isHidden && $0.category == category }
+        return matching.first ?? AIVideoService.shared.selectedProvider
+    }
+
     enum Provider: String, CaseIterable, Identifiable {
         // 视频生成
         case kling = "kling"
@@ -243,12 +260,24 @@ final class AIVideoService: ObservableObject {
             category == .text
         }
 
+        /// 当前选中的子模型 id。参考素材的额度**按子模型分**（Seedance 2.5 比 2.0
+        /// 宽松得多），所以下面几个上限都要先看它。
+        /// 没选过就取第一个 —— 跟界面上下拉的默认显示保持一致
+        private var currentSubModelID: String {
+            let saved = AppSettings.shared.providerModel(for: rawValue)
+            if subModels.contains(where: { $0.id == saved }) { return saved }
+            return subModels.first?.id ?? ""
+        }
+
         var maxReferenceImages: Int {
             switch self {
-            case .seedance, .seedance15: return 9
-            case .kling, .runway, .minimax, .vidu, .veo3: return 1
+            // Seedance 2.5 的额度比 2.0 大一截，得按子模型分
+            case .seedance: return currentSubModelID == "2.5" ? 30 : 9
+            case .seedance15: return 9
+            case .minimax: return 9
+            case .kling, .runway, .vidu, .veo3: return 1
             case .seedream: return 10
-            case .gptImage2: return 4
+            case .gptImage2: return 16
             case .nanobanana2, .flux, .sd3, .wanxiang: return 1
             default: return 0
             }
@@ -256,14 +285,16 @@ final class AIVideoService: ObservableObject {
 
         var maxReferenceVideos: Int {
             switch self {
-            case .seedance, .seedance15: return 3
+            case .seedance: return currentSubModelID == "2.5" ? 10 : 3
+            case .seedance15, .minimax: return 3
             default: return 0
             }
         }
 
         var maxReferenceAudios: Int {
             switch self {
-            case .seedance, .seedance15: return 3
+            case .seedance: return currentSubModelID == "2.5" ? 10 : 3
+            case .seedance15, .minimax: return 3
             default: return 0
             }
         }
@@ -285,7 +316,8 @@ final class AIVideoService: ObservableObject {
         /// 参考内容总数上限（图 + 视频 + 音频）
         var maxReferenceTotal: Int {
             switch self {
-            case .seedance, .seedance15: return 12
+            case .seedance: return currentSubModelID == "2.5" ? 50 : 12
+            case .seedance15, .minimax: return 12
             default: return max(maxReferenceImages, 1)
             }
         }
@@ -374,6 +406,9 @@ final class AIVideoService: ObservableObject {
     struct ConversationRecord: Identifiable, Codable {
         let id: UUID
         var title: String
+        /// 用户手动改过名字。改过之后自动保存就不再按内容重算标题了 ——
+        /// 画布每隔一会儿存一次，每次都重算的话，刚改的名字下一次保存就被冲掉
+        var titleIsCustom: Bool = false
         let createdAt: Date
         var entries: [Entry]
         /// 画布类会话带这一份；聊天会话是 nil。
@@ -381,6 +416,34 @@ final class AIVideoService: ObservableObject {
         var canvas: CanvasSnapshot?
 
         var isCanvas: Bool { canvas != nil }
+
+        init(id: UUID, title: String, createdAt: Date,
+             entries: [Entry], canvas: CanvasSnapshot? = nil, titleIsCustom: Bool = false) {
+            self.id = id
+            self.title = title
+            self.createdAt = createdAt
+            self.entries = entries
+            self.canvas = canvas
+            self.titleIsCustom = titleIsCustom
+        }
+
+        /// **手写解码，每个字段都 decodeIfPresent**。
+        ///
+        /// 自动生成的 Codable 缺一个键就抛错，那条记录整个解不出来 ——
+        /// 2026-08-21 给 CanvasNode 加字段就是这么把用户 21 条历史冲掉的。
+        /// 往这个结构加字段，照着加一行就行
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            // id 是**必需**的：没有 id 就不是一条记录。
+            // 这里也容错的话，任何一个 JSON 对象都能解成一条空记录，
+            // 坏数据不再被跳过，而是变成历史里一条莫名其妙的「未命名」
+            id = try c.decode(UUID.self, forKey: .id)
+            title = try c.decodeIfPresent(String.self, forKey: .title) ?? "未命名"
+            titleIsCustom = try c.decodeIfPresent(Bool.self, forKey: .titleIsCustom) ?? false
+            createdAt = try c.decodeIfPresent(Date.self, forKey: .createdAt) ?? Date()
+            entries = try c.decodeIfPresent([Entry].self, forKey: .entries) ?? []
+            canvas = try c.decodeIfPresent(CanvasSnapshot.self, forKey: .canvas)
+        }
 
         /// 画布存盘的样子。节点/连线/视口都在里面
         struct CanvasSnapshot: Codable {
@@ -701,6 +764,8 @@ final class AIVideoService: ObservableObject {
                            referenceImages: [URL] = [],
                            referenceVideos: [URL] = [],
                            referenceAudios: [URL] = [],
+                           firstFrame: URL? = nil,
+                           lastFrame: URL? = nil,
                            onFinish: @escaping (Result<URL, Error>) -> Void) -> UUID {
         let taskID = UUID()
         let category = provider.category
@@ -720,7 +785,7 @@ final class AIVideoService: ObservableObject {
                                                       referenceImages: referenceImages,
                                                       referenceVideos: referenceVideos,
                                                       referenceAudios: referenceAudios,
-                                                      firstFrame: nil, lastFrame: nil)
+                                                      firstFrame: firstFrame, lastFrame: lastFrame)
                     case .image:
                         url = try await generateImage(provider: provider, prompt: prompt,
                                                       referenceImages: referenceImages, ratio: imageRatio)
@@ -867,7 +932,8 @@ final class AIVideoService: ObservableObject {
     func saveCanvas(_ snapshot: ConversationRecord.CanvasSnapshot, id: UUID, title: String) {
         guard let i = history.firstIndex(where: { $0.id == id }) else { return }
         history[i].canvas = snapshot
-        history[i].title = title
+        // 用户自己起过名字就别再按内容改回去
+        if !history[i].titleIsCustom { history[i].title = title }
         saveHistoryToDisk()
     }
 
@@ -937,6 +1003,15 @@ final class AIVideoService: ObservableObject {
             currentConversationId = nil
         }
         history.removeAll { $0.id == id }
+        saveHistoryToDisk()
+    }
+
+    /// 重命名。空标题不写 —— 列表里顶一行空名字，找不着这条记录了
+    func renameConversation(_ id: UUID, title: String) {
+        let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, let i = history.firstIndex(where: { $0.id == id }) else { return }
+        history[i].title = trimmed
+        history[i].titleIsCustom = true
         saveHistoryToDisk()
     }
 

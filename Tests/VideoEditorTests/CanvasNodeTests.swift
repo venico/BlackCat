@@ -93,7 +93,9 @@ final class CanvasNodeTests: XCTestCase {
                        "文本能派生一切")
         XCTAssertEqual(CanvasNode.Kind.image.canGenerate, [.image, .video])
         XCTAssertEqual(CanvasNode.Kind.video.canGenerate, [.video], "视频只能再出视频")
-        XCTAssertEqual(CanvasNode.Kind.audio.canGenerate, [.audio])
+        // 音频往下只接视频：拿一段音频生成配套画面成立，
+        // 「音频再生成音频」没有实际用处
+        XCTAssertEqual(CanvasNode.Kind.audio.canGenerate, [.video])
     }
 
     // 左边 + 的菜单：这个节点能接什么上下文。
@@ -104,9 +106,11 @@ final class CanvasNodeTests: XCTestCase {
         XCTAssertEqual(CanvasNode.Kind.video.acceptsContext, [.text, .image, .video, .audio])
         XCTAssertEqual(CanvasNode.Kind.audio.acceptsContext, [.text])
 
-        // 这一对就是不对称的地方：视频收音频当参考，但音频不能「生成视频」
+        // 不对称在这儿：视频什么都能收当参考，音频却只收文字 ——
+        // 两张表各说各的事，别想当然地互相反推
         XCTAssertTrue(CanvasNode.Kind.video.acceptsContext.contains(.audio))
-        XCTAssertFalse(CanvasNode.Kind.audio.canGenerate.contains(.video))
+        XCTAssertFalse(CanvasNode.Kind.audio.acceptsContext.contains(.image))
+        XCTAssertFalse(CanvasNode.Kind.audio.canGenerate.contains(.audio))
     }
 
     // 连线查的是**目标**能接什么，跟左边 + 菜单同一份表

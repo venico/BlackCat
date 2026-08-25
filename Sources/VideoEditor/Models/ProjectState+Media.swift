@@ -230,15 +230,17 @@ extension ProjectState {
         coverGenerating.insert(assetID)
         let id = assetID
         Thread.detachNewThread {
-            let outcome = Self.avSingleFrameSync(url: url, maxSize: 400, timeout: 10)
             var cover: NSImage? = nil
-            switch outcome {
-            case .success(let cg):
-                cover = NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
-            case .failure(let msg):
-                DiagLog.log("[缩略图] 素材库封面 AVFoundation 失败 \(url.lastPathComponent) 错误=\(msg)，改用 ffmpeg")
-            case .timedOut:
-                DiagLog.log("[缩略图] 素材库封面 AVFoundation 超时(10s)无响应 \(url.lastPathComponent)，改用 ffmpeg")
+            // 这次运行里 AVFoundation 已经证明不行了，别再一个个文件去等超时
+            if !Self.avDecodeDegraded {
+                switch Self.avSingleFrameSync(url: url, maxSize: 400, timeout: 6) {
+                case .success(let cg):
+                    cover = NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
+                case .failure(let msg):
+                    DiagLog.log("[缩略图] 素材库封面 AVFoundation 失败 \(url.lastPathComponent) 错误=\(msg)，改用 ffmpeg")
+                case .timedOut:
+                    Self.markAVDegraded("素材库封面 \(url.lastPathComponent)")
+                }
             }
             if cover == nil {
                 cover = Self.ffmpegSingleFrame(url: url, maxSize: 400)
@@ -302,6 +304,35 @@ extension ProjectState {
         }
         lock.lock(); defer { lock.unlock() }
         return outcome ?? .timedOut
+    }
+
+    // MARK: - AVFoundation 退化开关
+
+    /// 这个进程里 AVFoundation 的媒体读取是不是已经不干活了。
+    ///
+    /// 实测（2026-08-24 用户机）：`AVAssetImageGenerator` 抽 200 帧 **60 秒一张没出**，
+    /// 转 ffmpeg 6 秒抽完；同一台机器上用独立进程跑同一个文件只要 1 秒 ——
+    /// 说明挂的不是文件也不是帧数，是本进程里的解码服务已经坏了（家用机那次同一个病）。
+    ///
+    /// 一旦超时过一次就置位，后面所有素材直接走 ffmpeg，不再每个文件都先干等一轮超时。
+    /// 进程级状态，重启 app 自动复位 —— 服务恢复了不该被永久判死刑。
+    /// 只认**超时**不认失败：文件本身坏了是它自己的事，跟解码服务无关
+    private static let avDegradedLock = NSLock()
+    nonisolated(unsafe) private static var _avDegraded = false
+
+    nonisolated static var avDecodeDegraded: Bool {
+        avDegradedLock.lock(); defer { avDegradedLock.unlock() }
+        return _avDegraded
+    }
+
+    nonisolated static func markAVDegraded(_ reason: String) {
+        avDegradedLock.lock()
+        let first = !_avDegraded
+        _avDegraded = true
+        avDegradedLock.unlock()
+        if first {
+            DiagLog.log("[解码] AVFoundation 超时无响应（\(reason)），本次运行改走 ffmpeg")
+        }
     }
 
     enum DurationOutcome {
@@ -563,10 +594,16 @@ extension ProjectState {
             var loadError: String? = nil
             var dur: Double = 0
             var avDurationOK = false
-            switch Self.durationSyncWithTimeout(url: url, seconds: 10) {
-            case .success(let d): dur = d; avDurationOK = true
-            case .failure(let msg): loadError = msg
-            case .timedOut: loadError = "超时(10s)无响应"
+            if Self.avDecodeDegraded {
+                loadError = "本次运行 AVFoundation 已降级"
+            } else {
+                switch Self.durationSyncWithTimeout(url: url, seconds: 6) {
+                case .success(let d): dur = d; avDurationOK = true
+                case .failure(let msg): loadError = msg
+                case .timedOut:
+                    loadError = "超时(6s)无响应"
+                    Self.markAVDegraded("读时长 \(url.lastPathComponent)")
+                }
             }
             if dur <= 0.1 {
                 // AVFoundation 读不出时长（-11821 机器上可能连元数据都拒）→ ffprobe 兜底再试一次
@@ -625,7 +662,7 @@ extension ProjectState {
                         url: url, times: coarse,
                         maxSize: CGSize(width: 160, height: 104),
                         tolerance: CMTime(seconds: 0.5, preferredTimescale: 600),
-                        timeout: 15), !fs.isEmpty {
+                        timeout: 8), !fs.isEmpty {
                         let quick = fs.sorted(by: { $0.time < $1.time })
                         DispatchQueue.main.async {
                             // 只在还没有更好的结果时贴，避免覆盖掉已经完成的高密度批
@@ -638,7 +675,7 @@ extension ProjectState {
                 let tol = CMTime(seconds: 0.3, preferredTimescale: 600)
                 switch Self.avFrameStripSync(url: url, times: times,
                                              maxSize: CGSize(width: 160, height: 104),
-                                             tolerance: tol, timeout: 60) {
+                                             tolerance: tol, timeout: 20) {
                 case .frames(let fs, let firstError):
                     sorted = fs.sorted(by: { $0.time < $1.time })
                     if sorted.isEmpty {
@@ -647,7 +684,8 @@ extension ProjectState {
                 case .timedOut(let partial):
                     timedOut = true
                     sorted = partial.sorted(by: { $0.time < $1.time })
-                    DiagLog.log("[缩略图] \(url.lastPathComponent) AVFoundation 60s 超时（完成 \(sorted.count)/\(frameCount) 帧），改用 ffmpeg")
+                    DiagLog.log("[缩略图] \(url.lastPathComponent) AVFoundation 20s 超时（完成 \(sorted.count)/\(frameCount) 帧），改用 ffmpeg")
+                    Self.markAVDegraded("抽帧 \(url.lastPathComponent)")
                 }
             } else {
                 // 时长是 ffprobe 读出来的 = AVFoundation 已证明挂起/失败，别再碰它
@@ -691,9 +729,13 @@ extension ProjectState {
         waveformGenerating.insert(assetID)
         let id = assetID
         Thread.detachNewThread {
-            var result = Self.waveformSyncWithTimeout(url: url, timeout: 30)
+            let degraded = Self.avDecodeDegraded
+            var result = degraded ? nil : Self.waveformSyncWithTimeout(url: url, timeout: 8)
             if result == nil {
-                DiagLog.log("[波形] AVAssetReader 失败/超时(30s) \(url.lastPathComponent)，改用 ffmpeg")
+                // 退化状态是直接跳过 AVAssetReader，不是「失败」，不用报
+                if !degraded {
+                    DiagLog.log("[波形] AVAssetReader 失败/超时(8s) \(url.lastPathComponent)，改用 ffmpeg")
+                }
                 result = Self.ffmpegWaveform(url: url)
                 DiagLog.log(result != nil ? "[波形] ffmpeg 兜底成功 \(url.lastPathComponent)"
                                           : "[波形] ffmpeg 兜底也失败 \(url.lastPathComponent)")

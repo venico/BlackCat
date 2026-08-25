@@ -75,6 +75,11 @@ struct CanvasNodeActionBar: View {
 
     // MARK: - 文字
 
+    /// 文本卡片改用 markdown 语法（v5.1.0）：H1/H2/H3/B/I/U/S 不再是「整段统一
+    /// 属性」的开关，而是往 `node.text` 里插入/去掉对应的 markdown 符号 ——
+    /// 默认态照 `CanvasMarkdown` 渲染出实际样式，编辑态看到的是原始符号。
+    /// 这是**整段**操作（不是选中范围），跟改动前的行为范围一致，只是
+    /// 存储方式从独立字段换成了内嵌在文本里的符号
     @ViewBuilder
     private var textActions: some View {
         ColorSwatch(hex: node.textColorHex) { hex in
@@ -82,31 +87,52 @@ struct CanvasNodeActionBar: View {
         }
         divider
         ForEach(1...3, id: \.self) { level in
-            labelButton("H\(level)", active: node.headingLevel == level) {
-                canvas.updateNode(id: node.id) {
-                    // 再点一次回到正文
-                    $0.headingLevel = ($0.headingLevel == level) ? 0 : level
-                }
+            labelButton("H\(level)", active: current.heading == level) {
+                rewriteText { CanvasMarkdown.toggleHeading($0, level: level) }
             }
         }
         divider
-        labelButton("B", active: node.bold, weight: .bold) {
-            canvas.updateNode(id: node.id) { $0.bold.toggle() }
+        labelButton("B", active: current.styles.contains(.bold), weight: .bold) {
+            rewriteText { CanvasMarkdown.toggle($0, style: .bold) }
         }
-        labelButton("I", active: node.italic, italic: true) {
-            canvas.updateNode(id: node.id) { $0.italic.toggle() }
+        labelButton("I", active: current.styles.contains(.italic), italic: true) {
+            rewriteText { CanvasMarkdown.toggle($0, style: .italic) }
         }
-        labelButton("U", active: node.underline, underline: true) {
-            canvas.updateNode(id: node.id) { $0.underline.toggle() }
+        labelButton("U", active: current.styles.contains(.underline), underline: true) {
+            rewriteText { CanvasMarkdown.toggle($0, style: .underline) }
         }
-        labelButton("S", active: node.strikethrough, strikethrough: true) {
-            canvas.updateNode(id: node.id) { $0.strikethrough.toggle() }
+        labelButton("S", active: current.styles.contains(.strikethrough), strikethrough: true) {
+            rewriteText { CanvasMarkdown.toggle($0, style: .strikethrough) }
         }
         divider
         actionButton(svg: "clear", tip: "清空文字", enabled: !node.text.isEmpty) {
-            canvas.pushUndo()
-            canvas.updateNode(id: node.id) { $0.text = "" }
+            // 撤销点由 rewriteText 统一压，这里再压一次会变成要按两下 ⌘Z
+            rewriteText { _ in "" }
         }
+    }
+
+    /// 工具栏改文字都走这儿。两件事：
+    ///
+    /// 1. **只改光标所在那一行** —— 光标在第二段就改第二段，
+    ///    不能不管光标在哪都往第一行加
+    /// 2. 改完把 `textEditRevision` 加一，好让**正在编辑中**的输入框知道
+    ///    「这次是程序改的，该同步进来」；不加的话编辑器为了不冲掉用户正在敲的字
+    ///    会拒绝覆盖，表现就是「点了 H1 没反应，退出编辑再进来才看见 #」
+    private func rewriteText(_ transform: @escaping (String) -> String) {
+        // 工具栏这一下是独立的一步，跟用户手打的那轮分开记
+        canvas.endTextEditUndoGroup()
+        canvas.pushUndo()
+        let caret = canvas.textCaretLocation
+        canvas.updateNode(id: node.id) {
+            $0.text = CanvasMarkdown.replacingLine(in: $0.text, caret: caret, transform)
+        }
+        canvas.textEditRevision += 1
+    }
+
+    /// 光标所在那一行被哪些样式包着、标题是几级 —— 按钮高亮和 toggle 用的是
+    /// **同一行、同一份拆解**，不会出现「按钮亮的是第一行的状态，改的却是第二行」
+    private var current: (heading: Int, styles: Set<CanvasMarkdown.StyleKind>, body: String) {
+        CanvasMarkdown.decompose(CanvasMarkdown.line(of: node.text, caret: canvas.textCaretLocation))
     }
 
     private var divider: some View {

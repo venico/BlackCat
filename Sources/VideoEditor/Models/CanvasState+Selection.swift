@@ -83,6 +83,19 @@ extension CanvasState {
         }
     }
 
+    /// 组的背景色。传 nil 回到默认的浅灰白
+    func setGroupColor(_ gid: UUID, _ hex: String?) {
+        guard let i = groups.firstIndex(where: { $0.id == gid }) else { return }
+        pushUndo()
+        groups[i].colorHex = hex
+    }
+
+    /// 组背景可选的几个颜色。半透明画出来只剩一点色调，不抢卡片
+    static let groupColors: [(name: String, hex: String)] = [
+        ("红", "#FF6B6B"), ("橙", "#FFA94D"), ("黄", "#FFD43B"), ("绿", "#69DB7C"),
+        ("蓝", "#4DABF7"), ("紫", "#DA77F2"), ("灰", "#ADB5BD")
+    ]
+
     /// 用户拖组边缘拉出来的框，松手提交
     func setGroupRect(_ gid: UUID, _ rect: CGRect) {
         guard let i = groups.firstIndex(where: { $0.id == gid }) else { return }
@@ -236,5 +249,129 @@ extension CanvasState {
         }
         selectedGroupID = nil
         selectedNodeIDs = fresh
+    }
+}
+
+// MARK: - 拖动吸附（v5.1.0）
+
+extension CanvasState {
+
+    /// 一条对齐辅助线。拖动时画出来，告诉用户「贴上了谁」
+    struct SnapGuide: Identifiable {
+        let id = UUID()
+        /// true = 竖线（左右方向对齐），false = 横线
+        let isVertical: Bool
+        /// 线所在的位置（内容坐标：竖线是 x，横线是 y）
+        let position: CGFloat
+        /// 线画多长 —— 只覆盖参与对齐的那两张卡片，画满整屏反而看不出在跟谁对
+        let start: CGFloat
+        let end: CGFloat
+    }
+
+    /// 吸附判定的距离（**屏幕像素**）。缩小画布时内容坐标里的容差要相应放大，
+    /// 不然缩到 50% 时手感会变成「要凑到一半的距离才吸得上」
+    private static let snapThresholdOnScreen: CGFloat = 8
+
+    /// 拖动中算一次吸附。
+    ///
+    /// 拿被拖的那批卡片的整体外框，去跟其它卡片的左/中/右、上/中/下对齐，
+    /// 每个方向各取最近的一条。返回修正后的位移和要画的辅助线
+    func snapOffset(draggingIDs: Set<UUID>, rawOffset: CGSize) -> (offset: CGSize, guides: [SnapGuide]) {
+        guard snapEnabled, !draggingIDs.isEmpty else { return (rawOffset, []) }
+
+        let moving = nodes.filter { draggingIDs.contains($0.id) }
+        let others = nodes.filter { !draggingIDs.contains($0.id) }
+        guard var box = moving.first?.frame, !others.isEmpty else { return (rawOffset, []) }
+        for n in moving.dropFirst() { box = box.union(n.frame) }
+        box = box.offsetBy(dx: rawOffset.width, dy: rawOffset.height)
+
+        let threshold = Self.snapThresholdOnScreen / max(0.1, zoom)
+
+        // 竖直方向的三条候选：自己的左边/中线/右边，各去找最近的目标
+        var bestX: (delta: CGFloat, line: CGFloat, dist: CGFloat)?
+        var bestY: (delta: CGFloat, line: CGFloat, dist: CGFloat)?
+
+        for other in others {
+            let f = other.frame
+            for mine in [box.minX, box.midX, box.maxX] {
+                for target in [f.minX, f.midX, f.maxX] {
+                    let d = abs(target - mine)
+                    if d <= threshold, d < (bestX?.dist ?? .greatestFiniteMagnitude) {
+                        bestX = (target - mine, target, d)
+                    }
+                }
+            }
+            for mine in [box.minY, box.midY, box.maxY] {
+                for target in [f.minY, f.midY, f.maxY] {
+                    let d = abs(target - mine)
+                    if d <= threshold, d < (bestY?.dist ?? .greatestFiniteMagnitude) {
+                        bestY = (target - mine, target, d)
+                    }
+                }
+            }
+        }
+
+        let snapped = CGSize(width: rawOffset.width + (bestX?.delta ?? 0),
+                             height: rawOffset.height + (bestY?.delta ?? 0))
+        let finalBox = box.offsetBy(dx: bestX?.delta ?? 0, dy: bestY?.delta ?? 0)
+
+        var guides: [SnapGuide] = []
+        if let x = bestX?.line {
+            // 辅助线纵向只画到「参与对齐的卡片」的范围，看得出是在跟谁对齐
+            let related = others.filter { abs($0.frame.minX - x) < 0.5 || abs($0.frame.midX - x) < 0.5
+                                       || abs($0.frame.maxX - x) < 0.5 }
+            let lo = min(finalBox.minY, related.map(\.frame.minY).min() ?? finalBox.minY)
+            let hi = max(finalBox.maxY, related.map(\.frame.maxY).max() ?? finalBox.maxY)
+            guides.append(SnapGuide(isVertical: true, position: x, start: lo, end: hi))
+        }
+        if let y = bestY?.line {
+            let related = others.filter { abs($0.frame.minY - y) < 0.5 || abs($0.frame.midY - y) < 0.5
+                                       || abs($0.frame.maxY - y) < 0.5 }
+            let lo = min(finalBox.minX, related.map(\.frame.minX).min() ?? finalBox.minX)
+            let hi = max(finalBox.maxX, related.map(\.frame.maxX).max() ?? finalBox.maxX)
+            guides.append(SnapGuide(isVertical: false, position: y, start: lo, end: hi))
+        }
+        return (snapped, guides)
+    }
+}
+
+// MARK: - 上游顺序
+
+extension CanvasState {
+
+    /// 调整某个节点的上游顺序。
+    ///
+    /// 上游的先后就是 `edges` 里那几条入边的先后（`upstreamNodes` 直接按数组序取），
+    /// 所以重排 = 把这几条边按新顺序写回去，其它边的位置不动
+    func moveUpstream(of nodeID: UUID, from source: Int, to destination: Int) {
+        let incomingIdx = edges.indices.filter { edges[$0].to == nodeID }
+        guard source >= 0, source < incomingIdx.count,
+              destination >= 0, destination <= incomingIdx.count else { return }
+
+        var incoming = incomingIdx.map { edges[$0] }
+        let moved = incoming.remove(at: source)
+        // 往后拖时，移除那一项会让目标下标前移一位
+        let target = destination > source ? destination - 1 : destination
+        incoming.insert(moved, at: min(target, incoming.count))
+
+        pushUndo()
+        for (slot, edgeIndex) in incomingIdx.enumerated() {
+            edges[edgeIndex] = incoming[slot]
+        }
+    }
+}
+
+extension CanvasState {
+
+    /// 对调两条入边的先后。
+    ///
+    /// 交换首尾帧走这个，而不是 `moveUpstream` —— 那个是「移动」语义，
+    /// 上游里夹着非图片素材时，移动会把不相干的东西也挤走位；
+    /// 这里要的就是干脆利落地把两张图的位置换过来，反复点也能来回换
+    func swapUpstream(of nodeID: UUID, _ a: Int, _ b: Int) {
+        let incoming = edges.indices.filter { edges[$0].to == nodeID }
+        guard a >= 0, b >= 0, a < incoming.count, b < incoming.count, a != b else { return }
+        pushUndo()
+        edges.swapAt(incoming[a], incoming[b])
     }
 }

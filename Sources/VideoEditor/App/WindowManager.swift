@@ -248,6 +248,13 @@ final class WindowManager: NSObject {
         canvasScrollMonitors[id] = monitor
     }
 
+    private var canvasRightClickMonitors: [WindowID: Any] = [:]
+
+    func setCanvasRightClickMonitor(_ monitor: Any?, for id: WindowID) {
+        if let old = canvasRightClickMonitors[id] { NSEvent.removeMonitor(old) }
+        canvasRightClickMonitors[id] = monitor
+    }
+
     func setEscMonitor(_ monitor: Any?, for id: WindowID) {
         // 同一个窗口重复注册时先撤掉旧的，避免一个窗口挂两个
         if let old = escMonitors[id] { NSEvent.removeMonitor(old) }

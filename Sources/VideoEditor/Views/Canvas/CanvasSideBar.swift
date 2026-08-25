@@ -36,7 +36,7 @@ struct CanvasSideBar: View {
             sideButton(icon: "folder", help: "素材库", active: panel == .library) {
                 panel = (panel == .library) ? nil : .library
             }
-            sideButton(icon: "compound", help: "元素库（这张画布生成的）", active: panel == .assets) {
+            sideButton(icon: "elementLibrary", help: "元素库（这张画布生成的）", active: panel == .assets) {
                 panel = (panel == .assets) ? nil : .assets
             }
         }

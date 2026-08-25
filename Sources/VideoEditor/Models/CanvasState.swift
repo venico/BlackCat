@@ -13,6 +13,9 @@ final class CanvasState: ObservableObject {
 
     @Published var zoom: CGFloat = 1.0
     @Published var offset: CGSize = .zero
+    /// 画布可视区域大小。NSEvent 层的右键监听靠它把窗口坐标换算成内容坐标，
+    /// 判断「这次右键是不是点在正在编辑的文本卡片上」
+    @Published var containerSize: CGSize = .zero
 
     /// 画布顶部露出底层界面的高度。默认 0 = 整个盖住，
     /// 用户可以拖顶部那个手柄把画布往下收，露出底下的预览和时间轴
@@ -146,11 +149,79 @@ final class CanvasState: ObservableObject {
     /// 点画布空白要退出编辑，本地状态收不到这个信号
     @Published var editingTextNodeID: UUID?
 
+    /// 拖卡片时吸附到别的卡片的边和中线。跟着 AppSettings 走 —— 这是用户偏好，
+    /// 换个画布、重开 app 都该记着
+    var snapEnabled: Bool {
+        get { AppSettings.shared.canvasSnapEnabled }
+        set { AppSettings.shared.canvasSnapEnabled = newValue; objectWillChange.send() }
+    }
+
+    /// 显示连接线
+    var edgesVisible: Bool {
+        get { AppSettings.shared.canvasEdgesVisible }
+        set { AppSettings.shared.canvasEdgesVisible = newValue; objectWillChange.send() }
+    }
+
+    /// 当前要画的对齐辅助线。拖动中实时更新，松手清空
+    @Published var snapGuides: [SnapGuide] = []
+
+    /// 鼠标正悬在哪张文本卡片上。
+    ///
+    /// 画布的滚轮监听默认把**所有**滚轮事件都吞掉去平移画布，文本卡片里的
+    /// NSTextView 一个都收不到 —— 文字超出卡片也滚不动。有了这个，
+    /// 滚轮落在文本卡片上时就放行给它自己滚
+    @Published var hoveredTextNodeID: UUID?
+
+    /// 编辑中的文本卡片，光标在文字里的位置（UTF-16 偏移）。
+    /// 工具栏按它决定「H1/B/I/U/S 作用在哪一行」—— 光标在第二段就改第二段，
+    /// 不能一律往第一行加
+    @Published var textCaretLocation: Int = 0
+
+    /// 「文字被程序改了，不是用户敲进去的」的信号，每改一次加一。
+    ///
+    /// 编辑中的 NSTextView 平时**不接受**外部内容覆盖 —— 用户打字时绑定值会
+    /// 短暂滞后一拍，那会儿拿绑定去盖 tv.string 会把刚敲的字冲掉。但工具栏点
+    /// H1/B/I/U/S 改的正是同一份文字，属于「确实该盖进去」的外部修改。
+    /// 靠这个计数把两者区分开：只有它变了，编辑器才强制同步一次
+    @Published var textEditRevision: Int = 0
+
+    /// 鼠标在内容坐标里的位置。
+    ///
+    /// **单独一个对象、而且是 let 不是 @Published**：只有连线层需要它（判断鼠标
+    /// 有没有悬在某条线上）。挂在 CanvasState 上的话，鼠标每动一下所有卡片、
+    /// 所有连线都得重算一次 body —— 卡片一多就是持续的掉帧，而鼠标移动是
+    /// 整个画布里最高频的事件
+    let hoverProbe = CanvasHoverProbe()
+
+    /// 最近一次右键的位置（画布容器坐标）。
+    /// 事件在 CanvasKeyMonitor 里捕获（挂在 ContentView 上），画布层收到后
+    /// 做命中判定并弹自绘菜单 —— 两边不在一个视图里，靠这个字段传话
+    @Published var rightClickAt: CGPoint?
+
+    /// 底部聊天框是不是真的在被输入。
+    ///
+    /// **不能靠 NSWindow.firstResponder 判断**：聊天框那个 NSTextView 一挂上
+    /// 视图层级就会自动成为第一响应者，哪怕用户从没点过它、界面上也没有光标。
+    /// 靠它判断「是不是在输入文字」的话，画布的 delete / ⌘Z / ⇧⌘Z 会被永久
+    /// 误判成「归输入框」而全部失效（实测日志：editing=true 但用户只是选中了卡片）。
+    /// 改成由用户的实际动作来置位：点进输入框才算在输入，点卡片/空白就收回
+    @Published var promptBarFocused = false
+
+    /// 待插入聊天框的提及文字（「@图1」这样）。
+    ///
+    /// 卡片上的 @ 按钮在画布层，输入框的内容是聊天框自己的本地状态，
+    /// 两边不在一个视图里，靠这个字段传话。插完由聊天框清空。
+    /// **只是往提示词里插一段文字，不建立任何连线**
+    @Published var pendingMention: String?
+
     /// 连线被拒时的提示，比如「图片不能参考音频」
     @Published var rejectMessage: String?
 
     /// 节点 → 在跑的任务 id，取消时用
     private var runningTaskIDs: [UUID: UUID] = [:]
+
+    /// 这一轮文字编辑有没有记过撤销点。见 noteTextEdit
+    private var textUndoRecordedFor: UUID?
 
     // MARK: - 撤销/重做
 
@@ -159,6 +230,10 @@ final class CanvasState: ObservableObject {
     private struct Snapshot: Equatable {
         var nodes: [CanvasNode]
         var edges: [CanvasEdge]
+        /// **组也要存**。只存节点和连线的话，删掉一个组再撤销，卡片会回来、
+        /// 卡片身上的 groupID 也回来了，但 `groups` 里那条记录没恢复 ——
+        /// 组名和那块浅色底就永远找不回来了
+        var groups: [CanvasGroup]
     }
 
     private var undoStack: [Snapshot] = []
@@ -182,22 +257,24 @@ final class CanvasState: ObservableObject {
     }
 
     func pushUndo() {
-        undoStack.append(Snapshot(nodes: nodes, edges: edges))
+        undoStack.append(Snapshot(nodes: nodes, edges: edges, groups: groups))
         if undoStack.count > Self.maxUndo { undoStack.removeFirst() }
         redoStack.removeAll()
         syncUndoCounts()
     }
 
     func undo() {
+        endTextEditUndoGroup()
         guard let snap = undoStack.popLast() else { return }
-        redoStack.append(Snapshot(nodes: nodes, edges: edges))
+        redoStack.append(Snapshot(nodes: nodes, edges: edges, groups: groups))
         apply(snap)
         syncUndoCounts()
     }
 
     func redo() {
+        endTextEditUndoGroup()
         guard let snap = redoStack.popLast() else { return }
-        undoStack.append(Snapshot(nodes: nodes, edges: edges))
+        undoStack.append(Snapshot(nodes: nodes, edges: edges, groups: groups))
         apply(snap)
         syncUndoCounts()
     }
@@ -205,6 +282,11 @@ final class CanvasState: ObservableObject {
     private func apply(_ snap: Snapshot) {
         nodes = snap.nodes
         edges = snap.edges
+        groups = snap.groups
+        // 选中的组可能已经不在了
+        if let g = selectedGroupID, !groups.contains(where: { $0.id == g }) {
+            selectedGroupID = nil
+        }
         // 选中的节点可能已经不在了
         let alive = Set(nodes.map(\.id))
         selectedNodeIDs.formIntersection(alive)
@@ -231,6 +313,7 @@ final class CanvasState: ObservableObject {
     /// 改比例：卡片跟着变形，中心保持不动（不然改一次比例卡片就往右下跑）
     func setRatio(_ ratio: String, for nodeID: UUID) {
         guard let i = nodes.firstIndex(where: { $0.id == nodeID }) else { return }
+        pushUndo()
         let old = nodes[i].size
         let new = nodes[i].kind.defaultSize(ratio: ratio)
         nodes[i].ratio = ratio
@@ -259,6 +342,22 @@ final class CanvasState: ObservableObject {
     }
 
     func node(_ id: UUID) -> CanvasNode? { nodes.first { $0.id == id } }
+
+    /// 文字被用户改动时调一下：**一轮编辑只压一个撤销点**。
+    ///
+    /// 每敲一个字压一次的话，50 步的撤销栈会被单个字符塞满，
+    /// 按 ⌘Z 只能一个字一个字往回退，而且几下就把之前的操作挤没了。
+    /// 「一轮」由 `endTextEditUndoGroup()` 划断（进出编辑态、工具栏改样式时）
+    func noteTextEdit(_ nodeID: UUID) {
+        guard textUndoRecordedFor != nodeID else { return }
+        textUndoRecordedFor = nodeID
+        pushUndo()
+    }
+
+    /// 结束当前这轮文字编辑：下次改动会重新压一个撤销点
+    func endTextEditUndoGroup() {
+        textUndoRecordedFor = nil
+    }
 
     // MARK: - 连线操作
 
@@ -353,6 +452,20 @@ final class CanvasState: ObservableObject {
             return
         }
 
+        // 首尾帧模式：上游的头两张图分别当首帧、尾帧，不再走参考图那条路。
+        // 顺序就是连线顺序 —— 界面上拖动重排，改的其实是连线的先后
+        var firstFrame: URL?
+        var lastFrame: URL?
+        if node.kind == .video, node.usesFrameMode {
+            firstFrame = images.first
+            lastFrame = images.dropFirst().first
+            images = []
+        }
+
+        // 空卡片是「就地填进去」，已经有素材的则**另起一张新卡片** ——
+        // 直接覆盖等于把上一次的结果冲掉，没法对比也退不回去。
+        // 要在发起时就记下来：等结果回来时卡片状态可能已经变了
+        let hadContent = node.hasContent
         updateNode(id: nodeID) { $0.isGenerating = true; $0.isWaiting = false }
 
         let taskID = AIVideoService.shared.generateForCanvas(
@@ -364,21 +477,25 @@ final class CanvasState: ObservableObject {
             imageRatio: settings.aiImageRatio,
             referenceImages: images,
             referenceVideos: videos,
-            referenceAudios: audios) { [weak self] result in
+            referenceAudios: audios,
+            firstFrame: firstFrame,
+            lastFrame: lastFrame) { [weak self] result in
                 guard let self else { return }
+                let kind = self.node(nodeID)?.kind
                 self.updateNode(id: nodeID) {
                     $0.isGenerating = false
                     switch result {
                     case .success(let url):
-                        $0.mediaPath = url.path
+                        // 原卡片已经有素材了就别动它，产物落到旁边的新卡片上
+                        if !hadContent { $0.mediaPath = url.path }
                         $0.failure = nil
                     case .failure(let error):
                         $0.failure = (error is CancellationError) ? "已取消" : error.localizedDescription
                     }
                 }
-                if case .success(let url) = result,
-                   let kind = self.node(nodeID)?.kind {
-                    self.recordProducedAsset(url: url, kind: kind)
+                if case .success(let url) = result {
+                    if hadContent { self.spawnResultNode(from: nodeID, mediaURL: url) }
+                    if let kind { self.recordProducedAsset(url: url, kind: kind) }
                 }
                 self.runningTaskIDs.removeValue(forKey: nodeID)
                 // 等着这个节点的下游可以开工了
@@ -403,21 +520,45 @@ final class CanvasState: ObservableObject {
             return
         }
 
+        // 跟素材卡片一个规矩：卡片里已经有字了就另起一张，别把原文冲掉
+        let hadContent = node.hasContent
         updateNode(id: nodeID) { $0.isGenerating = true; $0.isWaiting = false }
         let taskID = AIVideoService.shared.generateTextForCanvas(prompt: prompt, provider: provider) { [weak self] result in
             guard let self else { return }
             self.updateNode(id: nodeID) {
                 $0.isGenerating = false
                 switch result {
-                case .success(let text): $0.text = text; $0.failure = nil
+                case .success(let text):
+                    if !hadContent { $0.text = text }
+                    $0.failure = nil
                 case .failure(let error):
                     $0.failure = (error is CancellationError) ? "已取消" : error.localizedDescription
                 }
+            }
+            if case .success(let text) = result, hadContent {
+                self.spawnResultNode(from: nodeID, text: text)
             }
             self.runningTaskIDs.removeValue(forKey: nodeID)
             self.resumeWaitingNodes(provider: provider, settings: .shared)
         }
         runningTaskIDs[nodeID] = taskID
+    }
+
+    /// 生成结果落一张新卡片，摆在源卡片右边。
+    ///
+    /// 只在「源卡片本来就有内容」时走这条 —— 空卡片直接填进去更自然，
+    /// 生成一次冒出两张（一空一满）反而奇怪
+    private func spawnResultNode(from sourceID: UUID, mediaURL: URL? = nil, text: String? = nil) {
+        guard let src = node(sourceID) else { return }
+        let pos = CGPoint(x: src.position.x + src.size.width + 90, y: src.position.y)
+        let new = addNode(kind: src.kind, at: pos, ratio: src.ratio)
+        updateNode(id: new.id) {
+            $0.size = src.size
+            // 提示词一并带过去：接着再生成一版时不用重新写
+            $0.prompt = src.prompt
+            if let mediaURL { $0.mediaPath = mediaURL.path }
+            if let text { $0.text = text }
+        }
     }
 
     /// 上游完成后，把等着它的下游拉起来
@@ -499,6 +640,65 @@ final class CanvasState: ObservableObject {
         offset = .zero
     }
 
+    /// 把画布挪到让某张卡片居中，**同时放大到看得清**。
+    /// 聊天框里双击一张参考素材就用这个 —— 参考的是画布上哪张卡片，一眼看到
+    func focus(on nodeID: UUID, containerSize: CGSize) {
+        guard let n = node(nodeID), containerSize.width > 1, containerSize.height > 1 else { return }
+        let box = n.frame
+        // 让这张卡片占到视口的六成左右：太满会看不到它跟周围的关系，
+        // 太小又等于没放大。已经比这更大就不动缩放，免得反而缩小
+        let fit = min(containerSize.width * 0.6 / max(1, box.width),
+                      containerSize.height * 0.6 / max(1, box.height))
+        let target = min(Self.maxZoom, max(zoom, min(fit, 1.5)))
+
+        // 换算关系跟 setZoom / zoomToFit 一致：
+        // 屏幕位置 = (内容坐标 - center) × zoom + center + offset
+        let center = CGPoint(x: containerSize.width / 2, y: containerSize.height / 2)
+        withAnimation(.easeOut(duration: 0.25)) {
+            zoom = target
+            offset = CGSize(width: -(box.midX - center.x) * target,
+                            height: -(box.midY - center.y) * target)
+            selectedGroupID = nil
+            selectedNodeIDs = [nodeID]
+        }
+    }
+
+    /// 断开一条参考连线（聊天框里点素材上的 × 走这儿）
+    func disconnect(from: UUID, to: UUID) {
+        guard edges.contains(where: { $0.from == from && $0.to == to }) else { return }
+        pushUndo()
+        edges.removeAll { $0.from == from && $0.to == to }
+    }
+
+    /// 缩放到刚好装下画布上所有东西，并居中。
+    ///
+    /// 包围盒算的是**卡片连同上方标签行**，再并上组的浅色底 —— 组框可能比
+    /// 成员的包围盒还大（用户手动拉过），只算卡片会把组的边缘切在视口外
+    func zoomToFit(containerSize: CGSize) {
+        guard !nodes.isEmpty, containerSize.width > 1, containerSize.height > 1 else {
+            resetView()
+            return
+        }
+        var box = frameWithLabel(nodes[0])
+        for n in nodes.dropFirst() { box = box.union(frameWithLabel(n)) }
+        for g in groupFrames { box = box.union(g.rect) }
+        guard box.width > 1, box.height > 1 else { resetView(); return }
+
+        // 四周留一圈，不然卡片正好贴着边看着憋屈
+        let margin: CGFloat = 60
+        let usableW = max(1, containerSize.width - margin * 2)
+        let usableH = max(1, containerSize.height - margin * 2)
+        let fit = min(usableW / box.width, usableH / box.height)
+        let newZoom = min(Self.maxZoom, max(Self.minZoom, fit))
+
+        // 让包围盒中心落在视口中心。换算关系跟 setZoom 那边一致：
+        // 屏幕位置 = (内容坐标 - center) × zoom + center + offset
+        let center = CGPoint(x: containerSize.width / 2, y: containerSize.height / 2)
+        zoom = newZoom
+        offset = CGSize(width: -(box.midX - center.x) * newZoom,
+                        height: -(box.midY - center.y) * newZoom)
+    }
+
     /// 下一档缩放值。用固定档位而不是乘系数，是为了让百分比读数干净
     private func niceStep(from current: CGFloat, up: Bool) -> CGFloat {
         let stops: [CGFloat] = [0.1, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0]
@@ -558,4 +758,9 @@ extension CanvasState {
         title = "未命名画布"
         clearUndoHistory()
     }
+}
+
+/// 只装一个鼠标位置的小对象。见 CanvasState.hoverProbe 的注释
+final class CanvasHoverProbe: ObservableObject {
+    @Published var point: CGPoint?
 }

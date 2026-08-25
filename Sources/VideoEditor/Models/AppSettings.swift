@@ -354,6 +354,19 @@ final class AppSettings: ObservableObject {
         UserDefaults.standard.string(forKey: "settings.canvas.provider.\(category)") ?? ""
     }
 
+    /// 画布：拖卡片时吸附对齐。这类开关是用户偏好，得记住 ——
+    /// 每次打开画布都重置回默认会很烦
+    var canvasSnapEnabled: Bool {
+        get { UserDefaults.standard.object(forKey: "settings.canvas.snap") as? Bool ?? true }
+        set { UserDefaults.standard.set(newValue, forKey: "settings.canvas.snap"); objectWillChange.send() }
+    }
+
+    /// 画布：显示连接线
+    var canvasEdgesVisible: Bool {
+        get { UserDefaults.standard.object(forKey: "settings.canvas.edges") as? Bool ?? true }
+        set { UserDefaults.standard.set(newValue, forKey: "settings.canvas.edges"); objectWillChange.send() }
+    }
+
     func setCanvasProvider(_ raw: String, for category: String) {
         UserDefaults.standard.set(raw, forKey: "settings.canvas.provider.\(category)")
         objectWillChange.send()

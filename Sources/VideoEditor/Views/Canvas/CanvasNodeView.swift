@@ -21,6 +21,12 @@ struct CanvasNodeView: View {
     static let plusGutter: CGFloat = 40
     /// 卡片上方类型标签占的高度
     static let labelHeight: CGFloat = 18
+    /// 文本卡片调整热区骑在边线上：一半探出卡片外、一半留在卡片内，
+    /// 鼠标不用精确停在轮廓线上也能抓到。跟 plusGutter 一个道理 ——
+    /// 上/左/右三边探出去有 labelHeight/plusGutter 现成的余量兜着，
+    /// 只有底边没有任何余量，body 最外层的 frame 要单独为它多留这么高，
+    /// 不然探出去的那部分会被最外层 contentShape 裁在可交互区域之外
+    static let edgeStraddle: CGFloat = 8
 
     @ObservedObject private var player = AIInlinePlayer.shared
     @State private var isHovering = false
@@ -46,9 +52,17 @@ struct CanvasNodeView: View {
 
     /// 画的时候用这个尺寸：调整中是临时值，平时就是 model 里的
     private var effectiveSize: CGSize { liveSize ?? node.renderSize }
-    /// 输入框的焦点。TextEditor 冒出来不会自动带光标，
-    /// 不主动聚焦的话用户得再点一次 —— 表现就是「要双击才能输入」
-    @FocusState private var textFocused: Bool
+    /// 是否该把键盘焦点给文本卡片的输入框。
+    ///
+    /// **是 `@State` 不是 `@FocusState`** —— 换成 NSTextView（CanvasTextEditor）
+    /// 之后，这个值再没有 `.focused($textFocused)` 绑定到任何真正的 SwiftUI
+    /// 可聚焦控件上，纯粹是传给 `CanvasTextEditor.focused` 参数的一个普通开关。
+    /// 顶着 `@FocusState` 这个名不副实的类型，会被 SwiftUI 的焦点系统当成
+    /// 真·焦点状态去管理，在没有关联视图的情况下行为不可控 —— 表现就是
+    /// 「打一个字，输入框自己就失焦了，得再点一次才能接着打」
+    @State private var textFocused: Bool = false
+    /// 上次点击这张卡片的时间，用来自己判双击（见 onTapGesture 的注释）
+    @State private var lastTapTime: Date = .distantPast
 
     private var isSelected: Bool { canvas.selectedNodeIDs.contains(node.id) }
 
@@ -63,6 +77,8 @@ struct CanvasNodeView: View {
         guard !isDragging, canvas.draggingNodeIDs.contains(node.id) else { return .zero }
         return canvas.draggingOffset
     }
+    /// 只有文本卡片有 resize 热区，只有它需要这份底部余量
+    private var bottomResizeMargin: CGFloat { node.kind == .text ? Self.edgeStraddle : 0 }
     private var isEditingText: Bool { canvas.editingTextNodeID == node.id }
     /// 正在拉的线悬在这个节点上 —— 松手就会连上它
     private var isDropTarget: Bool { canvas.hoveredDropTarget == node.id }
@@ -84,39 +100,77 @@ struct CanvasNodeView: View {
                 .frame(width: effectiveSize.width, height: Self.labelHeight - 4, alignment: .bottom)
 
                 card
+                // 底部热区要探出卡片边界，占位撑开 VStack 的声明高度，
+                // 这样 ZStack 居中对齐不会因为外层 frame 变高而把内容一起下移
+                // ——「透明」是因为这里本来就不该看得见任何东西
+                if node.kind == .text {
+                    Color.clear.frame(height: Self.edgeStraddle)
+                }
             }
             .frame(width: effectiveSize.width)
 
             plusButton(.leading)
             plusButton(.trailing)
+            // 连接点排在 + 后面 —— 它贴着卡片边框，要压在文本卡片的
+            // resize 热区上面，不然拖它会变成调整卡片大小
+            connectorDot(.leading)
+            connectorDot(.trailing)
         }
-        // 把两侧空当算进 frame，+ 才收得到鼠标
+        // 把两侧空当算进 frame，+ 才收得到鼠标；底部再加一份给 resize 热区
         .frame(width: effectiveSize.width + Self.plusGutter * 2,
-               height: effectiveSize.height + Self.labelHeight)
+               height: effectiveSize.height + Self.labelHeight + bottomResizeMargin)
         .contentShape(Rectangle())
         .onHover { inside in
             isHovering = inside
             autoPlayOnHover(inside)
+            // 文本卡片：告诉画布「滚轮现在归这张卡片」，见 CanvasState.hoveredTextNodeID
+            if node.kind == .text {
+                if inside {
+                    canvas.hoveredTextNodeID = node.id
+                } else if canvas.hoveredTextNodeID == node.id {
+                    canvas.hoveredTextNodeID = nil
+                }
+            }
         }
         .offset(x: dragOffset.width + livePosDelta.width + carriedOffset.width,
                 y: dragOffset.height + livePosDelta.height + carriedOffset.height)
         .gesture(dragGesture)
+        // **自己判连击**，不挂 `.onTapGesture(count: 2)`。
+        // 同时挂单击和双击手势的话，SwiftUI 要等约 0.3 秒确认「不是双击」
+        // 才触发单击，选中卡片会明显延迟（画布空白处那次踩过同样的坑）
         .onTapGesture {
+            let now = Date()
+            let isDouble = now.timeIntervalSince(lastTapTime) < 0.35
+            lastTapTime = isDouble ? .distantPast : now
+
             // SwiftUI 的 tap 不给修饰键，只能问 NSEvent 当前按着什么
             let flags = NSEvent.modifierFlags
             canvas.select(node.id, additive: flags.contains(.command) || flags.contains(.shift))
             // 视频在放：点一下卡片就停下，播放图标跟着回来
-            if node.kind == .video, let url = node.mediaURL, player.isPlaying(url) {
+            if node.kind == .video, player.isPlaying(node.id) {
                 player.togglePause()
             }
-            // 文本节点：点一下直接进编辑并聚焦
-            if node.kind == .text {
+            // 文本卡片：**双击**才进编辑出光标。单击只选中 ——
+            // 单击就进编辑的话，「正在输入文字」一直成立，
+            // 画布的 delete / ⌘Z 会被一路放行给输入框，卡片就删不掉了
+            if node.kind == .text, isDouble {
                 canvas.editingTextNodeID = node.id
                 textFocused = true
+            } else {
+                // 其它情况一律把键盘焦点收回画布。不收的话焦点赖在
+                // 底部聊天框那个 NSTextView 上，快捷键会被当成「在输入框里」
+                canvas.editingTextNodeID = nil
+                canvas.promptBarFocused = false
+                NSApp.keyWindow?.makeFirstResponder(nil)
             }
         }
         .onChange(of: canvas.editingTextNodeID) { _, editing in
             textFocused = (editing == node.id)
+            // 进出编辑态各算一轮，下一轮改动会重新压撤销点
+            canvas.endTextEditUndoGroup()
+            // 换一张卡片编辑，光标位置得清零 —— 留着上一张的偏移，
+            // 工具栏会照着一个跟当前文字无关的位置去找行
+            if editing == node.id { canvas.textCaretLocation = 0 }
         }
         // 波形/时长/封面都得主动要一次。以前只读缓存不请求 ——
         // 进画布时音频卡片是空的，得等用户去点播放（那会儿别处顺带生成了）才冒出来
@@ -126,29 +180,33 @@ struct CanvasNodeView: View {
             localCover = nil
             prepareMedia()
         }
-        // 右键一张**已选中**的卡片 → 菜单管整批；右键没选中的 → 只管它自己（和它同组的）
-        .contextMenu {
-            CanvasContextMenuItems(canvas: canvas, targets: contextTargets)
-        }
+
 
     }
 
     /// 文本卡片四条边的调整热区。
     ///
     /// 不画把手 —— 鼠标挪到边上光标自己变成双向箭头，直接拖就改大小。
-    /// 热区 10pt（跟预览区控制框那边统一）：太宽会把卡片内容的点击也吃掉
+    /// 热区**骑在边线上**：一半探出卡片外、一半留在卡片内（各 edgeStraddle），
+    /// 不用把鼠标精确停在轮廓线上才能抓到。纯内嵌的话，鼠标稍微出去一点点
+    /// 就摸不到了，边缘本身又很细，很难一次就点中
     @ViewBuilder
     private var resizeEdges: some View {
-        let hit: CGFloat = 10
+        let straddle = Self.edgeStraddle
+        let thickness = straddle * 2
         ZStack {
-            edgeHandle(.top).frame(width: effectiveSize.width - hit * 2, height: hit)
+            edgeHandle(.top).frame(width: max(0, effectiveSize.width - thickness), height: thickness)
                 .frame(maxHeight: .infinity, alignment: .top)
-            edgeHandle(.bottom).frame(width: effectiveSize.width - hit * 2, height: hit)
+                .offset(y: -straddle)
+            edgeHandle(.bottom).frame(width: max(0, effectiveSize.width - thickness), height: thickness)
                 .frame(maxHeight: .infinity, alignment: .bottom)
-            edgeHandle(.leading).frame(width: hit, height: effectiveSize.height - hit * 2)
+                .offset(y: straddle)
+            edgeHandle(.leading).frame(width: thickness, height: max(0, effectiveSize.height - thickness))
                 .frame(maxWidth: .infinity, alignment: .leading)
-            edgeHandle(.trailing).frame(width: hit, height: effectiveSize.height - hit * 2)
+                .offset(x: -straddle)
+            edgeHandle(.trailing).frame(width: thickness, height: max(0, effectiveSize.height - thickness))
                 .frame(maxWidth: .infinity, alignment: .trailing)
+                .offset(x: straddle)
         }
         .frame(width: effectiveSize.width, height: effectiveSize.height)
     }
@@ -161,6 +219,8 @@ struct CanvasNodeView: View {
                 // 认领光标：画布层每次鼠标移动都会 set 一次箭头，
                 // 不认领的话这里刚设成双向箭头就被它改回去，看着就是狂闪
                 canvas.claimCursor(inside)
+                // 按住空格时光标归画布管（一直是手），这儿别抢
+                guard !canvas.isSpaceHeld else { return }
                 if inside {
                     (vertical ? NSCursor.resizeUpDown : NSCursor.resizeLeftRight).set()
                 } else {
@@ -239,11 +299,10 @@ struct CanvasNodeView: View {
         // 波形和缩略图都按 assetID 存，认不上 id 就等于没缓存
         if node.assetID == nil, let a = project.mediaAssets.first(where: { $0.url == url }) {
             canvas.updateNode(id: node.id) { $0.assetID = a.id }
-            project.loadWaveform(assetID: a.id, url: url)
         }
 
-        if node.kind == .audio, let id = node.assetID {
-            project.loadWaveform(assetID: id, url: url)
+        if node.kind == .audio {
+            project.loadWaveform(assetID: waveformKey, url: url)
         }
 
         // 素材库里有现成时长就不用自己算
@@ -273,9 +332,11 @@ struct CanvasNodeView: View {
         guard node.kind == .video, node.hasContent, !node.isGenerating,
               let url = node.mediaURL else { return }
         if inside {
-            // toggle 认 URL：这张已经暂停在半路就接着放，别的卡片在放就换成这张
-            if !player.isPlaying(url) { player.toggle(url) }
-        } else if player.isPlaying(url) {
+            // toggle 认 node.id：这张已经暂停在半路就接着放，别的卡片在放就换成这张。
+            // 不能认 url —— 两张卡片完全可能指向同一个文件，纯按 url 判断的话
+            // hover 一张会连带把另一张也标记成「正在播」
+            if !player.isPlaying(node.id) { player.toggle(url, key: node.id) }
+        } else if player.isPlaying(node.id) {
             player.togglePause()
         }
     }
@@ -296,16 +357,24 @@ struct CanvasNodeView: View {
                 isDragging = true
                 // 组里的卡片、框选中的一批：拖一张，其余的跟着走
                 canvas.draggingNodeIDs = canvas.dragCompanions(of: node.id)
-                dragOffset = CGSize(width: (value.location.x - value.startLocation.x) / canvas.zoom,
-                                    height: (value.location.y - value.startLocation.y) / canvas.zoom)
+                let raw = CGSize(width: (value.location.x - value.startLocation.x) / canvas.zoom,
+                                 height: (value.location.y - value.startLocation.y) / canvas.zoom)
+                // 吸附：贴到别的卡片的边或中线上，同时给出要画的辅助线
+                let snapped = canvas.snapOffset(draggingIDs: canvas.draggingNodeIDs, rawOffset: raw)
+                dragOffset = snapped.offset
+                canvas.snapGuides = snapped.guides
                 canvas.draggingOffset = dragOffset   // 连线跟着卡片走
             }
             .onEnded { value in
                 guard isDragging else { return }
                 isDragging = false
                 canvas.pushUndo()
-                let dx = (value.location.x - value.startLocation.x) / canvas.zoom
-                let dy = (value.location.y - value.startLocation.y) / canvas.zoom
+                // 提交时要用**吸附后**的位移，不然松手会弹回没对齐的位置
+                let raw = CGSize(width: (value.location.x - value.startLocation.x) / canvas.zoom,
+                                 height: (value.location.y - value.startLocation.y) / canvas.zoom)
+                let final = canvas.snapOffset(draggingIDs: canvas.draggingNodeIDs, rawOffset: raw).offset
+                let dx = final.width
+                let dy = final.height
                 for id in canvas.draggingNodeIDs {
                     guard let n = canvas.node(id) else { continue }
                     canvas.moveNode(id: id, to: CGPoint(x: n.position.x + dx, y: n.position.y + dy))
@@ -316,6 +385,7 @@ struct CanvasNodeView: View {
                 dragOffset = .zero
                 canvas.draggingNodeIDs = []
                 canvas.draggingOffset = .zero
+                canvas.snapGuides = []
             }
     }
 
@@ -426,23 +496,25 @@ struct CanvasNodeView: View {
             // 卡片 onHover 触发之后才出现的，等它出来鼠标早过去了，就是「一闪而过」
             if node.kind == .text { resizeEdges }
         }
-        // 时长贴在卡片内右上角，hover 才出 —— 平时别占着画面
-        .overlay(alignment: .topTrailing) {
-            if (isHovering || isDragging), let d = durationText {
-                Text(d)
-                    .font(.system(size: 10).monospacedDigit())
-                    .foregroundColor(.white)
-                    .padding(.horizontal, 6)
-                    .padding(.vertical, 3)
-                    .background(Capsule().fill(Color.black.opacity(0.55)))
-                    .padding(8)
-            }
-        }
         // hover 抬起来：投影要看得出来，才提示「这会儿可以直接拖」
         .shadow(color: .black.opacity(lifted ? 0.4 : 0),
                 radius: lifted ? 24 : 0,
                 y: lifted ? 12 : 0)
-        .overlay(alignment: .bottom) { floatingActions }
+        // 悬浮按钮统一放卡片上方（文本没有底部控制栏，之前留在底部，
+        // 现在跟图片/视频/音频统一到顶部）
+        .overlay(alignment: .top) { floatingActions }
+        // 播放控制栏：暂停、时间码、可拖进度条、静音，hover 才出，贴卡片底部
+        .overlay(alignment: .bottom) { mediaControlBar }
+    }
+
+    /// 播放控制栏。只有视频/音频、有内容、算得出时长才有意义
+    @ViewBuilder
+    private var mediaControlBar: some View {
+        if (isHovering || isDragging), node.kind == .video || node.kind == .audio,
+           node.hasContent, !node.isGenerating, assetDuration > 0, let url = node.mediaURL {
+            CanvasMediaControlBar(player: player, url: url, nodeID: node.id, duration: assetDuration,
+                                  showsSeekBar: node.kind == .video)
+        }
     }
 
     /// 卡片上的悬浮按钮。有内容且 hover 时才出 ——
@@ -453,6 +525,27 @@ struct CanvasNodeView: View {
     private var floatingActions: some View {
         if showsFloatingActions {
             HStack {
+                // 上传 / 换素材统一挪左上角，+ 号挪右上角 —— 跟改动前左右对调
+                if node.kind != .text {
+                    HStack(spacing: 4) {
+                        floatingButton(icon: "importFile", help: "从本地上传") {
+                            NotificationCenter.default.post(name: .canvasNodeUpload, object: node.id)
+                        }
+                        floatingButton(icon: "folder", help: "从素材库选择") {
+                            NotificationCenter.default.post(name: .canvasNodePickAsset, object: node.id)
+                        }
+                    }
+                }
+
+                Spacer()
+
+                // 图片/视频/音频：@ 把这张卡片挂到当前打开的聊天框上
+                // （连成参考 + 在提示词里插一个「@图1」这样的称呼）
+                if node.kind != .text {
+                    floatingButton(system: "at", help: "加到提示词里") {
+                        NotificationCenter.default.post(name: .canvasNodeMention, object: node.id)
+                    }
+                }
                 if node.kind == .text {
                     FloatingPlusButton(
                         items: [("添加到字幕", { NotificationCenter.default.post(name: .canvasNodeToSubtitle, object: node.id) }),
@@ -461,19 +554,6 @@ struct CanvasNodeView: View {
                     FloatingPlusButton(
                         items: [("添加到 AI 参考", { NotificationCenter.default.post(name: .canvasNodeToReference, object: node.id) }),
                                 ("添加到时间轴", { NotificationCenter.default.post(name: .canvasNodeToTimeline, object: node.id) })])
-                }
-
-                Spacer()
-
-                if node.kind != .text {
-                    HStack(spacing: 4) {
-                        floatingButton(icon: "importFile", help: "换成上传的文件") {
-                            NotificationCenter.default.post(name: .canvasNodeUpload, object: node.id)
-                        }
-                        floatingButton(icon: "folder", help: "从素材库换一个") {
-                            NotificationCenter.default.post(name: .canvasNodePickAsset, object: node.id)
-                        }
-                    }
                 }
             }
             .padding(10)
@@ -489,46 +569,86 @@ struct CanvasNodeView: View {
         FloatingIconButton(icon: icon, help: help, action: action)
     }
 
-    @ViewBuilder
+    /// SF Symbol 版的悬浮按钮（@ 这种项目图标里没有的）
+    private func floatingButton(system: String, help: String,
+                                action: @escaping () -> Void) -> some View {
+        FloatingIconButton(systemIcon: system, help: help, action: action)
+    }
+
+    /// 文本卡片，编辑态和默认态**统一用 NSTextView 渲染**，不分两条路径。
+    ///
+    /// 之前默认态用 SwiftUI 的 `Text`、编辑态用 NSTextView，内边距对齐了之后
+    /// 还是会「选中前后行数不一样」——两套排版引擎对同一字号的行高计算有细微
+    /// 差异，卡片高度刚好卡在「能放下 8 整行 + 半行」时，`Text` 会为了不露出
+    /// 裁一半的行，主动舍弃这半行并截断成省略号，NSTextView 配合滚动却能把
+    /// 这半行画出来。只有统一成同一套引擎才能保证像素级一致
     private var textCard: some View {
-        if isEditingText {
-            // 点过之后才是真输入框。一上来就放 TextEditor 的话，
-            // 想拖动节点会变成在文字里划选
-            // 用 NSTextView：SwiftUI 的 TextEditor 画不出下划线和删除线，
-            // 而文本卡片点一下就进编辑态，按 U / S 会看着像没反应
-            CanvasTextEditor(
-                text: Binding(
-                    get: { node.text },
-                    set: { newValue in canvas.updateNode(id: node.id) { $0.text = newValue } }),
-                fontSize: node.fontSize,
-                bold: node.bold,
-                italic: node.italic,
-                underline: node.underline,
-                strikethrough: node.strikethrough,
-                colorHex: node.textColorHex,
-                focused: textFocused)
-                .padding(6)
-        } else {
-            VStack {
-                HStack {
-                    // 样式（颜色/标题级别/粗斜体/下划线/删除线）在这层生效。
-                    // TextEditor 那层只吃字号、粗体、斜体、颜色 ——
-                    // 下划线和删除线 SwiftUI 的 TextEditor 给不了，编辑态先不显示
-                    Text(node.text.isEmpty ? "文本" : node.text)
-                        .font(.system(size: node.fontSize, weight: node.bold ? .bold : .regular))
-                        .italic(node.italic)
-                        .underline(node.underline)
-                        .strikethrough(node.strikethrough)
-                        .foregroundColor(node.text.isEmpty
-                                         ? Color.labelSecondary.opacity(0.4)
-                                         : Color(hex: node.textColorHex))
-                        .multilineTextAlignment(.leading)
-                    Spacer(minLength: 0)
+        ZStack {
+            // 生成中 / 失败：跟图片视频音频三种卡片同一套状态展示，只是之前漏了这一种
+            if node.isGenerating || node.isWaiting {
+                VStack(spacing: 8) {
+                    ProgressView().controlSize(.small)
+                    Text(node.progressText ?? (node.isWaiting ? "等上游生成完" : "生成中…"))
+                        .font(.system(size: 10))
+                        .foregroundColor(Color.labelSecondary)
+                    stopButton
                 }
-                Spacer(minLength: 0)
+            } else if let failure = node.failure {
+                VStack(spacing: 6) {
+                    Text(failure)
+                        .font(.system(size: 10))
+                        .foregroundColor(.orange)
+                        .multilineTextAlignment(.center)
+                        .lineLimit(3)
+                        .padding(.horizontal, 12)
+                    retryButton
+                }
+            } else {
+                CanvasTextEditor(
+                    text: isEditingText
+                        ? Binding(
+                            get: { node.text },
+                            set: { newValue in
+                                // 一轮编辑压一个撤销点（不是每个字一个）
+                                canvas.noteTextEdit(node.id)
+                                canvas.updateNode(id: node.id) { $0.text = newValue }
+                            })
+                        // 默认态不接文字改动，空文本时顶一句提示语上去；
+                        // 用独立的 .constant 绑定，不碰真实的 node.text
+                        : .constant(node.text.isEmpty ? "文本" : node.text),
+                    fontSize: node.fontSize,
+                    // 粗体/斜体/下划线/删除线现在完全由 markdown 语法决定（工具栏
+                    // 点 B/I/U/S 写的是 **/*/<u>/~~ 符号，不再写这几个字段了）。
+                    // 编辑态显示的是纯源码，不该再叠一层整段样式 —— 这几个字段是
+                    // markdown 改造前的遗留物，节点如果在改造前被点过对应按钮，
+                    // 值会一直留在数据里，读出来就会在编辑态凭空多出下划线/加粗，
+                    // 跟改动颜色这个操作本身毫无关系，只是同一次 setAttributes
+                    // 顺带把它们也画出来了
+                    bold: false,
+                    italic: false,
+                    underline: false,
+                    strikethrough: false,
+                    colorHex: node.text.isEmpty && !isEditingText ? "#FFFFFF" : node.textColorHex,
+                    focused: isEditingText && textFocused,
+                    isEditable: isEditingText,
+                    // 提示语要比正文淡：labelSecondary(white 0.45) × 0.4 ≈ 0.18
+                    textOpacity: node.text.isEmpty && !isEditingText ? 0.18 : 1.0,
+                    // 默认态按 markdown 渲染（## 变标题字号、**text** 变粗体，符号
+                    // 本身不显示）；编辑态给的是原始源码，用户要能看见、能改 # 和 **
+                    renderMarkdown: !isEditingText,
+                    // hover 才出滚动条、才能滚 —— 文字比卡片高时能看完整段内容
+                    isHovering: isHovering,
+                    // 工具栏（H1/B/I/U/S）改文字时靠它通知编辑器同步，
+                    // 见 CanvasState.textEditRevision
+                    syncRevision: canvas.textEditRevision,
+                    // 工具栏靠光标位置决定改哪一行
+                    onCaretMove: { canvas.textCaretLocation = $0 })
+                    .padding(14)
+                    // 默认态平时不接手势 —— 点击/拖动要穿透给卡片本体的 tap/drag
+                    // 处理，不能被这层 NSTextView 截胡（不然点文本卡片会变成
+                    // 「点了但没反应」）。hover 时放行，滚轮/拖滚动条才有地方接
+                    .allowsHitTesting(isEditingText || isHovering)
             }
-            .padding(14)
-            .contentShape(Rectangle())
         }
     }
 
@@ -536,7 +656,7 @@ struct CanvasNodeView: View {
     private func mediaCard(placeholder: String) -> some View {
         ZStack {
             if node.kind == .video, node.hasContent,
-               let url = node.mediaURL, player.isCurrent(url), let p = player.player {
+               player.isCurrent(node.id), let p = player.player {
                 // 播放中就直接画画面
                 InlinePlayerLayer(player: p)
                     .frame(width: effectiveSize.width, height: effectiveSize.height)
@@ -577,12 +697,7 @@ struct CanvasNodeView: View {
                                 .multilineTextAlignment(.center)
                                 .lineLimit(3)
                                 .padding(.horizontal, 12)
-                            Button("重试") {
-                                NotificationCenter.default.post(name: .canvasNodeRetry, object: node.id)
-                            }
-                            .buttonStyle(.plain)
-                            .font(.system(size: 11))
-                            .foregroundColor(Color.accent)
+                            retryButton
                         }
                     } else {
                         svgIcon(placeholder, size: 34)
@@ -606,17 +721,6 @@ struct CanvasNodeView: View {
         .overlay { playButton }
     }
 
-    /// 右上角时长。播放时跟着走（当前 / 总长），没播就只显示总长
-    private var durationText: String? {
-        guard node.kind == .video || node.kind == .audio, node.hasContent else { return nil }
-        let total = assetDuration
-        guard total > 0 else { return nil }
-        if let url = node.mediaURL, player.isCurrent(url), player.duration > 0 {
-            return "\(fmt(player.currentTime)) / \(fmt(total))"
-        }
-        return fmt(total)
-    }
-
     private var assetDuration: Double {
         if let id = node.assetID,
            let a = project.mediaAssets.first(where: { $0.id == id }), a.duration > 0 {
@@ -625,10 +729,7 @@ struct CanvasNodeView: View {
         return cachedDuration
     }
 
-    private func fmt(_ d: Double) -> String {
-        guard d.isFinite, d >= 0 else { return "--:--" }
-        return String(format: "%02d:%02d", Int(d) / 60, Int(d) % 60)
-    }
+
 
     /// 视频/音频卡片中央的播放按钮。播放器是单例，同时只响一个。
     /// 视频正在放的时候不显示 —— 那会儿画面自己在动，压个按钮在中间挡事
@@ -636,9 +737,11 @@ struct CanvasNodeView: View {
     private var playButton: some View {
         if node.hasContent, !node.isGenerating, let url = node.mediaURL,
            node.kind == .video || node.kind == .audio,
-           !(node.kind == .video && player.isPlaying(url)) {
-            Button { player.toggle(url) } label: {
-                Image(nsImage: TimelineSVGIcon.load(player.isPlaying(url) ? "pause" : "play"))
+           // 播放中不显示 —— 视频是画面自己在动，音频有底部控制栏的暂停按钮，
+           // 中间再压一个纯属重复
+           !player.isPlaying(node.id) {
+            Button { player.toggle(url, key: node.id) } label: {
+                Image(nsImage: TimelineSVGIcon.load(player.isPlaying(node.id) ? "pause" : "play"))
                     .renderingMode(.template)
                     .resizable()
                     .aspectRatio(contentMode: .fit)
@@ -649,12 +752,19 @@ struct CanvasNodeView: View {
                     .overlay(Circle().strokeBorder(Color.white.opacity(0.25)))
             }
             .buttonStyle(.plain)
-            .help(player.isPlaying(url) ? "暂停" : "播放")
+            .help(player.isPlaying(node.id) ? "暂停" : "播放")
         }
     }
 
     /// 封面。视频读素材库那份缩略图（跟素材库/时间轴共用一套缓存，不重复抽帧），
     /// 图片没进素材库时直接读文件
+    /// 波形缓存的 key。
+    ///
+    /// **不能只认 assetID** —— AI 生成、TTS、分离音轨出来的音频没进素材库，
+    /// assetID 是 nil，波形就永远画不出来（卡片只剩一个音频图标）。
+    /// 退回用节点自己的 id 当 key：缓存是内存里的字典，用谁的 id 都行，只要前后一致
+    private var waveformKey: UUID { node.assetID ?? node.id }
+
     private var coverImage: NSImage? {
         guard !node.isGenerating else { return nil }
         if let assetID = node.assetID, let thumb = project.mediaThumbnails[assetID] {
@@ -670,20 +780,25 @@ struct CanvasNodeView: View {
     private var audioCard: some View {
         ZStack {
             if node.isGenerating || node.isWaiting {
-                VStack(spacing: 8) {
+                // 音频卡片是矮横条，竖着摞「转圈 + 文字 + 停止」挤得放不下，
+                // 改成横排一行
+                HStack(spacing: 10) {
                     if let p = node.progress {
-                        ProgressView(value: p).frame(width: 140)
+                        ProgressView(value: p).frame(width: 90)
                         Text("\(node.progressText ?? "处理中…")  \(Int(p * 100))%")
                             .font(.system(size: 10).monospacedDigit())
                             .foregroundColor(Color.labelSecondary)
+                            .lineLimit(1)
                     } else {
                         ProgressView().controlSize(.small)
                         Text(node.progressText ?? "生成中…")
                             .font(.system(size: 10))
                             .foregroundColor(Color.labelSecondary)
+                            .lineLimit(1)
                     }
                     stopButton
                 }
+                .padding(.horizontal, 12)
             } else if let failure = node.failure {
                 VStack(spacing: 6) {
                     Text(failure)
@@ -691,18 +806,16 @@ struct CanvasNodeView: View {
                         .foregroundColor(.orange)
                         .lineLimit(2)
                         .padding(.horizontal, 12)
-                    Button("重试") {
-                        NotificationCenter.default.post(name: .canvasNodeRetry, object: node.id)
-                    }
-                    .buttonStyle(.plain)
-                    .font(.system(size: 11))
-                    .foregroundColor(Color.accent)
+                    retryButton
                 }
             } else if node.hasContent {
                 // 波形铺满卡片，播放按钮压在中间
-                if let assetID = node.assetID, let wave = project.waveformCache[assetID] {
+                if let wave = project.waveformCache[waveformKey] {
+                    // 时长优先用素材库那份；没有就用波形自己带的 ——
+                    // 传 0.1 进去等于只画开头那一瞬，画面上什么都看不见
                     AudioWaveformCanvas(waveData: wave, trimStart: 0,
-                                        clipDuration: max(0.1, assetDuration),
+                                        clipDuration: assetDuration > 0 ? assetDuration
+                                                                        : wave.totalDuration,
                                         fullHeight: true,
                                         barColor: Color(hex: "#5DB85D").opacity(0.5))
                 } else {
@@ -728,16 +841,24 @@ struct CanvasNodeView: View {
     @ViewBuilder
     private var playheadLine: some View {
         // 用 isCurrent 不是 isPlaying —— 暂停时线要停在原处，不能消失
-        if let url = node.mediaURL, player.isCurrent(url),
-           player.duration > 0, assetDuration > 0 {
-            GeometryReader { geo in
-                let ratio = min(1, max(0, player.currentTime / assetDuration))
-                Rectangle()
-                    .fill(Color.accent)
-                    .frame(width: 1)
-                    .position(x: geo.size.width * ratio, y: geo.size.height / 2)
+        if player.isCurrent(node.id), player.duration > 0, assetDuration > 0 {
+            CanvasPlayhead(clock: player.clock, duration: assetDuration) { player.seek(to: $0) }
+        }
+    }
+
+    /// 失败后的「重试」。三种卡片共用一个 —— 之前各写各的纯文字，
+    /// 混在同样是橙色的失败原因下面，看着像第二行说明而不是能点的东西
+    private var retryButton: some View {
+        HStack(spacing: 8) {
+            // 只有「重试」的话，这个失败态就退不出去了 —— 提示词写不对、
+            // 或者压根不想再生成时，卡片会一直卡在红字上。取消 = 清掉失败状态，
+            // 回到空卡片，该上传上传、该重写提示词重写
+            CanvasRetryButton(title: "取消", filled: false) {
+                canvas.updateNode(id: node.id) { $0.failure = nil }
             }
-            .allowsHitTesting(false)
+            CanvasRetryButton(title: "重试") {
+                NotificationCenter.default.post(name: .canvasNodeRetry, object: node.id)
+            }
         }
     }
 
@@ -785,11 +906,49 @@ struct CanvasNodeView: View {
                     Image(systemName: "plus")
                         .font(.system(size: 10, weight: .medium))
                         .foregroundColor(Color.labelSecondary))
+                // 用 effectiveSize 不用 node.size —— 拖左右边缘调整大小时，
+                // model 要等松手才更新，这里若读 node.size，+ 号在整个拖拽
+                // 过程里都不会挪窝，等松手才「唰」地跳到新位置
                 .offset(x: edge == .leading
-                        ? -(node.size.width / 2 + Self.plusGutter / 2)
-                        : (node.size.width / 2 + Self.plusGutter / 2),
-                        y: Self.labelHeight / 2)
+                        ? -(effectiveSize.width / 2 + Self.plusGutter / 2)
+                        : (effectiveSize.width / 2 + Self.plusGutter / 2),
+                        // 文本卡片底部多留了 edgeStraddle 高度，VStack 跟着变高，
+                        // ZStack 的几何中心被往下拉了半份 —— 减掉这一半才能让
+                        // + 号继续落在卡片纵向中点，不随这份余量往下漂
+                        y: Self.labelHeight / 2 - bottomResizeMargin / 2)
+                // 只管点击弹菜单。拉线交给卡片边缘上的连接点 ——
+                // 同一个控件既接 tap 又接 drag，轻点会被判成微小拖拽，
+                // 两种意图老打架
                 .onTapGesture { onPlusTap(edge) }
+        }
+    }
+
+    /// 这一侧接着线没有。右边看出边（这张卡片是谁的上游），左边看入边
+    private func isConnected(_ edge: Edge) -> Bool {
+        edge == .trailing ? canvas.edges.contains { $0.from == node.id }
+                          : canvas.edges.contains { $0.to == node.id }
+    }
+
+    /// 卡片左右边缘线上的连接点：**拖它拉线**。
+    ///
+    /// 跟 + 号分工明确：+ 在卡片外的空当里，点它弹菜单；圆点贴在卡片边框上，
+    /// 拖它连到别的卡片。位置贴边也是在说明「线是从这儿出去的」
+    @ViewBuilder
+    private func connectorDot(_ edge: Edge) -> some View {
+        if isHovering || canvas.pendingEdgeFrom == node.id {
+            // 这一侧连着线才实心，空着就是个空心圈 —— 一眼看出哪边已经接上了
+            let connected = isConnected(edge)
+            Circle()
+                .fill(connected ? Color.accent : Color(red: 0.19, green: 0.19, blue: 0.20))
+                .frame(width: 9, height: 9)
+                .overlay(Circle().strokeBorder(connected ? Color.black.opacity(0.35) : Color.accent,
+                                               lineWidth: 1.5))
+                // 视觉 9pt、热区 20pt —— 只按视觉大小做热区根本抓不住
+                .frame(width: 20, height: 20)
+                .contentShape(Circle())
+                // 贴在卡片左右边框的中点上。y 的补偿跟 + 号同理（见上面）
+                .offset(x: edge == .leading ? -effectiveSize.width / 2 : effectiveSize.width / 2,
+                        y: Self.labelHeight / 2 - bottomResizeMargin / 2)
                 .gesture(
                     DragGesture(coordinateSpace: .named("canvasContent"))
                         .onChanged { value in
@@ -807,6 +966,8 @@ extension Notification.Name {
     /// 节点上的「上传」/「素材」按钮 —— 文件面板得在 overlay 那层弹，
     /// 节点视图本身在缩放变换里，直接弹面板位置会乱
     static let canvasNodeUpload = Notification.Name("canvasNodeUpload")
+    /// 把这张卡片加到当前聊天框：连成参考并在提示词里插一个「@图1」
+    static let canvasNodeMention = Notification.Name("canvasNodeMention")
     static let canvasNodePickAsset = Notification.Name("canvasNodePickAsset")
     /// 把节点的素材挂到 AI 面板的参考区
     static let canvasNodeToReference = Notification.Name("canvasNodeToReference")
@@ -856,7 +1017,9 @@ private struct SmallCardAction: View {
 
 /// 卡片上的圆形悬浮按钮。hover 变亮，配气泡提示
 private struct FloatingIconButton: View {
-    let icon: String
+    var icon: String = ""
+    /// 项目图标库里没有的（比如 @）走 SF Symbol
+    var systemIcon: String?
     let help: String
     let action: () -> Void
 
@@ -864,11 +1027,18 @@ private struct FloatingIconButton: View {
 
     var body: some View {
         Button(action: action) {
-            Image(nsImage: SidebarSVGIcon.load(icon, size: 12))
-                .renderingMode(.template)
-                .resizable()
-                .aspectRatio(contentMode: .fit)
-                .frame(width: 12, height: 12)
+            Group {
+                if let systemIcon {
+                    Image(systemName: systemIcon)
+                        .font(.system(size: 11, weight: .medium))
+                } else {
+                    Image(nsImage: SidebarSVGIcon.load(icon, size: 12))
+                        .renderingMode(.template)
+                        .resizable()
+                        .aspectRatio(contentMode: .fit)
+                        .frame(width: 12, height: 12)
+                }
+            }
                 .foregroundColor(.white)
                 .frame(width: 24, height: 24)
                 .background(Circle().fill(Color.black.opacity(hovering ? 0.8 : 0.55)))
@@ -944,6 +1114,221 @@ private struct MenuItemRow: View {
                 .fill(Color.white.opacity(hovering ? 0.10 : 0))
                 .padding(.horizontal, 4))
             .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering = $0 }
+    }
+}
+
+
+/// 时间码格式化。文件级函数 —— 下面两个小视图和卡片本体都要用
+func canvasTimeText(_ d: Double) -> String {
+    guard d.isFinite, d >= 0 else { return "--:--" }
+    return String(format: "%02d:%02d", Int(d) / 60, Int(d) % 60)
+}
+
+/// 播放位置指示线。
+///
+/// **单独一个视图订阅时钟**：位置每 30ms 变一次，让整张卡片跟着重算的话，
+/// 画布上卡片一多就是持续掉帧（每秒 33 次 × 卡片数）
+private struct CanvasPlayhead: View {
+    @ObservedObject var clock: PlayheadClock
+    let duration: Double
+    var onSeek: (Double) -> Void
+
+    /// 线两侧各留这么宽的拖拽热区。**不能整卡片宽度都能拖** —— 那样会跟
+    /// 「拖动整张卡片挪位置」抢手势，音频卡片就没法正常拖动了。
+    /// 只在线本身附近才响应，用户说的是「拖动黄线」，不是「点哪都能跳转」
+    /// （点哪都能跳转是底部新加的进度条负责的）
+    private static let hit: CGFloat = 10
+
+    /// 手势按下那一刻的线位置，整个拖动过程用它做基准。
+    ///
+    /// **不能每帧都拿「当前重新算出来的 x」当基准** —— x 是跟着 clock.time 走的，
+    /// 而 clock.time 正是被 onSeek 改掉的那个值：上一次 onChanged 调了 onSeek，
+    /// 这一帧重新渲染出的 x 已经把那次结果算进去了，这时候再加上
+    /// 「从按下那一刻算起的累积 translation」，等于把同一段位移重复计了一次，
+    /// 拖一点点线就飞出去，跟手感完全对不上
+    @State private var dragBaseX: CGFloat?
+
+    var body: some View {
+        GeometryReader { geo in
+            let ratio = min(1, max(0, clock.time / duration))
+            let x = geo.size.width * ratio
+            ZStack {
+                Rectangle()
+                    .fill(Color.accent)
+                    .frame(width: 1)
+                    .position(x: x, y: geo.size.height / 2)
+                    .allowsHitTesting(false)
+
+                Color.white.opacity(0.001)
+                    .frame(width: Self.hit * 2)
+                    .position(x: x, y: geo.size.height / 2)
+                    .gesture(
+                        DragGesture(minimumDistance: 0)
+                            .onChanged { v in
+                                if dragBaseX == nil { dragBaseX = x }
+                                let base = dragBaseX ?? x
+                                let newX = min(geo.size.width, max(0, base + v.translation.width))
+                                onSeek(newX / geo.size.width * duration)
+                            }
+                            .onEnded { _ in dragBaseX = nil }
+                    )
+            }
+        }
+    }
+}
+
+/// 播放时右上角走字的时间码。同样只有它自己订阅时钟
+private struct CanvasPlayTime: View {
+    @ObservedObject var clock: PlayheadClock
+    let total: Double
+
+    var body: some View {
+        Text("\(canvasTimeText(clock.time)) / \(canvasTimeText(total))")
+    }
+}
+
+/// 视频/音频卡片底部的播放控制栏。
+/// 图标复用预览区/时间轴那套（play/pause、audioSpeaker/mute），
+/// 不新画一套，跟软件其它地方长一个样
+///
+/// 视频：暂停 + 时间码 + 可拖进度条 + 静音。
+/// 音频：**没有进度条** —— 波形图上已经有条可拖的黄线担着 seek 这件事，
+/// 控制栏里再放一条是重复；时间码改居中显示在暂停和静音中间，就是「卡片下边中间」
+private struct CanvasMediaControlBar: View {
+    @ObservedObject var player: AIInlinePlayer
+    let url: URL
+    let nodeID: UUID
+    let duration: Double
+    var showsSeekBar: Bool = true
+
+    private var isCurrent: Bool { player.isCurrent(nodeID) }
+
+    private var timeText: some View {
+        Group {
+            if isCurrent {
+                CanvasPlayTime(clock: player.clock, total: duration)
+            } else {
+                Text("\(canvasTimeText(0)) / \(canvasTimeText(duration))")
+            }
+        }
+        .font(.system(size: 10).monospacedDigit())
+        .foregroundColor(.white)
+        .fixedSize()
+    }
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Button { player.toggle(url, key: nodeID) } label: {
+                Image(nsImage: TimelineSVGIcon.load(player.isPlaying(nodeID) ? "pause" : "play"))
+                    .renderingMode(.template)
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .frame(width: 10, height: 10)
+                    .foregroundColor(.white)
+            }
+            .buttonStyle(.plain)
+            .help(player.isPlaying(nodeID) ? "暂停" : "播放")
+
+            if showsSeekBar {
+                timeText
+                CanvasSeekBar(isCurrent: isCurrent, clock: player.clock, duration: duration) {
+                    if !isCurrent { player.toggle(url, key: nodeID) }
+                    player.seek(to: $0)
+                }
+            } else {
+                Spacer(minLength: 0)
+                timeText
+                Spacer(minLength: 0)
+            }
+
+            Button { player.toggleMute() } label: {
+                Image(nsImage: SidebarSVGIcon.load(player.isMuted ? "mute" : "audioSpeaker", size: 12))
+                    .renderingMode(.template)
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .frame(width: 12, height: 12)
+                    .foregroundColor(.white)
+            }
+            .buttonStyle(.plain)
+            .help(player.isMuted ? "取消静音" : "静音")
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .frame(maxWidth: .infinity)
+        .background(LinearGradient(colors: [.clear, .black.opacity(0.65)],
+                                   startPoint: .top, endPoint: .bottom))
+    }
+}
+
+/// 可拖动进度条。点哪就跳到哪，跟拖播放线那种「只在线附近」不同 ——
+/// 这条整条宽度都是热区，这是控制栏里主要的 seek 入口
+private struct CanvasSeekBar: View {
+    let isCurrent: Bool
+    @ObservedObject var clock: PlayheadClock
+    let duration: Double
+    var onSeek: (Double) -> Void
+
+    @State private var isDragging = false
+    @State private var dragRatio: Double = 0
+
+    private var ratio: Double {
+        if isDragging { return dragRatio }
+        guard isCurrent, duration > 0 else { return 0 }
+        return min(1, max(0, clock.time / duration))
+    }
+
+    var body: some View {
+        GeometryReader { geo in
+            ZStack(alignment: .leading) {
+                Capsule().fill(Color.white.opacity(0.28))
+                Capsule().fill(Color.white.opacity(0.95))
+                    .frame(width: geo.size.width * ratio)
+            }
+            .frame(height: 3)
+            .frame(maxHeight: .infinity)   // 视觉细一条，热区撑满纵向好点中
+            .contentShape(Rectangle())
+            .gesture(
+                DragGesture(minimumDistance: 0)
+                    .onChanged { v in
+                        isDragging = true
+                        let r = min(1, max(0, v.location.x / geo.size.width))
+                        dragRatio = r
+                        onSeek(r * duration)
+                    }
+                    .onEnded { _ in isDragging = false }
+            )
+        }
+        .frame(height: 14)
+    }
+}
+
+/// 失败卡片上的「重试」。有底色的实心小按钮 —— 纯文字版跟上面橙色的
+/// 失败原因混在一起，看着像第二行说明文字，不像能点的
+private struct CanvasRetryButton: View {
+    var title: String = "重试"
+    /// 实心（主操作）还是描边（次要操作）
+    var filled: Bool = true
+    let action: () -> Void
+    @State private var hovering = false
+
+    var body: some View {
+        Button(action: action) {
+            Text(title)
+                .font(.system(size: 11, weight: .medium))
+                .foregroundColor(filled ? .black : Color.labelPrimary)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 5)
+                .background {
+                    if filled {
+                        Capsule().fill(Color.accent.opacity(hovering ? 1 : 0.9))
+                    } else {
+                        Capsule().fill(Color.white.opacity(hovering ? 0.16 : 0.10))
+                    }
+                }
+                .contentShape(Capsule())
         }
         .buttonStyle(.plain)
         .onHover { hovering = $0 }

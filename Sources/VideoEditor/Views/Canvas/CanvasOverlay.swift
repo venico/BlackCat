@@ -54,6 +54,11 @@ struct CanvasOverlay: View {
                     if effectiveGap > 0 { Color.clear.frame(height: effectiveGap) }
                     GeometryReader { geo in
                         canvasBody(containerSize: geo.size)
+                            // NSEvent 层的右键监听要判断「点击位置是否落在正在编辑的
+                            // 卡片上」，得知道这个容器多大才能做同一套坐标换算 ——
+                            // 见 CanvasKeyMonitor 里 rightMonitor 的注释
+                            .onAppear { canvas.containerSize = geo.size }
+                            .onChange(of: geo.size) { _, s in canvas.containerSize = s }
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .clipShape(UnevenRoundedRectangle(topLeadingRadius: 16, topTrailingRadius: 16))
@@ -123,6 +128,7 @@ struct CanvasOverlay: View {
         )
         .onHover { canvas.claimCursor($0) }
         .onHover { inside in
+            guard !canvas.isSpaceHeld else { return }   // 空格模式下光标归画布管
             if inside { NSCursor.resizeUpDown.set() } else { NSCursor.arrow.set() }
         }
         .help("上下拖动调整画布高度")
@@ -163,10 +169,20 @@ struct CanvasOverlay: View {
     private func topRightBar(containerSize: CGSize) -> some View {
         HStack(spacing: 6) {
             pillGroup {
-                barButton(system: "arrow.uturn.backward", help: "撤销（⌘Z）", enabled: canvas.canUndo) {
+                toggleButton(timeline: "snap", help: "吸附对齐", on: canvas.snapEnabled) {
+                    canvas.snapEnabled.toggle()
+                }
+                toggleButton(svg: "relink", help: "显示连接线", on: canvas.edgesVisible) {
+                    canvas.edgesVisible.toggle()
+                }
+            }
+
+            pillGroup {
+                // 图标复用时间轴那两个，同一件事在两处长一个样
+                barButton(timeline: "undo", help: "撤销（⌘Z）", enabled: canvas.canUndo) {
                     canvas.undo()
                 }
-                barButton(system: "arrow.uturn.forward", help: "重做（⇧⌘Z）", enabled: canvas.canRedo) {
+                barButton(timeline: "redo", help: "重做（⇧⌘Z）", enabled: canvas.canRedo) {
                     canvas.redo()
                 }
             }
@@ -175,7 +191,15 @@ struct CanvasOverlay: View {
                 barButton(system: "minus", help: "缩小", enabled: canvas.zoom > CanvasState.minZoom) {
                     canvas.zoomOut(containerSize: containerSize)
                 }
-                Button { canvas.resetView() } label: {
+                Button {
+                    // 已经在 100% 上了就切到「刚好装下全部内容」，否则先回 100%。
+                    // 一个按钮来回切这两档，不用再多摆一个「适应画布」的按钮
+                    if abs(canvas.zoom - 1) < 0.001 {
+                        canvas.zoomToFit(containerSize: containerSize)
+                    } else {
+                        canvas.resetView()
+                    }
+                } label: {
                     Text("\(canvas.zoomPercent)%")
                         .font(.system(size: 11).monospacedDigit())
                         .foregroundColor(Color.labelSecondary)
@@ -183,7 +207,7 @@ struct CanvasOverlay: View {
                         .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
-                .help("点一下回到 100%")
+                .help(abs(canvas.zoom - 1) < 0.001 ? "点一下缩放到全部内容" : "点一下回到 100%")
 
                 barButton(system: "plus", help: "放大", enabled: canvas.zoom < CanvasState.maxZoom) {
                     canvas.zoomIn(containerSize: containerSize)
@@ -195,14 +219,47 @@ struct CanvasOverlay: View {
     private func pillGroup<Content: View>(@ViewBuilder _ content: () -> Content) -> some View {
         HStack(spacing: 2) { content() }
             .padding(.horizontal, 4)
-            .padding(.vertical, 3)
+            // 高度跟左上角关闭按钮那个圆一致（28）。上下再留 padding 的话
+            // 这两条胶囊会比关闭按钮高出一截，顶栏看着不齐
+            .frame(height: 28)
             .background(Capsule().fill(Color.white.opacity(0.08)))
     }
 
-    private func barButton(system: String, help: String, enabled: Bool, action: @escaping () -> Void) -> some View {
+    /// 开关型按钮：开着高亮、关着变暗，一眼看出当前状态。
+    /// 图标复用现成的两套（时间轴的 snap、素材库的 relink），不新画
+    private func toggleButton(timeline: String? = nil, svg: String? = nil,
+                              help: String, on: Bool, action: @escaping () -> Void) -> some View {
+        let image = timeline.map { TimelineSVGIcon.load($0, size: 13) }
+            ?? SidebarSVGIcon.load(svg ?? "", size: 13)
+        return Button(action: action) {
+            Image(nsImage: image)
+                .renderingMode(.template)
+                .resizable()
+                .aspectRatio(contentMode: .fit)
+                .frame(width: 13, height: 13)
+                .foregroundColor(on ? Color.accent : Color.labelSecondary.opacity(0.55))
+                .frame(width: 30, height: 28)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(help)
+    }
+
+    private func barButton(system: String? = nil, timeline: String? = nil,
+                           help: String, enabled: Bool, action: @escaping () -> Void) -> some View {
         Button(action: action) {
-            Image(systemName: system)
-                .font(.system(size: 11, weight: .medium))
+            Group {
+                if let timeline {
+                    Image(nsImage: TimelineSVGIcon.load(timeline, size: 13))
+                        .renderingMode(.template)
+                        .resizable()
+                        .aspectRatio(contentMode: .fit)
+                        .frame(width: 13, height: 13)
+                } else {
+                    Image(systemName: system ?? "")
+                        .font(.system(size: 11, weight: .medium))
+                }
+            }
                 .foregroundColor(enabled ? Color.labelSecondary : Color.labelSecondary.opacity(0.3))
                 // 热区给大一点，11pt 的图标太难点
                 .frame(width: 30, height: 28)
@@ -218,6 +275,13 @@ struct CanvasOverlay: View {
         // 关画布先停播 —— 卡片上正播着的视频/音频，关掉窗口声音还在响
         // （关窗那次踩过一样的坑）
         AIInlinePlayer.shared.stop()
+        canvas.editingTextNodeID = nil
+        // 正在编辑文字卡片时关画布，那个 NSTextView 可能还占着第一响应者 ——
+        // 关闭动画播放期间这个 view 不一定还会再触发 updateNSView，
+        // 「focused=false 就交还」那条逻辑未必来得及跑，第一响应者会一直
+        // 「赖」在这个即将销毁的 NSTextView 上。表现是回到主界面之后，
+        // AI 聊天框怎么点都抢不到键盘焦点。主动交还，不依赖那条逻辑
+        WindowManager.shared.window(for: windowID)?.makeFirstResponder(nil)
         saveCanvas()
         closing = true   // 触发 onChange 里的收起动画
     }
@@ -261,17 +325,35 @@ private struct CanvasSurface: View {
     @State private var menuLocation: CGPoint = .zero
     @State private var menuContentPoint: CGPoint = .zero
     /// 从哪个节点的 + 拉出来的线（点 + 弹菜单时，新节点自动连上它）
-    @State private var menuSourceNode: UUID?
+    /// 添加菜单是从哪张卡片的哪一侧 + 弹出来的。nil = 从空白/侧栏弹的。
+    ///
+    /// **id 和 edge 必须绑在一个可选值里一起设、一起清**：早前是两个独立
+    /// @State，双击空白弹菜单那条路径只顾着弹、忘了清 id，菜单就照着上一次
+    /// 点过的那张卡片算「能生成什么」—— 表现是「明明在音频卡片/空白处弹的菜单，
+    /// 列出来的却是上一张视频卡片的选项」
+    @State private var menuSource: MenuSource?
+
+    struct MenuSource {
+        let nodeID: UUID
+        let kind: CanvasNode.Kind
+        let edge: Edge
+    }
     /// 从哪边的 + 点出来的。左边 = 新卡片当上游，右边 = 当下游
-    @State private var menuSourceEdge: Edge = .trailing
     @State private var showAssetPicker = false
     /// 鼠标在内容坐标里的位置，连线层拿它判断悬没悬在某条线上
-    @State private var hoverContentPoint: CGPoint?
+    // 鼠标位置放在 canvas.hoverProbe 上（单独对象），不放这层的 @State ——
+    // 放这儿的话鼠标每动一下整个画布层都要重算，卡片越多越卡
     /// 节点上那两个按钮点的是哪个节点（填内容进去，不是新建）
     @State private var fillTargetNode: UUID?
     /// 框选的起止点（内容坐标）。**本地状态** —— 每帧写 @Published 会让整层重建
     @State private var marqueeStart: CGPoint?
     @State private var marqueeEnd: CGPoint?
+    /// 空白处上一次点击的时间，自己判连击用（见下面 onTapGesture 的注释）
+    @State private var lastBlankTapTime: Date = .distantPast
+    /// 自绘右键菜单：弹在哪、作用于谁
+    @State private var ctxLocation: CGPoint?
+    @State private var ctxTargets: Set<UUID> = []
+    @State private var ctxGroupID: UUID?
 
     /// 左侧悬浮栏。抽成独立属性 —— 整段塞进 body 的话表达式太长，
     /// 编译器会直接报「无法在合理时间内完成类型检查」
@@ -279,24 +361,24 @@ private struct CanvasSurface: View {
         CanvasSideBar(
             canvas: canvas,
             onPickKind: { kind in
-                menuSourceNode = nil
+                menuSource = nil
                 menuContentPoint = viewportCenterContentPoint
                 _ = addNode(kind: kind)
             },
             onUpload: {
-                menuSourceNode = nil
+                menuSource = nil
                 menuContentPoint = viewportCenterContentPoint
                 uploadIntoNewNode()
             },
             onPickAssetFromLibrary: {
-                menuSourceNode = nil
+                menuSource = nil
                 menuContentPoint = viewportCenterContentPoint
                 fillTargetNode = nil
                 showAssetPicker = true
             },
             // 抽屉（素材库/资产库）里点一项：直接落成卡片
             onPickAsset: { url, kind in
-                menuSourceNode = nil
+                menuSource = nil
                 menuContentPoint = viewportCenterContentPoint
                 let asset = project.mediaAssets.first { $0.url == url }
                 _ = addNode(kind: kind, mediaURL: url, assetID: asset?.id)
@@ -312,19 +394,19 @@ private struct CanvasSurface: View {
             CanvasAddMenu(
                 onPick: { kind in
                     canvas.sideAddHovering = false; canvas.sideMenuHovering = false
-                    menuSourceNode = nil
+                    menuSource = nil
                     menuContentPoint = viewportCenterContentPoint
                     _ = addNode(kind: kind)
                 },
                 onUpload: {
                     canvas.sideAddHovering = false; canvas.sideMenuHovering = false
-                    menuSourceNode = nil
+                    menuSource = nil
                     menuContentPoint = viewportCenterContentPoint
                     uploadIntoNewNode()
                 },
                 onPickAsset: {
                     canvas.sideAddHovering = false; canvas.sideMenuHovering = false
-                    menuSourceNode = nil
+                    menuSource = nil
                     menuContentPoint = viewportCenterContentPoint
                     fillTargetNode = nil
                     showAssetPicker = true
@@ -350,15 +432,15 @@ private struct CanvasSurface: View {
     /// 菜单标题按来源变：从卡片右边的 + 出来是「拿它当参考生成什么」，
     /// 左边的 + 是「给它加什么上下文」，双击空白/侧栏就是普通的添加
     private var menuTitle: String {
-        guard menuSourceNode != nil else { return "添加节点" }
-        return menuSourceEdge == .trailing ? "引用该节点生成" : "添加上下文"
+        guard let src = menuSource else { return "添加节点" }
+        return src.edge == .trailing ? "引用该节点生成" : "添加上下文"
     }
 
     /// 菜单里列哪几种类型。规则挂在 `CanvasNode.Kind` 上：
     /// 右边看 canGenerate（这个节点能派生出什么），左边看 acceptsContext（它能接什么）
     private var menuKinds: [CanvasNode.Kind]? {
-        guard let src = menuSourceNode, let kind = canvas.node(src)?.kind else { return nil }
-        return menuSourceEdge == .trailing ? kind.canGenerate : kind.acceptsContext
+        guard let src = menuSource else { return nil }
+        return src.edge == .trailing ? src.kind.canGenerate : src.kind.acceptsContext
     }
 
     /// 卡片左右那个 + 弹出的菜单该摆哪。
@@ -412,20 +494,22 @@ private struct CanvasSurface: View {
         ZStack {
             // 组的浅色底。画在最底下 —— 压在连线和卡片上面会挡住它们
             ForEach(canvas.groupFrames, id: \.id) { g in
-                CanvasGroupBackdrop(canvas: canvas, gid: g.id, name: g.name, rect: g.rect)
+                CanvasGroupBackdrop(canvas: canvas, gid: g.id, name: g.name,
+                                    colorHex: canvas.group(g.id)?.colorHex, rect: g.rect)
             }
 
-            CanvasEdgeLayer(canvas: canvas, hoverPoint: hoverContentPoint)
+            if canvas.edgesVisible {
+                CanvasEdgeLayer(canvas: canvas, probe: canvas.hoverProbe)
+            }
 
-            ForEach(canvas.nodes) { node in
+            ForEach(visibleNodes) { node in
                 CanvasNodeView(
                     canvas: canvas,
                     node: node,
                     onPlusTap: { edge in
-                        menuSourceNode = node.id
+                        menuSource = MenuSource(nodeID: node.id, kind: node.kind, edge: edge)
                         // 让**这一侧**的 + 在菜单开着时保持显示
                         canvas.plusMenuSource = .init(nodeID: node.id, isTrailing: edge == .trailing)
-                        menuSourceEdge = edge
                         // 新卡片落在 + 那一侧，留出一个卡片的间距
                         menuContentPoint = CGPoint(
                             x: edge == .trailing
@@ -449,9 +533,17 @@ private struct CanvasSurface: View {
                         }
                     },
                     onPlusDragEnded: { finishPendingEdge() })
-                // 节点视图比卡片高出一个标签行（在卡片上方），所以中心要往上挪半行
-                .position(x: node.position.x + node.size.width / 2,
-                          y: node.position.y + node.size.height / 2 - CanvasNodeView.labelHeight / 2)
+                // 节点视图比卡片高出一个标签行（在卡片上方），所以中心要往上挪半行。
+                //
+                // 尺寸一律用 `renderSize`，跟连线端点（`node.frame`）同一个口径 ——
+                // 用 `node.size` 的话音频卡片会差一大截（它的显示高度是写死的 80）。
+                // 文本卡片底部还多留了一份 resize 热区的余量，把视图重心往下拽了
+                // 半份，这里补回来：不补的话卡片边上的连接圆点会比连线的端点
+                // 高出 4pt，看着就是「线不从圆点中间出去，从下边出去」
+                .position(x: node.position.x + node.renderSize.width / 2,
+                          y: node.position.y + node.renderSize.height / 2
+                             - CanvasNodeView.labelHeight / 2
+                             + (node.kind == .text ? CanvasNodeView.edgeStraddle / 2 : 0))
             }
 
             // 框选的那个框。线宽除以 zoom，缩到多小都是一样细的一根
@@ -464,7 +556,43 @@ private struct CanvasSurface: View {
                     .position(x: r.midX, y: r.midY)
                     .allowsHitTesting(false)
             }
+
+            // 吸附对齐的辅助线。线宽除以 zoom，缩到多小都是细细一根
+            ForEach(canvas.snapGuides) { g in
+                let thickness = 1 / max(0.1, canvas.zoom)
+                let length = max(1, g.end - g.start)
+                Rectangle()
+                    .fill(Color(hex: "#FF3B7F"))
+                    .frame(width: g.isVertical ? thickness : length,
+                           height: g.isVertical ? length : thickness)
+                    .position(x: g.isVertical ? g.position : (g.start + g.end) / 2,
+                              y: g.isVertical ? (g.start + g.end) / 2 : g.position)
+                    .allowsHitTesting(false)
+            }
         }
+    }
+
+    /// 当前看得见的那块内容区域，四周各放一屏三分之一的余量 ——
+    /// 边上正要滑进来的卡片得先画好，不然平移时会看见它「凭空冒出来」
+    private var visibleContentRect: CGRect {
+        let topLeft = contentPoint(from: .zero)
+        let bottomRight = contentPoint(from: CGPoint(x: containerSize.width,
+                                                     y: containerSize.height))
+        return CGRect(x: topLeft.x, y: topLeft.y,
+                      width: bottomRight.x - topLeft.x,
+                      height: bottomRight.y - topLeft.y)
+            .insetBy(dx: -containerSize.width / 3, dy: -containerSize.height / 3)
+    }
+
+    /// 真正要画的卡片。
+    ///
+    /// 视口外的卡片照样要参与布局和 diff，卡片一多就是纯浪费。
+    /// 少于这个数就全画 —— 过滤自己也有开销，而且视图增删会丢掉本地状态
+    /// （hover、拖动偏移），能不折腾就不折腾
+    private var visibleNodes: [CanvasNode] {
+        guard canvas.nodes.count > 24 else { return canvas.nodes }
+        let rect = visibleContentRect
+        return canvas.nodes.filter { rect.intersects($0.frame) }
     }
 
     /// 框选矩形（内容坐标）
@@ -472,6 +600,27 @@ private struct CanvasSurface: View {
         guard let s = marqueeStart, let e = marqueeEnd else { return nil }
         return CGRect(x: min(s.x, e.x), y: min(s.y, e.y),
                       width: abs(e.x - s.x), height: abs(e.y - s.y))
+    }
+
+    /// 右键命中判定。卡片画在组的上面，所以先查卡片；
+    /// 同类里后加的画在上层，倒着找才对得上眼睛看到的层次
+    private func openContextMenu(at viewPoint: CGPoint) {
+        let content = contentPoint(from: viewPoint)
+        if let node = canvas.nodes.last(where: { $0.frame.contains(content) }) {
+            // 右键已选中的卡片就管整批，右键没选中的只管它自己
+            ctxTargets = canvas.selectedNodeIDs.contains(node.id) ? canvas.selectedNodeIDs
+                                                                 : [node.id]
+            ctxGroupID = nil
+            ctxLocation = viewPoint
+            return
+        }
+        if let g = canvas.groupFrames.last(where: { $0.rect.contains(content) }) {
+            ctxTargets = canvas.nodeIDs(inGroup: g.id)
+            ctxGroupID = g.id
+            ctxLocation = viewPoint
+            return
+        }
+        ctxLocation = nil   // 点在空白处：不弹菜单
     }
 
     /// 落一个节点。从某个节点的 + 点出来的，自动连上去
@@ -496,14 +645,14 @@ private struct CanvasSurface: View {
         }
         // 从 + 点出来的卡片，落下就跟源卡片连上。
         // 方向按点的是哪边：左边的 + 意味着「给它加个上游参考」，右边才是下游
-        if let src = menuSourceNode {
-            let from = menuSourceEdge == .leading ? node.id : src
-            let to   = menuSourceEdge == .leading ? src : node.id
+        if let src = menuSource {
+            let from = src.edge == .leading ? node.id : src.nodeID
+            let to   = src.edge == .leading ? src.nodeID : node.id
             // 类型校验要按**下游**节点的模型来 —— 参考上限是下游那个模型的能力，
             // 用全局 selectedProvider 会拿错矩阵（比如给图片卡片按视频模型放行音频）
             let r = canvas.connect(from: from, to: to, provider: providerFor(nodeID: to))
             if let msg = r.message { flashReject(msg) }
-            menuSourceNode = nil
+            menuSource = nil
         }
         return node
     }
@@ -589,15 +738,13 @@ private struct CanvasSurface: View {
     }
 
     private func applyCursor() {
+        // 空格模式优先级最高，**盖过子控件的认领**：按住空格就是「要拖画布」，
+        // 这时候鼠标扫过卡片边缘、组边缘那些热区，不该变成调整大小的双向箭头
+        if canvas.isPanning { NSCursor.closedHand.set(); return }
+        if canvas.isSpaceHeld { NSCursor.openHand.set(); return }
         // 子控件（节点边缘热区之类）认领了光标就别抢
         guard !canvas.cursorClaimedByChild else { return }
-        if canvas.isPanning {
-            NSCursor.closedHand.set()
-        } else if canvas.isSpaceHeld {
-            NSCursor.openHand.set()
-        } else {
-            NSCursor.arrow.set()
-        }
+        NSCursor.arrow.set()
     }
 
     var body: some View {
@@ -654,19 +801,32 @@ private struct CanvasSurface: View {
         .onChange(of: showAddMenu) { _, showing in
             if !showing { canvas.plusMenuSource = nil }
         }
-        // 双击空白：在落点加节点
-        .onTapGesture(count: 2) { location in
-            let content = contentPoint(from: location)
-            canvas.selectedNodeIDs = []
-            canvas.selectedGroupID = nil
-            menuLocation = location
-            menuContentPoint = content
-            showAddMenu = true
-        }
-        .onTapGesture {
+        // 空白处点击：退出编辑/取消选中要立刻生效，不能等 SwiftUI 判断完
+        // 「这是不是双击」再触发 —— `.onTapGesture(count: 2)` 和 `.onTapGesture(count: 1)`
+        // 同时挂在同一个 view 上时，SwiftUI 会等约 0.3~0.4s 确认没有第二次点击
+        // 才触发单击回调，表现就是「点一下没反应，得点第二下才生效」。
+        // 改成自己判连击：单击该做的事立刻做，够快的第二下再追加「弹添加菜单」
+        .onTapGesture { location in
             canvas.selectedNodeIDs = []
             canvas.selectedGroupID = nil
             canvas.editingTextNodeID = nil   // 点空白退出文本编辑，回到默认态
+            // 焦点也一并收回，否则快捷键会一直被当成「在输入框里」而放行
+            canvas.promptBarFocused = false
+            NSApp.keyWindow?.makeFirstResponder(nil)
+
+            let now = Date()
+            if now.timeIntervalSince(lastBlankTapTime) < 0.35 {
+                let content = contentPoint(from: location)
+                menuLocation = location
+                menuContentPoint = content
+                // 从空白弹的菜单没有源卡片，这里必须清 —— 不清的话菜单会照着
+                // 上一次点过的那张卡片算「能生成什么」，列出一堆不相干的类型
+                menuSource = nil
+                showAddMenu = true
+                lastBlankTapTime = .distantPast   // 避免紧接着的第三下又被当成双击
+            } else {
+                lastBlankTapTime = now
+            }
         }
         // 触控板双指捏合缩放。跟时间轴那边一个套路：
         // 手势给的是**累积倍率**，所以要记住捏之前的 zoom 当基准，
@@ -710,6 +870,10 @@ private struct CanvasSurface: View {
                     }
                     if let r = marqueeRect, r.width > 3 || r.height > 3 {
                         canvas.selectInRect(r)
+                        // 框选完焦点归画布，delete 才能直接删这一批
+                        canvas.editingTextNodeID = nil
+                        canvas.promptBarFocused = false
+                        NSApp.keyWindow?.makeFirstResponder(nil)
                     }
                     marqueeStart = nil
                     marqueeEnd = nil
@@ -721,7 +885,7 @@ private struct CanvasSurface: View {
         .onHover { inside in
             if !inside {
                 canvas.isPanning = false
-                NSCursor.arrow.set()
+                if !canvas.isSpaceHeld { NSCursor.arrow.set() }
             }
         }
         // 按住空格是张开的手，拖起来是握紧的手（Figma/PS 手感）。
@@ -731,9 +895,9 @@ private struct CanvasSurface: View {
             switch phase {
             case .active(let location):
                 applyCursor()
-                hoverContentPoint = contentPoint(from: location)
+                canvas.hoverProbe.point = contentPoint(from: location)
             case .ended:
-                hoverContentPoint = nil
+                canvas.hoverProbe.point = nil
             }
         }
         .onChange(of: canvas.isSpaceHeld) { _, _ in applyCursor() }
@@ -750,7 +914,7 @@ private struct CanvasSurface: View {
                     .contentShape(Rectangle())
                     .onTapGesture {
                         showAddMenu = false
-                        menuSourceNode = nil
+                        menuSource = nil
                     }
             }
         }
@@ -759,7 +923,7 @@ private struct CanvasSurface: View {
                 CanvasAddMenu(
                     title: menuTitle,
                     kinds: menuKinds,
-                    showsResourceGroup: menuSourceNode == nil,
+                    showsResourceGroup: menuSource == nil,
                     onPick: { kind in
                         showAddMenu = false
                         addNode(kind: kind)
@@ -776,6 +940,29 @@ private struct CanvasSurface: View {
                 .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(Color.white.opacity(0.12)))
                 .shadow(color: .black.opacity(0.5), radius: 16, y: 6)
                 .offset(x: menuOffset.x, y: menuOffset.y)
+            }
+        }
+        // 右键：命中卡片或组就弹自绘菜单
+        .onChange(of: canvas.rightClickAt) { _, point in
+            guard let point else { return }
+            canvas.rightClickAt = nil          // 消费掉，下次右键才能再触发
+            openContextMenu(at: point)
+        }
+        .overlay {
+            if ctxLocation != nil {
+                Color.clear
+                    .contentShape(Rectangle())
+                    .onTapGesture { ctxLocation = nil }
+            }
+        }
+        .overlay(alignment: .topLeading) {
+            if let at = ctxLocation {
+                CanvasContextPanel(canvas: canvas, targets: ctxTargets,
+                                   groupID: ctxGroupID) { ctxLocation = nil }
+                .background(RoundedRectangle(cornerRadius: 10).fill(Color(red: 0.16, green: 0.16, blue: 0.17)))
+                .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(Color.white.opacity(0.12)))
+                .shadow(color: .black.opacity(0.5), radius: 16, y: 6)
+                .offset(x: at.x, y: at.y)
             }
         }
         // 点空白关菜单
@@ -889,9 +1076,39 @@ private struct CanvasSurface: View {
             project.addTextAtPlayhead(text: n.text)
             flashReject("已插入标题文字")
         }
+        // 卡片上的 @：在聊天框光标处插一句「@图1」。
+        // **纯粹是提示词里的一段文字，不建立连线** —— 要不要真当参考，
+        // 由用户自己拉线决定
+        .onReceive(NotificationCenter.default.publisher(for: .canvasNodeMention)) { note in
+            guard let id = note.object as? UUID, let src = canvas.node(id) else { return }
+            guard let targetID = canvas.selectedNodeID, targetID != id else {
+                flashReject("先选中要写提示词的那张卡片")
+                return
+            }
+            // 已经是上游的话用参考编号（图1/视频2…），跟聊天框里缩略图上的 @ 一致；
+            // 还没连线就用卡片自己的名字
+            let ups = canvas.upstreamNodes(of: targetID)
+            let sameKind = ups.filter { $0.kind == src.kind }
+            if let idx = sameKind.firstIndex(where: { $0.id == id }) {
+                let prefix: String
+                switch src.kind {
+                case .image: prefix = "图"
+                case .video: prefix = "视频"
+                case .audio: prefix = "音频"
+                case .text:  prefix = "文本"
+                }
+                canvas.pendingMention = "@\(prefix)\(idx + 1)"
+            } else {
+                let name = src.displayName.isEmpty ? src.kind.label : src.displayName
+                canvas.pendingMention = "@" + name.replacingOccurrences(of: " ", with: "")
+            }
+        }
         .onReceive(NotificationCenter.default.publisher(for: .canvasNodeRetry)) { note in
-            guard let id = note.object as? UUID else { return }
-            canvas.submitGeneration(nodeID: id, provider: AIVideoService.shared.selectedProvider)
+            guard let id = note.object as? UUID, let node = canvas.node(id) else { return }
+            // 按这张卡片的类型选对应的模型，不能用全局 selectedProvider ——
+            // 那个可能是任何类型，用错了会报「XX 不支持 XX 生成」
+            let provider = AIVideoService.provider(for: node.kind.providerCategory)
+            canvas.submitGeneration(nodeID: id, provider: provider)
         }
         .onReceive(NotificationCenter.default.publisher(for: .canvasNodeToReference)) { note in
             guard let id = note.object as? UUID, let n = canvas.node(id), let url = n.mediaURL else { return }
@@ -976,8 +1193,20 @@ struct CanvasKeyMonitor: ViewModifier {
             // 只认当前窗口的按键，否则别的窗口按空格这边也会跟着进拖拽模式
             guard let w = event.window,
                   WindowManager.shared.id(of: w) == windowID else { return event }
-            // 正在输入文字时这些键都归输入框
-            let editing = (w.firstResponder is NSTextView) || (w.firstResponder is NSTextField)
+            // 正在输入文字时这些键都归输入框。
+            //
+            // **判据是我们自己维护的两个状态，不是 NSWindow.firstResponder** ——
+            // 聊天框那个 NSTextView 一挂上视图层级就自动成了第一响应者，
+            // 哪怕用户没点过它、界面上也没有光标。按 firstResponder 判断的话
+            // editing 会永远为真，delete / ⌘Z / ⇧⌘Z 全被放行给输入框，
+            // 表现就是「选中卡片按 delete 没反应」（诊断日志实测到的）
+            let editing = canvas.promptBarFocused || canvas.editingTextNodeID != nil
+            if event.type == .keyDown, event.keyCode == 51 || event.keyCode == 117 {
+                let a = "editing=\(editing) promptFocus=\(canvas.promptBarFocused)"
+                let b = "editingText=\(canvas.editingTextNodeID != nil)"
+                let c = "选中=\(canvas.selectedNodeIDs.count) 组=\(canvas.selectedGroupID != nil)"
+                DiagLog.log("[画布] delete " + a + " " + b + " " + c)
+            }
 
             // ⌘Z / ⇧⌘Z 撤的是画布自己的栈，不是时间轴的
             if event.type == .keyDown, !editing,
@@ -1029,17 +1258,45 @@ struct CanvasKeyMonitor: ViewModifier {
                node.kind == .video || node.kind == .audio,
                node.hasContent, !node.isGenerating,
                let url = node.mediaURL {
-                if event.type == .keyDown { AIInlinePlayer.shared.toggle(url) }
+                if event.type == .keyDown { AIInlinePlayer.shared.toggle(url, key: node.id) }
                 canvas.isSpaceHeld = false
                 return nil
             }
-            canvas.isSpaceHeld = (event.type == .keyDown)
+            let held = (event.type == .keyDown)
+            if held != canvas.isSpaceHeld {
+                canvas.isSpaceHeld = held
+                // **必须禁掉窗口的 cursor rect**，光靠自己反复 set 抢不过系统：
+                // 每个 AppKit/SwiftUI 控件都在自己的区域注册了光标（按钮的箭头、
+                // 文本的 I 形…），鼠标一移动系统就按 cursor rect 重设一次，
+                // 我们再设回手 —— 一来一回就是「手和箭头之间闪」。
+                // 禁用之后这套自动重设整个停掉，光标才真正听我们的
+                if held {
+                    w.disableCursorRects()
+                    NSCursor.openHand.set()
+                    // 在键盘事件的处理周期里 set 光标，屏幕上往往要等到下一次
+                    // 鼠标事件才反映出来 —— 表现就是「按下空格没反应，
+                    // 鼠标动一下才变手」。补一次异步的，当场就变
+                    DispatchQueue.main.async { NSCursor.openHand.set() }
+                } else {
+                    w.enableCursorRects()
+                    NSCursor.arrow.set()
+                    DispatchQueue.main.async { NSCursor.arrow.set() }
+                }
+            }
             return nil   // 吞掉，免得底下的时间轴拿去播放/暂停
         }
 
         let scrollMonitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { event in
             guard let w = event.window,
                   WindowManager.shared.id(of: w) == windowID else { return event }
+
+            // 鼠标停在文本卡片上：滚轮归那张卡片自己滚（文字可能比卡片高）。
+            // 不放行的话这里会把每一个滚轮事件都吞去平移画布，
+            // 卡片里的 NSTextView 一个都收不到，文字再长也滚不动。
+            // ⌘+滚轮是缩放画布，那个优先级更高，不让
+            if !event.modifierFlags.contains(.command), canvas.hoveredTextNodeID != nil {
+                return event
+            }
 
             if event.modifierFlags.contains(.command) {
                 // 锚点：事件坐标是窗口坐标、y 轴朝上；画布容器从窗口顶部往下 topGap 开始
@@ -1050,23 +1307,63 @@ struct CanvasKeyMonitor: ViewModifier {
                 let containerSize = CGSize(width: w.contentView?.bounds.width ?? 0,
                                            height: containerH)
                 let delta = event.scrollingDeltaY != 0 ? event.scrollingDeltaY : event.scrollingDeltaX
-                let factor = 1 + delta * 0.01
+                let factor = 1 + delta * 0.08
                 canvas.setZoom(canvas.zoom * factor, anchor: anchor, containerSize: containerSize)
             } else {
-                canvas.offset = CGSize(width: canvas.offset.width + event.scrollingDeltaX,
-                                       height: canvas.offset.height + event.scrollingDeltaY)
+                // 系统给的滚动量是按「一屏内容」的尺度来的，用在画布上一格挪不了多远。
+                // 放大 2.5 倍，滚一下的位移跟手感对得上
+                let step: CGFloat = 10
+                canvas.offset = CGSize(width: canvas.offset.width + event.scrollingDeltaX * step,
+                                       height: canvas.offset.height + event.scrollingDeltaY * step)
             }
             return nil   // 吞掉，否则时间轴的滚轮监听会跟着缩放
         }
 
+        // 右键：自绘菜单（系统 contextMenu 排不出横着一排色点）。
+        // 这里只把位置换算成画布容器坐标传出去，命中判定在画布层做
+        let rightMonitor = NSEvent.addLocalMonitorForEvents(matching: .rightMouseDown) { event in
+            guard let w = event.window,
+                  WindowManager.shared.id(of: w) == windowID else { return event }
+            let winH = w.contentView?.bounds.height ?? 0
+            let containerH = max(1, winH - canvas.topGap)
+            let viewPoint = CGPoint(x: event.locationInWindow.x, y: containerH - event.locationInWindow.y)
+
+            // 文本卡片编辑时右键要的是系统那套拷贝/粘贴/拼写，别抢 ——
+            // 但**只看 firstResponder 是不是 NSTextView 不够**：退出编辑后如果没
+            // 正确交还第一响应者（曾经就踩过），或者编辑中的卡片其实在别处，
+            // 右键随便点哪张卡片都会被这条一刀切放行，表现是「右键全变成系统菜单，
+            // 其它卡片也右键不了」。加一道位置校验：点击处真落在正在编辑的那张
+            // 卡片范围内，才放行
+            if w.firstResponder is NSTextView, let editingID = canvas.editingTextNodeID,
+               let node = canvas.node(editingID) {
+                let cs = canvas.containerSize
+                let center = CGPoint(x: cs.width / 2, y: cs.height / 2)
+                let content = CGPoint(
+                    x: (viewPoint.x - canvas.offset.width - center.x) / canvas.zoom + center.x,
+                    y: (viewPoint.y - canvas.offset.height - center.y) / canvas.zoom + center.y)
+                if node.frame.contains(content) { return event }
+            }
+
+            canvas.rightClickAt = viewPoint
+            return nil
+        }
+
         WindowManager.shared.setCanvasSpaceMonitor(keyMonitor, for: windowID)
         WindowManager.shared.setCanvasScrollMonitor(scrollMonitor, for: windowID)
+        WindowManager.shared.setCanvasRightClickMonitor(rightMonitor, for: windowID)
     }
 
     private func remove() {
+        // 空格期间禁掉过窗口的 cursor rect，走之前一定要恢复 ——
+        // 留着禁用状态，整个 app 的光标都不会再自动变了
+        if canvas.isSpaceHeld {
+            WindowManager.shared.window(for: windowID)?.enableCursorRects()
+            NSCursor.arrow.set()
+        }
         canvas.isSpaceHeld = false
         WindowManager.shared.setCanvasSpaceMonitor(nil, for: windowID)
         WindowManager.shared.setCanvasScrollMonitor(nil, for: windowID)
+        WindowManager.shared.setCanvasRightClickMonitor(nil, for: windowID)
     }
 }
 
@@ -1085,8 +1382,11 @@ extension View {
 /// 都算悬在线上。改成拿鼠标点算到曲线的最近距离。
 private struct CanvasEdgeLayer: View {
     @ObservedObject var canvas: CanvasState
-    /// 鼠标在内容坐标里的位置（由画布层换算好传进来），nil 表示鼠标不在画布上
-    let hoverPoint: CGPoint?
+    /// 鼠标位置。**只有这一层订阅它** —— 鼠标移动很频繁，
+    /// 让画布层去订阅的话所有卡片会跟着一起重算
+    @ObservedObject var probe: CanvasHoverProbe
+
+    private var hoverPoint: CGPoint? { probe.point }
 
     @State private var selectedEdge: UUID?
     /// 蚂蚁线的相位。一直往负方向跑，线看着就在往前爬
@@ -1131,8 +1431,8 @@ private struct CanvasEdgeLayer: View {
                     EdgeShape(start: start, end: end)
                         .stroke(isActive || linked ? Color.accent : Color.white.opacity(0.35),
                                 style: linked
-                                    ? StrokeStyle(lineWidth: 2, dash: [6, 4], dashPhase: dashPhase)
-                                    : StrokeStyle(lineWidth: isActive ? 2 : 1.5))
+                                    ? StrokeStyle(lineWidth: 1, dash: [6, 4], dashPhase: dashPhase)
+                                    : StrokeStyle(lineWidth: 1))
                         .allowsHitTesting(false)
 
                     // 悬上去就出删除，不用先点一下
@@ -1160,9 +1460,12 @@ private struct CanvasEdgeLayer: View {
                let from = canvas.node(fromID),
                let to = canvas.pendingEdgeTo {
                 let f = canvas.displayFrame(of: from)
-                EdgeShape(start: CGPoint(x: f.maxX, y: f.midY), end: to)
+                // 从哪一侧的圆点拖出来的，线就从哪一侧起 ——
+                // 写死 maxX 的话，从左边拉线会看到虚线绕到右边去起头
+                let startX = canvas.pendingEdgeIsLeading ? f.minX : f.maxX
+                EdgeShape(start: CGPoint(x: startX, y: f.midY), end: to)
                     .stroke(Color.accent,
-                            style: StrokeStyle(lineWidth: 2, dash: [5, 4]))
+                            style: StrokeStyle(lineWidth: 1, dash: [5, 4]))
                     .allowsHitTesting(false)
             }
         }

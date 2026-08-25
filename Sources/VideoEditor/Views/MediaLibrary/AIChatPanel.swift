@@ -11,6 +11,10 @@ struct AIChatPanel: View {
     /// 而不是从空白开始
     @State private var showHistory = true
     @State private var swapHovering = false
+    /// 正在重命名的历史会话
+    @State private var renamingConversationID: UUID?
+    @State private var renameDraft: String = ""
+    @FocusState private var renameFieldFocused: Bool
 
     // 输入区状态存在 service 上，切 tab 重建 View 时不丢失
     private typealias RefContentType = AIVideoService.RefContentType
@@ -173,15 +177,31 @@ struct AIChatPanel: View {
                     .padding(.horizontal, 6)
                     .padding(.vertical, 6)
                 }
+                // 点列表空白处：正在重命名就提交。失焦本身也会提交（见 TextField
+                // 那边的 onChange），这里是兜底 —— 万一点到的空白区域接不住焦点转移
+                .contentShape(Rectangle())
+                .onTapGesture { commitRename() }
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
+    /// 提交重命名。标题为空就当取消，不写回
+    private func commitRename() {
+        guard let id = renamingConversationID else { return }
+        service.renameConversation(id, title: renameDraft)
+        if project.canvas.conversationID == id, !renameDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            project.canvas.title = renameDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        renamingConversationID = nil
+    }
+
     @ViewBuilder
     private func historyRow(_ conv: AIVideoService.ConversationRecord) -> some View {
         let isActive = conv.id == service.currentConversationId
+        let isRenaming = renamingConversationID == conv.id
         Button {
+            guard !isRenaming else { return }   // 重命名中点这一行不该跳转
             if conv.isCanvas {
                 // 画布类记录：还原到画布里打开，不当聊天加载。
                 // **不收起历史列表** —— 画布是全屏盖上去的，关掉它应该退回原来那个列表，
@@ -198,10 +218,25 @@ struct AIChatPanel: View {
             HStack(spacing: 6) {
                 VStack(alignment: .leading, spacing: 3) {
                     HStack(spacing: 5) {
-                        Text(conv.title)
-                            .font(.system(size: 11))
-                            .foregroundColor(isActive ? .white : Color.labelPrimary)
-                            .lineLimit(1)
+                        if isRenaming {
+                            // 原地把标题换成输入框，样式跟旁边的 Text 对齐 ——
+                            // 不然行内一换成 TextField 高度/位置会跳一下
+                            TextField("", text: $renameDraft)
+                                .textFieldStyle(.plain)
+                                .font(.system(size: 11))
+                                .foregroundColor(.white)
+                                .focused($renameFieldFocused)
+                                .onSubmit { commitRename() }
+                                .onChange(of: renameFieldFocused) { _, focused in
+                                    if !focused { commitRename() }
+                                }
+                                .onExitCommand { renamingConversationID = nil }
+                        } else {
+                            Text(conv.title)
+                                .font(.system(size: 11))
+                                .foregroundColor(isActive ? .white : Color.labelPrimary)
+                                .lineLimit(1)
+                        }
                         // 画布类挂个小标签区分；普通对话什么都不加
                         if conv.isCanvas {
                             Text("画布")
@@ -226,11 +261,22 @@ struct AIChatPanel: View {
         }
         .buttonStyle(.plain)
         .contextMenu {
+            Button { startRenaming(conv) } label: {
+                Image(nsImage: SidebarSVGIcon.load("rename", size: 14))
+                Text("重命名")
+            }
             Button(role: .destructive) { service.deleteConversation(conv.id) } label: {
                 Image(nsImage: TimelineSVGIcon.load("delete", size: 14))
                 Text("删除")
             }
         }
+    }
+
+    private func startRenaming(_ conv: AIVideoService.ConversationRecord) {
+        renameDraft = conv.title
+        renamingConversationID = conv.id
+        // 键盘焦点要等 TextField 真正出现在树上才能抢，同一帧抢不到
+        DispatchQueue.main.async { renameFieldFocused = true }
     }
 
     private func formatDate(_ date: Date) -> String {
@@ -1403,16 +1449,33 @@ private struct ImageThumbnailView: View {
 
 // MARK: - 行内试听
 
+/// 只装播放位置的小对象。见 AIInlinePlayer.clock 的注释
+@MainActor
+final class PlayheadClock: ObservableObject {
+    @Published var time: Double = 0
+}
+
 /// AI 面板里缩略图上的试听播放器。全局单例，同一时刻只播一条，
 /// 点第二条会自动停掉上一条，避免多条一起响
 @MainActor
 final class AIInlinePlayer: ObservableObject {
     static let shared = AIInlinePlayer()
 
+    /// 谁在播。**不是 URL** —— 两张卡片完全可能指向同一个文件（同一个素材
+    /// 拖了两次、或创建副本），这时候纯按 URL 判断会把两张卡片都当成「正在播」，
+    /// 表现就是「hover 一个，另一个也跟着显示播放画面」。
+    /// 画布卡片传 node.id 做 key，素材库列表没有节点概念就传 url 自己
+    @Published private(set) var playingKey: AnyHashable?
     @Published private(set) var playingURL: URL?
     @Published private(set) var player: AVPlayer?
-    /// 播放位置和总时长。画布卡片要拿它画进度指示线、显示倒数时长
-    @Published private(set) var currentTime: Double = 0
+    /// 播放位置。**单独一个对象**：它每 30ms 变一次，挂在这里的话
+    /// 每张画布卡片（都订阅了播放器）每秒要重算三十多次 body，
+    /// 卡片一多就是持续掉帧。只有真正画进度线、显示走字时间的那两个小视图订阅它
+    let clock = PlayheadClock()
+
+    /// 非响应式地读当前位置。要跟着走的视图请订阅 `clock`
+    var currentTime: Double { clock.time }
+
     @Published private(set) var duration: Double = 0
 
     private var endObserver: NSObjectProtocol?
@@ -1420,12 +1483,15 @@ final class AIInlinePlayer: ObservableObject {
 
     private init() {}
 
-    /// 这个 URL 是当前这条（播放中或暂停中）
-    func isCurrent(_ url: URL) -> Bool { playingURL == url }
+    /// 这个 key 是当前这条（播放中或暂停中）
+    func isCurrent(_ key: AnyHashable) -> Bool { playingKey == key }
     /// 真正在响
-    func isPlaying(_ url: URL) -> Bool { playingURL == url && !isPaused }
+    func isPlaying(_ key: AnyHashable) -> Bool { playingKey == key && !isPaused }
 
     @Published private(set) var isPaused = false
+    /// 静音。**不随切换视频重置** —— 静音是用户对播放器的偏好，
+    /// 不是某一条素材自己的属性，切下一条也该保持
+    @Published private(set) var isMuted = false
 
     /// 暂停 / 继续。**不销毁 player** —— 销毁的话进度回到 0，
     /// 用户要的是「黄线停在当前位置，再点继续」
@@ -1434,19 +1500,39 @@ final class AIInlinePlayer: ObservableObject {
         if isPaused { p.play(); isPaused = false } else { p.pause(); isPaused = true }
     }
 
-    func toggle(_ url: URL) {
-        if playingURL == url { togglePause(); return }
+    func toggleMute() {
+        isMuted.toggle()
+        player?.isMuted = isMuted
+    }
+
+    /// 拖进度条 / 拖播放线 都走这个。**手动把 clock.time 顶到位**，
+    /// 不等 seek 完成后 periodic observer 的下一次回调 —— 那个隔 30ms 才报一次，
+    /// 拖动中不立刻更新的话，手柄会跟鼠标脱节，看着一卡一卡的
+    func seek(to seconds: Double) {
+        guard let p = player else { return }
+        let clamped = max(0, min(duration, seconds))
+        clock.time = clamped
+        p.seek(to: CMTime(seconds: clamped, preferredTimescale: 600),
+              toleranceBefore: .zero, toleranceAfter: .zero)
+    }
+
+    /// `key` 缺省用 url 自己 —— 素材库列表没有节点概念，url 就是身份；
+    /// 画布卡片会显式传 node.id，避免两张卡片撞同一个文件时互相认串
+    func toggle(_ url: URL, key: AnyHashable? = nil) {
+        let key: AnyHashable = key ?? AnyHashable(url)
+        if playingKey == key { togglePause(); return }
         stop()
         let p = AVPlayer(url: url)
+        p.isMuted = isMuted   // 静音是播放器偏好，跨切换视频保持
         isPaused = false
         duration = AVURLAsset(url: url).duration.seconds
-        currentTime = 0
+        clock.time = 0
         // 每 0.1 秒报一次位置，够画指示线了；再密只是白烧 CPU
         timeObserver = p.addPeriodicTimeObserver(
             // 0.1 秒一次线是一跳一跳的，30ms 才跟得上眼睛
             forInterval: CMTime(seconds: 0.03, preferredTimescale: 600),
             queue: .main) { [weak self] t in
-                self?.currentTime = t.seconds
+                self?.clock.time = t.seconds
             }
         // 播完自动复位成播放态图标
         endObserver = NotificationCenter.default.addObserver(
@@ -1458,6 +1544,7 @@ final class AIInlinePlayer: ObservableObject {
         }
         player = p
         playingURL = url
+        playingKey = key
         p.play()
     }
 
@@ -1474,8 +1561,9 @@ final class AIInlinePlayer: ObservableObject {
         }
         player = nil
         playingURL = nil
+        playingKey = nil
         isPaused = false
-        currentTime = 0
+        clock.time = 0
         duration = 0
     }
 }

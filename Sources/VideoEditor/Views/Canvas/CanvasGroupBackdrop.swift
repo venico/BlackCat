@@ -11,6 +11,8 @@ struct CanvasGroupBackdrop: View {
     @ObservedObject var canvas: CanvasState
     let gid: UUID
     let name: String
+    /// 背景色（十六进制）。nil = 默认浅灰白
+    var colorHex: String?
     /// 内容坐标里的框（成员包围盒 ∪ 用户拉过的框）
     let rect: CGRect
 
@@ -22,15 +24,26 @@ struct CanvasGroupBackdrop: View {
 
     private static let hit: CGFloat = 10
     private var shown: CGRect { liveRect ?? rect }
+
+    /// 上了色也只留一点色调 —— 底太实会把卡片压住
+    private var fillColor: Color {
+        guard let colorHex else { return Color.white.opacity(0.055) }
+        return Color(hex: colorHex).opacity(0.16)
+    }
+
+    private var borderColor: Color {
+        guard let colorHex else { return Color.white.opacity(0.10) }
+        return Color(hex: colorHex).opacity(0.38)
+    }
     private var isSelected: Bool { canvas.selectedGroupID == gid }
 
     var body: some View {
         ZStack {
             RoundedRectangle(cornerRadius: 18)
-                .fill(Color.white.opacity(0.055))
+                .fill(fillColor)
                 .overlay(
                     RoundedRectangle(cornerRadius: 18)
-                        .strokeBorder(isSelected ? Color.accent : Color.white.opacity(0.10),
+                        .strokeBorder(isSelected ? Color.accent : borderColor,
                                       lineWidth: isSelected ? 1.5 : 1))
 
             resizeEdges
@@ -57,13 +70,15 @@ struct CanvasGroupBackdrop: View {
         .contentShape(RoundedRectangle(cornerRadius: 18))
         .position(x: shown.midX, y: shown.midY)
         .offset(dragOffset)
-        .onTapGesture { canvas.selectGroup(gid) }
-        .gesture(moveGesture)
-        .contextMenu {
-            CanvasContextMenuItems(canvas: canvas,
-                                   targets: canvas.nodeIDs(inGroup: gid),
-                                   groupID: gid)
+        .onTapGesture {
+            canvas.selectGroup(gid)
+            // 跟点卡片一样，把焦点从聊天框收回来，delete/⌘Z 才管用
+            canvas.editingTextNodeID = nil
+            canvas.promptBarFocused = false
+            NSApp.keyWindow?.makeFirstResponder(nil)
         }
+        .gesture(moveGesture)
+
     }
 
     // MARK: 整组移动
@@ -119,6 +134,8 @@ struct CanvasGroupBackdrop: View {
                 // 认领光标：画布层每次鼠标移动都会 set 一次箭头，
                 // 不认领的话这里刚设成双向箭头就被它改回去，看着就是狂闪
                 canvas.claimCursor(inside)
+                // 按住空格时光标归画布管（一直是手），这儿别抢
+                guard !canvas.isSpaceHeld else { return }
                 if inside {
                     (vertical ? NSCursor.resizeUpDown : NSCursor.resizeLeftRight).set()
                 } else {
