@@ -487,8 +487,9 @@ struct CanvasPromptBar: View {
                     typeIcon(up)
                 }
             case .audio:
-                // 音频画波形，跟卡片上那条同一份缓存、同一个绿色
-                if let id = up.assetID, let wave = project.waveformCache[id] {
+                // 音频画波形，跟卡片上那条同一份缓存、同一个绿色。
+                // key 必须跟卡片一致走 thumbKey —— 产物没进素材库，只认 assetID 就取不到
+                if let wave = project.waveformCache[cacheKey(up)] {
                     AudioWaveformCanvas(waveData: wave, trimStart: 0,
                                         clipDuration: max(0.1, refDuration(up)),
                                         fullHeight: true,
@@ -575,9 +576,14 @@ struct CanvasPromptBar: View {
             .foregroundColor(Color.labelSecondary.opacity(0.45))
     }
 
-    /// 缩略图：优先用素材库那份缓存（跟时间轴/素材库共用，不重复抽帧）
+    /// 缩略图 / 波形的缓存 key。跟卡片、元素库共用同一套（见 `CanvasState.thumbKey`）
+    private func cacheKey(_ up: CanvasNode) -> UUID {
+        canvas.thumbKey(assetID: up.assetID, path: up.mediaPath, fallback: up.id)
+    }
+
+    /// 缩略图：优先用缓存（跟卡片/时间轴/素材库共用，不重复抽帧）
     private func thumbImage(for up: CanvasNode) -> NSImage? {
-        if let id = up.assetID, let t = project.mediaThumbnails[id] { return t }
+        if let t = project.mediaThumbnails[cacheKey(up)] { return t }
         guard up.kind == .image, let url = up.mediaURL else { return nil }
         return NSImage(contentsOf: url)
     }
@@ -677,9 +683,9 @@ struct CanvasPromptBar: View {
             ?? provider.subModels.first?.label ?? ""
     }
 
-    private var ratioLabel: String {
-        node.kind == .image ? settings.aiImageRatio : settings.aiRatio
-    }
+    /// 显示**这张卡片**自己的比例，不是全局那个 ——
+    /// 上传/从库来的素材是「原始」，空卡片是上次记住的档位，两者不该显示成一样
+    private var ratioLabel: String { node.ratio }
 
     /// 下拉。**不加背景**，只有文字 + 一个小箭头
     private func capsule(_ text: String, action: @escaping () -> Void) -> some View {
@@ -738,19 +744,28 @@ struct CanvasPromptBar: View {
 
     private func showRatioMenu() {
         let menu = NSMenu()
-        let options = node.kind == .image
-            ? ["1:1", "16:9", "9:16", "4:3", "3:4", "21:9"]
-            : ["16:9", "9:16", "1:1", "4:3"]
+        // 图片/视频卡片才有「原始」——音频文本没有画面比例可跟随
+        var options = CanvasNode.ratioOptions(for: node.kind)
+        if node.kind == .image || node.kind == .video {
+            options.insert(CanvasNode.originalRatio, at: 0)
+        }
         for r in options {
             let item = NSMenuItem(title: r, action: #selector(MenuBridge.pickRatio(_:)), keyEquivalent: "")
             item.representedObject = r
             item.target = MenuBridge.shared
+            item.state = (r == node.ratio) ? .on : .off
             menu.addItem(item)
+            // 「原始」跟固定档位不是一类东西，画条线分开
+            if r == CanvasNode.originalRatio { menu.addItem(.separator()) }
         }
         let isImage = node.kind == .image
         let nodeID = node.id
         MenuBridge.shared.onPickRatio = { [weak canvas] r in
-            if isImage { settings.aiImageRatio = r } else { settings.aiRatio = r }
+            // 「原始」不是能记住的生成档位，别写进全局设置 ——
+            // 写了下次新建空卡片就会带着「原始」出生，而空卡片没素材可跟随
+            if r != CanvasNode.originalRatio {
+                if isImage { settings.aiImageRatio = r } else { settings.aiRatio = r }
+            }
             canvas?.setRatio(r, for: nodeID)   // 卡片跟着变形
         }
         popUp(menu)

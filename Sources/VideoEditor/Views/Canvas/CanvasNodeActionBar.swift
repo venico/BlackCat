@@ -168,6 +168,8 @@ struct CanvasNodeActionBar: View {
         let pos = CGPoint(x: node.position.x + node.size.width + 90,
                           y: node.position.y + CGFloat(rowOffset) * 140)
         let new = canvas.addNode(kind: kind, at: pos, ratio: node.ratio)
+        // 产物进全局素材库（v5.3.0 合并了元素库）：卡片拿到 assetID，
+        // 才能跟着素材一起改名 / 删除 / 重新关联
         project.importFile(url)
         let asset = project.mediaAssets.first { $0.url == url }
         canvas.updateNode(id: new.id) {
@@ -175,11 +177,14 @@ struct CanvasNodeActionBar: View {
             $0.assetID = asset?.id
             if kind == node.kind { $0.size = node.size }
         }
-        // addNode 里已经按类型排过号了，这里不重复命名
-        canvas.recordProducedAsset(url: url, kind: kind)
     }
 
-    /// 就地换掉这张卡片的内容（镜像/旋转/裁剪走这条）
+    /// 就地换掉这张卡片的内容 —— **镜像和旋转专用**，三个调用者都在本文件里
+    /// （图片镜像 / 图片旋转 / 视频的 `runVideoOp`）。裁剪走 `CanvasNodeView.applyCropped`。
+    ///
+    /// 镜像/旋转产物**也进素材库** —— 卡片改名要能连着素材名、片段名一起改，
+    /// 那就得在素材库里有它这条（用户 2026-08-25 定的，代价是转几次多几条素材）。
+    /// 旧的 assetID 必须换掉：不换的话缩略图还按旧 key 取缓存，显示的是翻转前那张
     private func replaceContent(url: URL, newSize: CGSize? = nil) {
         canvas.pushUndo()
         project.importFile(url)
@@ -187,9 +192,9 @@ struct CanvasNodeActionBar: View {
         canvas.updateNode(id: node.id) {
             $0.mediaPath = url.path
             $0.assetID = asset?.id
+            if let assetName = asset?.name { $0.displayName = assetName }
             if let newSize { $0.size = newSize }
         }
-        canvas.recordProducedAsset(url: url, kind: node.kind)
     }
 
     private func runRemoveBackground() {

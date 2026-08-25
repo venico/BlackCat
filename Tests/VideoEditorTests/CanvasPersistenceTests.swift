@@ -21,7 +21,11 @@ final class CanvasPersistenceTests: XCTestCase {
         _ = c.connect(from: text.id, to: img.id, provider: .seedream)
         c.zoom = 1.5
         c.offset = CGSize(width: 30, height: -40)
-        c.recordProducedAsset(url: URL(fileURLWithPath: "/tmp/out.png"), kind: .image)
+        // 老存档里可能还带着元素库清单（v5.3.0 已并入素材库），
+        // 存档格式仍要能原样往返，迁移才有东西可读
+        c.producedAssets = [
+            CanvasState.ProducedAsset(path: "/tmp/out.png", kind: .image)
+        ]
         return c
     }
 
@@ -141,12 +145,78 @@ final class CanvasPersistenceTests: XCTestCase {
         XCTAssertEqual(c.conversationID, id)
     }
 
-    // 同一个文件不该在资产库里记两条
-    func testProducedAssetDeduplicates() {
+    // 画布关着的时候在侧边栏改了素材名，打开画布要能对上账 ——
+    // 通知挂在 CanvasOverlay 上，画布没开就没人接，只能靠这次对账补
+    func testSyncNodesFromLibrary() {
+        let project = ProjectState()
+        let url = URL(fileURLWithPath: "/tmp/canvas-sync-\(UUID().uuidString).png")
+        var asset = MediaAsset(url: url, name: "改过的名字.png", type: .image)
+        asset.importDate = Date()
+        project.mediaAssets = [asset]
+
         let c = CanvasState()
-        let url = URL(fileURLWithPath: "/tmp/same.png")
-        c.recordProducedAsset(url: url, kind: .image)
-        c.recordProducedAsset(url: url, kind: .image)
-        XCTAssertEqual(c.producedAssets.count, 1)
+        let node = c.addNode(kind: .image, at: .zero)
+        c.updateNode(id: node.id) {
+            $0.assetID = asset.id
+            $0.mediaPath = "/tmp/old-name-before-rename.png"   // 改名前的旧路径
+            $0.displayName = "图片 1"     // 产物卡片那种自动编号
+        }
+
+        c.syncNodesFromLibrary(project)
+        XCTAssertEqual(c.node(node.id)?.displayName, "改过的名字.png")
+        // 路径也要跟着素材走，只对名字不对路径的话卡片会显示「素材丢失」
+        XCTAssertEqual(c.node(node.id)?.mediaPath, url.path)
+    }
+
+    // 删素材：画布上引用它的卡片一并删掉（跟时间轴片段一个待遇）
+    func testRemoveAssetDropsCards() {
+        let c = CanvasState()
+        let aid = UUID()
+        let n1 = c.addNode(kind: .image, at: .zero)
+        let n2 = c.addNode(kind: .image, at: CGPoint(x: 400, y: 0))
+        c.updateNode(id: n1.id) { $0.assetID = aid }
+        c.updateNode(id: n2.id) { $0.assetID = UUID() }   // 别的素材，不该被误删
+
+        XCTAssertEqual(c.nodeCount(usingAsset: aid), 1)
+        c.removeNodes(usingAsset: aid)
+        XCTAssertNil(c.node(n1.id), "引用被删素材的卡片要没掉")
+        XCTAssertNotNil(c.node(n2.id), "别的卡片不能受影响")
+    }
+
+    // 一次 ⌘Z 三样一起回来：素材恢复时，画布那步也跟着撤
+    func testUndoRestoresCards() {
+        let c = CanvasState()
+        let aid = UUID()
+        let n = c.addNode(kind: .image, at: .zero)
+        c.updateNode(id: n.id) { $0.assetID = aid }
+
+        c.removeNodes(usingAsset: aid)
+        XCTAssertNil(c.node(n.id))
+        c.restoreNodesAfterUndo(assetID: aid)
+        XCTAssertNotNil(c.node(n.id), "素材撤销恢复后，卡片要跟着回来")
+    }
+
+    // 删完之后画布上又干了别的：栈顶已经不是那步，宁可不撤也不能撤错
+    func testUndoSkipsWhenCanvasMovedOn() {
+        let c = CanvasState()
+        let aid = UUID()
+        let n = c.addNode(kind: .image, at: .zero)
+        c.updateNode(id: n.id) { $0.assetID = aid }
+
+        c.removeNodes(usingAsset: aid)
+        let later = c.addNode(kind: .text, at: CGPoint(x: 100, y: 100))   // 又加了一张
+        c.restoreNodesAfterUndo(assetID: aid)
+        XCTAssertNotNil(c.node(later.id), "后来加的卡片不能被误撤掉")
+    }
+
+    // v5.3.0 元素库并进素材库：老存档里的清单迁移完要清空，
+    // 否则下次存档还带着它，界面上又没有入口能看到
+    func testMigrateClearsProducedAssets() {
+        let c = CanvasState()
+        c.producedAssets = [
+            CanvasState.ProducedAsset(path: "/tmp/gone-\(UUID().uuidString).png", kind: .image)
+        ]
+        c.migrateProducedAssetsIntoLibrary(ProjectState())
+        XCTAssertTrue(c.producedAssets.isEmpty)
     }
 }

@@ -1,4 +1,6 @@
 import SwiftUI
+import AVFoundation
+import ImageIO
 
 // MARK: - 节点
 
@@ -71,7 +73,9 @@ struct CanvasNode: Identifiable, Equatable, Codable {
             }
         }
 
-        /// 按比例算卡片尺寸。长边固定 300，短边跟着比例走
+        /// 按比例算卡片尺寸。长边固定 300，短边跟着比例走。
+        /// 「原始」这会儿还不知道素材多大，先按 1:1 摆着 ——
+        /// 素材尺寸读出来后 `CanvasState.applyOriginalRatio` 再把卡片调正
         static func sizeFor(ratio: String) -> CGSize {
             let parts = ratio.split(separator: ":").compactMap { Double($0) }
             guard parts.count == 2, parts[0] > 0, parts[1] > 0 else {
@@ -83,6 +87,66 @@ struct CanvasNode: Identifiable, Equatable, Codable {
                 ? CGSize(width: long, height: long / r)
                 : CGSize(width: long * r, height: long)
         }
+    }
+
+    /// 「跟随素材本身」。上传的、从素材库/元素库拿的素材默认是它；
+    /// 空卡片（等着生成的）用上次记住的档位
+    static let originalRatio = "原始"
+
+    /// 各家 API 认的比例档位。菜单和「原始」的吸附共用这两份，别各写各的
+    static let imageRatios = ["1:1", "16:9", "9:16", "4:3", "3:4", "21:9"]
+    static let videoRatios = ["16:9", "9:16", "1:1", "4:3"]
+
+    static func ratioOptions(for kind: Kind) -> [String] {
+        kind == .image ? imageRatios : videoRatios
+    }
+
+    /// 素材真实的宽高（**已按 preferredTransform 摆正**）。
+    ///
+    /// 竖拍视频的 `naturalSize` 是横的，方向在 `preferredTransform` 里 ——
+    /// 不套变换就会把竖视频当成横的，卡片形状和生成比例一起错（见交接文档第 45 条）
+    static func naturalSize(of url: URL, kind: Kind) async -> CGSize? {
+        switch kind {
+        case .image:
+            return await Task.detached {
+                guard let src = CGImageSourceCreateWithURL(url as CFURL, nil),
+                      let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any],
+                      let w = props[kCGImagePropertyPixelWidth] as? Double,
+                      let h = props[kCGImagePropertyPixelHeight] as? Double,
+                      w > 0, h > 0 else { return nil }
+                return CGSize(width: w, height: h)
+            }.value
+        case .video:
+            let asset = AVURLAsset(url: url)
+            guard let track = try? await asset.loadTracks(withMediaType: .video).first,
+                  let natural = try? await track.load(.naturalSize),
+                  let transform = try? await track.load(.preferredTransform) else { return nil }
+            let box = CGRect(origin: .zero, size: natural).applying(transform)
+            let size = CGSize(width: abs(box.width), height: abs(box.height))
+            return (size.width > 0 && size.height > 0) ? size : nil
+        case .audio, .text:
+            return nil
+        }
+    }
+
+    /// 把真实比例吸附到最近的合法档位。
+    ///
+    /// 各家 API 只认固定几个比例，传 "1440:1080" 这种算出来的值不是报错就是
+    /// 被静默忽略（交接文档第 59 条：服务端忽略不认识的字段，不报错）。
+    /// 所以「原始」发出去之前一定要落到档位上
+    static func snapRatio(_ size: CGSize, options: [String]) -> String {
+        guard size.width > 0, size.height > 0, !options.isEmpty else { return options.first ?? "1:1" }
+        let target = log(size.width / size.height)
+        return options.min { a, b in
+            abs(log(ratioValue(a)) - target) < abs(log(ratioValue(b)) - target)
+        } ?? options[0]
+    }
+
+    /// "16:9" → 1.777…。解析不了当 1:1
+    static func ratioValue(_ ratio: String) -> Double {
+        let parts = ratio.split(separator: ":").compactMap { Double($0) }
+        guard parts.count == 2, parts[0] > 0, parts[1] > 0 else { return 1 }
+        return parts[0] / parts[1]
     }
 
     var id = UUID()
@@ -110,8 +174,22 @@ struct CanvasNode: Identifiable, Equatable, Codable {
     /// 时间轴那边用通知卡片显示，画布上直接显示在卡片里 —— 逻辑一样，壳不同
     var progressText: String?
     var progress: Double?
-    /// 这个节点用的画面比例。改比例时卡片跟着变形
+    /// 这个节点用的画面比例。改比例时卡片跟着变形。
+    /// 可以是 `CanvasNode.originalRatio`（跟随素材本身）
     var ratio: String = "1:1"
+
+    /// 「原始」比例的卡片是不是已经按素材真实尺寸摆正过了。
+    ///
+    /// 素材尺寸要读盘，摆正只能是异步的。没这个标记的话每次卡片重新上屏都会摆一次，
+    /// 把用户后来手动拖出来的尺寸冲掉
+    var originalSizeApplied: Bool = false
+
+    /// 「原始」比例吸附到的合法档位，摆正那次顺手算好存下来。
+    ///
+    /// 发起生成时要一个 API 认的比例值，现算就得等读盘 ——
+    /// 存一份就不用把整条生成流程改成异步
+    var snappedRatio: String?
+
 
     /// 卡片显示名。生成/上传时给一个「图片 1」「视频 2」这样的名字，
     /// 显示在卡片**上方的类型标签那一行**，卡片里不再放文件名
@@ -187,6 +265,8 @@ struct CanvasNode: Identifiable, Equatable, Codable {
         displayName = try c.decodeIfPresent(String.self, forKey: .displayName) ?? ""
         groupID = try c.decodeIfPresent(UUID.self, forKey: .groupID)
         usesFrameMode = try c.decodeIfPresent(Bool.self, forKey: .usesFrameMode) ?? false
+        originalSizeApplied = try c.decodeIfPresent(Bool.self, forKey: .originalSizeApplied) ?? false
+        snappedRatio = try c.decodeIfPresent(String.self, forKey: .snappedRatio)
     }
 
     /// 实际画多大。音频卡片高度**写死** —— 波形不需要那么高，

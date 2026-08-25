@@ -420,6 +420,12 @@ struct ContentView: View {
         // 不给 showWelcome 加动画：欢迎页 → 主界面要一步到位。
         // 带动画的话窗口尺寸恢复和内容切换会错开，看着像被"撑开"，
         // 而且打开项目/新建项目两条路的观感还不一致
+        // 回到 app 时重新盘一次「哪些素材文件没了」——
+        // 用户很可能刚在 Finder 里挪了文件或改了名
+        .onReceive(NotificationCenter.default.publisher(
+            for: NSApplication.didBecomeActiveNotification)) { _ in
+            project.refreshMissingAssets()
+        }
         .onAppear {
             switch initialAction {
             case .openProject(let url):
@@ -534,21 +540,9 @@ struct ContentView: View {
             }
             Button("取消", role: .cancel) { project.pendingDeleteAssetID = nil }
         } message: {
-            if let id = project.pendingDeleteAssetID {
-                let count = project.clipCountForAsset(id)
-                let name = project.mediaAssets.first(where: { $0.id == id })?.name ?? ""
-                // 素材库全 app 一份：这里删的是全局那条，别的项目也会受影响
-                if count > 0 {
-                    Text("「\(name)」将从素材库移除（所有项目共用一个素材库）。\n"
-                         + "当前项目时间轴上有 \(count) 个片段引用它，会一并删除；"
-                         + "别的项目里的引用会变成「文件丢失」。")
-                } else {
-                    Text("「\(name)」将从素材库移除。素材库是所有项目共用的，"
-                         + "别的项目里引用它的片段会变成「文件丢失」。")
-                }
-            } else {
-                Text("确定要移除该素材吗？")
-            }
+            // 文案在函数里拼好再进来。在 ViewBuilder 里写这段条件逻辑会让
+            // 类型检查超时（unable to type-check this expression）
+            Text(deleteAssetMessage(project.pendingDeleteAssetID))
         }
         .sheet(isPresented: $project.showWhisperModelPicker) {
             WhisperModelPickerSheet()
@@ -569,6 +563,28 @@ struct ContentView: View {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.22) {
             project.showSettings = false
         }
+    }
+
+    /// 移除素材的确认文案。
+    ///
+    /// 素材库全 app 一份，删的是全局那条，别的项目也会受影响；
+    /// 时间轴片段和画布卡片都会跟着删，所以**引用了什么要分别说清楚**。
+    /// 本地文件一律不删
+    private func deleteAssetMessage(_ id: UUID?) -> String {
+        guard let id else { return "确定要移除该素材吗？" }
+        let name = project.mediaAssets.first(where: { $0.id == id })?.name ?? ""
+        let clips = project.clipCountForAsset(id)
+        let cards = project.canvas.nodeCount(usingAsset: id)
+        var refs: [String] = []
+        if clips > 0 { refs.append("时间轴上有 \(clips) 个片段") }
+        if cards > 0 { refs.append("画布上有 \(cards) 张卡片") }
+        if refs.isEmpty {
+            return "「\(name)」将从素材库移除。素材库是所有项目共用的，"
+                + "别的项目里引用它的片段会变成「文件丢失」。\n本地文件不会删除。"
+        }
+        return "「\(name)」将从素材库移除（所有项目共用一个素材库）。\n"
+            + refs.joined(separator: "，") + "引用它，会一并删除，可撤销；\n"
+            + "别的项目里的引用会变成「文件丢失」。本地文件不会删除。"
     }
 
     private func setupEscMonitor() {

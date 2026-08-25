@@ -1104,6 +1104,15 @@ struct TimelineView: View {
                                     Image(nsImage: SidebarSVGIcon.load("rename", size: 14))
                                     Text("重命名")
                                 }
+                                // 源文件没了才给这一项。关联走的是素材，所以关联完
+                                // 素材库、其它引用它的片段、画布卡片一起恢复
+                                if let aid = project.assetIDOfSelectedClip(rid),
+                                   project.missingAssetIDs.contains(aid) {
+                                    Button { relinkAssetWithPanel(aid, project: project) } label: {
+                                        Image(nsImage: SidebarSVGIcon.load("relink", size: 14))
+                                        Text("重新关联文件…")
+                                    }
+                                }
                             }
                             if let cid = project.selectedCompoundClipID {
                                 Button { project.renamingCompoundClipID = cid } label: {
@@ -3445,7 +3454,7 @@ private struct VideoClipView: View {
     private func commitRename() {
         guard editing else { return }           // Esc 已把它置 false，则不提交
         editing = false
-        project.renameClip(id: clip.id, to: editName)
+        project.renameClipOrAsset(clipID: clip.id, to: editName)
         project.renamingClipID = nil
     }
     private func cancelRename() {
@@ -3560,6 +3569,9 @@ private struct VideoClipView: View {
         }
         .frame(width: w, height: h-4)
         .clipShape(RoundedRectangle(cornerRadius: 6))
+        // 源文件没了：压暗 + 橙描边 + 可点的警示图标（点了重新关联）。
+        // 在 clipShape 之后挂，标记才跟着片段的圆角裁剪
+        .overlay(ClipMissingOverlay(assetID: clip.assetID, width: w))
         .opacity(isDragging ? 0 : (project.clipboardIsCut && project.clipboardSourceIDs.contains(clip.id) ? 0.35 : 1.0))
         // 占位：整块 opacity 在 1.0 ↔ 0.45 之间呼吸。必须作用在整块上而不是叠一层
         // 同色遮罩——底下就是同色实块，叠加前后混出来一个样，看不出在动。
@@ -3682,7 +3694,7 @@ private struct ImageClipView: View {
     private func commitRename() {
         guard editing else { return }           // Esc 已把它置 false，则不提交
         editing = false
-        project.renameClip(id: clip.id, to: editName)
+        project.renameClipOrAsset(clipID: clip.id, to: editName)
         project.renamingClipID = nil
     }
     private func cancelRename() {
@@ -3761,6 +3773,9 @@ private struct ImageClipView: View {
         }
         .frame(width: w, height: h-4)
         .clipShape(RoundedRectangle(cornerRadius: 6))
+        // 源文件没了：压暗 + 橙描边 + 可点的警示图标（点了重新关联）。
+        // 在 clipShape 之后挂，标记才跟着片段的圆角裁剪
+        .overlay(ClipMissingOverlay(assetID: clip.assetID, width: w))
         .opacity(isDragging ? 0 : (project.clipboardIsCut && project.clipboardSourceIDs.contains(clip.id) ? 0.35 : 1.0))
         .offset(x: clip.startTime*pps + 1)
         .allowsHitTesting(isRenaming)
@@ -3783,7 +3798,7 @@ private struct AudioClipView: View {
     private func commitRename() {
         guard editing else { return }           // Esc 已把它置 false，则不提交
         editing = false
-        project.renameClip(id: clip.id, to: editName)
+        project.renameClipOrAsset(clipID: clip.id, to: editName)
         project.renamingClipID = nil
     }
     private func cancelRename() {
@@ -3886,6 +3901,9 @@ private struct AudioClipView: View {
         }
         .frame(width: w, height: h-4)
         .clipShape(RoundedRectangle(cornerRadius: 6))
+        // 源文件没了：压暗 + 橙描边 + 可点的警示图标（点了重新关联）。
+        // 在 clipShape 之后挂，标记才跟着片段的圆角裁剪
+        .overlay(ClipMissingOverlay(assetID: clip.assetID, width: w))
         .opacity(isDragging ? 0 : (project.clipboardIsCut && project.clipboardSourceIDs.contains(clip.id) ? 0.35 : 1.0))
         .offset(x: clip.startTime*pps + 1)
         .onAppear {
@@ -5800,5 +5818,69 @@ private final class AIToolsMenuHandler: NSObject {
     /// 去背景：BiRefNet 一个模型全包，系统内置那套才需要在语义分割和色键之间选
     @objc func removeBg(_ s: NSMenuItem) {
         project?.removeBackgroundForSelection(mode: .subject)
+    }
+}
+
+
+// MARK: - 素材丢失（片段上的标记 + 重新关联）
+
+/// 弹面板给某个素材重新指定文件。
+///
+/// **素材是唯一的真相源**：这里一改，素材库那条、时间轴上所有引用它的片段、
+/// 画布上的卡片全都跟着恢复 —— 所以从哪个入口关联效果都一样
+@MainActor
+func relinkAssetWithPanel(_ assetID: UUID, project: ProjectState) {
+    guard let asset = project.mediaAssets.first(where: { $0.id == assetID }) else { return }
+    let panel = NSOpenPanel()
+    panel.allowsMultipleSelection = false
+    panel.canChooseDirectories = false
+    panel.message = "请选择「\(asset.name)」的新位置"
+    guard panel.runModal() == .OK, let url = panel.url else { return }
+    project.relinkAsset(id: assetID, newURL: url)
+}
+
+/// 片段上的「素材丢失」标记：压暗 + 橙色描边 + 左上角警示图标，**图标本身可点**，
+/// 点了就是重新关联（用户要的「上边有重新关联的图标」）。
+///
+/// 判据读 `project.missingAssetIDs` 这个缓存，**绝不能在这里查盘** ——
+/// 时间轴上百个片段每帧都渲染，`fileExists` 是每次一个系统调用
+private struct ClipMissingOverlay: View {
+    @EnvironmentObject var project: ProjectState
+    let assetID: UUID
+    /// 片段当前多宽 —— 太窄就只留图标，放不下文字
+    let width: CGFloat
+
+    @State private var hovering = false
+
+    var body: some View {
+        if project.missingAssetIDs.contains(assetID) {
+            ZStack(alignment: .topLeading) {
+                RoundedRectangle(cornerRadius: 6).fill(Color.black.opacity(0.4))
+                RoundedRectangle(cornerRadius: 6)
+                    .strokeBorder(Color(hex: "#FF9230"), lineWidth: 1.5)
+                Button { relinkAssetWithPanel(assetID, project: project) } label: {
+                    HStack(spacing: 3) {
+                        Image(nsImage: SidebarSVGIcon.load("toastWarn", size: 10))
+                            .renderingMode(.template)
+                            .resizable()
+                            .aspectRatio(contentMode: .fit)
+                            .frame(width: 10, height: 10)
+                        if width > 110 {
+                            Text(hovering ? "重新关联…" : "素材丢失")
+                                .font(.system(size: 8, weight: .medium))
+                        }
+                    }
+                    .foregroundColor(Color(hex: "#FF9230"))
+                    .padding(.horizontal, 4)
+                    .padding(.vertical, 2)
+                    .background(Capsule().fill(Color.black.opacity(hovering ? 0.75 : 0.5)))
+                    .contentShape(Capsule())
+                }
+                .buttonStyle(.plain)
+                .onHover { hovering = $0 }
+                .help("素材丢失 —— 点一下重新关联")
+                .padding(3)
+            }
+        }
     }
 }

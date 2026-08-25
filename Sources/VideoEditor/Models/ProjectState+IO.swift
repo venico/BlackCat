@@ -130,6 +130,7 @@ extension ProjectState {
             loadMediaResources(asset)
         }
         reportMissingAssetReferences()
+        refreshMissingAssets()
 
         // 重建时间轴缩略图和波形
         for track in videoTracks {

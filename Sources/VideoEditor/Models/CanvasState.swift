@@ -87,6 +87,13 @@ final class CanvasState: ObservableObject {
         return node.frame.offsetBy(dx: draggingOffset.width, dy: draggingOffset.height)
     }
 
+    /// 所在窗口的项目状态。
+    ///
+    /// 素材库合并之后（v5.3.0），画布产物要直接进全局素材库，模型层这边也得能调
+    /// `importFile`。**弱引用**：`ProjectState` 是窗口的 `@StateObject`，
+    /// 强持有会让窗口关不掉。挂载点在 `CanvasOverlay.onAppear`
+    weak var project: ProjectState?
+
     /// 这张画布对应的会话 id。一张画布 = AI 历史里的一条记录
     @Published var conversationID: UUID?
     /// 画布标题，历史列表里显示
@@ -101,7 +108,16 @@ final class CanvasState: ObservableObject {
         var path: String
         var kind: CanvasNode.Kind
         var createdAt: Date = Date()
+        /// 用户在元素库里改的名字。nil = 就用文件名。
+        ///
+        /// **只改这个显示名，不动磁盘文件**：产物文件是节点靠 `mediaPath` 找的，
+        /// 改文件名就得同步改所有引用它的节点，撤销时还得把文件名改回去 ——
+        /// 素材库那套 `renameAsset` 为此配了 `reconcileAssetFiles`，
+        /// 这里没有对应机制，改文件名一旦和撤销撞上就是素材丢失
+        var displayName: String?
         var url: URL { URL(fileURLWithPath: path) }
+        /// 列表里显示的名字
+        var name: String { displayName ?? url.lastPathComponent }
     }
 
     /// 给新卡片起名：同类型顺着数下去，「图片 1」「图片 2」……
@@ -111,9 +127,133 @@ final class CanvasState: ObservableObject {
         return "\(kind.label) \(n)"
     }
 
-    func recordProducedAsset(url: URL, kind: CanvasNode.Kind) {
-        guard !producedAssets.contains(where: { $0.path == url.path }) else { return }
-        producedAssets.insert(ProducedAsset(path: url.path, kind: kind), at: 0)
+    /// 打开老画布时把元素库并进全局素材库（v5.3.0 起元素库取消）。
+    ///
+    /// 老存档里的 `producedAssets` 是当年那套「产物只登记画布、不进素材库」留下的。
+    /// 现在两边合并成一个素材库，这些产物要补进去，卡片也补上 `assetID` ——
+    /// 补完它们才能享受改名/删除/重新关联的联动。文件已经不在的跳过。
+    /// 并完清空清单，下次存档就不带了
+    func migrateProducedAssetsIntoLibrary(_ project: ProjectState) {
+        guard !producedAssets.isEmpty else { return }
+        for item in producedAssets where FileManager.default.fileExists(atPath: item.path) {
+            if project.mediaAssets.first(where: { $0.url.path == item.path }) == nil {
+                project.importFile(item.url)
+            }
+            guard let asset = project.mediaAssets.first(where: { $0.url.path == item.path }) else { continue }
+            for j in nodes.indices where nodes[j].mediaPath == item.path && nodes[j].assetID == nil {
+                nodes[j].assetID = asset.id
+            }
+        }
+        producedAssets = []
+    }
+
+    // MARK: - 跟素材库联动（删除 / 撤销 / 改名）
+
+    /// 因为素材库删除而删掉卡片的那一步撤销点。
+    ///
+    /// 记下「为哪个素材删的」和「删完时撤销栈有多深」，撤销时用来核对：
+    /// 栈顶那一步确实是为这个素材删的，才跟着撤一步。
+    /// 如果删完之后用户又在画布上做了别的操作，栈顶就不是那步了 ——
+    /// 这时**宁可不撤**，也不能把用户后来做的操作误撤掉
+    private var assetRemovalMarks: [(assetID: UUID, undoDepth: Int)] = []
+
+    /// 画布上有几张卡片在用这个素材。删素材前的确认框要报这个数
+    func nodeCount(usingAsset id: UUID) -> Int {
+        nodes.filter { $0.assetID == id }.count
+    }
+
+    /// 素材被移出素材库：引用它的卡片一并删掉（跟时间轴片段一个待遇）。
+    /// 删之前压一个撤销点并做标记，撤销时才能一次把卡片也带回来
+    func removeNodes(usingAsset id: UUID) {
+        let victims = nodes.filter { $0.assetID == id }
+        guard !victims.isEmpty else { return }
+        pushUndo()
+        let ids = Set(victims.map(\.id))
+        nodes.removeAll { ids.contains($0.id) }
+        edges.removeAll { ids.contains($0.from) || ids.contains($0.to) }
+        selectedNodeIDs.subtract(ids)
+        assetRemovalMarks.append((assetID: id, undoDepth: undoCount))
+    }
+
+    /// 素材被撤销恢复了：如果画布这边最近一步正是为它删的卡片，就跟着撤一步 ——
+    /// 一次 ⌘Z 素材、片段、卡片一起回来
+    func restoreNodesAfterUndo(assetID: UUID) {
+        guard let mark = assetRemovalMarks.last, mark.assetID == assetID else { return }
+        assetRemovalMarks.removeLast()
+        guard mark.undoDepth == undoCount else {
+            // 删完之后画布上又做过别的操作，栈顶已经不是那一步了。
+            // 这时撤下去会把别的操作也撤掉，不如不动
+            DiagLog.log("[画布] 素材恢复了，但画布撤销栈顶已不是当初那步，卡片不自动恢复")
+            return
+        }
+        undo()
+    }
+
+    /// 打开画布时跟素材库对一次账：有 assetID 的卡片，**名字和文件路径**都取素材当前的值。
+    ///
+    /// **光靠通知不够** —— `MediaRelocationSync` 挂在 `CanvasOverlay` 上，
+    /// 画布没打开时视图不在树里，通知没人接。在**侧边栏**改名或重新关联过的，
+    /// 卡片就停在改动前的状态。
+    ///
+    /// **路径必须一起对**：改名会连磁盘文件一起改，只同步名字不同步路径的话，
+    /// 卡片名字是新的、`mediaPath` 还指着已经不存在的旧文件 ——
+    /// 表现就是「名字改好了，卡片却显示素材丢失」。
+    /// 路径走 `repointNodes` 换，撤销栈里的旧路径一并换掉，撤销回去也不会又丢
+    func syncNodesFromLibrary(_ project: ProjectState) {
+        for j in nodes.indices {
+            guard let aid = nodes[j].assetID,
+                  let asset = project.mediaAssets.first(where: { $0.id == aid }) else { continue }
+            if nodes[j].displayName != asset.name {
+                nodes[j].displayName = asset.name
+            }
+            if let old = nodes[j].mediaPath, old != asset.url.path {
+                repointNodes(from: old, to: asset.url.path)
+            }
+        }
+    }
+
+    /// 素材改名后，画布上引用它的卡片显示名一起改。
+    ///
+    /// **按 `assetID` 认卡片，不能按名字匹配** —— 产物卡片的显示名是
+    /// `nextName(for:)` 给的「图片 1」「视频 2」这种自动编号，跟文件名对不上，
+    /// 按名字匹配一条都改不到（这就是「素材库改名卡片没跟着变」的原因）
+    func renameNodeLabels(assetID: UUID, to newName: String) {
+        for j in nodes.indices where nodes[j].assetID == assetID {
+            nodes[j].displayName = newName
+        }
+    }
+
+    /// 没有 assetID 的卡片（镜像/旋转那类）按文件路径认
+    func renameNodeLabels(path: String, to newName: String) {
+        for j in nodes.indices where nodes[j].mediaPath == path {
+            nodes[j].displayName = newName
+        }
+    }
+
+    /// 把所有指向 `oldPath` 的引用改到 `newPath` —— 当前画布 + 撤销/重做栈
+    func repointNodes(from oldPath: String, to newPath: String) {
+        for j in nodes.indices where nodes[j].mediaPath == oldPath {
+            nodes[j].mediaPath = newPath
+        }
+        for s in undoStack.indices {
+            for j in undoStack[s].nodes.indices where undoStack[s].nodes[j].mediaPath == oldPath {
+                undoStack[s].nodes[j].mediaPath = newPath
+            }
+        }
+        for s in redoStack.indices {
+            for j in redoStack[s].nodes.indices where redoStack[s].nodes[j].mediaPath == oldPath {
+                redoStack[s].nodes[j].mediaPath = newPath
+            }
+        }
+    }
+
+    /// 缩略图 / 波形缓存的 key。
+    ///
+    /// 素材库里有就用素材 id（跟时间轴/素材库共用那份缓存，不重复抽帧）。
+    /// 镜像/旋转的产物按约定不进素材库，没有 `assetID`，退回节点自己的 id ——
+    /// 缓存是内存里的字典，用谁的 id 都行，只要前后一致
+    func thumbKey(assetID: UUID?, path: String?, fallback: UUID) -> UUID {
+        assetID ?? fallback
     }
 
     /// 正在拉的这条线是从卡片哪一侧的 + 出来的。
@@ -171,6 +311,49 @@ final class CanvasState: ObservableObject {
     /// NSTextView 一个都收不到 —— 文字超出卡片也滚不动。有了这个，
     /// 滚轮落在文本卡片上时就放行给它自己滚
     @Published var hoveredTextNodeID: UUID?
+
+    /// 鼠标是不是悬在素材库/元素库那个面板上。
+    ///
+    /// 跟 `hoveredTextNodeID` 同一个道理：滚轮监听默认全吞去平移画布，
+    /// 面板里的列表一格都滚不动。悬在面板上时滚轮改成滚这个列表
+    @Published var assetPanelHovered = false
+
+    /// 素材库/元素库面板底下那个 NSScrollView。
+    ///
+    /// 滚轮和自绘滚动条都要直接驱动它 —— SwiftUI 的 ScrollView 既拿不到滚动位置、
+    /// 也没法程序化滚到某个偏移，只能顺着视图链把底层的 NSScrollView 找出来
+    /// （跟时间轴那条横向滚动条同一套路）。**弱引用**，面板关掉就自动断
+    weak var assetPanelScroller: NSScrollView?
+
+    /// 把面板滚到某个位置（0~1）。拖自绘滚动条时调
+    func scrollAssetPanel(toFraction frac: Double) {
+        guard let sv = assetPanelScroller, let doc = sv.documentView else { return }
+        let maxY = max(0, doc.frame.height - sv.contentView.bounds.height)
+        guard maxY > 0 else { return }
+        var origin = sv.contentView.bounds.origin
+        origin.y = maxY * CGFloat(frac.clamped(to: 0...1))
+        sv.contentView.scroll(to: origin)
+        sv.reflectScrolledClipView(sv.contentView)
+    }
+
+    /// 滚轮落在面板上：滚这个列表。返回 true = 事件已消化，别再拿去平移画布。
+    ///
+    /// 不靠「放行给系统去分发」那条路 —— SwiftUI 合并绘制，hitTest 命中的是最外层
+    /// NSHostingView，能不能落到 ScrollView 上没准。直接改 clipView 的 bounds 最稳
+    @discardableResult
+    func scrollAssetPanelByWheel(_ event: NSEvent) -> Bool {
+        guard assetPanelHovered, let sv = assetPanelScroller, let doc = sv.documentView else { return false }
+        let maxY = max(0, doc.frame.height - sv.contentView.bounds.height)
+        // 内容不足一屏也要吞掉：指针在面板上，画布不该跟着动
+        guard maxY > 0 else { return true }
+        // 触控板给的是像素、鼠标滚轮给的是行数，后者不放大一格挪不动
+        let step: CGFloat = event.hasPreciseScrollingDeltas ? 1 : 16
+        var origin = sv.contentView.bounds.origin
+        origin.y = (origin.y - event.scrollingDeltaY * step).clamped(to: 0...maxY)
+        sv.contentView.scroll(to: origin)
+        sv.reflectScrolledClipView(sv.contentView)
+        return true
+    }
 
     /// 编辑中的文本卡片，光标在文字里的位置（UTF-16 偏移）。
     /// 工具栏按它决定「H1/B/I/U/S 作用在哪一行」—— 光标在第二段就改第二段，
@@ -320,6 +503,44 @@ final class CanvasState: ObservableObject {
         nodes[i].size = new
         nodes[i].position = CGPoint(x: nodes[i].position.x + (old.width - new.width) / 2,
                                     y: nodes[i].position.y + (old.height - new.height) / 2)
+        // 选回「原始」要重新按素材尺寸摆一次，所以把标记清掉
+        nodes[i].originalSizeApplied = (ratio != CanvasNode.originalRatio)
+    }
+
+    /// 「原始」比例的卡片按素材真实尺寸摆正。素材尺寸要读盘，所以是
+    /// 先摆个默认形状、读出来再调 —— `CanvasNodeView` 拿到尺寸后调这里。
+    ///
+    /// **只摆一次**（`originalSizeApplied`）：卡片每次重新上屏都摆的话，
+    /// 用户后来手动拖出来的尺寸会被冲掉。中心保持不动，跟 `setRatio` 一致
+    func applyOriginalRatio(nodeID: UUID, natural: CGSize) {
+        guard let i = nodes.firstIndex(where: { $0.id == nodeID }),
+              nodes[i].ratio == CanvasNode.originalRatio,
+              !nodes[i].originalSizeApplied,
+              natural.width > 0, natural.height > 0 else { return }
+        let r = natural.width / natural.height
+        let long: CGFloat = 300
+        let new = r >= 1 ? CGSize(width: long, height: long / r)
+                         : CGSize(width: long * r, height: long)
+        let old = nodes[i].size
+        nodes[i].originalSizeApplied = true
+        nodes[i].size = new
+        nodes[i].position = CGPoint(x: nodes[i].position.x + (old.width - new.width) / 2,
+                                    y: nodes[i].position.y + (old.height - new.height) / 2)
+        // 顺手把「发给 API 用哪个档位」算好存下来，省得生成时再读一次盘
+        nodes[i].snappedRatio = CanvasNode.snapRatio(
+            natural, options: CanvasNode.ratioOptions(for: nodes[i].kind))
+    }
+
+    /// 这个节点发起生成时该用哪个比例。
+    ///
+    /// 「原始」不能直接发出去 —— 各家 API 只认固定档位，所以用摆正时算好的吸附值；
+    /// 还没摆正过（素材尺寸没读出来）就退回全局记住的那个
+    func generationRatio(for node: CanvasNode, settings: AppSettings) -> String {
+        let remembered = node.kind == .image ? settings.aiImageRatio : settings.aiRatio
+        guard node.ratio == CanvasNode.originalRatio else {
+            return node.ratio.contains(":") ? node.ratio : remembered
+        }
+        return node.snappedRatio ?? remembered
     }
 
     func removeNode(id: UUID) {
@@ -468,13 +689,17 @@ final class CanvasState: ObservableObject {
         let hadContent = node.hasContent
         updateNode(id: nodeID) { $0.isGenerating = true; $0.isWaiting = false }
 
+        // 比例按**这张卡片**自己的来（选「原始」时用吸附好的档位），
+        // 不再一律用全局那个 —— 素材卡片和空卡片本来就该不一样
+        let ratio = generationRatio(for: node, settings: settings)
+
         let taskID = AIVideoService.shared.generateForCanvas(
             prompt: prompt,
             provider: provider,
             duration: settings.aiDuration,
-            aspectRatio: settings.aiRatio,
+            aspectRatio: node.kind == .image ? settings.aiRatio : ratio,
             resolution: settings.aiResolution,
-            imageRatio: settings.aiImageRatio,
+            imageRatio: node.kind == .image ? ratio : settings.aiImageRatio,
             referenceImages: images,
             referenceVideos: videos,
             referenceAudios: audios,
@@ -494,8 +719,16 @@ final class CanvasState: ObservableObject {
                     }
                 }
                 if case .success(let url) = result {
-                    if hadContent { self.spawnResultNode(from: nodeID, mediaURL: url) }
-                    if let kind { self.recordProducedAsset(url: url, kind: kind) }
+                    // 产物进全局素材库（v5.3.0 合并了元素库），卡片挂上 assetID ——
+                    // 之后改名/删除/重新关联才跟着素材联动
+                    var landed = nodeID
+                    if hadContent, let spawned = self.spawnResultNode(from: nodeID, mediaURL: url) {
+                        landed = spawned
+                    }
+                    project?.importFile(url)
+                    if let asset = project?.mediaAssets.first(where: { $0.url == url }) {
+                        self.updateNode(id: landed) { $0.assetID = asset.id }
+                    }
                 }
                 self.runningTaskIDs.removeValue(forKey: nodeID)
                 // 等着这个节点的下游可以开工了
@@ -548,8 +781,10 @@ final class CanvasState: ObservableObject {
     ///
     /// 只在「源卡片本来就有内容」时走这条 —— 空卡片直接填进去更自然，
     /// 生成一次冒出两张（一空一满）反而奇怪
-    private func spawnResultNode(from sourceID: UUID, mediaURL: URL? = nil, text: String? = nil) {
-        guard let src = node(sourceID) else { return }
+    /// - Returns: 新卡片的 id，调用方拿去把元素库依赖挂上
+    @discardableResult
+    private func spawnResultNode(from sourceID: UUID, mediaURL: URL? = nil, text: String? = nil) -> UUID? {
+        guard let src = node(sourceID) else { return nil }
         let pos = CGPoint(x: src.position.x + src.size.width + 90, y: src.position.y)
         let new = addNode(kind: src.kind, at: pos, ratio: src.ratio)
         updateNode(id: new.id) {
@@ -559,6 +794,7 @@ final class CanvasState: ObservableObject {
             if let mediaURL { $0.mediaPath = mediaURL.path }
             if let text { $0.text = text }
         }
+        return new.id
     }
 
     /// 上游完成后，把等着它的下游拉起来

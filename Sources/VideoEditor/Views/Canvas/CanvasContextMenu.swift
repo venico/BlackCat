@@ -12,10 +12,18 @@ struct CanvasContextPanel: View {
     let targets: Set<UUID>
     /// 右键的是组的底就带上组 id
     var groupID: UUID?
+    /// 右键的那张卡片素材丢了，就多一项「重新关联文件…」。
+    /// nil = 没丢或者选了多张，不显示
+    var relinkTarget: UUID?
+    var onRelink: ((UUID) -> Void)?
     var onClose: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
+            if let rid = relinkTarget, let onRelink {
+                row(SidebarSVGIcon.load("relink", size: 13), "重新关联文件…") { onRelink(rid) }
+                Divider().opacity(0.12).padding(.vertical, 4)
+            }
             if let gid = groupID {
                 row(SidebarSVGIcon.load("dissolveCompound", size: 13), "解散组") {
                     canvas.ungroup(gid)

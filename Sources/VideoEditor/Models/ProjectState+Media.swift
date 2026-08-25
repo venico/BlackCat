@@ -885,6 +885,9 @@ extension ProjectState {
     /// 删除素材并移除时间轴上所有引用该素材的片段
     func removeAssetAndClips(assetID: UUID) {
         let snap = currentSnapshot(includeAssets: true)
+        // 画布上引用它的卡片也一并删（跟时间轴片段一个待遇）。
+        // 画布有自己的撤销栈，所以它自己压一步 + 做标记，撤销时才能一起回来
+        canvas.removeNodes(usingAsset: assetID)
         mediaAssets.removeAll { $0.id == assetID }
         for i in videoTracks.indices {
             videoTracks[i].clips.removeAll { $0.assetID == assetID }
@@ -942,9 +945,24 @@ extension ProjectState {
 
     func relinkAsset(id: UUID, newURL: URL) {
         pushUndoSavingAssets()
+        // 改名（`renameAsset` 改完磁盘文件后也走这里）和重新关联，都会让文件路径变。
+        // 画布上的卡片认的是路径，不通知一声它们就还挂在旧路径上 → 显示成素材丢失
+        let oldPath = mediaAssets.first(where: { $0.id == id })?.url.path
         if let i = mediaAssets.firstIndex(where: { $0.id == id }) {
             mediaAssets[i].url = newURL
             mediaAssets[i].name = newURL.lastPathComponent
+        }
+        defer {
+            if let oldPath, oldPath != newURL.path {
+                // **故意广播、不带窗口 id**：素材库是全局一份（v5.1.0 起），
+                // 一个文件改了名，所有窗口的画布都该跟着改。
+                // 这跟「保存」那种必须定向到某个窗口的命令不是一回事
+                NotificationCenter.default.post(
+                    name: .mediaFileRelocated, object: nil,
+                    userInfo: ["assetID": id,
+                               "old": oldPath, "new": newURL.path,
+                               "newName": newURL.lastPathComponent])
+            }
         }
         for ti in videoTracks.indices {
             for ci in videoTracks[ti].clips.indices where videoTracks[ti].clips[ci].assetID == id {
@@ -970,6 +988,8 @@ extension ProjectState {
         if let asset = mediaAssets.first(where: { $0.id == id }) {
             loadMediaResources(asset)
         }
+        // 关联/改名之后丢失状态就变了，重新盘一遍
+        refreshMissingAssets()
         // 重新加载时长和尺寸
         Task {
             let avAsset = AVURLAsset(url: newURL)

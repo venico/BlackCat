@@ -16,6 +16,14 @@ struct CanvasCropOverlay: View {
 
     private static let handleHit: CGFloat = 10
 
+    /// 这一次拖拽开始时的框。
+    ///
+    /// **必须记这个快照**：`DragGesture.translation` 是相对手势起点的**累计**位移，
+    /// 而 `rect` 每帧都被改。拿当前 rect 再加一次完整位移，等于把位移一遍遍累加 ——
+    /// 框先加速冲出去、撞到边界被 clamp 卡住，鼠标再动它也不动，
+    /// 表现就是「不跟鼠标」。一律以起始框为基准算
+    @State private var dragStartRect: CGRect?
+
     var body: some View {
         GeometryReader { geo in
             let w = geo.size.width, h = geo.size.height
@@ -115,42 +123,49 @@ struct CanvasCropOverlay: View {
     private func moveGesture(size: CGSize) -> some Gesture {
         DragGesture()
             .onChanged { v in
+                let base = dragStartRect ?? rect
+                if dragStartRect == nil { dragStartRect = rect }
                 let dx = v.translation.width / size.width
                 let dy = v.translation.height / size.height
-                var r = rect
-                r.origin.x = min(max(0, rect.minX + dx), 1 - rect.width)
-                r.origin.y = min(max(0, rect.minY + dy), 1 - rect.height)
+                var r = base
+                r.origin.x = min(max(0, base.minX + dx), 1 - base.width)
+                r.origin.y = min(max(0, base.minY + dy), 1 - base.height)
                 rect = r
             }
+            .onEnded { _ in dragStartRect = nil }
     }
 
     /// 拖角。最小 10% —— 拖到 0 会裁出一张空图
     private func cornerGesture(_ corner: Corner, size: CGSize) -> some Gesture {
         DragGesture()
             .onChanged { v in
+                // 跟 moveGesture 同一个道理：基准是**起始框**，不是每帧变着的 rect
+                let base = dragStartRect ?? rect
+                if dragStartRect == nil { dragStartRect = rect }
                 let dx = v.translation.width / size.width
                 let dy = v.translation.height / size.height
-                var r = rect
+                var r = base
                 let minSide: CGFloat = 0.1
                 switch corner {
                 case .topLeading:
-                    let nx = min(max(0, rect.minX + dx), rect.maxX - minSide)
-                    let ny = min(max(0, rect.minY + dy), rect.maxY - minSide)
-                    r = CGRect(x: nx, y: ny, width: rect.maxX - nx, height: rect.maxY - ny)
+                    let nx = min(max(0, base.minX + dx), base.maxX - minSide)
+                    let ny = min(max(0, base.minY + dy), base.maxY - minSide)
+                    r = CGRect(x: nx, y: ny, width: base.maxX - nx, height: base.maxY - ny)
                 case .topTrailing:
-                    let nx = max(min(1, rect.maxX + dx), rect.minX + minSide)
-                    let ny = min(max(0, rect.minY + dy), rect.maxY - minSide)
-                    r = CGRect(x: rect.minX, y: ny, width: nx - rect.minX, height: rect.maxY - ny)
+                    let nx = max(min(1, base.maxX + dx), base.minX + minSide)
+                    let ny = min(max(0, base.minY + dy), base.maxY - minSide)
+                    r = CGRect(x: base.minX, y: ny, width: nx - base.minX, height: base.maxY - ny)
                 case .bottomLeading:
-                    let nx = min(max(0, rect.minX + dx), rect.maxX - minSide)
-                    let ny = max(min(1, rect.maxY + dy), rect.minY + minSide)
-                    r = CGRect(x: nx, y: rect.minY, width: rect.maxX - nx, height: ny - rect.minY)
+                    let nx = min(max(0, base.minX + dx), base.maxX - minSide)
+                    let ny = max(min(1, base.maxY + dy), base.minY + minSide)
+                    r = CGRect(x: nx, y: base.minY, width: base.maxX - nx, height: ny - base.minY)
                 case .bottomTrailing:
-                    let nx = max(min(1, rect.maxX + dx), rect.minX + minSide)
-                    let ny = max(min(1, rect.maxY + dy), rect.minY + minSide)
-                    r = CGRect(x: rect.minX, y: rect.minY, width: nx - rect.minX, height: ny - rect.minY)
+                    let nx = max(min(1, base.maxX + dx), base.minX + minSide)
+                    let ny = max(min(1, base.maxY + dy), base.minY + minSide)
+                    r = CGRect(x: base.minX, y: base.minY, width: nx - base.minX, height: ny - base.minY)
                 }
                 rect = r
             }
+            .onEnded { _ in dragStartRect = nil }
     }
 }

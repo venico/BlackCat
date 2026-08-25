@@ -422,16 +422,40 @@ final class ProjectState: ObservableObject {
     @Published var selectedShapeClipID: UUID?    = nil
     @Published var selectedCompoundClipID: UUID? = nil
     @Published var renamingCompoundClipID: UUID? = nil
+    /// 源文件已经不在的素材。片段和卡片据此显示「素材丢失」。
+    ///
+    /// **必须缓存**：`MediaAsset.fileExists` 是计算属性，每次都发一次
+    /// `FileManager` 查询。素材库几十项无所谓，时间轴上百个片段每帧渲染都查
+    /// 就是几百次系统调用。这里存成集合，UI 只读它，刷新时机见 `refreshMissingAssets`
+    @Published private(set) var missingAssetIDs: Set<UUID> = []
+
+    /// 重新盘一遍哪些素材的文件没了。
+    ///
+    /// 调用时机：打开项目、导入素材、改名/重新关联之后、**app 重新激活时**
+    /// （用户很可能刚在 Finder 里挪了文件或改了名）
+    func refreshMissingAssets() {
+        var missing = Set<UUID>()
+        for a in mediaAssets where !FileManager.default.fileExists(atPath: a.url.path) {
+            missing.insert(a.id)
+        }
+        guard missing != missingAssetIDs else { return }
+        missingAssetIDs = missing
+    }
+
     /// 素材库里正在重命名的素材
     @Published var renamingAssetID: UUID? = nil
     /// 轨道区正在重命名的视频/图片/音频片段
     @Published var renamingClipID: UUID? = nil
 
-    /// 改素材名，同时重命名磁盘文件。扩展名强制保持不变。
-    /// 片段与素材靠 assetID 关联，改名不影响关联；已在轨道上的片段保留自己的标题
+    /// 改素材名 —— **一改全改**（用户 2026-08-25 要求）：磁盘文件名、素材名、
+    /// 所有引用它的时间轴片段、画布上的卡片，一起换成新名字。扩展名强制不变。
+    ///
+    /// 这推翻了 v4.2.0「片段名和素材名两套独立」的设计：那时片段名是加进时间轴
+    /// 那一刻拷过去的副本，之后各改各的。现在素材是唯一的真相源
     func renameAsset(id: UUID, to newName: String) {
         let input = newName.trimmingCharacters(in: .whitespaces)
         guard !input.isEmpty, let i = mediaAssets.firstIndex(where: { $0.id == id }) else { return }
+        let oldName = mediaAssets[i].name
         let oldURL = mediaAssets[i].url
         let ext = oldURL.pathExtension
 
@@ -463,9 +487,77 @@ final class ProjectState: ObservableObject {
             // 文件路径变了，素材和所有引用它的片段一起改指向
             relinkAsset(id: id, newURL: newURL)
         } else {
+            // 文件本来就不在（素材丢失状态下改名）：只改名字，不动路径。
+            // 这条分支 `relinkAsset` 不会跑，所以要自己把通知发出去
             pushUndo()
             mediaAssets[i].name = finalName
+            NotificationCenter.default.post(
+                name: .mediaFileRelocated, object: nil,
+                userInfo: ["assetID": id, "newName": finalName])
         }
+        syncClipNames(assetID: id, to: finalName)
+    }
+
+    /// 所有引用这个素材的片段，名字一律跟着素材走 —— 包括复合片段内部那些。
+    /// 单独改过名的片段也会被覆盖，这是定好的口径（素材是唯一真相源）
+    private func syncClipNames(assetID: UUID, to name: String) {
+        func fixVideo(_ tracks: inout [Track<VideoClip>]) {
+            for ti in tracks.indices {
+                for ci in tracks[ti].clips.indices where tracks[ti].clips[ci].assetID == assetID {
+                    tracks[ti].clips[ci].name = name
+                }
+            }
+        }
+        func fixAudio(_ tracks: inout [Track<AudioClip>]) {
+            for ti in tracks.indices {
+                for ci in tracks[ti].clips.indices where tracks[ti].clips[ci].assetID == assetID {
+                    tracks[ti].clips[ci].name = name
+                }
+            }
+        }
+        func fixImage(_ tracks: inout [Track<ImageClip>]) {
+            for ti in tracks.indices {
+                for ci in tracks[ti].clips.indices where tracks[ti].clips[ci].assetID == assetID {
+                    tracks[ti].clips[ci].name = name
+                }
+            }
+        }
+        fixVideo(&videoTracks); fixAudio(&audioTracks); fixImage(&imageTracks)
+        for ti in compoundTracks.indices {
+            for ci in compoundTracks[ti].clips.indices {
+                fixVideo(&compoundTracks[ti].clips[ci].videoTracks)
+                fixAudio(&compoundTracks[ti].clips[ci].audioTracks)
+                fixImage(&compoundTracks[ti].clips[ci].imageTracks)
+            }
+        }
+    }
+
+    /// 按片段 id 反查它用的素材。右键菜单判断「要不要给重新关联」用
+    func assetIDOfSelectedClip(_ clipID: UUID) -> UUID? {
+        assetID(ofClip: clipID)
+    }
+
+    /// 片段改名的统一入口。有重命名入口的只有视频/音频/图片三类
+    /// （字幕、文字、图形片段本来就没有名字这个字段）。
+    ///
+    /// **素材还在库里就等于改素材** —— 磁盘文件、素材名、其它引用同一素材的片段、
+    /// 画布卡片全部跟着变。
+    ///
+    /// 素材**不在库里**（片段的 assetID 悬空，比如素材被移除过）时退回只改片段自己：
+    /// 不然 `renameAsset` 查不到素材会直接 return，表现是「改了名什么都没发生」
+    func renameClipOrAsset(clipID: UUID, to newName: String) {
+        if let aid = assetID(ofClip: clipID), mediaAssets.contains(where: { $0.id == aid }) {
+            renameAsset(id: aid, to: newName)
+        } else {
+            renameClip(id: clipID, to: newName)
+        }
+    }
+
+    private func assetID(ofClip id: UUID) -> UUID? {
+        for t in videoTracks { if let c = t.clips.first(where: { $0.id == id }) { return c.assetID } }
+        for t in audioTracks { if let c = t.clips.first(where: { $0.id == id }) { return c.assetID } }
+        for t in imageTracks { if let c = t.clips.first(where: { $0.id == id }) { return c.assetID } }
+        return nil
     }
 
     /// 改轨道片段标题，不动素材

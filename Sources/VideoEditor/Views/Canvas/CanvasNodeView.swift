@@ -35,6 +35,11 @@ struct CanvasNodeView: View {
     @State private var dragOffset: CGSize = .zero
     @State private var isDragging = false
     @State private var isResizing = false
+    /// 名字正在改。Finder 式「点、停、再点」进入
+    @State private var isRenaming = false
+    @State private var editName = ""
+    @FocusState private var nameFieldFocused: Bool
+
     @State private var resizeStart: CGSize?
     @State private var resizeStartPos: CGPoint?
     /// 调整中的临时尺寸和位置补偿。每帧写 canvas.nodes 会让整层 ForEach 重建 ——
@@ -91,9 +96,7 @@ struct CanvasNodeView: View {
                 // 文件名不再画在卡片里 —— 盖着画面看着乱
                 HStack(spacing: 4) {
                     svgIcon(Self.iconKey(for: node.kind), size: 11)
-                    Text(node.displayName.isEmpty ? node.kind.label : node.displayName)
-                        .font(.system(size: 10))
-                        .lineLimit(1)
+                    nameLabel
                     Spacer(minLength: 4)
                 }
                 .foregroundColor(Color.labelSecondary.opacity(0.7))
@@ -290,6 +293,64 @@ struct CanvasNodeView: View {
         canvas.updateNode(id: node.id) { $0.size = size; $0.position = pos }
     }
 
+    /// 卡片上沿那个名字。**已选中时再点一下就能改名**（Finder 那种「点、停、再点」），
+    /// 不是双击 —— 双击在画布上是别的操作，而且同一个视图上单击和双击并存会
+    /// 让单击等 0.3 秒判连击（交接文档第 34 条）。
+    ///
+    /// 改完连磁盘文件名、素材名、时间轴上引用同一素材的片段一起变（素材是唯一真相源）。
+    /// 镜像/旋转那类不进素材库的产物没有 assetID，只改卡片自己显示的名字
+    @ViewBuilder
+    private var nameLabel: some View {
+        if isRenaming {
+            TextField("", text: $editName)
+                .textFieldStyle(.plain)
+                .font(.system(size: 10))
+                .focused($nameFieldFocused)
+                .onAppear { nameFieldFocused = true }
+                .onSubmit { commitRename() }
+                .onExitCommand { isRenaming = false }
+                .onChange(of: nameFieldFocused) { _, focused in
+                    if !focused { commitRename() }
+                }
+                .padding(.horizontal, 3)
+                .background(RoundedRectangle(cornerRadius: 3).fill(Color.white.opacity(0.14)))
+                .frame(maxWidth: effectiveSize.width - 24)
+        } else {
+            Text(node.displayName.isEmpty ? node.kind.label : node.displayName)
+                .font(.system(size: 10))
+                .lineLimit(1)
+                // 命中区按标签行的整块给，只按文字宽度的话得精确点在字上才有反应
+                .frame(height: Self.labelHeight - 4)
+                .contentShape(Rectangle())
+                // highPriority：这一行压在卡片的拖拽手势上，普通 tap 会被它抢走，
+                // 表现就是「有时候能触发」
+                .highPriorityGesture(TapGesture().onEnded {
+                    if isSelected {
+                        editName = node.displayName.isEmpty ? node.kind.label : node.displayName
+                        isRenaming = true
+                    } else {
+                        // Finder 那套「点、停、再点」：第一下先选中卡片
+                        canvas.selectedNodeID = node.id
+                    }
+                })
+                .help(isSelected ? "点一下改名" : "")
+        }
+    }
+
+    private func commitRename() {
+        guard isRenaming else { return }
+        isRenaming = false
+        let name = editName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty, name != node.displayName else { return }
+        if let aid = node.assetID {
+            // 一改全改：磁盘文件、素材名、所有引用它的片段和卡片
+            project.renameAsset(id: aid, to: name)
+        } else {
+            // 没进素材库的产物（老画布里可能还有）：只改这张卡片自己显示的名字
+            canvas.updateNode(id: node.id) { $0.displayName = name }
+        }
+    }
+
     /// 卡片出现时把要用的素材准备好：音频波形、时长、封面。
     /// 都是**读盘的活**，一律挪出主线程 —— 波形那套本身就是后台线程 + 超时兜底
     private func prepareMedia() {
@@ -317,11 +378,26 @@ struct CanvasNodeView: View {
             }
         }
 
-        if node.kind == .image, localCover == nil,
-           node.assetID.flatMap({ project.mediaThumbnails[$0] }) == nil {
+        if node.kind == .image, localCover == nil, project.mediaThumbnails[thumbKey] == nil {
             Task.detached {
                 let img = NSImage(contentsOf: url)
                 await MainActor.run { localCover = img }
+            }
+        }
+
+        // 视频封面：产物不进素材库，没人替它抽帧了，这里按同一个 key 自己抽一帧。
+        // `loadMediaThumbnail` 只往 `mediaThumbnails` 这个内存缓存里写，不碰素材库清单
+        if node.kind == .video, project.mediaThumbnails[thumbKey] == nil {
+            project.loadMediaThumbnail(assetID: thumbKey, url: url)
+        }
+
+        // 比例选了「原始」：读素材真实尺寸把卡片摆正。读盘所以是异步的，
+        // `applyOriginalRatio` 里有 `originalSizeApplied` 挡着，只摆一次
+        if node.ratio == CanvasNode.originalRatio, !node.originalSizeApplied {
+            let kind = node.kind, nodeID = node.id
+            Task {
+                guard let natural = await CanvasNode.naturalSize(of: url, kind: kind) else { return }
+                await MainActor.run { canvas.applyOriginalRatio(nodeID: nodeID, natural: natural) }
             }
         }
     }
@@ -429,6 +505,7 @@ struct CanvasNodeView: View {
 
     private func applyCropped(url: URL, size: CGSize, kind: CanvasNode.Kind) {
         canvas.pushUndo()
+        // 裁剪产物进全局素材库，卡片挂上新素材的 id
         project.importFile(url)
         let asset = project.mediaAssets.first { $0.url == url }
         canvas.updateNode(id: node.id) {
@@ -436,7 +513,6 @@ struct CanvasNodeView: View {
             $0.assetID = asset?.id
             $0.size = size
         }
-        canvas.recordProducedAsset(url: url, kind: kind)
     }
 
     /// 用素材库那套自己的图标，别混 SF Symbols
@@ -488,6 +564,37 @@ struct CanvasNodeView: View {
                                   onCancel: { canvas.croppingNodeID = nil })
                     .frame(width: effectiveSize.width, height: effectiveSize.height)
                     .offset(y: Self.labelHeight / 2)
+            }
+        }
+        // 源文件没了：盖一层提示 + 一颗重新关联按钮，跟素材库那边一个样。
+        // 卡片本身不动 —— 文件找回来关联一下就恢复
+        .overlay {
+            if mediaMissing {
+                RoundedRectangle(cornerRadius: 24)
+                    .fill(Color.black.opacity(0.55))
+                    .overlay(
+                        VStack(spacing: 6) {
+                            Image(nsImage: SidebarSVGIcon.load("toastWarn", size: 18))
+                                .renderingMode(.template)
+                                .resizable()
+                                .aspectRatio(contentMode: .fit)
+                                .frame(width: 18, height: 18)
+                                .foregroundColor(Color(hex: "#FF9230"))
+                            Text("素材丢失")
+                                .font(.system(size: 11))
+                                .foregroundColor(Color(hex: "#FF9230"))
+                            Button { relinkMedia() } label: {
+                                Text("重新关联…")
+                                    .font(.system(size: 11))
+                                    .foregroundColor(.white)
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 4)
+                                    .background(Capsule().fill(Color.white.opacity(0.18)))
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    )
+                    .allowsHitTesting(true)
             }
         }
         .overlay {
@@ -756,20 +863,33 @@ struct CanvasNodeView: View {
         }
     }
 
-    /// 封面。视频读素材库那份缩略图（跟素材库/时间轴共用一套缓存，不重复抽帧），
-    /// 图片没进素材库时直接读文件
-    /// 波形缓存的 key。
+    /// 缩略图 / 波形缓存的 key。
     ///
-    /// **不能只认 assetID** —— AI 生成、TTS、分离音轨出来的音频没进素材库，
-    /// assetID 是 nil，波形就永远画不出来（卡片只剩一个音频图标）。
-    /// 退回用节点自己的 id 当 key：缓存是内存里的字典，用谁的 id 都行，只要前后一致
-    private var waveformKey: UUID { node.assetID ?? node.id }
+    /// **不能只认 assetID** —— 画布产物（AI 生成、去背景、超分、分离音轨、裁剪、
+    /// 镜像旋转）一律不进全局素材库，assetID 是 nil，只认它的话波形永远画不出来、
+    /// 视频封面也是空的。`thumbKey` 会退到元素库那条记录的 id，
+    /// 让卡片、元素库、聊天框参考区共用同一份缓存
+    private var thumbKey: UUID {
+        canvas.thumbKey(assetID: node.assetID, path: node.mediaPath, fallback: node.id)
+    }
+
+    /// 卡片算不算「素材丢失」：指着的文件不在了。
+    /// 生成中不算 —— 那会儿本来就还没有文件
+    private var mediaMissing: Bool {
+        guard !node.isGenerating, !node.isWaiting, let path = node.mediaPath else { return false }
+        return !FileManager.default.fileExists(atPath: path)
+    }
+
+    private func relinkMedia() {
+        canvasRelinkNode(node, canvas: canvas, project: project)
+        localCover = nil
+    }
+
+    private var waveformKey: UUID { thumbKey }
 
     private var coverImage: NSImage? {
         guard !node.isGenerating else { return nil }
-        if let assetID = node.assetID, let thumb = project.mediaThumbnails[assetID] {
-            return thumb
-        }
+        if let thumb = project.mediaThumbnails[thumbKey] { return thumb }
         return localCover
     }
 
@@ -978,6 +1098,9 @@ extension Notification.Name {
     /// 文本节点的内容插成字幕 / 标题文字
     static let canvasNodeToSubtitle = Notification.Name("canvasNodeToSubtitle")
     static let canvasNodeToTitle = Notification.Name("canvasNodeToTitle")
+    /// 某个素材文件改了名或换了位置。`userInfo`：`old` / `new` 两个路径字符串。
+    /// 画布上引用它的卡片要跟着换路径和显示名，否则会显示成素材丢失
+    static let mediaFileRelocated = Notification.Name("mediaFileRelocated")
 }
 
 
@@ -1333,4 +1456,34 @@ private struct CanvasRetryButton: View {
         .buttonStyle(.plain)
         .onHover { hovering = $0 }
     }
+}
+
+// MARK: - 重新关联（卡片上的按钮 / 卡片右键菜单 共用）
+
+/// 给一张卡片重新指定素材文件。
+///
+/// **跟元素库那个入口走同一条路，效果完全一样**：素材库来的素材走 `ProjectState`
+/// 那套（时间轴片段一起换），画布产物走 `CanvasState`（元素库记录 + 所有引用它的
+/// 卡片 + 撤销栈一起重指）。两边都要清掉旧缩略图缓存，否则显示的还是关联前那张
+@MainActor
+func canvasRelinkNode(_ node: CanvasNode, canvas: CanvasState, project: ProjectState) {
+    guard let oldURL = node.mediaURL else { return }
+    let shownName = node.displayName.isEmpty ? oldURL.lastPathComponent : node.displayName
+    let panel = NSOpenPanel()
+    panel.allowsMultipleSelection = false
+    panel.canChooseDirectories = false
+    panel.message = "请选择「\(shownName)」的新位置"
+    guard panel.runModal() == .OK, let url = panel.url else { return }
+
+    let key = canvas.thumbKey(assetID: node.assetID, path: node.mediaPath, fallback: node.id)
+    if let aid = node.assetID {
+        // 素材是唯一真相源：这里一改，素材库、时间轴片段、其它画布卡片都跟着好
+        project.relinkAsset(id: aid, newURL: url)
+        canvas.repointNodes(from: oldURL.path, to: url.path)
+    } else {
+        // 镜像/旋转那类不进素材库的产物：只能改这张卡片自己指向哪儿
+        canvas.repointNodes(from: oldURL.path, to: url.path)
+        canvas.renameNodeLabels(path: url.path, to: url.lastPathComponent)
+    }
+    project.mediaThumbnails.removeValue(forKey: key)
 }

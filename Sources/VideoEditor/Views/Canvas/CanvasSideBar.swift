@@ -2,9 +2,8 @@ import SwiftUI
 
 /// 画布左侧的悬浮栏（v5.1.0，B5）
 ///
-/// 三个入口：添加（跟双击空白同一个菜单）、素材库（全局那份）、
-/// 元素库（**这张画布**产出过的东西）。
-/// 后两个点开是同一个抽屉，只是内容不同。
+/// 两个入口：添加（跟双击空白同一个菜单）、素材库（全局那份，跟侧边栏同一份数据）。
+/// v5.3.0 起元素库并进素材库，不再单列。
 struct CanvasSideBar: View {
     @EnvironmentObject var project: ProjectState
     @ObservedObject var canvas: CanvasState
@@ -19,9 +18,12 @@ struct CanvasSideBar: View {
     var onPickAsset: (URL, CanvasNode.Kind) -> Void
 
     @State private var panel: Panel?
+    /// 拖宽度时的起始宽度。基准必须是**起手那一刻**的宽度，
+    /// 拿每帧都在变的 drawerWidth 再加一次累计位移会越拖越快
+    @State private var dragStartWidth: Double?
 
     enum Panel: String, Identifiable {
-        case library, assets
+        case library
         var id: String { rawValue }
     }
 
@@ -35,9 +37,6 @@ struct CanvasSideBar: View {
             AddButton(isHovering: canvas.sideMenuVisible) { canvas.sideAddHovering = $0 }
             sideButton(icon: "folder", help: "素材库", active: panel == .library) {
                 panel = (panel == .library) ? nil : .library
-            }
-            sideButton(icon: "elementLibrary", help: "元素库（这张画布生成的）", active: panel == .assets) {
-                panel = (panel == .assets) ? nil : .assets
             }
         }
         .padding(.vertical, 10)
@@ -75,7 +74,7 @@ struct CanvasSideBar: View {
     private func drawer(for panel: Panel) -> some View {
         VStack(spacing: 0) {
             HStack {
-                Text(panel == .library ? "素材库" : "元素库")
+                Text("素材库")
                     .font(.system(size: 13, weight: .semibold))
                     .foregroundColor(Color.labelSecondary)
                 Spacer()
@@ -94,17 +93,53 @@ struct CanvasSideBar: View {
             .padding(.bottom, 6)
 
             CanvasAssetBrowser(
-                producedOnly: panel == .assets ? canvas.producedAssets : nil,
+                canvas: canvas,
                 cellWidth: 92,
                 onPick: onPickAsset)
                 .environmentObject(project)
         }
-        .frame(width: 300, height: 420)
+        .frame(width: drawerWidth, height: 420)
         .background(RoundedRectangle(cornerRadius: 14)
             .fill(Color(red: 0.16, green: 0.16, blue: 0.17)))
         .overlay(RoundedRectangle(cornerRadius: 14)
             .strokeBorder(Color.white.opacity(0.10)))
         .shadow(color: .black.opacity(0.4), radius: 16, y: 6)
+        // 右边缘拖宽窄，跟文字卡片一个手感：不画把手，鼠标挪到边上光标自己
+        // 变双向箭头。热区骑在边线上（各 5pt），纯内嵌的话鼠标稍微出去就摸不到
+        .overlay(alignment: .trailing) { widthHandle }
+    }
+
+    /// 抽屉宽度。跨会话记住 —— 每次开画布都要重新拖一遍太烦。
+    /// 下限 260 保证两列格子放得下，上限 640 是四列的宽度
+    @AppStorage("canvasAssetDrawerWidth") private var drawerWidth: Double = 300
+    static let minDrawerWidth: Double = 260
+    static let maxDrawerWidth: Double = 640
+
+    private var widthHandle: some View {
+        Color.white.opacity(0.001)
+            .frame(width: 10)
+            .contentShape(Rectangle())
+            .offset(x: 5)
+            .onHover { inside in
+                // 认领光标：画布层每次鼠标移动都会 set 一次箭头，
+                // 不认领的话这里刚设成双向箭头就被它改回去，看着就是狂闪
+                canvas.claimCursor(inside)
+                guard !canvas.isSpaceHeld else { return }
+                if inside { NSCursor.resizeLeftRight.set() } else { NSCursor.arrow.set() }
+            }
+            .gesture(
+                // 用 .global：手柄跟着抽屉右边缘走，局部坐标系的参考点会漂，
+                // 表现是「不跟手 + 宽度抖动」
+                DragGesture(minimumDistance: 1, coordinateSpace: .global)
+                    .onChanged { v in
+                        let base = dragStartWidth ?? drawerWidth
+                        if dragStartWidth == nil { dragStartWidth = drawerWidth }
+                        // 位移是屏幕像素，抽屉画在画布容器里但不随画布缩放，直接用
+                        let w = base + Double(v.location.x - v.startLocation.x)
+                        drawerWidth = min(max(w, Self.minDrawerWidth), Self.maxDrawerWidth)
+                    }
+                    .onEnded { _ in dragStartWidth = nil }
+            )
     }
 }
 

@@ -72,6 +72,12 @@ struct CanvasOverlay: View {
                     withAnimation(.easeOut(duration: 0.24)) { slideY = 0 }
                     // 滑到位再让顶部暗下来
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.24) { maskVisible = true }
+                    // 模型层要往全局素材库里加产物，得先认识 project（弱引用）
+                    canvas.project = project
+                    // 老画布带着元素库数据：并进素材库，卡片补上 assetID
+                    canvas.migrateProducedAssetsIntoLibrary(project)
+                    // 画布关着的时候在侧边栏改的素材名，这会儿补上
+                    canvas.syncNodesFromLibrary(project)
                 }
                 .onChange(of: closing) { _, isClosing in
                     guard isClosing else { return }
@@ -324,6 +330,15 @@ private struct CanvasSurface: View {
     @State private var showAddMenu = false
     @State private var menuLocation: CGPoint = .zero
     @State private var menuContentPoint: CGPoint = .zero
+
+    /// 右键菜单里要不要出「重新关联文件…」：只选中一张、且它指的文件已经不在了。
+    /// 多选时不给 —— 一次只能挑一个新文件，批量关联没有意义
+    private var missingMediaTarget: UUID? {
+        guard ctxTargets.count == 1, let id = ctxTargets.first,
+              let n = canvas.node(id), let path = n.mediaPath,
+              !FileManager.default.fileExists(atPath: path) else { return nil }
+        return id
+    }
     /// 从哪个节点的 + 拉出来的线（点 + 弹菜单时，新节点自动连上它）
     /// 添加菜单是从哪张卡片的哪一侧 + 弹出来的。nil = 从空白/侧栏弹的。
     ///
@@ -628,7 +643,12 @@ private struct CanvasSurface: View {
     private func addNode(kind: CanvasNode.Kind, mediaURL: URL? = nil, assetID: UUID? = nil) -> CanvasNode {
         // 卡片以点击点为中心落下。position 存的是左上角，所以要减掉半个卡片 ——
         // 直接把左上角对着点击点的话，卡片会整个跑到鼠标的右下方
-        let ratio = kind == .image ? AppSettings.shared.aiImageRatio : AppSettings.shared.aiRatio
+        // 带素材落地的卡片（上传、从素材库/元素库选）默认「原始」，跟随素材本身；
+        // 空卡片是等着生成的，用上次记住的档位
+        let hasMedia = mediaURL != nil || assetID != nil
+        let remembered = kind == .image ? AppSettings.shared.aiImageRatio : AppSettings.shared.aiRatio
+        let ratio = (hasMedia && (kind == .image || kind == .video))
+            ? CanvasNode.originalRatio : remembered
         let size = kind.defaultSize(ratio: ratio)
         let origin = CGPoint(x: menuContentPoint.x - size.width / 2,
                              y: menuContentPoint.y - size.height / 2)
@@ -958,7 +978,12 @@ private struct CanvasSurface: View {
         .overlay(alignment: .topLeading) {
             if let at = ctxLocation {
                 CanvasContextPanel(canvas: canvas, targets: ctxTargets,
-                                   groupID: ctxGroupID) { ctxLocation = nil }
+                                   groupID: ctxGroupID,
+                                   relinkTarget: missingMediaTarget,
+                                   onRelink: { id in
+                                       guard let n = canvas.node(id) else { return }
+                                       canvasRelinkNode(n, canvas: canvas, project: project)
+                                   }) { ctxLocation = nil }
                 .background(RoundedRectangle(cornerRadius: 10).fill(Color(red: 0.16, green: 0.16, blue: 0.17)))
                 .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(Color.white.opacity(0.12)))
                 .shadow(color: .black.opacity(0.5), radius: 16, y: 6)
@@ -1001,7 +1026,8 @@ private struct CanvasSurface: View {
                 Color.black.opacity(0.4)
                     .ignoresSafeArea()
                     .onTapGesture { showAssetPicker = false; fillTargetNode = nil }
-                CanvasAssetPicker(limitTo: fillTargetNode.flatMap { canvas.node($0)?.kind }) { asset in
+                CanvasAssetPicker(canvas: canvas,
+                                  limitTo: fillTargetNode.flatMap { canvas.node($0)?.kind }) { asset in
                     showAssetPicker = false
                     guard let asset else { fillTargetNode = nil; return }
                     if let target = fillTargetNode {
@@ -1046,19 +1072,10 @@ private struct CanvasSurface: View {
                 $0.displayName = asset?.name ?? url.lastPathComponent
             }
         }
-        // 生成完的产物自动进全局素材库（画布产物落地的规则）
-        .onChange(of: canvas.nodes.compactMap(\.mediaPath)) { old, new in
-            for path in new where !old.contains(path) {
-                let url = URL(fileURLWithPath: path)
-                guard project.mediaAssets.first(where: { $0.url == url }) == nil else { continue }
-                project.importFile(url)
-                // 回填 assetID，节点封面就能走素材库那份缩略图
-                if let asset = project.mediaAssets.first(where: { $0.url == url }),
-                   let nodeID = canvas.nodes.first(where: { $0.mediaPath == path && $0.assetID == nil })?.id {
-                    canvas.updateNode(id: nodeID) { $0.assetID = asset.id }
-                }
-            }
-        }
+        // 产物**不**自动进全局素材库（用户 2026-08-25 要求）：画布里生成/处理出来的东西
+        // 只登记进元素库（`canvas.producedAssets`），素材库保持干净。
+        // 要进素材库只有两条明路：卡片操作栏的「保存到素材库」、「添加到时间轴」。
+        // 因此这些卡片没有 assetID，缩略图/波形一律走 `canvas.thumbKey(...)` 取缓存 key
         .onReceive(NotificationCenter.default.publisher(for: .canvasNodeToTimeline)) { note in
             guard let id = note.object as? UUID, let n = canvas.node(id), let url = n.mediaURL else { return }
             project.importFile(url)
@@ -1110,6 +1127,7 @@ private struct CanvasSurface: View {
             let provider = AIVideoService.provider(for: node.kind.providerCategory)
             canvas.submitGeneration(nodeID: id, provider: provider)
         }
+        .modifier(MediaRelocationSync(canvas: canvas))
         .onReceive(NotificationCenter.default.publisher(for: .canvasNodeToReference)) { note in
             guard let id = note.object as? UUID, let n = canvas.node(id), let url = n.mediaURL else { return }
             let type: AIVideoService.RefContentType
@@ -1119,7 +1137,10 @@ private struct CanvasSurface: View {
             case .audio: type = .audio
             case .text:  return
             }
-            let thumb = n.assetID.flatMap { project.mediaThumbnails[$0] }
+            // 产物没进素材库、assetID 是 nil，缓存要按 thumbKey 取，否则视频这里
+            // 拿不到帧，只能退化成 1×1 的空图
+            let key = canvas.thumbKey(assetID: n.assetID, path: n.mediaPath, fallback: n.id)
+            let thumb = project.mediaThumbnails[key]
                 ?? NSImage(contentsOf: url)
                 ?? NSImage(size: NSSize(width: 1, height: 1))
             AIVideoService.shared.referenceContents.append(
@@ -1298,6 +1319,12 @@ struct CanvasKeyMonitor: ViewModifier {
                 return event
             }
 
+            // 鼠标停在素材库/元素库面板上：滚轮滚那个列表，别平移画布。
+            // 这里直接驱动底层 NSScrollView，不指望把事件放行给 SwiftUI 去分发
+            if !event.modifierFlags.contains(.command), canvas.scrollAssetPanelByWheel(event) {
+                return nil
+            }
+
             if event.modifierFlags.contains(.command) {
                 // 锚点：事件坐标是窗口坐标、y 轴朝上；画布容器从窗口顶部往下 topGap 开始
                 let winH = w.contentView?.bounds.height ?? 0
@@ -1324,6 +1351,10 @@ struct CanvasKeyMonitor: ViewModifier {
         let rightMonitor = NSEvent.addLocalMonitorForEvents(matching: .rightMouseDown) { event in
             guard let w = event.window,
                   WindowManager.shared.id(of: w) == windowID else { return event }
+            // 指针在素材库/元素库面板上：右键归面板自己那份菜单（重命名/移除等）。
+            // 不放行的话这条 monitor 会一律吞掉，面板上的 .contextMenu 永远弹不出来
+            if canvas.assetPanelHovered { return event }
+
             let winH = w.contentView?.bounds.height ?? 0
             let containerH = max(1, winH - canvas.topGap)
             let viewPoint = CGPoint(x: event.locationInWindow.x, y: containerH - event.locationInWindow.y)
@@ -1633,6 +1664,32 @@ enum CanvasSurfaceKindResolver {
         case .audio: return .audio
         case .image: return .image
         case .subtitle: return nil   // 字幕没有对应的节点类型
+        }
+    }
+}
+
+
+/// 素材改名 / 重新关联之后，把画布上引用它的卡片跟着换过去（路径 + 显示名）。
+///
+/// 单拎成 modifier 是因为 `CanvasOverlay` 的 body 已经很大，再往里塞一段
+/// `onReceive` 就会让 Swift 的类型检查超时（`unable to type-check this expression`）。
+/// 广播不带窗口 id 是**故意的**：素材库全局一份，一个文件改了名，
+/// 所有窗口的画布都该跟着改
+private struct MediaRelocationSync: ViewModifier {
+    @ObservedObject var canvas: CanvasState
+
+    func body(content: Content) -> some View {
+        content.onReceive(NotificationCenter.default.publisher(for: .mediaFileRelocated)) { note in
+            guard let info = note.userInfo else { return }
+            // 路径变了就重指（改名、重新关联都会）
+            if let old = info["old"] as? String, let new = info["new"] as? String {
+                canvas.repointNodes(from: old, to: new)
+            }
+            // 显示名按 assetID 认卡片：产物卡片显示的是「图片 1」这种编号，
+            // 按名字匹配根本对不上
+            if let aid = info["assetID"] as? UUID, let newName = info["newName"] as? String {
+                canvas.renameNodeLabels(assetID: aid, to: newName)
+            }
         }
     }
 }
