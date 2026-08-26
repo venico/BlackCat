@@ -442,6 +442,55 @@ final class ProjectState: ObservableObject {
         missingAssetIDs = missing
     }
 
+    /// 监听素材库的删除/恢复广播。
+    ///
+    /// **素材库全 app 一份，时间轴却是每个窗口一份** —— 在 A 窗口删素材，
+    /// B 窗口时间轴上引用它的片段还留着，指向一个已经不在库里的素材
+    /// （实测：「多窗口删除时片段还留着删的素材」）。跟画布卡片同一个道理
+    private func installLibraryObservers() {
+        let center = NotificationCenter.default
+        libraryObservers.append(center.addObserver(
+            forName: .assetRemovedFromLibrary, object: nil, queue: .main
+        ) { [weak self] note in
+            guard let self,
+                  let id = note.userInfo?["assetID"] as? UUID,
+                  note.userInfo?["origin"] as? UUID != self.instanceID   // 发起方自己已经删过了
+            else { return }
+            self.removeClipsReferencingAsset(id)
+        })
+        libraryObservers.append(center.addObserver(
+            forName: .assetRestoredToLibrary, object: nil, queue: .main
+        ) { [weak self] note in
+            guard let self,
+                  let id = note.userInfo?["assetID"] as? UUID,
+                  note.userInfo?["origin"] as? UUID != self.instanceID
+            else { return }
+            self.restoreClipsAfterAssetRestore(id)
+        })
+    }
+
+    /// 别的窗口删了素材：把本窗口引用它的片段也清掉，先存一份备份好恢复
+    private func removeClipsReferencingAsset(_ assetID: UUID) {
+        guard clipCountForAsset(assetID) > 0 else { return }
+        clipsRemovedByAssetDeletion[assetID] = currentSnapshot(includeAssets: false)
+        for i in videoTracks.indices    { videoTracks[i].clips.removeAll    { $0.assetID == assetID } }
+        for i in audioTracks.indices    { audioTracks[i].clips.removeAll    { $0.assetID == assetID } }
+        for i in imageTracks.indices    { imageTracks[i].clips.removeAll    { $0.assetID == assetID } }
+        for i in subtitleTracks.indices { subtitleTracks[i].clips.removeAll { $0.assetID == assetID } }
+        DiagLog.log("[素材库] 别的窗口删了素材，本窗口清掉引用它的片段")
+        rebuildTimelinePreview()
+        scheduleAutoSave()
+    }
+
+    /// 发起方撤销了那次删除：本窗口的片段也回来
+    private func restoreClipsAfterAssetRestore(_ assetID: UUID) {
+        guard let snap = clipsRemovedByAssetDeletion.removeValue(forKey: assetID) else { return }
+        applySnapshot(snap)
+        DiagLog.log("[素材库] 别的窗口撤销了删除，本窗口片段恢复")
+        rebuildTimelinePreview()
+        scheduleAutoSave()
+    }
+
     /// 素材库里正在重命名的素材
     @Published var renamingAssetID: UUID? = nil
     /// 轨道区正在重命名的视频/图片/音频片段
@@ -871,11 +920,27 @@ final class ProjectState: ObservableObject {
         showSuccessToast(icon: "stop.fill", iconColor: .yellow, title: "大模型分析", subtitle: "已停止", autoCountdown: false)
     }
 
-    @Published var mediaLibraryTab: String = "video"      // 素材库当前标签（提升到 ProjectState，转场图标点击可切换）
+    /// 侧边栏当前在看哪一栏：`ai` / `library`（素材库）/ `transition`（转场）。
+    /// **默认 AI 生成** —— 进软件先落在这儿
+    @Published var mediaLibraryTab: String = "ai"
+    /// 素材库里的六个分类标签：video / audio / image / subtitle / text / shape。
+    /// 原来这六类各占一个侧边栏图标，v5.3.0 合并进素材库，改成里面的标签页
+    @Published var libraryCategory: String = "video"
+    /// 素材库用缩略图还是列表看。侧边栏和画布素材库**共用这一份**，
+    /// 一边切了另一边跟着变（跟排序设置一个待遇）
+    @Published var mediaGridMode: Bool = true
 
-    /// 当前标签对应的素材类型。转场/文字/图形/AI 是预置面板，没有素材概念，返回 nil
+    /// 项目封面的设计稿。属性区那个入口点开就是编辑它，
+    /// 确认后渲染成 PNG 给欢迎页用（见 `ProjectCover`）
+    @Published var cover: ProjectCover?
+    /// 封面设计弹窗开着没
+    @Published var showCoverDesigner = false
+
+    /// 当前看的是哪类素材。只在素材库那一栏有意义；
+    /// 文字/图形是预置面板、转场和 AI 更不是素材，都返回 nil
     var currentLibraryAssetType: AssetType? {
-        switch mediaLibraryTab {
+        guard mediaLibraryTab == "library" else { return nil }
+        switch libraryCategory {
         case "video":    return .video
         case "audio":    return .audio
         case "image":    return .image
@@ -1191,8 +1256,17 @@ final class ProjectState: ObservableObject {
         syncOverlayOrder()
     }
 
+    /// 这个窗口自己的标识。删素材的广播靠它区分「我是发起方」还是「别的窗口」
+    let instanceID = UUID()
+    /// 因为素材库删除而删掉的片段备份（**别的窗口**才用得上）。
+    /// 发起方那次删除进的是自己的撤销栈，能正常 ⌘Z；
+    /// 别的窗口没参与那次操作，栈里没有对应的一步，只能存备份等恢复广播
+    private var clipsRemovedByAssetDeletion: [UUID: ProjectSnapshot] = [:]
+    private var libraryObservers: [Any] = []
+
     init() {
         seedDefaultTrackOrder()
+        installLibraryObservers()
         // 素材库是全局的，加载和存盘都归 MediaLibrary 自己管。
         // 这里只把它的变更转成本对象的 objectWillChange，
         // 让所有读 project.mediaAssets 的视图照常刷新（另一个窗口改的也能收到）

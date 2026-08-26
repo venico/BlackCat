@@ -883,6 +883,28 @@ struct CanvasNodeView: View {
     private func relinkMedia() {
         canvasRelinkNode(node, canvas: canvas, project: project)
         localCover = nil
+        // 关联完要**主动**把封面重新抽一遍。
+        //
+        // `prepareMedia` 只在卡片上屏时跑一次，这会儿早过去了 —— 缓存刚被清掉、
+        // 又没人去生成，卡片就一直空着，非得重进画布或者 hover 播放才有画面。
+        // 视图里的 `node` 还是关联前那份，得从画布取最新的
+        guard let fresh = canvas.node(node.id), let url = fresh.mediaURL else { return }
+        let key = canvas.thumbKey(assetID: fresh.assetID, path: fresh.mediaPath, fallback: fresh.id)
+        project.mediaThumbnails.removeValue(forKey: key)
+        switch fresh.kind {
+        case .video:
+            project.loadMediaThumbnail(assetID: key, url: url)
+        case .image:
+            Task.detached {
+                let img = NSImage(contentsOf: url)
+                await MainActor.run { localCover = img }
+            }
+        case .audio:
+            project.waveformCache.removeValue(forKey: key)
+            project.loadWaveform(assetID: key, url: url)
+        case .text:
+            break
+        }
     }
 
     private var waveformKey: UUID { thumbKey }
@@ -1098,6 +1120,11 @@ extension Notification.Name {
     /// 文本节点的内容插成字幕 / 标题文字
     static let canvasNodeToSubtitle = Notification.Name("canvasNodeToSubtitle")
     static let canvasNodeToTitle = Notification.Name("canvasNodeToTitle")
+    /// 素材被移出素材库。`userInfo`：`assetID` + `path`（素材当时的文件路径）。
+    /// **每个窗口的画布各自监听** —— 素材库全 app 一份，画布是每窗口一份
+    static let assetRemovedFromLibrary = Notification.Name("assetRemovedFromLibrary")
+    /// 素材被撤销恢复了，跟着删掉的卡片要插回来。`userInfo`：`assetID`
+    static let assetRestoredToLibrary = Notification.Name("assetRestoredToLibrary")
     /// 某个素材文件改了名或换了位置。`userInfo`：`old` / `new` 两个路径字符串。
     /// 画布上引用它的卡片要跟着换路径和显示名，否则会显示成素材丢失
     static let mediaFileRelocated = Notification.Name("mediaFileRelocated")
@@ -1383,7 +1410,17 @@ private struct CanvasMediaControlBar: View {
         .frame(maxWidth: .infinity)
         .background(LinearGradient(colors: [.clear, .black.opacity(0.65)],
                                    startPoint: .top, endPoint: .bottom))
+        // 只裁**下面**两个角，跟卡片圆角同半径。
+        //
+        // 这条是 `.overlay(alignment: .bottom)` 挂在卡片的 clipShape **之后**的，
+        // 不受卡片裁剪管 —— 那层黑色渐变是直角矩形，卡片圆角处就露出两个黑角。
+        // 上面两角必须保持直角：它在卡片中间，切圆了会跟画面之间裂开一道缝
+        .clipShape(UnevenRoundedRectangle(bottomLeadingRadius: Self.cardCornerRadius,
+                                          bottomTrailingRadius: Self.cardCornerRadius))
     }
+
+    /// 跟卡片的圆角保持一致（`CanvasNodeView.card` 里那个 24）
+    private static let cardCornerRadius: CGFloat = 24
 }
 
 /// 可拖动进度条。点哪就跳到哪，跟拖播放线那种「只在线附近」不同 ——

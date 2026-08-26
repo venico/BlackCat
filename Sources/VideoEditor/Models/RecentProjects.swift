@@ -134,6 +134,15 @@ final class RecentProjects: ObservableObject {
             return nil
         }
 
+        // **用户自己设计过封面就用那张**（属性区 → 封面 → 设计封面）。
+        // 路径存的是相对项目文件的，项目整个拷到别处也找得到。
+        // 没设计过才退回老规矩：从项目引用的素材里挑一张（视频优先，其次图片）
+        if let cover = root["cover"] as? [String: Any],
+           let rel = cover["renderedPath"] as? String {
+            let url = projectURL.deletingLastPathComponent().appendingPathComponent(rel)
+            if let img = NSImage(contentsOf: url) { return img }
+        }
+
         /// 把片段里的 URL 字段解成本地路径。存的是 file:// 形式且做过百分号编码。
         ///
         /// 字段名按片段类型不同：`VideoClip` 是 `url`、`ImageClip` 是 `imageURL`。

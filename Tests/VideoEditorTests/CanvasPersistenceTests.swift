@@ -183,6 +183,56 @@ final class CanvasPersistenceTests: XCTestCase {
         XCTAssertNotNil(c.node(n2.id), "别的卡片不能受影响")
     }
 
+    // 没有 assetID 的老卡片（产物不进素材库那几个版本留下的）也要能被删掉，
+    // 只按 assetID 匹配的话表现是「片段没了、卡片还在」
+    func testRemoveAssetDropsCardsWithoutAssetID() {
+        let c = CanvasState()
+        let aid = UUID()
+        let path = "/tmp/legacy-card.png"
+        let n = c.addNode(kind: .image, at: .zero)
+        c.updateNode(id: n.id) { $0.assetID = nil; $0.mediaPath = path }
+
+        XCTAssertEqual(c.nodeCount(usingAsset: aid, path: path), 1, "按路径也要认出来")
+        c.removeNodes(usingAsset: aid, path: path)
+        XCTAssertNil(c.node(n.id))
+    }
+
+    // 多窗口：素材库全 app 一份、画布每窗口一份，删素材要靠广播才能删到
+    // **所有**窗口的卡片。之前直接调自己那个 canvas，别的窗口的卡片纹丝不动
+    func testAssetRemovalBroadcastReachesEveryCanvas() {
+        let aid = UUID()
+        let a = CanvasState(), b = CanvasState()
+        for c in [a, b] {
+            let n = c.addNode(kind: .image, at: .zero)
+            c.updateNode(id: n.id) { $0.assetID = aid }
+        }
+        XCTAssertEqual(CanvasState.totalNodeCount(usingAsset: aid, path: nil), 2,
+                       "两个窗口的画布都该数进来")
+
+        NotificationCenter.default.post(name: .assetRemovedFromLibrary, object: nil,
+                                        userInfo: ["assetID": aid])
+        XCTAssertTrue(a.nodes.isEmpty, "本窗口的卡片要删掉")
+        XCTAssertTrue(b.nodes.isEmpty, "别的窗口的卡片也要删掉")
+
+        NotificationCenter.default.post(name: .assetRestoredToLibrary, object: nil,
+                                        userInfo: ["assetID": aid])
+        XCTAssertEqual(a.nodes.count, 1, "撤销恢复也要广播到每个窗口")
+        XCTAssertEqual(b.nodes.count, 1)
+    }
+
+    // 画布开着时 ⌘Z 只走画布的栈，「删素材」那一步得记进去转给项目撤，
+    // 否则表现是「⌘Z 只恢复卡片、不恢复素材」。顺序也要对：
+    // 删素材之后又加了张卡片，第一次 ⌘Z 该撤加卡片，第二次才撤删除
+    func testProjectAssetRemovalEntryUndoesInOrder() {
+        let c = CanvasState()
+        c.pushProjectAssetRemoval()          // 先删了素材
+        let later = c.addNode(kind: .text, at: .zero)   // 之后又加了张卡片（自带 pushUndo）
+
+        c.undo()
+        XCTAssertNil(c.node(later.id), "第一次 ⌘Z 撤的应该是后加的那张卡片")
+        XCTAssertEqual(c.undoCount, 1, "删素材那一步还留在栈里，等下一次 ⌘Z")
+    }
+
     // 一次 ⌘Z 三样一起回来：素材恢复时，画布那步也跟着撤
     func testUndoRestoresCards() {
         let c = CanvasState()
@@ -196,8 +246,9 @@ final class CanvasPersistenceTests: XCTestCase {
         XCTAssertNotNil(c.node(n.id), "素材撤销恢复后，卡片要跟着回来")
     }
 
-    // 删完之后画布上又干了别的：栈顶已经不是那步，宁可不撤也不能撤错
-    func testUndoSkipsWhenCanvasMovedOn() {
+    // 删完之后画布上又干了别的，卡片照样能恢复，且不影响后来做的操作 ——
+    // 卡片备份不走画布撤销栈，所以跟用户自己的操作历史互不干扰
+    func testUndoRestoresEvenAfterOtherEdits() {
         let c = CanvasState()
         let aid = UUID()
         let n = c.addNode(kind: .image, at: .zero)
@@ -206,7 +257,8 @@ final class CanvasPersistenceTests: XCTestCase {
         c.removeNodes(usingAsset: aid)
         let later = c.addNode(kind: .text, at: CGPoint(x: 100, y: 100))   // 又加了一张
         c.restoreNodesAfterUndo(assetID: aid)
-        XCTAssertNotNil(c.node(later.id), "后来加的卡片不能被误撤掉")
+        XCTAssertNotNil(c.node(n.id), "被删的卡片要回来")
+        XCTAssertNotNil(c.node(later.id), "后来加的卡片不能受影响")
     }
 
     // v5.3.0 元素库并进素材库：老存档里的清单迁移完要清空，

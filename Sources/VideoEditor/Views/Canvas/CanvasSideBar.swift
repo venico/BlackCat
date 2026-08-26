@@ -35,7 +35,7 @@ struct CanvasSideBar: View {
             // 「添加」是主操作，给实心圆底突出出来（其余两个是普通图标按钮）。
             // hover 就出菜单，不用点。菜单画在**外层**，见 CanvasState.sideMenuVisible
             AddButton(isHovering: canvas.sideMenuVisible) { canvas.sideAddHovering = $0 }
-            sideButton(icon: "folder", help: "素材库", active: panel == .library) {
+            sideButton(icon: "folderFill", help: "素材库", active: panel == .library) {
                 panel = (panel == .library) ? nil : .library
             }
         }

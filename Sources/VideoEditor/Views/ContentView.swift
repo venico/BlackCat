@@ -313,6 +313,40 @@ struct ContentView: View {
             }
         }
         .animation(.easeOut(duration: 0.2), value: project.showExportSheet)
+        // 封面设计弹窗。跟导出那个一样挂 overlay，不用 .sheet ——
+        // 系统 sheet 是独立窗口，floatingPanelMaterial 采样不到主界面
+        .overlay {
+            if project.showCoverDesigner {
+                Color.black.opacity(0.4).ignoresSafeArea()
+                CoverDesignerSheet().environmentObject(project)
+                    .clipShape(RoundedRectangle(cornerRadius: 14))
+                    .overlay(RoundedRectangle(cornerRadius: 14)
+                        .stroke(Color.white.opacity(0.15), lineWidth: 0.5))
+                    .transition(.opacity.combined(with: .scale(scale: 0.95)))
+            }
+        }
+        .animation(.easeOut(duration: 0.2), value: project.showCoverDesigner)
+        // 提示气泡本来画在主界面那层 ZStack 里，而弹窗是 overlay ——
+        // overlay 永远盖在内容之上，弹窗一开提示就被压在底下看不见了。
+        // 弹窗开着时把提示再画一层到最上面
+        .overlay(alignment: .bottomTrailing) {
+            if project.showCoverDesigner {
+                VStack(alignment: .trailing, spacing: 8) {
+                    ForEach(project.successToasts) { toast in
+                        SuccessToastBubble(toast: toast,
+                            onTap: { project.dismissSuccessToast(toast.id) },
+                            onDismiss: { project.dismissSuccessToast(toast.id) })
+                        .transition(.asymmetric(
+                            insertion: .move(edge: .trailing).combined(with: .opacity),
+                            removal: .opacity))
+                    }
+                }
+                .animation(.spring(response: 0.35, dampingFraction: 0.8),
+                           value: project.successToasts.count)
+                .padding(.trailing, 16)
+                .padding(.bottom, 16)
+            }
+        }
         // AI 画布：全屏弹层，从下方升起，顶部留一条露出底层界面。
         // 同样挂 overlay 不用 .sheet（材质原因见 CanvasOverlay 顶部注释）
         .overlay {
@@ -572,9 +606,11 @@ struct ContentView: View {
     /// 本地文件一律不删
     private func deleteAssetMessage(_ id: UUID?) -> String {
         guard let id else { return "确定要移除该素材吗？" }
-        let name = project.mediaAssets.first(where: { $0.id == id })?.name ?? ""
+        let asset = project.mediaAssets.first(where: { $0.id == id })
+        let name = asset?.name ?? ""
         let clips = project.clipCountForAsset(id)
-        let cards = project.canvas.nodeCount(usingAsset: id)
+        // 所有窗口的画布一起数 —— 删素材是全局的，只报自己这个窗口会少报
+        let cards = CanvasState.totalNodeCount(usingAsset: id, path: asset?.url.path)
         var refs: [String] = []
         if clips > 0 { refs.append("时间轴上有 \(clips) 个片段") }
         if cards > 0 { refs.append("画布上有 \(cards) 张卡片") }

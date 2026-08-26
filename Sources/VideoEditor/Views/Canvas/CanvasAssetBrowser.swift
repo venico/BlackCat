@@ -95,8 +95,13 @@ struct CanvasAssetBrowser: View {
         }
     }
 
-    /// 音频没有画面，摆成网格全是一样的图标 —— 跟素材库侧边栏一样用列表
-    private var showsAsList: Bool { tab == .audio }
+    /// 用列表还是缩略图。**跟侧边栏素材库共用同一个开关**（`project.mediaGridMode`），
+    /// 一边切了另一边跟着变，跟排序设置一个待遇。
+    /// 音频没有画面，摆成网格全是一样的图标 —— 那一栏固定用列表
+    private var showsAsList: Bool { tab == .audio || !project.mediaGridMode }
+
+    /// 音频那栏没缩略图可看，不给切换按钮
+    private var canSwitchViewMode: Bool { tab != .audio }
 
     struct Item: Identifiable {
         var id: URL { url }
@@ -267,7 +272,12 @@ struct CanvasAssetBrowser: View {
         guard panel.runModal() == .OK, let url = panel.url else { return }
         // 素材是唯一的真相源：这里一改，时间轴片段和画布卡片都会跟着好
         project.relinkAsset(id: item.assetID, newURL: url)
+        // 旧缓存是旧文件的，清掉之后要**主动**重新生成 ——
+        // 格子的 onAppear 不会因为换了文件再跑一次，不生成就一直空着
         project.mediaThumbnails.removeValue(forKey: item.assetID)
+        if item.kind == .video || item.kind == .image {
+            project.loadMediaThumbnail(assetID: item.assetID, url: url)
+        }
     }
 
     private func commitRename(_ item: Item) {
@@ -338,6 +348,24 @@ struct CanvasAssetBrowser: View {
     private var searchRow: some View {
         HStack(spacing: 8) {
             searchField
+            // 缩略图 / 列表切换，跟侧边栏那个同一个开关
+            if canSwitchViewMode {
+            Button { project.mediaGridMode.toggle() } label: {
+                Image(nsImage: SidebarSVGIcon.load(project.mediaGridMode ? "gridView" : "listView",
+                                                   size: 13))
+                    .renderingMode(.template)
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .frame(width: 13, height: 13)
+                    .foregroundColor(Color.labelSecondary)
+                    .frame(width: 30, height: 30)
+                    .background(RoundedRectangle(cornerRadius: 8).fill(Color.white.opacity(0.06)))
+                    .contentShape(RoundedRectangle(cornerRadius: 8))
+            }
+            .buttonStyle(.plain)
+            .help(project.mediaGridMode ? "缩略图（点击切列表）" : "列表（点击切缩略图）")
+            }
+
             Button { showSortNSMenu(project: project) } label: {
                 Image(nsImage: SidebarSVGIcon.load("sort", size: 13))
                     .renderingMode(.template)
@@ -570,6 +598,32 @@ private struct AssetRow<Menu: View>: View {
     var body: some View {
         Button(action: action) {
             HStack(spacing: 8) {
+                // 视频和图片在列表视图里带一张**正方形**小封面，跟侧边栏那边一致；
+                // 音频没有画面，不占这个位置
+                if item.kind == .video || item.kind == .image {
+                    ZStack {
+                        RoundedRectangle(cornerRadius: 4).fill(Color.white.opacity(0.06))
+                        if let thumb = project.mediaThumbnails[item.assetID] {
+                            Color.clear.overlay(
+                                Image(nsImage: thumb).resizable().aspectRatio(contentMode: .fill)
+                            )
+                        } else {
+                            Image(nsImage: SidebarSVGIcon.load(CanvasNodeView.iconKey(for: item.kind), size: 12))
+                                .renderingMode(.template)
+                                .resizable()
+                                .aspectRatio(contentMode: .fit)
+                                .frame(width: 12, height: 12)
+                                .foregroundColor(Color.labelSecondary.opacity(0.4))
+                        }
+                    }
+                    .frame(width: 34, height: 34)
+                    .clipShape(RoundedRectangle(cornerRadius: 4))
+                    .onAppear {
+                        guard item.kind == .video,
+                              project.mediaThumbnails[item.assetID] == nil else { return }
+                        project.loadMediaThumbnail(assetID: item.assetID, url: item.url)
+                    }
+                }
                 VStack(alignment: .leading, spacing: 2) {
                     if renaming {
                         TextField("", text: $editName)

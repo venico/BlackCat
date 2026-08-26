@@ -236,9 +236,7 @@ private struct SubtitleInspector: View {
                         .foregroundColor(Color.labelSecondary)
                         .frame(width: 68, alignment: .leading)
                     Toggle("", isOn: $ls.mergeLineBreaks)
-                        .toggleStyle(.switch)
-                        .scaleEffect(0.7, anchor: .leading)
-                        .labelsHidden()
+                        .inspectorSwitch()
                         .onChange(of: ls.mergeLineBreaks) { _ in writeStyle() }
                     Spacer()
                 }
@@ -1378,7 +1376,7 @@ private struct ShapeInspector: View {
                 HStack {
                     Text("等比缩放").font(.system(size: 11)).foregroundColor(Color.labelSecondary)
                     Spacer()
-                    Toggle("", isOn: $lockAspect).labelsHidden().toggleStyle(.switch).scaleEffect(0.8)
+                    Toggle("", isOn: $lockAspect).inspectorSwitch()
                         .onChange(of: lockAspect) { _ in write { $0.lockAspect = lockAspect } }
                 }
                 if lockAspect {
@@ -1488,7 +1486,7 @@ private struct ShapeInspector: View {
                         Toggle("", isOn: Binding(
                             get: { clip.penClosed },
                             set: { v in write { $0.penClosed = v; if v && !$0.fillEnabled { $0.fillEnabled = true; $0.fillOpacity = 0.3 } } }
-                        )).labelsHidden().toggleStyle(.switch).scaleEffect(0.8)
+                        )).inspectorSwitch()
                     }
                     Button {
                         project.penEditingClipID = clip.id
@@ -1665,7 +1663,7 @@ private struct ShapeInspector: View {
         HStack {
             Text(label).font(.system(size: 11)).foregroundColor(Color.labelSecondary)
             Spacer()
-            Toggle("", isOn: isOn).labelsHidden().toggleStyle(.switch).scaleEffect(0.8).onChange(of: isOn.wrappedValue) { _ in onChange() }
+            Toggle("", isOn: isOn).inspectorSwitch().onChange(of: isOn.wrappedValue) { _ in onChange() }
         }
         .dimNonUniform(dimKP.map { isMulti && !uniform($0) } ?? false)
     }
@@ -2610,9 +2608,7 @@ private struct AudioInspector: View {
                             project.rebuildTimelinePreview()
                         }
                     ))
-                    .toggleStyle(.switch)
-                    .scaleEffect(0.7, anchor: .leading)
-                    .labelsHidden()
+                    .inspectorSwitch()
                     Spacer()
                 }
                 if clip.fadeInEnabled {
@@ -2642,9 +2638,7 @@ private struct AudioInspector: View {
                             project.rebuildTimelinePreview()
                         }
                     ))
-                    .toggleStyle(.switch)
-                    .scaleEffect(0.7, anchor: .leading)
-                    .labelsHidden()
+                    .inspectorSwitch()
                     Spacer()
                 }
                 if clip.fadeOutEnabled {
@@ -2704,6 +2698,19 @@ private struct AudioInspector: View {
 
 // MARK: - Shared layout components
 
+/// 属性区里所有开关统一走这个：**小一号 + 开启时是主题黄**。
+///
+/// 原来各处自己写 `.scaleEffect(0.8)` / `.scaleEffect(0.7, anchor: .leading)`，
+/// 大小不一，开启时还是系统蓝，跟界面里别的选中态（橙黄）对不上
+extension View {
+    func inspectorSwitch() -> some View {
+        self.labelsHidden()
+            .toggleStyle(.switch)
+            .tint(Color.accent)
+            .scaleEffect(0.7, anchor: .leading)
+    }
+}
+
 struct ISection<Content: View>: View {
     let title: String?
     @ViewBuilder let content: Content
@@ -2752,10 +2759,12 @@ struct ISlider: View {
     let range: ClosedRange<Double>
     let unit: String
     var decimals: Int = 0
+    /// 标签占多宽。默认 64 是属性区那套；封面弹窗窄，传四个字的宽度换更长的滑条
+    var labelWidth: CGFloat = 64
 
     var body: some View {
         ICapsuleSlider(label: label, value: $value, range: range,
-                       decimals: decimals, unit: unit, labelWidth: 64)
+                       decimals: decimals, unit: unit, labelWidth: labelWidth)
     }
 }
 
@@ -3064,7 +3073,8 @@ final class IPickerItemHandler: NSObject {
 
 // MARK: - FontHelper
 
-private enum FontHelper {
+/// 字体列表。封面弹窗的文字属性也要用同一份，所以不是 private
+enum FontHelper {
     static let fontOptions: [(String, String)] = {
         let all = NSFontManager.shared.availableFontFamilies
         let cjk = all.filter { name in

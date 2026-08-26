@@ -7,6 +7,72 @@ import SwiftUI
 /// 在画布里按 ⌘Z 撤的应该是刚加的节点，不是时间轴上的操作
 final class CanvasState: ObservableObject {
 
+    /// 监听素材库的删除/恢复广播。
+    ///
+    /// **必须广播、不能由 `ProjectState` 直接调自己那个 canvas** —— 素材库是全 app
+    /// 一份，画布却是**每个窗口一份**。在 A 窗口删素材只动 A 的画布，卡片在 B 窗口
+    /// 的画布上就完全不受影响（实测日志：「命中卡片 0 张（画布共 0 张）」，
+    /// 因为那个窗口的画布本来就是空的）。
+    /// 注册在 init 里，画布开没开都收得到
+    private var libraryObservers: [Any] = []
+
+    /// 所有活着的画布，每个窗口一份（弱引用，窗口关了自动掉）。
+    /// 删素材的确认框要报「**一共**多少张卡片会被删」，只数自己那份会报少
+    private static let allCanvases = NSHashTable<CanvasState>.weakObjects()
+
+    /// 全部窗口的画布上，一共有几张卡片在用这个素材
+    static func totalNodeCount(usingAsset id: UUID, path: String?) -> Int {
+        allCanvases.allObjects.reduce(0) { $0 + $1.nodeCount(usingAsset: id, path: path) }
+    }
+
+    init() {
+        Self.allCanvases.add(self)
+        let center = NotificationCenter.default
+        libraryObservers.append(center.addObserver(
+            forName: .assetRemovedFromLibrary, object: nil, queue: .main
+        ) { [weak self] note in
+            guard let self, let id = note.userInfo?["assetID"] as? UUID else { return }
+            self.removeNodes(usingAsset: id, path: note.userInfo?["path"] as? String)
+            // 本窗口发起的那次删除，在画布栈里记一步「转给项目撤」——
+            // 画布开着时 ⌘Z 只走画布的栈，不记的话素材永远撤不回来
+            if let origin = note.userInfo?["origin"] as? UUID,
+               origin == self.project?.instanceID {
+                self.pushProjectAssetRemoval()
+            }
+        })
+        libraryObservers.append(center.addObserver(
+            forName: .assetRestoredToLibrary, object: nil, queue: .main
+        ) { [weak self] note in
+            guard let id = note.userInfo?["assetID"] as? UUID else { return }
+            self?.restoreNodesAfterUndo(assetID: id)
+        })
+        // 素材改名 / 重新关联：卡片的路径和显示名跟着走。
+        //
+        // **这条也必须在这里听，不能挂在视图上** —— 画布关着的时候在侧边栏
+        // 改名或重新关联，卡片就停在旧路径上，跟素材彻底失联：
+        // 之后删这个素材会「命中 0 张」（实测日志里就是这样），
+        // 因为卡片的 mediaPath 是旧的、又没有 assetID，谁也认不出谁
+        libraryObservers.append(center.addObserver(
+            forName: .mediaFileRelocated, object: nil, queue: .main
+        ) { [weak self] note in
+            guard let self, let info = note.userInfo else { return }
+            var changed = false
+            if let old = info["old"] as? String, let new = info["new"] as? String, old != new {
+                self.repointNodes(from: old, to: new)
+                changed = true
+            }
+            if let aid = info["assetID"] as? UUID, let newName = info["newName"] as? String {
+                self.renameNodeLabels(assetID: aid, to: newName)
+                changed = true
+            }
+            if changed { self.persist() }
+        })
+    }
+
+    deinit {
+        libraryObservers.forEach { NotificationCenter.default.removeObserver($0) }
+    }
+
     /// 缩放倍率。上下限按小云雀那类画布的手感定，太小看不清、太大没意义
     static let minZoom: CGFloat = 0.1
     static let maxZoom: CGFloat = 4.0
@@ -149,44 +215,88 @@ final class CanvasState: ObservableObject {
 
     // MARK: - 跟素材库联动（删除 / 撤销 / 改名）
 
-    /// 因为素材库删除而删掉卡片的那一步撤销点。
+    /// 因为素材库删除而删掉的卡片备份，撤销时原样插回来。
     ///
-    /// 记下「为哪个素材删的」和「删完时撤销栈有多深」，撤销时用来核对：
-    /// 栈顶那一步确实是为这个素材删的，才跟着撤一步。
-    /// 如果删完之后用户又在画布上做了别的操作，栈顶就不是那步了 ——
-    /// 这时**宁可不撤**，也不能把用户后来做的操作误撤掉
-    private var assetRemovalMarks: [(assetID: UUID, undoDepth: Int)] = []
+    /// **不走画布自己的撤销栈**。走栈的话这一步会变成画布历史里的独立一步：
+    /// 画布开着时 ⌘Z 先撤画布（卡片回来）、再撤项目（素材和片段回来），
+    /// 两边各撤一半，撤哪个还取决于焦点在哪 —— 实测日志里就是
+    /// 「素材恢复了，但画布撤销栈顶已不是当初那步」。
+    /// 存一份备份、由项目那次撤销直接插回来，一次 ⌘Z 三样齐
+    private var removedByAssetDeletion: [(assetID: UUID,
+                                          nodes: [CanvasNode],
+                                          edges: [CanvasEdge])] = []
 
-    /// 画布上有几张卡片在用这个素材。删素材前的确认框要报这个数
-    func nodeCount(usingAsset id: UUID) -> Int {
-        nodes.filter { $0.assetID == id }.count
+    /// 这张卡片算不算在用这个素材。
+    ///
+    /// **不能只认 assetID**：中间几个版本产出的卡片没有 assetID
+    /// （那时画布产物不进素材库），只有 `mediaPath`。只按 id 匹配的话
+    /// 删素材时一张卡片都匹配不到 —— 表现就是「片段没了、卡片还在」。
+    /// 没有 id 的按文件路径认
+    private func node(_ n: CanvasNode, uses id: UUID, path: String?) -> Bool {
+        if let aid = n.assetID { return aid == id }
+        guard let path, let mine = n.mediaPath else { return false }
+        return mine == path
     }
 
-    /// 素材被移出素材库：引用它的卡片一并删掉（跟时间轴片段一个待遇）。
-    /// 删之前压一个撤销点并做标记，撤销时才能一次把卡片也带回来
-    func removeNodes(usingAsset id: UUID) {
-        let victims = nodes.filter { $0.assetID == id }
+    /// 画布上有几张卡片在用这个素材。删素材前的确认框要报这个数 ——
+    /// **判据必须跟 `removeNodes` 一致**，否则报的数跟实际删掉的对不上
+    func nodeCount(usingAsset id: UUID, path: String? = nil) -> Int {
+        nodes.filter { node($0, uses: id, path: path) }.count
+    }
+
+    /// 素材被移出素材库：引用它的卡片一并删掉（跟时间轴片段一个待遇），
+    /// 删掉的卡片和它们的连线存一份备份，等项目那次撤销把它们插回来
+    func removeNodes(usingAsset id: UUID, path: String? = nil) {
+        let victims = nodes.filter { node($0, uses: id, path: path) }
+        DiagLog.log("[画布] 素材移除 → 命中卡片 \(victims.count) 张"
+                    + "（画布共 \(nodes.count) 张，path=\(path ?? "nil")）")
         guard !victims.isEmpty else { return }
-        pushUndo()
         let ids = Set(victims.map(\.id))
+        let deadEdges = edges.filter { ids.contains($0.from) || ids.contains($0.to) }
+        removedByAssetDeletion.append((assetID: id, nodes: victims, edges: deadEdges))
         nodes.removeAll { ids.contains($0.id) }
         edges.removeAll { ids.contains($0.from) || ids.contains($0.to) }
         selectedNodeIDs.subtract(ids)
-        assetRemovalMarks.append((assetID: id, undoDepth: undoCount))
+        persist()
     }
 
-    /// 素材被撤销恢复了：如果画布这边最近一步正是为它删的卡片，就跟着撤一步 ——
-    /// 一次 ⌘Z 素材、片段、卡片一起回来
+    /// 素材被撤销恢复了：把当初跟着删掉的卡片原样插回来 ——
+    /// 一次 ⌘Z 素材、片段、卡片一起回来。
+    /// 已经在画布上的不重复插（用户可能自己手动撤过）
     func restoreNodesAfterUndo(assetID: UUID) {
-        guard let mark = assetRemovalMarks.last, mark.assetID == assetID else { return }
-        assetRemovalMarks.removeLast()
-        guard mark.undoDepth == undoCount else {
-            // 删完之后画布上又做过别的操作，栈顶已经不是那一步了。
-            // 这时撤下去会把别的操作也撤掉，不如不动
-            DiagLog.log("[画布] 素材恢复了，但画布撤销栈顶已不是当初那步，卡片不自动恢复")
-            return
-        }
-        undo()
+        guard let i = removedByAssetDeletion.lastIndex(where: { $0.assetID == assetID }) else { return }
+        let backup = removedByAssetDeletion.remove(at: i)
+        let haveNodes = Set(nodes.map(\.id))
+        nodes.append(contentsOf: backup.nodes.filter { !haveNodes.contains($0.id) })
+        let haveEdges = Set(edges.map(\.id))
+        edges.append(contentsOf: backup.edges.filter { !haveEdges.contains($0.id) })
+        DiagLog.log("[画布] 素材撤销恢复 → 插回卡片 \(backup.nodes.count) 张")
+        persist()
+    }
+
+    /// 把画布存回它那条会话记录。
+    ///
+    /// **不能只靠视图层那个防抖保存** —— 那个挂在 `CanvasOverlay` 上，
+    /// 画布关着的时候（比如在侧边栏删素材）视图根本不在树里，没人触发保存。
+    /// 结果是卡片当场删了、存档里还留着，下次打开画布从存档恢复，卡片又回来
+    /// （实测：日志明明写着「命中卡片 1 张」，用户看到的却是卡片还在）
+    func persist() {
+        guard let id = conversationID else { return }
+        AIVideoService.shared.saveCanvas(snapshot(), id: id, title: derivedTitle)
+    }
+
+    /// 画布标题：取第一个有内容的节点。全空就留「未命名画布」——
+    /// 历史列表里一排「未命名」认不出谁是谁
+    var derivedTitle: String {
+        nodes.compactMap { n -> String? in
+            if n.kind == .text {
+                let t = n.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                return t.isEmpty ? nil : String(t.prefix(20))
+            }
+            let p = n.prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !p.isEmpty { return String(p.prefix(20)) }
+            return n.mediaURL?.lastPathComponent
+        }.first ?? "未命名画布"
     }
 
     /// 打开画布时跟素材库对一次账：有 assetID 的卡片，**名字和文件路径**都取素材当前的值。
@@ -200,16 +310,41 @@ final class CanvasState: ObservableObject {
     /// 表现就是「名字改好了，卡片却显示素材丢失」。
     /// 路径走 `repointNodes` 换，撤销栈里的旧路径一并换掉，撤销回去也不会又丢
     func syncNodesFromLibrary(_ project: ProjectState) {
+        var changed = false
         for j in nodes.indices {
+            // 老卡片可能没有 assetID（产物不进素材库那几个版本留下的）：
+            // 按文件路径去素材库认领一次，认上了才能享受改名/删除/关联的联动
+            if nodes[j].assetID == nil, let path = nodes[j].mediaPath {
+                if let owner = project.mediaAssets.first(where: { $0.url.path == path }) {
+                    nodes[j].assetID = owner.id
+                    changed = true
+                } else if !FileManager.default.fileExists(atPath: path) {
+                    // 路径对不上、文件也不在了 —— 素材很可能是在画布关着的时候
+                    // 被挪过位置或改过名，卡片停在旧路径上跟素材彻底失联了。
+                    // **按文件名兜一次**：卡片反正已经指着一个不存在的文件，
+                    // 认错的代价小于一直失联（文件还在的卡片不动，避免同名误配）
+                    let name = (path as NSString).lastPathComponent
+                    if let owner = project.mediaAssets.first(where: { $0.url.lastPathComponent == name }) {
+                        nodes[j].assetID = owner.id
+                        nodes[j].mediaPath = owner.url.path
+                        changed = true
+                        DiagLog.log("[画布] 卡片按文件名认回素材 \(name)")
+                    }
+                }
+            }
             guard let aid = nodes[j].assetID,
                   let asset = project.mediaAssets.first(where: { $0.id == aid }) else { continue }
             if nodes[j].displayName != asset.name {
                 nodes[j].displayName = asset.name
+                changed = true
             }
             if let old = nodes[j].mediaPath, old != asset.url.path {
                 repointNodes(from: old, to: asset.url.path)
+                changed = true
             }
         }
+        // 对账动过东西就落盘，否则下次打开又从存档读回错的
+        if changed { persist() }
     }
 
     /// 素材改名后，画布上引用它的卡片显示名一起改。
@@ -235,15 +370,21 @@ final class CanvasState: ObservableObject {
         for j in nodes.indices where nodes[j].mediaPath == oldPath {
             nodes[j].mediaPath = newPath
         }
-        for s in undoStack.indices {
-            for j in undoStack[s].nodes.indices where undoStack[s].nodes[j].mediaPath == oldPath {
-                undoStack[s].nodes[j].mediaPath = newPath
+        repointStack(&undoStack, from: oldPath, to: newPath)
+        repointStack(&redoStack, from: oldPath, to: newPath)
+    }
+
+    /// 撤销栈里的历史快照也要跟着换路径，否则撤销回去卡片又指着旧文件。
+    /// 「转给项目撤」那种条目不含节点，跳过
+    private func repointStack(_ stack: inout [UndoEntry], from oldPath: String, to newPath: String) {
+        for s in stack.indices {
+            guard case .canvas(var snap) = stack[s] else { continue }
+            var touched = false
+            for j in snap.nodes.indices where snap.nodes[j].mediaPath == oldPath {
+                snap.nodes[j].mediaPath = newPath
+                touched = true
             }
-        }
-        for s in redoStack.indices {
-            for j in redoStack[s].nodes.indices where redoStack[s].nodes[j].mediaPath == oldPath {
-                redoStack[s].nodes[j].mediaPath = newPath
-            }
+            if touched { stack[s] = .canvas(snap) }
         }
     }
 
@@ -419,10 +560,24 @@ final class CanvasState: ObservableObject {
         var groups: [CanvasGroup]
     }
 
-    private var undoStack: [Snapshot] = []
+    /// 撤销栈里的一步。
+    ///
+    /// 大部分是画布自己的快照，但**在画布里删素材**这种操作动的是项目那边
+    /// （素材、时间轴片段），得记成一步「转给项目撤」——
+    /// 画布开着时 ⌘Z 被画布的监听吞掉、只走 `canvas.undo()`，
+    /// 项目那次撤销永远轮不到，表现就是「⌘Z 只恢复卡片、不恢复素材」。
+    /// 记成栈里的一条，顺序才对：删素材之后又拖了张卡片，⌘Z 先撤拖动、再撤删除
+    private enum UndoEntry {
+        case canvas(Snapshot)
+        /// 本窗口发起的素材删除。撤销时转交 `ProjectState.undo()`，
+        /// 素材、片段、卡片由那条链一起恢复
+        case projectAssetRemoval
+    }
+
+    private var undoStack: [UndoEntry] = []
 
     /// 换画布时清掉撤销历史 —— 在新画布上撤销回上一张画布的内容毫无意义
-    private var redoStack: [Snapshot] = []
+    private var redoStack: [UndoEntry] = []
     private static let maxUndo = 50
 
     @Published private(set) var undoCount = 0
@@ -440,7 +595,16 @@ final class CanvasState: ObservableObject {
     }
 
     func pushUndo() {
-        undoStack.append(Snapshot(nodes: nodes, edges: edges, groups: groups))
+        push(.canvas(Snapshot(nodes: nodes, edges: edges, groups: groups)))
+    }
+
+    /// 记一步「这次删素材是本窗口在画布里发起的」，⌘Z 时转给项目撤
+    func pushProjectAssetRemoval() {
+        push(.projectAssetRemoval)
+    }
+
+    private func push(_ entry: UndoEntry) {
+        undoStack.append(entry)
         if undoStack.count > Self.maxUndo { undoStack.removeFirst() }
         redoStack.removeAll()
         syncUndoCounts()
@@ -448,17 +612,30 @@ final class CanvasState: ObservableObject {
 
     func undo() {
         endTextEditUndoGroup()
-        guard let snap = undoStack.popLast() else { return }
-        redoStack.append(Snapshot(nodes: nodes, edges: edges, groups: groups))
-        apply(snap)
+        guard let entry = undoStack.popLast() else { return }
+        switch entry {
+        case .canvas(let snap):
+            redoStack.append(.canvas(Snapshot(nodes: nodes, edges: edges, groups: groups)))
+            apply(snap)
+        case .projectAssetRemoval:
+            // 交给项目撤：素材和时间轴片段在那边，卡片由恢复广播插回来
+            redoStack.append(.projectAssetRemoval)
+            project?.undo()
+        }
         syncUndoCounts()
     }
 
     func redo() {
         endTextEditUndoGroup()
-        guard let snap = redoStack.popLast() else { return }
-        undoStack.append(Snapshot(nodes: nodes, edges: edges, groups: groups))
-        apply(snap)
+        guard let entry = redoStack.popLast() else { return }
+        switch entry {
+        case .canvas(let snap):
+            undoStack.append(.canvas(Snapshot(nodes: nodes, edges: edges, groups: groups)))
+            apply(snap)
+        case .projectAssetRemoval:
+            undoStack.append(.projectAssetRemoval)
+            project?.redo()
+        }
         syncUndoCounts()
     }
 

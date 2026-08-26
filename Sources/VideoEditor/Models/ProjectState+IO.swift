@@ -18,6 +18,7 @@ extension ProjectState {
         textTracks = [Track(label: "文字")]
         shapeTracks = [Track(label: "图形")]
         overlayTrackOrder.removeAll()
+        cover = nil
         videoSectionOrder.removeAll()
         audioSectionOrder.removeAll()
         seedDefaultTrackOrder()
@@ -82,7 +83,16 @@ extension ProjectState {
             reportOpenFailure("无法读取项目", "文件可能已损坏：\(url.lastPathComponent)")
             return
         }
-        guard let doc = try? JSONDecoder().decode(ProjectDocument.self, from: data) else {
+        // 解码失败要把真实原因记下来 —— `try?` 会把 DecodingError 整个吞掉，
+        // 界面只剩一句「文件格式不正确」，缺哪个字段全靠猜
+        let decoded: ProjectDocument?
+        do {
+            decoded = try JSONDecoder().decode(ProjectDocument.self, from: data)
+        } catch {
+            DiagLog.log("[打开项目] 解析失败 \(url.lastPathComponent)：\(error)")
+            decoded = nil
+        }
+        guard let doc = decoded else {
             reportOpenFailure("无法解析项目", "文件格式不正确：\(url.lastPathComponent)")
             return
         }
@@ -107,6 +117,7 @@ extension ProjectState {
         subtitleBottomMargin = doc.subtitleBottomMargin ?? doc.subtitleStyles.first?.bottomMargin ?? 5
         subtitleLineSpacing = doc.subtitleLineSpacing ?? doc.subtitleStyles.first?.lineSpacing ?? 6
         overlayTrackOrder = doc.overlayTrackOrder ?? []
+        cover = doc.cover
         compoundTracks = doc.compoundTracks ?? []
         videoSectionOrder = doc.videoSectionOrder ?? []
         audioSectionOrder = doc.audioSectionOrder ?? []
@@ -217,6 +228,7 @@ extension ProjectState {
             projectBitrate: projectBitrate,
             subtitleBottomMargin: subtitleBottomMargin,
             subtitleLineSpacing: subtitleLineSpacing,
+            cover: cover,
             overlayTrackOrder: overlayTrackOrder.isEmpty ? nil : overlayTrackOrder,
             compoundTracks: compoundTracks.isEmpty ? nil : compoundTracks,
             videoSectionOrder: videoSectionOrder.isEmpty ? nil : videoSectionOrder,

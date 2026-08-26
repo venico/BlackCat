@@ -301,19 +301,7 @@ struct CanvasOverlay: View {
 
     /// 把画布存回它那条会话记录。标题取第一个有内容的节点，
     /// 全空就留「未命名画布」—— 历史列表里一排「未命名」认不出谁是谁
-    private func saveCanvas() {
-        guard let id = canvas.conversationID else { return }
-        let title = canvas.nodes.compactMap { n -> String? in
-            if n.kind == .text {
-                let t = n.text.trimmingCharacters(in: .whitespacesAndNewlines)
-                return t.isEmpty ? nil : String(t.prefix(20))
-            }
-            let p = n.prompt.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !p.isEmpty { return String(p.prefix(20)) }
-            return n.mediaURL?.lastPathComponent
-        }.first ?? "未命名画布"
-        AIVideoService.shared.saveCanvas(canvas.snapshot(), id: id, title: title)
-    }
+    private func saveCanvas() { canvas.persist() }
 }
 
 // MARK: - 画布表面（点阵背景 + 平移缩放）
@@ -1127,7 +1115,6 @@ private struct CanvasSurface: View {
             let provider = AIVideoService.provider(for: node.kind.providerCategory)
             canvas.submitGeneration(nodeID: id, provider: provider)
         }
-        .modifier(MediaRelocationSync(canvas: canvas))
         .onReceive(NotificationCenter.default.publisher(for: .canvasNodeToReference)) { note in
             guard let id = note.object as? UUID, let n = canvas.node(id), let url = n.mediaURL else { return }
             let type: AIVideoService.RefContentType
@@ -1230,9 +1217,15 @@ struct CanvasKeyMonitor: ViewModifier {
             }
 
             // ⌘Z / ⇧⌘Z 撤的是画布自己的栈，不是时间轴的
-            if event.type == .keyDown, !editing,
+            if event.type == .keyDown,
                event.modifierFlags.contains(.command),
                event.charactersIgnoringModifiers?.lowercased() == "z" {
+                // 撤销没反应时靠这条判断卡在哪：被输入状态挡了，还是栈本来就是空的
+                DiagLog.log("[画布] ⌘Z editing=\(editing) "
+                            + "promptFocus=\(canvas.promptBarFocused) "
+                            + "editingText=\(canvas.editingTextNodeID != nil) "
+                            + "undo=\(canvas.undoCount) redo=\(canvas.redoCount)")
+                guard !editing else { return event }
                 if event.modifierFlags.contains(.shift) { canvas.redo() } else { canvas.undo() }
                 return nil
             }
@@ -1669,27 +1662,3 @@ enum CanvasSurfaceKindResolver {
 }
 
 
-/// 素材改名 / 重新关联之后，把画布上引用它的卡片跟着换过去（路径 + 显示名）。
-///
-/// 单拎成 modifier 是因为 `CanvasOverlay` 的 body 已经很大，再往里塞一段
-/// `onReceive` 就会让 Swift 的类型检查超时（`unable to type-check this expression`）。
-/// 广播不带窗口 id 是**故意的**：素材库全局一份，一个文件改了名，
-/// 所有窗口的画布都该跟着改
-private struct MediaRelocationSync: ViewModifier {
-    @ObservedObject var canvas: CanvasState
-
-    func body(content: Content) -> some View {
-        content.onReceive(NotificationCenter.default.publisher(for: .mediaFileRelocated)) { note in
-            guard let info = note.userInfo else { return }
-            // 路径变了就重指（改名、重新关联都会）
-            if let old = info["old"] as? String, let new = info["new"] as? String {
-                canvas.repointNodes(from: old, to: new)
-            }
-            // 显示名按 assetID 认卡片：产物卡片显示的是「图片 1」这种编号，
-            // 按名字匹配根本对不上
-            if let aid = info["assetID"] as? UUID, let newName = info["newName"] as? String {
-                canvas.renameNodeLabels(assetID: aid, to: newName)
-            }
-        }
-    }
-}

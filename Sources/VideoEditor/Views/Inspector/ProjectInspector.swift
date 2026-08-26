@@ -12,6 +12,7 @@ struct ProjectInspector: View {
     @State private var widthDraft: String = ""
     @State private var heightDraft: String = ""
     @FocusState private var sizeFieldFocused: Bool
+    @State private var coverHovering = false
 
     private var isCustomSize: Bool { project.previewAspectRatio == ExportSettings.customAspect }
 
@@ -20,6 +21,9 @@ struct ProjectInspector: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             ISection(title: "项目") {
+                fieldLabel("封面")
+                coverEntry
+
                 fieldLabel("项目名称")
                 TextField("未命名项目", text: $nameDraft)
                     .textFieldStyle(.plain)
@@ -182,6 +186,106 @@ struct ProjectInspector: View {
         let s = computedSize
         widthDraft  = String(Int(s.width))
         heightDraft = String(Int(s.height))
+    }
+
+    /// 封面入口。没设计过显示缺省图，hover 出「设计封面」按钮；
+    /// 已经设置过的还多一个清除。**按钮画在块里**，不用 tooltip ——
+    /// tooltip 会飘到面板外面去
+    private var coverEntry: some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: 6).fill(Color.white.opacity(0.06))
+            if let img = coverImage {
+                // fill + 裁切：铺满整个框，不在框里留黑边
+                Color.clear.overlay(
+                    Image(nsImage: img).resizable().aspectRatio(contentMode: .fill)
+                )
+                .clipped()
+            } else {
+                // 缺省态只放一个大图标，不写字 —— 上面本来就有「封面」那行标签
+                Image(nsImage: SidebarSVGIcon.load("image", size: 34))
+                    .renderingMode(.template)
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .frame(width: 34, height: 34)
+                    .foregroundColor(Color.labelSecondary.opacity(0.4))
+            }
+
+            // hover 才出的操作层：压暗 + 「设计封面」，右上角是清除
+            if coverHovering {
+                Color.black.opacity(0.45)
+                Button { project.showCoverDesigner = true } label: {
+                    Text("设计封面")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundColor(.white)
+                        .padding(.horizontal, 12)
+                        .frame(height: 26)
+                        .background(Capsule().fill(Color.white.opacity(0.22)))
+                        .contentShape(Capsule())
+                }
+                .buttonStyle(.plain)
+
+                if project.cover != nil {
+                    VStack {
+                        HStack {
+                            Spacer()
+                            Button { clearCover() } label: {
+                                Image(systemName: "xmark")
+                                    .font(.system(size: 9, weight: .bold))
+                                    .foregroundColor(.white)
+                                    .frame(width: 18, height: 18)
+                                    .background(Circle().fill(Color.black.opacity(0.6)))
+                                    .contentShape(Circle())
+                            }
+                            .buttonStyle(.plain)
+                            .help("清除封面")
+                        }
+                        Spacer()
+                    }
+                    .padding(5)
+                }
+            }
+        }
+        // **裁剪和边框都要排在 aspectRatio 之前**：排在后面的话它们作用在外层那个
+        // 满宽的 frame 上，而内容按比例缩在中间 —— 就是边框两侧空出一条的样子。
+        //
+        // 比例跟着项目设置走；限高 300，竖版项目（9:16 那种）按比例撑起来
+        // 会占掉大半个属性区
+        .clipShape(RoundedRectangle(cornerRadius: 6))
+        .overlay(RoundedRectangle(cornerRadius: 6)
+            .strokeBorder(Color.white.opacity(coverHovering ? 0.25 : 0.10)))
+        .aspectRatio(coverAspect, contentMode: .fit)
+        .frame(maxWidth: .infinity, maxHeight: 300)
+        .contentShape(RoundedRectangle(cornerRadius: 6))
+        .onHover { coverHovering = $0 }
+        .padding(.bottom, 4)
+    }
+
+    /// 清除封面：清掉设计稿，顺手把渲染出来的那张 PNG 删掉，不留垃圾
+    private func clearCover() {
+        if let rel = project.cover?.renderedPath,
+           let base = project.projectFileURL?.deletingLastPathComponent() {
+            try? FileManager.default.removeItem(at: base.appendingPathComponent(rel))
+        }
+        project.cover = nil
+        project.isSaved = false
+        project.scheduleAutoSave()
+    }
+
+    /// 框按**项目比例**画。封面渲染出来就是这个比例（`renderCover` 用的是
+    /// `previewRenderSize`），所以两者本来就该贴合；
+    /// 项目比例后来改过的旧封面，图按 fill 铺满裁切，不留空边
+    private var coverAspect: CGFloat {
+        let s = project.previewRenderSize
+        guard s.width > 0, s.height > 0 else { return 16.0 / 9.0 }
+        return s.width / s.height
+    }
+
+    /// 已经渲染好的封面图。相对路径存的，按项目文件所在目录还原
+    private var coverImage: NSImage? {
+        guard let rel = project.cover?.renderedPath else { return nil }
+        let base = project.projectFileURL?.deletingLastPathComponent()
+        let url = base.map { $0.appendingPathComponent(rel) } ?? URL(fileURLWithPath: rel)
+        return NSImage(contentsOf: url)
     }
 
     private func commitName() {

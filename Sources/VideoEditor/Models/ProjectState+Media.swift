@@ -886,8 +886,13 @@ extension ProjectState {
     func removeAssetAndClips(assetID: UUID) {
         let snap = currentSnapshot(includeAssets: true)
         // 画布上引用它的卡片也一并删（跟时间轴片段一个待遇）。
-        // 画布有自己的撤销栈，所以它自己压一步 + 做标记，撤销时才能一起回来
-        canvas.removeNodes(usingAsset: assetID)
+        // **广播**给所有窗口的画布 —— 素材库全 app 一份，画布每窗口一份，
+        // 只调自己那个 canvas 的话，卡片在别的窗口就删不掉
+        NotificationCenter.default.post(
+            name: .assetRemovedFromLibrary, object: nil,
+            userInfo: ["assetID": assetID,
+                       "origin": instanceID,
+                       "path": mediaAssets.first(where: { $0.id == assetID })?.url.path as Any])
         mediaAssets.removeAll { $0.id == assetID }
         for i in videoTracks.indices {
             videoTracks[i].clips.removeAll { $0.assetID == assetID }

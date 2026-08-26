@@ -3571,7 +3571,7 @@ private struct VideoClipView: View {
         .clipShape(RoundedRectangle(cornerRadius: 6))
         // 源文件没了：压暗 + 橙描边 + 可点的警示图标（点了重新关联）。
         // 在 clipShape 之后挂，标记才跟着片段的圆角裁剪
-        .overlay(ClipMissingOverlay(assetID: clip.assetID, width: w))
+        .overlay(ClipMissingOverlay(assetID: clip.assetID, width: w, selected: sel))
         .opacity(isDragging ? 0 : (project.clipboardIsCut && project.clipboardSourceIDs.contains(clip.id) ? 0.35 : 1.0))
         // 占位：整块 opacity 在 1.0 ↔ 0.45 之间呼吸。必须作用在整块上而不是叠一层
         // 同色遮罩——底下就是同色实块，叠加前后混出来一个样，看不出在动。
@@ -3775,7 +3775,7 @@ private struct ImageClipView: View {
         .clipShape(RoundedRectangle(cornerRadius: 6))
         // 源文件没了：压暗 + 橙描边 + 可点的警示图标（点了重新关联）。
         // 在 clipShape 之后挂，标记才跟着片段的圆角裁剪
-        .overlay(ClipMissingOverlay(assetID: clip.assetID, width: w))
+        .overlay(ClipMissingOverlay(assetID: clip.assetID, width: w, selected: sel))
         .opacity(isDragging ? 0 : (project.clipboardIsCut && project.clipboardSourceIDs.contains(clip.id) ? 0.35 : 1.0))
         .offset(x: clip.startTime*pps + 1)
         .allowsHitTesting(isRenaming)
@@ -3903,7 +3903,7 @@ private struct AudioClipView: View {
         .clipShape(RoundedRectangle(cornerRadius: 6))
         // 源文件没了：压暗 + 橙描边 + 可点的警示图标（点了重新关联）。
         // 在 clipShape 之后挂，标记才跟着片段的圆角裁剪
-        .overlay(ClipMissingOverlay(assetID: clip.assetID, width: w))
+        .overlay(ClipMissingOverlay(assetID: clip.assetID, width: w, selected: sel))
         .opacity(isDragging ? 0 : (project.clipboardIsCut && project.clipboardSourceIDs.contains(clip.id) ? 0.35 : 1.0))
         .offset(x: clip.startTime*pps + 1)
         .onAppear {
@@ -5839,8 +5839,9 @@ func relinkAssetWithPanel(_ assetID: UUID, project: ProjectState) {
     project.relinkAsset(id: assetID, newURL: url)
 }
 
-/// 片段上的「素材丢失」标记：压暗 + 橙色描边 + 左上角警示图标，**图标本身可点**，
+/// 片段上的「素材丢失」标记：压暗 + 左上角警示图标，**图标本身可点**，
 /// 点了就是重新关联（用户要的「上边有重新关联的图标」）。
+/// 不画描边 —— 那是选中态的事（白框）。
 ///
 /// 判据读 `project.missingAssetIDs` 这个缓存，**绝不能在这里查盘** ——
 /// 时间轴上百个片段每帧都渲染，`fileExists` 是每次一个系统调用
@@ -5849,15 +5850,27 @@ private struct ClipMissingOverlay: View {
     let assetID: UUID
     /// 片段当前多宽 —— 太窄就只留图标，放不下文字
     let width: CGFloat
+    /// 片段选中没有。选中时压暗层要让出边缘那圈，白框才跟别的片段一样
+    var selected: Bool = false
 
     @State private var hovering = false
 
     var body: some View {
         if project.missingAssetIDs.contains(assetID) {
             ZStack(alignment: .topLeading) {
+                // 压暗直接铺满叠上去，不内缩 —— 内缩会让边缘露出片段底色，
+                // 看着像给丢失片段镶了一圈绿边
                 RoundedRectangle(cornerRadius: 6).fill(Color.black.opacity(0.4))
-                RoundedRectangle(cornerRadius: 6)
-                    .strokeBorder(Color(hex: "#FF9230"), lineWidth: 1.5)
+                // 选中的白框在这一层**重画一遍**：片段自己那圈画在压暗底下，
+                // 会被压成灰的，跟别的片段选中时不一样。
+                //
+                // 必须用 `strokeBorder`（往内画）而不是 `stroke`（居中）：
+                // 居中描边有一半探到边界外，而这一层是 overlay、不受片段的
+                // clipShape 裁剪，于是跟底下那圈错开半像素，两圈叠起来看着就更粗
+                if selected {
+                    RoundedRectangle(cornerRadius: 6)
+                        .strokeBorder(Color.white, lineWidth: 1)
+                }
                 Button { relinkAssetWithPanel(assetID, project: project) } label: {
                     HStack(spacing: 3) {
                         Image(nsImage: SidebarSVGIcon.load("toastWarn", size: 10))

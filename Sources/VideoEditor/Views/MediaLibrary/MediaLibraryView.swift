@@ -8,12 +8,21 @@ struct MediaLibraryView: View {
     @State private var isDragOver = false
 
     private var isTransitionTab: Bool { project.mediaLibraryTab == "transition" }
-    private var isTextTab: Bool { project.mediaLibraryTab == "text" }
-    private var isShapeTab: Bool { project.mediaLibraryTab == "shape" }
     private var isAITab: Bool { project.mediaLibraryTab == "ai" }
+    /// 素材库里的分类（六个标签页）
+    private var isTextTab: Bool { project.mediaLibraryTab == "library" && project.libraryCategory == "text" }
+    private var isShapeTab: Bool { project.mediaLibraryTab == "library" && project.libraryCategory == "shape" }
+
+    /// 只有视频和图片有缩略图可看，能在两种视图之间切
+    private var canSwitchViewMode: Bool {
+        selectedAssetType == .video || selectedAssetType == .image
+    }
+
+    /// 素材库里六个标签页，按用户定的顺序
+    private static let libraryCategories = ["video", "audio", "image", "subtitle", "text", "shape"]
 
     private var selectedAssetType: AssetType {
-        switch project.mediaLibraryTab {
+        switch project.libraryCategory {
         case "audio": return .audio
         case "image": return .image
         case "subtitle": return .subtitle
@@ -57,7 +66,7 @@ struct MediaLibraryView: View {
             VStack(spacing: 0) {
             // Section header
             HStack {
-                Text(tabName(project.mediaLibraryTab))
+                Text(isTransitionTab ? "转场" : "素材库")
                     .font(.system(size: 11, weight: .semibold))
                     .foregroundColor(Color.labelSecondary)
                     .textCase(.uppercase)
@@ -78,6 +87,11 @@ struct MediaLibraryView: View {
             .padding(.trailing, 8)
             .padding(.top, 8)
             .padding(.bottom, 8)
+
+            // 六个分类标签页。样式跟画布素材库那套一致：胶囊底 + 选中态填充
+            if !isTransitionTab {
+                libraryTabBar
+            }
 
             // Search + Sort bar
             if !isTransitionTab && !isTextTab && !isShapeTab && !isAITab {
@@ -107,6 +121,15 @@ struct MediaLibraryView: View {
                     .background(Color.white.opacity(0.06))
                     .clipShape(RoundedRectangle(cornerRadius: 6))
 
+                    // 缩略图 / 列表切换。一个按钮循环切，图标显示**当前**是哪种。
+                    // 音频和字幕没有画面，不给这个按钮
+                    if canSwitchViewMode {
+                        MediaToolBtn(svgName: project.mediaGridMode ? "gridView" : "listView",
+                                     help: project.mediaGridMode ? "缩略图（点击切列表）"
+                                                                 : "列表（点击切缩略图）") {
+                            project.mediaGridMode.toggle()
+                        }
+                    }
                     MediaToolBtn(svgName: "sort", help: "排序") {
                         showSortNSMenu(project: project)
                     }
@@ -127,18 +150,9 @@ struct MediaLibraryView: View {
                     emptyState
                 } else {
                     ScrollView(showsIndicators: false) {
-                        if selectedAssetType == .image {
-                            // 2-column grid for images
-                            LazyVGrid(columns: [GridItem(.flexible(), spacing: 4),
-                                                GridItem(.flexible(), spacing: 4)], spacing: 4) {
-                                ForEach(filteredAssets) { asset in
-                                    AssetRow(assetID: asset.id)
-                                }
-                            }
-                            .padding(.horizontal, 8)
-                            .padding(.bottom, 8)
-                        } else if selectedAssetType == .video {
-                            // 2-column grid for videos
+                        // 缩略图两列 / 列表一条条。只有**视频和图片**能切，
+                        // 音频和字幕固定列表
+                        if project.mediaGridMode, canSwitchViewMode {
                             LazyVGrid(columns: [GridItem(.flexible(), spacing: 4),
                                                 GridItem(.flexible(), spacing: 4)], spacing: 4) {
                                 ForEach(filteredAssets) { asset in
@@ -190,15 +204,13 @@ struct MediaLibraryView: View {
     // 左侧竖排图标标签栏
     private var verticalTabBar: some View {
         VStack(spacing: 4) {
-            tabBtnSVG("video")
-            tabBtnSVG("audio")
-            tabBtnSVG("image")
-            tabBtnSVG("subtitle")
-            tabBtnSVG("transition")
-            tabBtnSVG("text")
-            tabBtnSVG("shape")
-            Spacer()
+            // AI 生成排第一（进软件默认选中它），素材库第二。
+            // 视频/音频/图片/字幕/文字/图形原来各占一个图标，现在并进素材库当标签页。
+            // **转场留着**：它不是素材，是拖到片段上的效果，没并进去
             tabBtnAI()
+            tabBtnSVG("library", icon: "folderFill")
+            tabBtnSVG("transition")
+            Spacer()
             importExportMenuBtn
         }
         .padding(.top, 10)
@@ -206,6 +218,31 @@ struct MediaLibraryView: View {
         .padding(.horizontal, 6)
         .frame(minWidth: 44, maxWidth: 44, alignment: .center)
         .frame(maxHeight: .infinity)
+    }
+
+    /// 素材库里的六个分类标签页。跟画布素材库那套一个样式：胶囊底 + 选中态填充。
+    /// 六个挤在窄侧栏里，字号和内边距都收紧一档
+    private var libraryTabBar: some View {
+        HStack(spacing: 0) {
+            ForEach(Self.libraryCategories, id: \.self) { cat in
+                let isOn = project.libraryCategory == cat
+                Button { project.libraryCategory = cat } label: {
+                    Text(tabName(cat))
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundColor(isOn ? .white : Color.labelSecondary)
+                        .frame(maxWidth: .infinity)
+                        .frame(height: 22)
+                        .background(isOn ? Color.white.opacity(0.15) : Color.clear)
+                        .clipShape(Capsule())
+                        .contentShape(Capsule())
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .background(Color.white.opacity(0.06))
+        .clipShape(Capsule())
+        .padding(.horizontal, 8)
+        .padding(.bottom, 8)
     }
 
     private func tabName(_ tab: String) -> String {
@@ -217,7 +254,8 @@ struct MediaLibraryView: View {
         case "transition": return "转场"
         case "text": return "文字"
         case "shape": return "图形"
-        case "ai": return "AI"
+        case "library": return "素材库"
+        case "ai": return "AI 创作"
         default: return ""
         }
     }
@@ -257,14 +295,15 @@ struct MediaLibraryView: View {
                 .contentShape(RoundedRectangle(cornerRadius: 7))
         }
         .buttonStyle(.plain)
-        .help("AI")
+        .help("AI 创作")
     }
 
     private var emptyState: some View {
         // 图标直接复用左侧标签栏那套 SVG（同一个 key），只是放大。
         // 原来这里是 SF Symbols，跟标签栏的自绘图标不是一套，形状对不上
         VStack(spacing: 10) {
-            Image(nsImage: SidebarSVGIcon.load(project.mediaLibraryTab))
+            // 空状态图标跟着**分类**走（素材库那栏的六个标签），不是侧边栏那一栏
+            Image(nsImage: SidebarSVGIcon.load(project.libraryCategory))
                 .renderingMode(.template)
                 .resizable()
                 .aspectRatio(contentMode: .fit)
@@ -389,7 +428,9 @@ private struct AssetRow: View {
 
     var body: some View {
         Group {
-            if asset.type == .video || asset.type == .image {
+            // 视频和图片跟着**视图模式**走；音频和字幕没有画面，
+            // 摆成网格全是一样的占位图标，没意义 —— 固定用列表
+            if project.mediaGridMode, asset.type == .video || asset.type == .image {
                 videoAssetCard
             } else {
                 normalAssetRow
@@ -522,6 +563,25 @@ private struct AssetRow: View {
         // spacing 0：名字长到撑满时 Spacer 压到 0，行内不再有任何死间距，
         // 名字能一直排到按钮跟前（按钮自己的 padding 就是视觉间隔）
         HStack(spacing: 0) {
+            // 视频和图片在列表视图里带一张**正方形**小封面，一眼认得出是哪条；
+            // 音频和字幕没有画面，不占这个位置
+            if asset.type == .video || asset.type == .image {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 4).fill(Color.white.opacity(0.06))
+                    if let thumb = project.mediaThumbnails[asset.id] {
+                        Color.clear.overlay(
+                            Image(nsImage: thumb).resizable().aspectRatio(contentMode: .fill)
+                        )
+                    } else {
+                        Image(systemName: asset.type == .image ? "photo" : "film")
+                            .font(.system(size: 12, weight: .ultraLight))
+                            .foregroundColor(Color.labelSecondary.opacity(0.35))
+                    }
+                }
+                .frame(width: 34, height: 34)
+                .clipShape(RoundedRectangle(cornerRadius: 4))
+                .padding(.trailing, 6)
+            }
             // 正常状态不再放类型图标：音频/字幕列表本来就按标签页分好了类，
             // 图标提供不了额外信息，却白占宽度，名字长的素材少显示好几个字。
             // 丢失状态仍要图标——那是必须看见的警示
@@ -1659,8 +1719,13 @@ private extension Character {
 
 // MARK: - Text Layer Panel
 
-private struct TextLayerPanel: View {
+/// 文字模板。侧边栏点了是套用到选中的文字片段，封面弹窗点了是往封面加一条 ——
+/// 同上，落点用 `onPick` 传
+struct TextLayerPanel: View {
     @EnvironmentObject private var project: ProjectState
+    var onPick: ((TextTemplate) -> Void)? = nil
+    /// 同 `ShapePanel`：侧边栏 8，封面弹窗 24
+    var hPadding: CGFloat = 8
 
     var body: some View {
         VStack(spacing: 0) {
@@ -1684,10 +1749,10 @@ private struct TextLayerPanel: View {
                 ScrollView(showsIndicators: false) {
                     VStack(alignment: .leading, spacing: 6) {
                         ForEach(project.textTemplates) { tmpl in
-                            TextTemplateCard(template: tmpl)
+                            TextTemplateCard(template: tmpl, onPick: onPick)
                         }
                     }
-                    .padding(.horizontal, 8)
+                    .padding(.horizontal, hPadding)
                     .padding(.top, 6)
                     .padding(.bottom, 8)
                 }
@@ -1698,6 +1763,7 @@ private struct TextLayerPanel: View {
 
 private struct TextTemplateCard: View {
     let template: TextTemplate
+    var onPick: ((TextTemplate) -> Void)? = nil
     @EnvironmentObject private var project: ProjectState
     @State private var isHovered = false
 
@@ -1751,7 +1817,9 @@ private struct TextTemplateCard: View {
         )
         .onHover { isHovered = $0 }
         .onTapGesture {
-            if let clipID = project.selectedTextClipID {
+            if let onPick {
+                onPick(template)
+            } else if let clipID = project.selectedTextClipID {
                 project.applyTextTemplate(template, to: clipID)
             }
         }
@@ -2011,18 +2079,25 @@ private struct MediaToolBtn: View {
 
 // MARK: - Shape Panel（图形素材面板）
 
-private struct ShapePanel: View {
+/// 八种图形。侧边栏点了是加到时间轴，封面弹窗点了是加到封面 ——
+/// 落点用 `onPick` 传进来，不传就走时间轴那条老路
+struct ShapePanel: View {
     @EnvironmentObject private var project: ProjectState
-
+    var onPick: ((ShapeType) -> Void)? = nil
+    /// 左右内边距。侧边栏是 8，封面弹窗要跟它那排标签对齐所以传 24
+    var hPadding: CGFloat = 8
     var body: some View {
         ScrollView(showsIndicators: false) {
             LazyVGrid(columns: [GridItem(.flexible(), spacing: 8),
                                 GridItem(.flexible(), spacing: 8)], spacing: 8) {
                 ForEach(ShapeType.allCases, id: \.self) { type in
-                    ShapeCard(type: type) { project.addShapeAtPlayhead(type: type) }
+                    ShapeCard(type: type) {
+                        if let onPick { onPick(type) }
+                        else { project.addShapeAtPlayhead(type: type) }
+                    }
                 }
             }
-            .padding(.horizontal, 8)
+            .padding(.horizontal, hPadding)
             .padding(.top, 6)
             .padding(.bottom, 8)
         }
@@ -2039,8 +2114,12 @@ private struct ShapeCard: View {
             ZStack {
                 RoundedRectangle(cornerRadius: 6).fill(Color.white.opacity(0.05))
                 GeometryReader { geo in
-                    let r = CGRect(x: geo.size.width * 0.2, y: geo.size.height * 0.28,
-                                   width: geo.size.width * 0.6, height: geo.size.height * 0.44)
+                    // 图形按固定基准宽度画、居中放，**不跟着侧边栏拉宽**（拉宽只有灰底变宽）。
+                    // 84 = 侧边栏默认 260 宽时的卡片内容宽；侧边栏拉窄到装不下时才跟着缩
+                    let boxW = min(geo.size.width, 84)
+                    let ox = (geo.size.width - boxW) / 2
+                    let r = CGRect(x: ox + boxW * 0.2, y: geo.size.height * 0.28,
+                                   width: boxW * 0.6, height: geo.size.height * 0.44)
                     let col = Color.labelSecondary.opacity(0.85)
                     if type == .pen {
                         // 钢笔图标：一条贝塞尔曲线
@@ -2248,6 +2327,9 @@ enum SidebarSVGIcon {
         """,
         "hide": """
         <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path d="M3.72907219,8.0844456 L5.23576901,9.40083903 C5.03636408,9.61464043 4.8379419,9.83869961 4.64048115,10.0730664 C3.70162763,11.1873947 3.70547071,12.8187779 4.64918504,13.9372568 C6.95684475,16.6722674 9.39573151,18 12,18 C12.8677789,18 13.7172032,17.8525761 14.5495305,17.5547865 L16.2227315,19.0193784 C14.8731571,19.6706911 13.4645389,20 12,20 C8.75422105,20 5.78303634,18.3824838 3.12060057,15.2269969 C1.54976572,13.3652623 1.54335762,10.6450296 3.11097789,8.78441603 C3.31519715,8.54202754 3.5212337,8.30869209 3.72907219,8.0844456 Z M4.65850461,4.24742331 L20.6585046,18.2474233 C21.0741412,18.6111054 21.1162587,19.242868 20.7525767,19.6585046 C20.3888946,20.0741412 19.757132,20.1162587 19.3414954,19.7525767 L3.34149539,5.75257669 C2.92585876,5.38889464 2.88374125,4.75713202 3.24742331,4.34149539 C3.61110536,3.92585876 4.24286798,3.88374125 4.65850461,4.24742331 Z M8.003,11.825 L12.7026739,15.9384837 C12.4745446,15.9789099 12.2397352,16 12,16 C9.790861,16 8,14.209139 8,12 L8.003,11.825 Z M12,4 C15.245779,4 18.2169637,5.61751617 20.8793994,8.7730031 C22.4502343,10.6347377 22.4566424,13.3549704 20.8890221,15.215584 C20.6848029,15.4579725 20.4787663,15.6913079 20.2709278,15.9155544 L18.7651672,14.5981571 C18.964257,14.3846583 19.1623671,14.1609336 19.3595188,13.9269336 C20.2983724,12.8126053 20.2945293,11.1812221 19.350815,10.0627432 C17.0431552,7.32773259 14.6042685,6 12,6 C11.1315235,6 10.2814312,6.14766103 9.44846229,6.44593195 L7.77527213,4.9815853 C9.1254537,4.32963377 10.534739,4 12,4 Z M12,8 C14.209139,8 16,9.790861 16,12 L15.995,12.174 L11.2953251,8.06187139 C11.5240823,8.02121365 11.7595638,8 12,8 Z" fill="black" fill-rule="evenodd"/></svg>
+        """,
+        "folderFill": """
+        <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path d="M7.17366336,4 C7.64433057,4 7.7562402,4.00271564 7.94380266,4.02897409 L8.08109393,4.05145178 C8.21779037,4.07709983 8.35259326,4.11223327 8.48452044,4.15662022 C8.66402452,4.21701445 8.76533401,4.26463302 9.18631155,4.47512179 L10.236068,5.00000001 L16.2,5 C18.5012462,5 19.0479856,5.04467038 19.815962,5.4359739 C20.5686104,5.8194674 21.1805326,6.43138963 21.5640261,7.184038 C21.9553296,7.95201441 22,8.49875384 22,10.8 L22,14.2 C22,16.5012462 21.9553296,17.0479856 21.5640261,17.815962 C21.1805326,18.5686104 20.5686104,19.1805326 19.815962,19.5640261 C19.0479856,19.9553296 18.5012462,20 16.2,20 L7.8,20 C5.49875384,20 4.95201441,19.9553296 4.184038,19.5640261 C3.43138963,19.1805326 2.8194674,18.5686104 2.4359739,17.815962 C2.04467038,17.0479856 2,16.5012462 2,14.2 L2,9.8 C2,7.49875384 2.04467038,6.95201441 2.4359739,6.184038 C2.9898659,5.09696375 4.00960181,4.32211449 5.20533469,4.07973125 C5.55869027,4.00810366 5.79108813,4 6.76393202,4 L7.17366336,4 Z M17,10 L7,10 C6.44771525,10 6,10.4477153 6,11 C6,11.5522847 6.44771525,12 7,12 L17,12 C17.5522847,12 18,11.5522847 18,11 C18,10.4477153 17.5522847,10 17,10 Z" fill="#FFFFFF" fill-rule="evenodd"/></svg>
         """,
         "folder": """
         <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path d="M7.17366336,4 C7.64433057,4 7.7562402,4.00271564 7.94380266,4.02897409 L8.08109393,4.05145178 C8.21779037,4.07709983 8.35259326,4.11223327 8.48452044,4.15662022 C8.66402452,4.21701445 8.76533401,4.26463302 9.18631155,4.47512179 L9.70811564,4.73602383 C10.0228338,4.89338289 10.1016748,4.93044059 10.1532505,4.94779326 C10.2118848,4.96752079 10.2722232,4.98176477 10.3334898,4.99034198 C10.3873808,4.99788663 10.4744711,5 10.8263366,5 L16.2,5 C18.5012462,5 19.0479856,5.04467038 19.815962,5.4359739 C20.5686104,5.8194674 21.1805326,6.43138963 21.5640261,7.184038 C21.9553296,7.95201441 22,8.49875384 22,10.8 L22,14.2 C22,16.5012462 21.9553296,17.0479856 21.5640261,17.815962 C21.1805326,18.5686104 20.5686104,19.1805326 19.815962,19.5640261 C19.0479856,19.9553296 18.5012462,20 16.2,20 L7.8,20 C5.49875384,20 4.95201441,19.9553296 4.184038,19.5640261 C3.43138963,19.1805326 2.8194674,18.5686104 2.4359739,17.815962 C2.04467038,17.0479856 2,16.5012462 2,14.2 L2,9.8 C2,7.49875384 2.04467038,6.95201441 2.4359739,6.184038 C2.9898659,5.09696375 4.00960181,4.32211449 5.20533469,4.07973125 C5.55869027,4.00810366 5.79108813,4 6.76393202,4 L7.17366336,4 Z M5.60266734,6.03986563 C5.0048009,6.16105725 4.49493295,6.54848188 4.21798695,7.092019 C4.03707473,7.44707923 4,7.90085237 4,9.8 L4,14.2 C4,16.0991476 4.03707473,16.5529208 4.21798695,16.907981 C4.4097337,17.2843052 4.71569481,17.5902663 5.092019,17.782013 C5.44707923,17.9629253 5.90085237,18 7.8,18 L16.2,18 C18.0991476,18 18.5529208,17.9629253 18.907981,17.782013 C19.2843052,17.5902663 19.5902663,17.2843052 19.782013,16.907981 C19.9629253,16.5529208 20,16.0991476 20,14.2 L20,10.8 C20,8.90085237 19.9629253,8.44707923 19.782013,8.092019 C19.5902663,7.71569481 19.2843052,7.4097337 18.907981,7.21798695 C18.5529208,7.03707473 18.0991476,7 16.2,7 L10.8263366,7 C10.3556694,7 10.2437598,6.99728436 10.0561973,6.97102593 C9.87239775,6.9452943 9.69138246,6.90256238 9.51547956,6.84337978 C9.33597548,6.78298555 9.23466599,6.73536698 8.81368845,6.52487821 L8.29188436,6.26397617 C7.97716624,6.10661711 7.8983252,6.06955941 7.84674951,6.05220674 C7.78811521,6.03247921 7.72777678,6.01823523 7.66651026,6.00965803 L7.65596009,6.00830624 C7.60069863,6.00185745 7.50353732,6 7.17366336,6 L6.76393202,6 C5.96189026,6 5.76556108,6.00684595 5.60266734,6.03986563 Z M17,10 C17.5522847,10 18,10.4477153 18,11 C18,11.5522847 17.5522847,12 17,12 L7,12 C6.44771525,12 6,11.5522847 6,11 C6,10.4477153 6.44771525,10 7,10 L17,10 Z" fill="black" fill-rule="evenodd"/></svg>

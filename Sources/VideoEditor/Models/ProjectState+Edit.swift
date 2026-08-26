@@ -77,7 +77,10 @@ extension ProjectState {
         // 这一步撤回来的素材，画布上那些卡片也跟着回来 ——
         // 一次 ⌘Z 素材、片段、卡片一起恢复
         let restored = Set(mediaAssets.map(\.id)).subtracting(before.map(\.id))
-        for id in restored { canvas.restoreNodesAfterUndo(assetID: id) }
+        for id in restored {
+            NotificationCenter.default.post(name: .assetRestoredToLibrary, object: nil,
+                                            userInfo: ["assetID": id, "origin": instanceID])
+        }
         undoCount = undoStack.count
         redoCount = redoStack.count
         isSaved = false

@@ -644,7 +644,11 @@ struct ExportSheetView: View {
             previewRenderSize: project.previewRenderSize,
             customOutputSize: CGSize(width: project.customOutputWidth, height: project.customOutputHeight),
             settings: project.exportSettings,
-            outputURL: outputURL)
+            outputURL: outputURL,
+            coverImagePath: project.cover?.renderedPath.flatMap { rel in
+                project.projectFileURL?.deletingLastPathComponent()
+                    .appendingPathComponent(rel).path
+            })
 
         // 立即关闭导出面板，进度在右下角气泡显示
         dismiss()
@@ -669,6 +673,9 @@ struct ExportInput {
     let customOutputSize: CGSize           // 比例为「自定义」时的输出尺寸
     let settings:       ExportSettings
     let outputURL:      URL
+    /// 项目封面那张 PNG 的绝对路径。写进成片的 artwork 元数据用，
+    /// 没设过封面就是 nil（行为跟以前一样）
+    let coverImagePath: String?
 }
 
 private final class CancelFlag: @unchecked Sendable {
@@ -1496,6 +1503,7 @@ actor TimelineExporter {
                 bitrate: settings.bitrate,
                 outputURL: input.outputURL,
                 globalEndTime: globalEndTime,
+                coverImagePath: input.coverImagePath,
                 progress: progress
             )
             progress(1.0)
@@ -1659,6 +1667,8 @@ actor TimelineExporter {
         fps: Int, bitrate: Int,
         outputURL: URL,
         globalEndTime: Double,
+        /// 项目封面那张 PNG。写进成片 artwork 用，没设封面就是 nil
+        coverImagePath: String?,
         progress: @escaping (Double) -> Void
     ) async throws {
         let renderSize = videoComposition.renderSize
@@ -1695,6 +1705,29 @@ actor TimelineExporter {
 
         // ── Writer ──
         let writer = try AVAssetWriter(outputURL: outputURL, fileType: .mp4)
+
+        // 项目设过封面就写进成片的 artwork 元数据 —— Finder 的预览、
+        // QuickTime、各家播放器都读这个字段，导出的视频就有自己的封面图，
+        // 不再是随便取的第一帧
+        if let p = coverImagePath,
+           let data = try? Data(contentsOf: URL(fileURLWithPath: p)) {
+            // **两条都写**：mp4 的封面事实标准是 iTunes 那套 `covr` atom，
+            // 只写 common artwork 的话多数播放器不认（实测导出的片子没封面）。
+            // common 那条留着给认它的软件
+            let common = AVMutableMetadataItem()
+            common.identifier = .commonIdentifierArtwork
+            common.dataType = kCMMetadataBaseDataType_PNG as String
+            common.value = data as NSData
+
+            let itunes = AVMutableMetadataItem()
+            itunes.identifier = .iTunesMetadataCoverArt
+            itunes.keySpace = .iTunes
+            itunes.dataType = kCMMetadataBaseDataType_PNG as String
+            itunes.value = data as NSData
+
+            writer.metadata = [common, itunes]
+            DiagLog.log("[导出] 写入封面 artwork \(data.count) 字节")
+        }
 
         let videoSettings: [String: Any] = [
             AVVideoCodecKey: AVVideoCodecType.h264,
@@ -1752,6 +1785,7 @@ actor TimelineExporter {
         }
         writer.startSession(atSourceTime: .zero)
 
+
         let hasSubtitles = subtitleInfo.hasSubtitles
         let imageClipsByTrack: [UUID: [ImageClip]] = Dictionary(
             uniqueKeysWithValues: imageTracks.filter { $0.isVisible }.map { ($0.id, $0.clips) })
@@ -1772,6 +1806,33 @@ actor TimelineExporter {
         let audioQueue = DispatchQueue(label: "export.audio")
         let targetFps = fps
         let ciCtx = ExportCIContext.shared
+
+        // ── 封面当第一帧 ──
+        //
+        // artwork 元数据 Finder 不读（它跑 QuickLook 自己抽帧），所以真要让成片
+        // 「有封面」，最可靠的就是把第一帧换成封面本身。这里只**替换**不插入，
+        // 时长不变，音画同步也不受影响 —— 代价是丢掉原来的第 1 帧（1/fps 秒）
+        var coverFramePB: CVPixelBuffer? = nil
+        if let p = coverImagePath,
+           let cover = CIImage(contentsOf: URL(fileURLWithPath: p)),
+           let pool = adaptor.pixelBufferPool {
+            var buf: CVPixelBuffer?
+            CVPixelBufferPoolCreatePixelBuffer(nil, pool, &buf)
+            if let buf {
+                // 封面是按项目比例渲染的，导出分辨率可能不同 —— 按 fill 铺满再居中裁
+                let ext = cover.extent
+                if ext.width > 0, ext.height > 0 {
+                    let scale = max(renderSize.width / ext.width, renderSize.height / ext.height)
+                    let scaled = cover.transformed(by: .init(scaleX: scale, y: scale))
+                    let dx = (renderSize.width - scaled.extent.width) / 2 - scaled.extent.minX
+                    let dy = (renderSize.height - scaled.extent.height) / 2 - scaled.extent.minY
+                    let placed = scaled.transformed(by: .init(translationX: dx, y: dy))
+                    ciCtx.render(placed, to: buf)
+                    coverFramePB = buf
+                    DiagLog.log("[导出] 封面已作为第一帧")
+                }
+            }
+        }
 
         // 预加载图片 CIImage 缓存。
         // **复合片段里的图片轨也要收**——renderImageOverlay 只认这份缓存，
@@ -1929,11 +1990,14 @@ actor TimelineExporter {
                                             CVPixelBufferPoolCreatePixelBuffer(nil, pool, &outBuf)
                                             if let outBuf = outBuf {
                                                 ciCtx.render(image, to: outBuf)
-                                                adaptor.append(outBuf, withPresentationTime: outputPTS)
+                                                // 第一帧换成封面（见上面「封面当第一帧」）
+                                                adaptor.append(frameIndex == 0 ? (coverFramePB ?? outBuf) : outBuf,
+                                                               withPresentationTime: outputPTS)
                                             }
                                         }
                                     } else {
-                                        adaptor.append(effectivePB, withPresentationTime: outputPTS)
+                                        adaptor.append(frameIndex == 0 ? (coverFramePB ?? effectivePB) : effectivePB,
+                                                       withPresentationTime: outputPTS)
                                     }
                                 }
                                 frameIndex += 1

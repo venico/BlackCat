@@ -125,7 +125,7 @@ struct AIChatPanel: View {
 
     private var header: some View {
         HStack {
-            Text("AI 生成")
+            Text("AI 创作")
                 .font(.system(size: 11, weight: .semibold))
                 .foregroundColor(Color.labelSecondary)
                 .textCase(.uppercase)
@@ -141,7 +141,9 @@ struct AIChatPanel: View {
         }
         .padding(.leading, 10)
         .padding(.trailing, 8)
-        .padding(.top, 13)
+        // 顶部留白跟素材库那栏对齐（那边也是 8）——
+        // 两栏切换时标题行不该上下跳
+        .padding(.top, 8)
         .padding(.bottom, 8)
     }
 

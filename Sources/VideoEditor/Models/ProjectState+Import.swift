@@ -47,25 +47,30 @@ extension ProjectState {
     /// 导入文件或文件夹（文件夹会递归扫描）
     /// 批量导入时收集结果、抑制逐条提示；nil = 单文件模式（照旧逐条弹）。
     /// 拖十个重复文件会弹十张卡，这就是它存在的理由
-    private static var batchStats: (added: Int, skipped: Int, unsupported: Int)?
+    private static var batchStats: (added: Int, skipped: Int, unsupported: Int, relinked: Int)?
 
     /// 批量导入入口。单个文件走原路径（逐条提示更具体），多个才汇总
     func importFiles(_ urls: [URL]) {
         guard !urls.isEmpty else { return }
         guard urls.count > 1 else { importFile(urls[0]); return }
 
-        Self.batchStats = (0, 0, 0)
+        refreshMissingAssets()          // 认领丢失素材要用，进循环前刷一次就够
+        Self.batchStats = (0, 0, 0, 0)
         for u in urls { importFile(u) }
-        let st = Self.batchStats ?? (0, 0, 0)
+        let st = Self.batchStats ?? (0, 0, 0, 0)
         Self.batchStats = nil
 
         var parts: [String] = []
+        if st.relinked > 0 { parts.append("自动关联 \(st.relinked) 个丢失素材") }
         if st.skipped > 0 { parts.append("跳过 \(st.skipped) 个重复") }
         if st.unsupported > 0 { parts.append("\(st.unsupported) 个格式不支持") }
-        let ok = st.added > 0
+        // 只认领没新增也算成功 —— 用户要的正是「把挪走的素材接回来」
+        let ok = st.added > 0 || st.relinked > 0
+        let title = st.added > 0 ? "已导入 \(st.added) 个素材"
+                                 : (st.relinked > 0 ? "已关联 \(st.relinked) 个丢失素材" : "没有导入任何素材")
         showSuccessToast(icon: ok ? "checkmark.circle.fill" : "exclamationmark.circle.fill",
                          iconColor: ok ? .green : .orange,
-                         title: ok ? "已导入 \(st.added) 个素材" : "没有导入任何素材",
+                         title: title,
                          subtitle: parts.joined(separator: "，"),
                          autoCountdown: true)
     }
@@ -80,6 +85,17 @@ extension ProjectState {
         var isDir: ObjCBool = false
         if FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir), isDir.boolValue {
             importFolder(url)
+            return
+        }
+
+        // 先认领：这个文件很可能就是某个「丢失」素材换了个位置
+        if claimMissingAsset(url) {
+            if Self.batchStats != nil { Self.batchStats?.relinked += 1 }
+            else {
+                showSuccessToast(icon: "checkmark.circle.fill", iconColor: .green,
+                                 title: "已重新关联素材",
+                                 subtitle: url.lastPathComponent.truncatedFileName())
+            }
             return
         }
 
@@ -136,6 +152,41 @@ extension ProjectState {
         }
 
         importFileDirectly(url: url, type: type)
+    }
+
+    /// 这个文件是不是某个「丢失」素材换了位置？是就接回原来那条，返回 true。
+    ///
+    /// 用户把素材挪走 → 素材库报丢失 → 再把文件（或整个文件夹）拖进来，
+    /// 应该自动接回去。不做的话会新增一条重复素材，**原来那条还是丢失状态**，
+    /// 时间轴片段和画布卡片也跟着接不回来。
+    ///
+    /// 判据：**文件名相同**，且两边都记着文件大小时大小也得对上 ——
+    /// 只按名字认会把同名不同内容的文件错接上（`video.mp4` 这种名字太常见）。
+    /// 老素材可能没记 fileSize，那种情况只能退回只按名字认
+    private func claimMissingAsset(_ url: URL) -> Bool {
+        // 丢失状态平时只在打开项目 / 关联改名后 / app 重新激活时刷新。
+        // 单文件导入前补一次，免得「刚挪完文件就拖进来」这种情况认不出来。
+        // 批量导入由 `importFiles` 在入口统一刷一次，不逐个文件重刷
+        if Self.batchStats == nil { refreshMissingAssets() }
+        guard !missingAssetIDs.isEmpty else { return false }
+        let name = url.lastPathComponent
+        let size = (try? FileManager.default
+            .attributesOfItem(atPath: url.path)[.size]) as? Int64
+        // 拖进来的文件本身得真的存在，否则「丢失素材」会认领另一个同样不存在的路径
+        guard FileManager.default.fileExists(atPath: url.path) else { return false }
+        guard let hit = mediaAssets.first(where: { a in
+            missingAssetIDs.contains(a.id)
+                // **路径必须不同**：同一个 url 再导入一次是「重复导入」，不是「换了位置」。
+                // 不排掉的话重复导入会被认领成重新关联（ML004 就是这么挂的）
+                && a.url != url
+                && a.url.lastPathComponent == name
+                && (a.fileSize == nil || size == nil || a.fileSize == size)
+        }) else { return false }
+
+        DiagLog.log("[素材库] 自动关联丢失素材 \(name) → \(url.path)")
+        // 走正规的重新关联：素材库、时间轴片段、画布卡片一起恢复
+        relinkAsset(id: hit.id, newURL: url)
+        return true
     }
 
     /// 直接导入（原生格式或转码完成后的文件）

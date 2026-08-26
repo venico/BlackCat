@@ -823,6 +823,84 @@ struct WaveformData {
 
 // MARK: - Project Document (for .bcj file)
 
+/// 项目封面的**设计稿**（v5.3.0）。
+///
+/// 存的是「怎么做出这张封面」而不是最终图片：底图是哪个素材的哪一帧、
+/// 上面叠了什么文字和图形。这样下次打开还能接着改。
+/// 渲染好的成品另存成 PNG（`renderedPath`），欢迎页直接读它，不用每次重画
+struct ProjectCover: Codable, Equatable {
+    /// 底图来源：素材库里那个素材的路径，或者用户上传的图片
+    var sourcePath: String?
+    /// 底图是视频时取第几秒那一帧
+    var frameTime: Double = 0
+    /// 叠在封面上的文字。复用时间轴那套 `TextClip` —— 属性面板照搬得动，
+    /// 只是时间相关的字段（开始/持续）在封面里没有意义，界面上不显示
+    var texts: [TextClip] = []
+    /// 叠在封面上的图形，同上
+    var shapes: [ShapeClip] = []
+    /// 底图的变换。字段跟外面图片片段的属性区对齐 ——
+    /// 偏移是相对画面尺寸的比例（-1~1），缩放 1 = 铺满
+    var baseOffsetX: Double = 0
+    var baseOffsetY: Double = 0
+    var baseScale: Double = 1
+    var baseRotation: Double = 0
+    var baseMirrorH: Bool = false
+    var baseMirrorV: Bool = false
+
+    /// 裁剪（各边裁掉的比例 0~1），字段跟图片片段一致
+    var cropTop: Double = 0
+    var cropBottom: Double = 0
+    var cropLeft: Double = 0
+    var cropRight: Double = 0
+
+    /// 色调，复用片段那套 `ColorAdjust`
+    var colorAdjust: ColorAdjust = .identity
+
+    /// 描边，跟图片片段一样：颜色存十六进制、宽度像素、柔和度 0~1
+    var strokeColorHex: String? = nil
+    var strokeWidth: Double? = nil
+    var strokeSoftness: Double? = nil
+
+    /// 渲染好的成品图。相对项目文件所在目录，换台机器也找得到
+    var renderedPath: String?
+
+    var isEmpty: Bool { sourcePath == nil && texts.isEmpty && shapes.isEmpty }
+
+    init() {}
+
+    // MARK: - 解码容错
+
+    /// **手写解码，每个字段都用 decodeIfPresent**。
+    ///
+    /// Swift 自动合成的 Codable 对「属性有默认值但 JSON 里缺这个键」并不宽容 ——
+    /// 缺一个键就抛错，整个 `ProjectDocument` 跟着解不出来，表现是
+    /// 「文件格式不正确，项目打不开」。加了裁剪/色调/描边那几个字段之后，
+    /// 之前存的封面全少这几个键，老项目当场打不开（实测踩到）。
+    /// `CanvasNode` 早有同款教训 —— **以后往这个结构加字段，照着加一行 decodeIfPresent**
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        sourcePath = try c.decodeIfPresent(String.self, forKey: .sourcePath)
+        frameTime = try c.decodeIfPresent(Double.self, forKey: .frameTime) ?? 0
+        texts = try c.decodeIfPresent([TextClip].self, forKey: .texts) ?? []
+        shapes = try c.decodeIfPresent([ShapeClip].self, forKey: .shapes) ?? []
+        baseOffsetX = try c.decodeIfPresent(Double.self, forKey: .baseOffsetX) ?? 0
+        baseOffsetY = try c.decodeIfPresent(Double.self, forKey: .baseOffsetY) ?? 0
+        baseScale = try c.decodeIfPresent(Double.self, forKey: .baseScale) ?? 1
+        baseRotation = try c.decodeIfPresent(Double.self, forKey: .baseRotation) ?? 0
+        baseMirrorH = try c.decodeIfPresent(Bool.self, forKey: .baseMirrorH) ?? false
+        baseMirrorV = try c.decodeIfPresent(Bool.self, forKey: .baseMirrorV) ?? false
+        cropTop = try c.decodeIfPresent(Double.self, forKey: .cropTop) ?? 0
+        cropBottom = try c.decodeIfPresent(Double.self, forKey: .cropBottom) ?? 0
+        cropLeft = try c.decodeIfPresent(Double.self, forKey: .cropLeft) ?? 0
+        cropRight = try c.decodeIfPresent(Double.self, forKey: .cropRight) ?? 0
+        colorAdjust = try c.decodeIfPresent(ColorAdjust.self, forKey: .colorAdjust) ?? .identity
+        strokeColorHex = try c.decodeIfPresent(String.self, forKey: .strokeColorHex)
+        strokeWidth = try c.decodeIfPresent(Double.self, forKey: .strokeWidth)
+        strokeSoftness = try c.decodeIfPresent(Double.self, forKey: .strokeSoftness)
+        renderedPath = try c.decodeIfPresent(String.self, forKey: .renderedPath)
+    }
+}
+
 struct ProjectDocument: Codable {
     var name: String
     var videoTracks: [Track<VideoClip>]
@@ -843,6 +921,9 @@ struct ProjectDocument: Codable {
     var projectBitrate: Int?
     var subtitleBottomMargin: Double?
     var subtitleLineSpacing: Double?
+    /// 项目封面（v5.3.0）。用户自己设计的那张，欢迎页最近文件优先显示它；
+    /// 没设计过就还是按老规矩从素材里自动取一张
+    var cover: ProjectCover?
     var overlayTrackOrder: [ProjectState.OverlayTrackRef]?
     /// 复合片段轨道。**必须存**——不存的话保存再打开，时间轴上的复合片段整个消失。
     /// 可选是为了兼容没有这个字段的旧 .bcj

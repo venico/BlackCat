@@ -1250,4 +1250,38 @@ final class TransformTests: XCTestCase {
         XCTAssertEqual(rect.width, 1536, accuracy: 1)  // 1920 * 0.8
         XCTAssertEqual(rect.height, 864, accuracy: 1)   // 1080 * 0.8
     }
+    // 素材挪了位置 → 素材库报丢失 → 再把文件拖进来，应该**自动接回原来那条**，
+    // 而不是新增一条重复素材（原来那条还丢着，片段和卡片也接不回去）
+    func testImportReclaimsMissingAsset() throws {
+        let fm = FileManager.default
+        let dirA = fm.temporaryDirectory.appendingPathComponent("claimA-\(UUID().uuidString)")
+        let dirB = fm.temporaryDirectory.appendingPathComponent("claimB-\(UUID().uuidString)")
+        try fm.createDirectory(at: dirA, withIntermediateDirectories: true)
+        try fm.createDirectory(at: dirB, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: dirA); try? fm.removeItem(at: dirB) }
+
+        let body = Data("blackcat-test-payload".utf8)
+        let fileA = dirA.appendingPathComponent("素材.png")
+        let fileB = dirB.appendingPathComponent("素材.png")   // 同名同内容 = 挪过去的那个
+        try body.write(to: fileA)
+        try body.write(to: fileB)
+
+        let p = ProjectState()
+        p.importFile(fileA)
+        XCTAssertEqual(p.mediaAssets.count, 1)
+        let originalID = p.mediaAssets[0].id
+
+        // 模拟「文件被挪走」
+        try fm.removeItem(at: fileA)
+        p.refreshMissingAssets()
+        XCTAssertTrue(p.missingAssetIDs.contains(originalID), "文件没了要先算丢失")
+
+        // 把挪到新位置的那个拖进来
+        p.importFile(fileB)
+        XCTAssertEqual(p.mediaAssets.count, 1, "不该新增一条重复素材")
+        XCTAssertEqual(p.mediaAssets[0].id, originalID, "要接回原来那条（id 不变，片段才接得上）")
+        XCTAssertEqual(p.mediaAssets[0].url, fileB, "路径要指到新位置")
+        XCTAssertFalse(p.missingAssetIDs.contains(originalID), "接回来之后不该还算丢失")
+    }
+
 }

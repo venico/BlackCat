@@ -2751,7 +2751,18 @@ private struct ShapeTransformOverlay: View {
 
 // MARK: - Pen Drawing Overlay（钢笔绘制模式）
 
-private struct PenDrawingOverlay: View {
+/// 钢笔绘制层。预览区和封面弹窗**共用这一份** —— 手感、控制柄、闭合判定、
+/// 键盘监听全都一样，不另写一套。
+///
+/// 两个可选参数是给封面弹窗留的口子：
+/// 画哪条图形（`forcedClipID`），以及画完之后把点交给谁（`onFinalize`）。
+/// 都不传就是预览区那条老路：画时间轴上选中的图形、写进 `shapeTracks`
+struct PenDrawingOverlay: View {
+    var forcedClipID: UUID? = nil
+    var onFinalize: ((_ rawPoints: [(x: Double, y: Double, cInDX: Double, cInDY: Double,
+                                     cOutDX: Double, cOutDY: Double, smooth: Bool)],
+                      _ closed: Bool) -> Void)? = nil
+
     @EnvironmentObject private var project: ProjectState
     @Environment(\.windowID) private var windowID
     @State private var draggingHandle = false
@@ -2762,7 +2773,12 @@ private struct PenDrawingOverlay: View {
 
     var body: some View {
         GeometryReader { geo in
-            if project.penDrawingMode, let clipID = project.selectedShapeClipID {
+            // 封面弹窗在画钢笔时，**预览区这层必须让开** —— 绘制中的点存在
+            // 共享的 `project.penRawPoints` 里，两层同时活着会各画各的，
+            // 回车还会把时间轴上选中的那条图形一起改掉
+            if project.penDrawingMode,
+               !(forcedClipID == nil && project.showCoverDesigner),
+               let clipID = forcedClipID ?? project.selectedShapeClipID {
                 let vs = geo.size
                 ZStack {
                     Color.black.opacity(0.01).contentShape(Rectangle())
@@ -2808,7 +2824,7 @@ private struct PenDrawingOverlay: View {
                     let first = project.penRawPoints[0]
                     let dx = cx - first.x, dy = cy - first.y
                     if hypot(dx, dy) < 12 * max(scaleX, scaleY) {
-                        project.finalizePenDrawing(clipID: clipID, rawPoints: project.penRawPoints, closed: true)
+                        finalize(clipID: clipID, closed: true)
                         project.penRawPoints = []; draggingHandle = false; dragStartPos = nil; dragCurrentPos = nil
                         return
                     }
@@ -2956,13 +2972,33 @@ private struct PenDrawingOverlay: View {
             guard project.penDrawingMode else { return event }
             if event.keyCode == 53 || event.keyCode == 36 {
                 if project.penRawPoints.count >= 2 {
-                    project.finalizePenDrawing(clipID: clipID, rawPoints: project.penRawPoints, closed: false)
-                } else { project.cancelPenDrawing(clipID: clipID) }
+                    finalize(clipID: clipID, closed: false)
+                } else if onFinalize != nil {
+                    // 外部接管时点数不够 = 放弃这次绘制，由外部自己收拾
+                    onFinalize?([], false)
+                    project.penDrawingMode = false
+                } else {
+                    project.cancelPenDrawing(clipID: clipID)
+                }
                 project.penRawPoints = []
                 return nil
             }
             return event
         }
+    }
+
+    /// 收尾：外部接管就把原始点交出去，否则走时间轴那条老路
+    private func finalize(clipID: UUID, closed: Bool) {
+        if let onFinalize {
+            onFinalize(project.penRawPoints, closed)
+            project.penDrawingMode = false
+        } else {
+            project.finalizePenDrawing(clipID: clipID, rawPoints: project.penRawPoints, closed: closed)
+        }
+        project.penRawPoints = []
+        draggingHandle = false
+        dragStartPos = nil
+        dragCurrentPos = nil
     }
 
     private func removeKeyMonitor() {
