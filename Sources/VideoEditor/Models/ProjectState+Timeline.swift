@@ -1029,3 +1029,371 @@ extension ProjectState {
         scheduleAutoSave()
     }
 }
+
+// MARK: - 图层对齐（图片 / 文字 / 图形共用）
+
+extension ProjectState {
+    /// 图层在**渲染坐标系**里的中心和尺寸。对齐和多选包围盒都靠它。
+    ///
+    /// 三种元素存位置的方式不一样：图片是相对画面的偏移（0 = 居中），
+    /// 文字和图形是 0~1 的中心点，这里统一换算成像素
+    func layerBounds(for id: UUID) -> (center: CGPoint, size: CGSize)? {
+        let rw = Double(previewRenderSize.width), rh = Double(previewRenderSize.height)
+        guard rw > 0, rh > 0 else { return nil }
+
+        if let s = shapeTracks.flatMap({ $0.clips }).first(where: { $0.id == id }) {
+            return (CGPoint(x: s.posX * rw, y: s.posY * rh),
+                    CGSize(width: s.width * s.scaleX, height: s.height * s.scaleY))
+        }
+        if let t = textTracks.flatMap({ $0.clips }).first(where: { $0.id == id }) {
+            let box = textLayerSize(t)
+            return (CGPoint(x: t.posX * rw, y: t.posY * rh), box)
+        }
+        if let i = imageTracks.flatMap({ $0.clips }).first(where: { $0.id == id }) {
+            let natW = Double(i.imageWidth), natH = Double(i.imageHeight)
+            guard natW > 0, natH > 0 else { return nil }
+            let fit = rotatedFitSize(CGSize(width: natW, height: natH), rotation: i.rotation)
+            let base = min(rw / Double(fit.width), rh / Double(fit.height))
+            return (CGPoint(x: (0.5 + i.offsetX) * rw, y: (0.5 + i.offsetY) * rh),
+                    CGSize(width: natW * base * i.scaleX, height: natH * base * i.scaleY))
+        }
+        return nil
+    }
+
+    /// 文字图层的尺寸（渲染坐标）。拖过边定死了范围框就用它，否则按文字量一次
+    private func textLayerSize(_ t: TextClip) -> CGSize {
+        if let w = t.boxWidth {
+            return CGSize(width: w + 20, height: (t.boxHeight ?? Double(t.fontSize) * 1.4) + 10)
+        }
+        var font = NSFont(name: t.fontName, size: t.fontSize) ?? NSFont.systemFont(ofSize: t.fontSize)
+        if t.bold { font = NSFontManager.shared.convert(font, toHaveTrait: .boldFontMask) }
+        let str = t.text.isEmpty ? " " : t.text
+        let sz = (str as NSString).size(withAttributes: [.font: font])
+        return CGSize(width: sz.width + 20, height: sz.height + 10)
+    }
+
+    /// 把图层挪到中心点（渲染坐标）
+    private func moveLayer(_ id: UUID, to c: CGPoint) {
+        let rw = Double(previewRenderSize.width), rh = Double(previewRenderSize.height)
+        guard rw > 0, rh > 0 else { return }
+        if shapeTracks.flatMap({ $0.clips }).contains(where: { $0.id == id }) {
+            updateShapeClip(id: id) { $0.posX = Double(c.x) / rw; $0.posY = Double(c.y) / rh }
+        } else if textTracks.flatMap({ $0.clips }).contains(where: { $0.id == id }) {
+            updateTextClip(id: id) { $0.posX = Double(c.x) / rw; $0.posY = Double(c.y) / rh }
+        } else if imageTracks.flatMap({ $0.clips }).contains(where: { $0.id == id }) {
+            updateImageClip(id: id) {
+                $0.offsetX = Double(c.x) / rw - 0.5
+                $0.offsetY = Double(c.y) / rh - 0.5
+            }
+        }
+    }
+
+    /// 对齐。**只选中一个就对齐画面，多选就对齐选中那几个的包围盒**；
+    /// 分布要三个以上才有意义
+    func alignLayers(_ mode: LayerAlignMode, anchorID: UUID) {
+        let ids = selectedClipIDs.count > 1 ? Array(selectedClipIDs) : [anchorID]
+        let items = ids.compactMap { id -> (id: UUID, c: CGPoint, s: CGSize)? in
+            guard let b = layerBounds(for: id) else { return nil }
+            return (id, b.center, b.size)
+        }
+        guard !items.isEmpty else { return }
+        let rw = Double(previewRenderSize.width), rh = Double(previewRenderSize.height)
+        let single = items.count <= 1
+        let left = single ? 0 : items.map { Double($0.c.x) - Double($0.s.width) / 2 }.min()!
+        let right = single ? rw : items.map { Double($0.c.x) + Double($0.s.width) / 2 }.max()!
+        let top = single ? 0 : items.map { Double($0.c.y) - Double($0.s.height) / 2 }.min()!
+        let bottom = single ? rh : items.map { Double($0.c.y) + Double($0.s.height) / 2 }.max()!
+
+        pushUndo()
+        switch mode {
+        case .left:
+            for it in items { moveLayer(it.id, to: CGPoint(x: left + Double(it.s.width) / 2, y: Double(it.c.y))) }
+        case .hcenter:
+            let cx = (left + right) / 2
+            for it in items { moveLayer(it.id, to: CGPoint(x: cx, y: Double(it.c.y))) }
+        case .right:
+            for it in items { moveLayer(it.id, to: CGPoint(x: right - Double(it.s.width) / 2, y: Double(it.c.y))) }
+        case .top:
+            for it in items { moveLayer(it.id, to: CGPoint(x: Double(it.c.x), y: top + Double(it.s.height) / 2)) }
+        case .vcenter:
+            let cy = (top + bottom) / 2
+            for it in items { moveLayer(it.id, to: CGPoint(x: Double(it.c.x), y: cy)) }
+        case .bottom:
+            for it in items { moveLayer(it.id, to: CGPoint(x: Double(it.c.x), y: bottom - Double(it.s.height) / 2)) }
+        case .hdist:
+            let sorted = items.sorted { $0.c.x < $1.c.x }
+            guard sorted.count >= 3 else { return }
+            let total = sorted.reduce(0.0) { $0 + Double($1.s.width) }
+            let spanL = Double(sorted.first!.c.x) - Double(sorted.first!.s.width) / 2
+            let spanR = Double(sorted.last!.c.x) + Double(sorted.last!.s.width) / 2
+            let gap = (spanR - spanL - total) / Double(sorted.count - 1)
+            var cur = spanL
+            for it in sorted {
+                moveLayer(it.id, to: CGPoint(x: cur + Double(it.s.width) / 2, y: Double(it.c.y)))
+                cur += Double(it.s.width) + gap
+            }
+        case .vdist:
+            let sorted = items.sorted { $0.c.y < $1.c.y }
+            guard sorted.count >= 3 else { return }
+            let total = sorted.reduce(0.0) { $0 + Double($1.s.height) }
+            let spanT = Double(sorted.first!.c.y) - Double(sorted.first!.s.height) / 2
+            let spanB = Double(sorted.last!.c.y) + Double(sorted.last!.s.height) / 2
+            let gap = (spanB - spanT - total) / Double(sorted.count - 1)
+            var cur = spanT
+            for it in sorted {
+                moveLayer(it.id, to: CGPoint(x: Double(it.c.x), y: cur + Double(it.s.height) / 2))
+                cur += Double(it.s.height) + gap
+            }
+        }
+        rebuildTimelinePreviewDebounced()
+    }
+}
+
+// MARK: - 多选属性面板的数据源
+
+extension ProjectState {
+    /// 当前多选里那些能一起调的图层（图片 / 文字 / 图形）。
+    /// 视频、音频、字幕这些不参与 —— 它们没有共同的位置和缩放语义
+    func multiLayerHandles() -> [MultiLayerHandle] {
+        let rw = Double(previewRenderSize.width), rh = Double(previewRenderSize.height)
+        guard rw > 0, rh > 0 else { return [] }
+
+        return selectedClipIDs.compactMap { id -> MultiLayerHandle? in
+            guard let b = layerBounds(for: id) else { return nil }
+
+            if let s = shapeTracks.flatMap({ $0.clips }).first(where: { $0.id == id }) {
+                return MultiLayerHandle(
+                    id: id, center: b.center, size: b.size, opacity: s.opacity,
+                    scaleBy: { k in self.updateShapeClip(id: id) { $0.scaleX *= k; $0.scaleY *= k } },
+                    moveBy: { d in self.updateShapeClip(id: id) {
+                        $0.posX = min(1, max(0, $0.posX + Double(d.x) / rw))
+                        $0.posY = min(1, max(0, $0.posY + Double(d.y) / rh))
+                    } },
+                    rotateBy: { d in self.updateShapeClip(id: id) { $0.rotation += d } },
+                    setOpacity: { v in self.updateShapeClip(id: id) { $0.opacity = v } })
+            }
+            if let t = textTracks.flatMap({ $0.clips }).first(where: { $0.id == id }) {
+                return MultiLayerHandle(
+                    id: id, center: b.center, size: b.size, opacity: t.opacity,
+                    // 文字的「放大」是字号加范围框一起走，跟拖四角圆点一个意思
+                    scaleBy: { k in self.updateTextClip(id: id) {
+                        $0.fontSize = max(8, $0.fontSize * CGFloat(k))
+                        if let w = $0.boxWidth { $0.boxWidth = w * k }
+                        if let h = $0.boxHeight { $0.boxHeight = h * k }
+                    } },
+                    moveBy: { d in self.updateTextClip(id: id) {
+                        $0.posX = min(1, max(0, $0.posX + Double(d.x) / rw))
+                        $0.posY = min(1, max(0, $0.posY + Double(d.y) / rh))
+                    } },
+                    rotateBy: { d in self.updateTextClip(id: id) { $0.rotation += d } },
+                    setOpacity: { v in self.updateTextClip(id: id) { $0.opacity = v } })
+            }
+            if let i = imageTracks.flatMap({ $0.clips }).first(where: { $0.id == id }) {
+                return MultiLayerHandle(
+                    id: id, center: b.center, size: b.size, opacity: i.alpha,
+                    scaleBy: { k in self.updateImageClip(id: id) { $0.scaleX *= k; $0.scaleY *= k } },
+                    moveBy: { d in self.updateImageClip(id: id) {
+                        $0.offsetX += Double(d.x) / rw
+                        $0.offsetY += Double(d.y) / rh
+                    } },
+                    rotateBy: { d in self.updateImageClip(id: id) { $0.rotation += d } },
+                    setOpacity: { v in self.updateImageClip(id: id) { $0.opacity = v } })
+            }
+            return nil
+        }
+    }
+}
+
+extension ProjectState {
+    /// 只选中这一个图层，其余选中态清空。按 id 属于哪类自动分派
+    func selectLayerExclusive(_ id: UUID) {
+        selectedVideoClipID = nil
+        selectedImageClipID = nil
+        selectedAudioClipID = nil
+        selectedSubtitleClipID = nil
+        selectedTextClipID = nil
+        selectedShapeClipID = nil
+        selectedCompoundClipID = nil
+
+        if shapeTracks.flatMap({ $0.clips }).contains(where: { $0.id == id }) {
+            selectedShapeClipID = id
+        } else if textTracks.flatMap({ $0.clips }).contains(where: { $0.id == id }) {
+            selectedTextClipID = id
+        } else if imageTracks.flatMap({ $0.clips }).contains(where: { $0.id == id }) {
+            selectedImageClipID = id
+        }
+        selectedClipIDs = [id]
+    }
+}
+
+// MARK: - 预览区点击穿透
+
+extension ProjectState {
+    // MARK: - Tap 穿透选择
+
+    /// 点在重叠处时**循环切换**：把命中的图层从上到下列出来，
+    /// 选中当前那个的下一个，到底了绕回第一个。
+    /// 按住 Shift 是加选/取消选，不参与轮换
+    func tapThroughSelect(at pt: CGPoint, viewSize: CGSize, time: Double,
+                          currentClipID: UUID? = nil) {
+        let hits = layersHit(at: pt, viewSize: viewSize, time: time)
+        guard !hits.isEmpty else {
+            selectedImageClipID = nil; selectedShapeClipID = nil
+            selectedTextClipID = nil; selectedVideoClipID = nil
+            selectedClipIDs.removeAll()
+            editingTextClipID = nil
+            return
+        }
+        if NSEvent.modifierFlags.contains(.shift) {
+            // 点图片走的是这条路，之前只 toggle 最上面那个，
+            // 所以在图片重叠处按 shift 一点循环效果都没有
+            shiftCycle(in: hits, fallback: hits[0])
+            return
+        }
+        // 当前选中的那个（优先用调用方给的，其次看单选状态）
+        let cur = currentClipID
+            ?? selectedShapeClipID ?? selectedTextClipID
+            ?? selectedImageClipID
+        let next: UUID
+        if let cur, let i = hits.firstIndex(of: cur) {
+            next = hits[(i + 1) % hits.count]
+        } else {
+            next = hits[0]
+        }
+        editingTextClipID = nil
+        selectLayerExclusive(next)
+    }
+
+    /// 命中点击位置的图层，**上层在前**（`overlayTrackOrder` 就是叠放顺序）
+    func layersHit(at pt: CGPoint, viewSize: CGSize, time: Double) -> [UUID] {
+        let t = time
+        let scale = viewSize.width / max(previewRenderSize.width, 1)
+        var out: [UUID] = []
+        for ref in overlayTrackOrder {
+            switch ref {
+            case .shape(let trackID):
+                guard let track = shapeTracks.first(where: { $0.id == trackID }),
+                      track.isVisible,
+                      let sc = track.clips.first(where: { $0.startTime <= t && $0.endTime > t }) else { continue }
+                let cx = viewSize.width * sc.posX, cy = viewSize.height * sc.posY
+                let w = sc.width * sc.scaleX * scale, h = sc.height * sc.scaleY * scale
+                if CGRect(x: cx - w / 2, y: cy - h / 2, width: w, height: h).contains(pt) {
+                    out.append(sc.id)
+                }
+            case .text(let trackID):
+                guard let track = textTracks.first(where: { $0.id == trackID }),
+                      track.isVisible,
+                      let tc = track.clips.first(where: { $0.startTime <= t && $0.endTime > t }) else { continue }
+                let cx = viewSize.width * tc.posX, cy = viewSize.height * tc.posY
+                let sz = textClipViewSizes[tc.id] ?? CGSize(width: 100, height: 30)
+                if CGRect(x: cx - sz.width / 2, y: cy - sz.height / 2,
+                          width: sz.width, height: sz.height).contains(pt) {
+                    out.append(tc.id)
+                }
+            case .image(let trackID):
+                guard let track = imageTracks.first(where: { $0.id == trackID }),
+                      track.isVisible,
+                      let ic = track.clips.first(where: { $0.startTime <= t && $0.endTime > t }),
+                      let b = layerBounds(for: ic.id) else { continue }
+                // layerBounds 给的是渲染坐标，换算到视图坐标
+                let cx = Double(b.center.x) * Double(scale), cy = Double(b.center.y) * Double(scale)
+                let w = Double(b.size.width) * Double(scale), h = Double(b.size.height) * Double(scale)
+                if CGRect(x: cx - w / 2, y: cy - h / 2, width: w, height: h).contains(pt) {
+                    out.append(ic.id)
+                }
+            default: continue
+            }
+        }
+        return out
+    }
+}
+
+extension ProjectState {
+    /// 跟这个图层**外接框相交**的所有图层，按叠放顺序（下层在前）
+    func overlappingLayers(_ id: UUID) -> [UUID] {
+        guard let base = layerBounds(for: id) else { return [id] }
+        let baseRect = CGRect(x: base.center.x - base.size.width / 2,
+                              y: base.center.y - base.size.height / 2,
+                              width: base.size.width, height: base.size.height)
+        var out: [UUID] = []
+        for ref in overlayTrackOrder {
+            let clipIDs: [UUID]
+            switch ref {
+            case .shape(let tid):
+                clipIDs = shapeTracks.first { $0.id == tid }?.clips.map(\.id) ?? []
+            case .text(let tid):
+                clipIDs = textTracks.first { $0.id == tid }?.clips.map(\.id) ?? []
+            case .image(let tid):
+                clipIDs = imageTracks.first { $0.id == tid }?.clips.map(\.id) ?? []
+            default:
+                clipIDs = []
+            }
+            for cid in clipIDs {
+                guard let b = layerBounds(for: cid) else { continue }
+                let r = CGRect(x: b.center.x - b.size.width / 2,
+                               y: b.center.y - b.size.height / 2,
+                               width: b.size.width, height: b.size.height)
+                if r.intersects(baseRect) { out.append(cid) }
+            }
+        }
+        return out.isEmpty ? [id] : out
+    }
+
+    /// 点在重叠处时**沿叠放顺序轮换**：选中当前那个的下一个，到底了绕回第一个。
+    ///
+    /// 各图层自己的点击手势都调这个 —— 之前它们各调各的
+    /// `selectXXXExclusive`，压在上面的图层一拦，下面那个永远点不到
+    func cycleSelectOverlapping(_ id: UUID) {
+        let hits = overlappingLayers(id)
+        guard hits.count > 1 else { selectLayerExclusive(id); return }
+        let cur = selectedShapeClipID ?? selectedTextClipID ?? selectedImageClipID
+        if let cur, let i = hits.firstIndex(of: cur) {
+            selectLayerExclusive(hits[(i + 1) % hits.count])
+        } else {
+            selectLayerExclusive(id)
+        }
+    }
+}
+
+extension ProjectState {
+    /// Shift 点击。
+    ///
+    /// - 非重叠处：就是普通的加选 / 减选
+    /// - 重叠处：**先把叠在一起的挨个加进来**，全加完了再点就挨个移出去
+    func shiftCycleOverlapping(_ id: UUID) {
+        shiftCycle(in: overlappingLayers(id), fallback: id)
+    }
+
+    /// Shift 在一叠图层上的行为。`hits` 是叠在一起的那些（下层在前）。
+    ///
+    /// **要记着现在是在加还是在减**：只看「有没有没选中的」的话，
+    /// 加满之后移出第一个，下一次点又发现它没选中、于是原样加回去，
+    /// 两个状态之间来回跳，看着就是「减选没反应」
+    func shiftCycle(in hits: [UUID], fallback: UUID) {
+        guard hits.count > 1 else {
+            shiftToggleClip(fallback)
+            shiftCycleRemoving = false
+            return
+        }
+        // 一个都没选中 → 重新从加选开始
+        if !hits.contains(where: { selectedClipIDs.contains($0) }) {
+            shiftCycleRemoving = false
+        }
+
+        if shiftCycleRemoving {
+            if let first = hits.first(where: { selectedClipIDs.contains($0) }) {
+                shiftToggleClip(first)
+            }
+            // 减光了，下一轮回到加选
+            if !hits.contains(where: { selectedClipIDs.contains($0) }) {
+                shiftCycleRemoving = false
+            }
+        } else if let next = hits.first(where: { !selectedClipIDs.contains($0) }) {
+            shiftToggleClip(next)
+            // 加满了，下一次点开始往外减
+            if hits.allSatisfy({ selectedClipIDs.contains($0) }) {
+                shiftCycleRemoving = true
+            }
+        }
+    }
+}

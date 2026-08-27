@@ -20,7 +20,8 @@ struct ProjectInspector: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            ISection(title: "项目") {
+            // 标题在属性区头部统一画了，这儿不再重复
+            ISection(title: nil) {
                 fieldLabel("封面")
                 coverEntry
 

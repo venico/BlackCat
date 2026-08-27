@@ -1898,7 +1898,8 @@ private struct TransitionPreviewCard: View {
                     // 叠加层：灰白色块做转场动画
                     transitionOverlay
                 }
-                .frame(height: 44)
+                // **固定 16:9**。原来只钉死高度 44，侧边栏一拉宽封面就越来越扁
+                .aspectRatio(16.0 / 9.0, contentMode: .fit)
                 .clipShape(RoundedRectangle(cornerRadius: 4))
 
                 Text(type.label)

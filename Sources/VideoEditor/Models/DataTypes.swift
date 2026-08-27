@@ -338,7 +338,9 @@ struct ImageClip: Identifiable, Equatable, Codable {
     var cropRight: Double  = 0
     var mirrorH: Bool = false
     var mirrorV: Bool = false
-    var rotation: Int = 0
+    /// 旋转角度（度）。属性区的「旋转90°」按钮走整档，预览里拖旋转手柄是任意角度。
+    /// 老 .bcj 存的是整数，JSON 里 90 能直接解成 90.0，不影响打开
+    var rotation: Double = 0
     // 色调调节
     var colorAdjust: ColorAdjust = .identity
     // 描边。用可选类型是为了兼容旧 .bcj —— 自动合成的 Codable 遇到缺失的非可选字段会直接解码失败
@@ -346,7 +348,15 @@ struct ImageClip: Identifiable, Equatable, Codable {
     var strokeWidth: Double? = nil
     var strokeSoftness: Double? = nil
     var markers: [Marker]? = nil
+    /// 画面圆角（px）。同样用可选类型，理由见上面那条注释
+    var cornerRadius: Double? = nil
+    /// 不透明度 0~1。同上，可选是为了兼容老 .bcj
+    var opacity: Double? = nil
 
+    /// 圆角半径，nil = 不切
+    var corner: Double { cornerRadius ?? 0 }
+    /// 不透明度，没设过就是全不透明
+    var alpha: Double { opacity ?? 1 }
     var strokeColor: Color { Color(hex: strokeColorHex ?? "#FFFFFF") }
     /// 描边宽度（px），0 = 不描边
     var strokeW: Double { strokeWidth ?? 0 }
@@ -437,6 +447,8 @@ struct TextClip: Identifiable, Equatable, Codable {
     var textColor: Color  = .white
     var strokeColor: Color = .black
     var strokeWidth: Double = 0        // 描边宽度(px)，0=无描边
+    /// 描边柔和度 0~1。0 = 硬边（默认），1 = 完全糊开。跟图片描边同一个语义
+    var strokeSoftness: Double = 0
     var bgColor: Color    = .black
     var bgOpacity: Double = 0          // 背景不透明度，0=无背景框
     var alignment: String = "center"   // left/center/right
@@ -444,13 +456,30 @@ struct TextClip: Identifiable, Equatable, Codable {
     var opacity: Double   = 1
     var animation: TextAnimation = .none
     var markers: [Marker]? = nil
+    // 裁剪：0~1 比例，从各边往里裁掉多少（跟图片片段同一个语义）。
+    // 只露半个字这种做法就靠它
+    var cropTop: Double    = 0
+    var cropBottom: Double = 0
+    var cropLeft: Double   = 0
+    var cropRight: Double  = 0
+    // 文本框尺寸。nil = 跟着文字自适应；
+    // 双击进编辑态后拖四边横条写的是这两个值，字号不变
+    var boxWidth: Double?  = nil
+    var boxHeight: Double? = nil
+    var mirrorH: Bool = false
+    var mirrorV: Bool = false
+    /// 范围框缩放是否锁比例（面板上的开关，不影响渲染）
+    var lockBoxAspect: Bool = true
 
     enum CodingKeys: String, CodingKey {
         case id, text, startTime, endTime, posX, posY
         case fontName, fontSize, bold, italic
-        case textColorHex, strokeColorHex, strokeWidth, bgColorHex, bgOpacity
+        case textColorHex, strokeColorHex, strokeWidth, strokeSoftness, bgColorHex, bgOpacity
         case alignment, rotation, opacity, animation
         case markers
+        case cropTop, cropBottom, cropLeft, cropRight
+        case boxWidth, boxHeight
+        case mirrorH, mirrorV, lockBoxAspect
     }
     func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
@@ -467,6 +496,7 @@ struct TextClip: Identifiable, Equatable, Codable {
         try c.encode(textColor.toHex(), forKey: .textColorHex)
         try c.encode(strokeColor.toHex(), forKey: .strokeColorHex)
         try c.encode(strokeWidth, forKey: .strokeWidth)
+        try c.encode(strokeSoftness, forKey: .strokeSoftness)
         try c.encode(bgColor.toHex(), forKey: .bgColorHex)
         try c.encode(bgOpacity, forKey: .bgOpacity)
         try c.encode(alignment, forKey: .alignment)
@@ -474,6 +504,15 @@ struct TextClip: Identifiable, Equatable, Codable {
         try c.encode(opacity, forKey: .opacity)
         try c.encode(animation, forKey: .animation)
         try c.encodeIfPresent(markers, forKey: .markers)
+        try c.encode(cropTop, forKey: .cropTop)
+        try c.encode(cropBottom, forKey: .cropBottom)
+        try c.encode(cropLeft, forKey: .cropLeft)
+        try c.encode(cropRight, forKey: .cropRight)
+        try c.encodeIfPresent(boxWidth, forKey: .boxWidth)
+        try c.encodeIfPresent(boxHeight, forKey: .boxHeight)
+        try c.encode(mirrorH, forKey: .mirrorH)
+        try c.encode(mirrorV, forKey: .mirrorV)
+        try c.encode(lockBoxAspect, forKey: .lockBoxAspect)
     }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -490,6 +529,7 @@ struct TextClip: Identifiable, Equatable, Codable {
         textColor   = Color(hex: (try? c.decode(String.self, forKey: .textColorHex)) ?? "#FFFFFF")
         strokeColor = Color(hex: (try? c.decode(String.self, forKey: .strokeColorHex)) ?? "#000000")
         strokeWidth = (try? c.decode(Double.self, forKey: .strokeWidth)) ?? 0
+        strokeSoftness = (try? c.decode(Double.self, forKey: .strokeSoftness)) ?? 0
         bgColor     = Color(hex: (try? c.decode(String.self, forKey: .bgColorHex)) ?? "#000000")
         bgOpacity   = (try? c.decode(Double.self, forKey: .bgOpacity)) ?? 0
         alignment   = (try? c.decode(String.self, forKey: .alignment)) ?? "center"
@@ -497,6 +537,15 @@ struct TextClip: Identifiable, Equatable, Codable {
         opacity     = (try? c.decode(Double.self, forKey: .opacity)) ?? 1
         animation   = (try? c.decode(TextAnimation.self, forKey: .animation)) ?? .none
         markers = try? c.decode([Marker].self, forKey: .markers)
+        cropTop    = (try? c.decode(Double.self, forKey: .cropTop)) ?? 0
+        cropBottom = (try? c.decode(Double.self, forKey: .cropBottom)) ?? 0
+        cropLeft   = (try? c.decode(Double.self, forKey: .cropLeft)) ?? 0
+        cropRight  = (try? c.decode(Double.self, forKey: .cropRight)) ?? 0
+        boxWidth   = try? c.decode(Double.self, forKey: .boxWidth)
+        boxHeight  = try? c.decode(Double.self, forKey: .boxHeight)
+        mirrorH    = (try? c.decode(Bool.self, forKey: .mirrorH)) ?? false
+        mirrorV    = (try? c.decode(Bool.self, forKey: .mirrorV)) ?? false
+        lockBoxAspect = (try? c.decode(Bool.self, forKey: .lockBoxAspect)) ?? true
     }
     init(text: String = "标题文字", startTime: Double, endTime: Double) {
         self.text = text; self.startTime = startTime; self.endTime = endTime
@@ -602,6 +651,12 @@ struct ShapeClip: Identifiable, Equatable, Codable {
     var penPoints: [PenPoint]? = nil
     var penClosed: Bool = false
     var markers: [Marker]? = nil
+    // 裁剪：0~1 比例，从各边往里裁掉多少（跟图片、文字同一个语义）。
+    // 四边横条拖的是它；不等比缩放走属性区的 scaleX/scaleY
+    var cropTop: Double    = 0
+    var cropBottom: Double = 0
+    var cropLeft: Double   = 0
+    var cropRight: Double  = 0
 
     /// 是否闭合路径（pen 由 penClosed 决定，其余由 ShapeType 决定）
     var effectiveIsClosed: Bool { type == .pen ? penClosed : type.isClosed }
@@ -616,6 +671,7 @@ struct ShapeClip: Identifiable, Equatable, Codable {
         case shadowEnabled, shadowColorHex, shadowOpacity, shadowRadius, shadowOffsetX, shadowOffsetY
         case penPoints, penClosed
         case markers
+        case cropTop, cropBottom, cropLeft, cropRight
     }
     func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
@@ -652,6 +708,10 @@ struct ShapeClip: Identifiable, Equatable, Codable {
         try c.encodeIfPresent(penPoints, forKey: .penPoints)
         try c.encode(penClosed, forKey: .penClosed)
         try c.encodeIfPresent(markers, forKey: .markers)
+        try c.encode(cropTop, forKey: .cropTop)
+        try c.encode(cropBottom, forKey: .cropBottom)
+        try c.encode(cropLeft, forKey: .cropLeft)
+        try c.encode(cropRight, forKey: .cropRight)
     }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -687,6 +747,10 @@ struct ShapeClip: Identifiable, Equatable, Codable {
         shadowOffsetY = (try? c.decode(Double.self, forKey: .shadowOffsetY)) ?? 4
         penPoints = try? c.decode([PenPoint].self, forKey: .penPoints)
         penClosed = (try? c.decode(Bool.self, forKey: .penClosed)) ?? false
+        cropTop    = (try? c.decode(Double.self, forKey: .cropTop)) ?? 0
+        cropBottom = (try? c.decode(Double.self, forKey: .cropBottom)) ?? 0
+        cropLeft   = (try? c.decode(Double.self, forKey: .cropLeft)) ?? 0
+        cropRight  = (try? c.decode(Double.self, forKey: .cropRight)) ?? 0
         markers = try? c.decode([Marker].self, forKey: .markers)
     }
     init(type: ShapeType, startTime: Double, endTime: Double) {
@@ -843,6 +907,11 @@ struct ProjectCover: Codable, Equatable {
     var baseOffsetX: Double = 0
     var baseOffsetY: Double = 0
     var baseScale: Double = 1
+    /// 垂直方向的缩放。nil = 跟 `baseScale` 等比
+    var baseScaleY: Double? = nil
+    /// 缩放是否锁比例（只是面板上的开关，不影响渲染）
+    var baseLockAspect: Bool = true
+    var baseOpacity: Double = 1
     var baseRotation: Double = 0
     var baseMirrorH: Bool = false
     var baseMirrorV: Bool = false
@@ -857,6 +926,8 @@ struct ProjectCover: Codable, Equatable {
     var colorAdjust: ColorAdjust = .identity
 
     /// 描边，跟图片片段一样：颜色存十六进制、宽度像素、柔和度 0~1
+    /// 画面圆角（px），跟图片片段同一个语义
+    var cornerRadius: Double = 0
     var strokeColorHex: String? = nil
     var strokeWidth: Double? = nil
     var strokeSoftness: Double? = nil
@@ -886,6 +957,9 @@ struct ProjectCover: Codable, Equatable {
         baseOffsetX = try c.decodeIfPresent(Double.self, forKey: .baseOffsetX) ?? 0
         baseOffsetY = try c.decodeIfPresent(Double.self, forKey: .baseOffsetY) ?? 0
         baseScale = try c.decodeIfPresent(Double.self, forKey: .baseScale) ?? 1
+        baseScaleY = try c.decodeIfPresent(Double.self, forKey: .baseScaleY)
+        baseLockAspect = try c.decodeIfPresent(Bool.self, forKey: .baseLockAspect) ?? true
+        baseOpacity = try c.decodeIfPresent(Double.self, forKey: .baseOpacity) ?? 1
         baseRotation = try c.decodeIfPresent(Double.self, forKey: .baseRotation) ?? 0
         baseMirrorH = try c.decodeIfPresent(Bool.self, forKey: .baseMirrorH) ?? false
         baseMirrorV = try c.decodeIfPresent(Bool.self, forKey: .baseMirrorV) ?? false
@@ -898,6 +972,7 @@ struct ProjectCover: Codable, Equatable {
         strokeWidth = try c.decodeIfPresent(Double.self, forKey: .strokeWidth)
         strokeSoftness = try c.decodeIfPresent(Double.self, forKey: .strokeSoftness)
         renderedPath = try c.decodeIfPresent(String.self, forKey: .renderedPath)
+        cornerRadius = try c.decodeIfPresent(Double.self, forKey: .cornerRadius) ?? 0
     }
 }
 
@@ -1163,7 +1238,15 @@ func makeChannelTap(left: Float, right: Float) -> MTAudioProcessingTap? {
 // MARK: - Shape Geometry（图形路径，素材库缩略图 / 预览 / 导出共用）
 
 enum ShapeGeometry {
-    /// 在给定矩形内生成图形路径。矩形圆角由调用方另行处理。
+    /// 支持圆角的形状。其余的（圆、线段、箭头、钢笔）属性区里那一项要灰掉
+    static func supportsCorner(_ type: ShapeType) -> Bool {
+        switch type {
+        case .rectangle, .triangle, .trapezoid, .parallelogram: return true
+        default: return false
+        }
+    }
+
+    /// 在给定矩形内生成图形路径。圆角由调用方按 `cornerRadius` 走 `roundedPolygon`。
     static func path(for type: ShapeType, in r: CGRect) -> Path {
         var p = Path()
         switch type {
@@ -1171,25 +1254,13 @@ enum ShapeGeometry {
             p.addRect(r)
         case .ellipse:
             p.addEllipse(in: r)
-        case .triangle:
-            p.move(to: CGPoint(x: r.midX, y: r.minY))
-            p.addLine(to: CGPoint(x: r.maxX, y: r.maxY))
-            p.addLine(to: CGPoint(x: r.minX, y: r.maxY))
-            p.closeSubpath()
-        case .parallelogram:
-            let dx = r.width * 0.25
-            p.move(to: CGPoint(x: r.minX + dx, y: r.minY))
-            p.addLine(to: CGPoint(x: r.maxX, y: r.minY))
-            p.addLine(to: CGPoint(x: r.maxX - dx, y: r.maxY))
-            p.addLine(to: CGPoint(x: r.minX, y: r.maxY))
-            p.closeSubpath()
-        case .trapezoid:
-            let dx = r.width * 0.22
-            p.move(to: CGPoint(x: r.minX + dx, y: r.minY))
-            p.addLine(to: CGPoint(x: r.maxX - dx, y: r.minY))
-            p.addLine(to: CGPoint(x: r.maxX, y: r.maxY))
-            p.addLine(to: CGPoint(x: r.minX, y: r.maxY))
-            p.closeSubpath()
+        case .triangle, .parallelogram, .trapezoid:
+            let pts = polygonPoints(for: type, in: r) ?? []
+            if let first = pts.first {
+                p.move(to: first)
+                for q in pts.dropFirst() { p.addLine(to: q) }
+                p.closeSubpath()
+            }
         case .line:
             p.move(to: CGPoint(x: r.minX, y: r.midY))
             p.addLine(to: CGPoint(x: r.maxX, y: r.midY))

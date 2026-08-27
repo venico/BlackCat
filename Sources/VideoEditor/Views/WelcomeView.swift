@@ -272,7 +272,7 @@ struct WelcomeView: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .panelSurfaceClear(.content)
+        // 不铺底色也不描边，跟主界面那三块一个路子
         .padding(.vertical, 8)
         .padding(.trailing, 8)
     }

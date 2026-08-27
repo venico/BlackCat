@@ -86,7 +86,8 @@ struct PlayerView: View {
                         .shadow(color: .black.opacity(0.8), radius: 3, x: 0, y: 1)
                         .shadow(color: .black.opacity(0.5), radius: 6, x: 0, y: 2)
                     .padding(.horizontal, 8)
-                    .padding(.top, 8)
+                    // 往上提 12pt：原来是 8，负值让它探进预览区上边缘之外
+                    .padding(.top, -4)
                     .transition(.opacity)
                 }
             }
@@ -256,9 +257,10 @@ private struct OverlayStack: View {
                         .onTapGesture {
                             if project.editingTextClipID != nil { commitTextEdit() }
                             if NSEvent.modifierFlags.contains(.shift) {
-                                project.shiftToggleClip(clip.id)
+                                project.shiftCycleOverlapping(clip.id)
                             } else {
-                                selectImageExclusive(clip.id)
+                                // 点重叠处按叠放顺序轮换，压在下面的也点得到
+                                project.cycleSelectOverlapping(clip.id)
                             }
                         }
                         .position(x: imgRect.midX, y: imgRect.midY)
@@ -330,9 +332,9 @@ private struct OverlayStack: View {
                         }
                         .onTapGesture {
                             if NSEvent.modifierFlags.contains(.shift) {
-                                project.shiftToggleClip(clip.id)
+                                project.shiftCycleOverlapping(clip.id)
                             } else {
-                                selectTextExclusive(clip.id)
+                                project.cycleSelectOverlapping(clip.id)
                             }
                         }
                 }
@@ -385,9 +387,9 @@ private struct OverlayStack: View {
                     }
                     .onTapGesture {
                         if NSEvent.modifierFlags.contains(.shift) {
-                            project.shiftToggleClip(clip.id)
+                            project.shiftCycleOverlapping(clip.id)
                         } else {
-                            selectShapeExclusive(clip.id)
+                            project.cycleSelectOverlapping(clip.id)
                         }
                     }
             }
@@ -674,7 +676,7 @@ fileprivate final class PreviewImageCache {
     }
 }
 
-private extension View {
+extension View {
     /// 图片描边：八向阴影堆叠近似轮廓。四向在斜边上会露口子，所以补到八向。
     /// shadow 的 radius 天生是模糊的，硬边靠把 radius 压到极小、纯靠偏移堆出来；
     /// softness 才把 radius 放开，跟导出侧 ImageStroke 的高斯模糊对应
@@ -752,11 +754,14 @@ private struct ImageLayerView: View {
                 }
                 .frame(width: cropW * vs, height: cropH * vs, alignment: .topLeading)
                 .clipped()
+                // 圆角切在描边之前，描边才会沿着圆角走
+                .clipShape(RoundedRectangle(cornerRadius: CGFloat(clip.corner) * vs))
                 // 描边必须加在 clipped 之后，否则会连同描边一起被裁掉。
                 // shadow 基于 alpha，所以去背图沿主体轮廓描边，不透明图沿裁剪框描边
                 .imageStroke(width: clip.strokeW * vs, color: clip.strokeColor, softness: clip.strokeSoft)
                 .scaleEffect(x: clip.mirrorH ? -1 : 1, y: clip.mirrorV ? -1 : 1)
                 .rotationEffect(.degrees(Double(clip.rotation)))
+                .opacity(clip.alpha)
                 .position(x: originX + (cropX + cropW / 2) * vs,
                           y: originY + (cropY + cropH / 2) * vs)
             }
@@ -766,10 +771,9 @@ private struct ImageLayerView: View {
 
 /// 把屏幕坐标下的拖动位移转回画面自身的坐标（抵消 rotationEffect）。
 /// 视频和图片共用。
-func unrotateTranslation(_ t: CGSize, rotation: Int) -> CGSize {
-    let rot = ((rotation % 360) + 360) % 360
-    guard rot != 0 else { return t }
-    let rad = -CGFloat(rot) * .pi / 180
+func unrotateTranslation(_ t: CGSize, rotation: Double) -> CGSize {
+    guard abs(rotation) > 0.001 else { return t }
+    let rad = -CGFloat(rotation) * .pi / 180
     return CGSize(width:  t.width * cos(rad) - t.height * sin(rad),
                   height: t.width * sin(rad) + t.height * cos(rad))
 }
@@ -778,9 +782,15 @@ func unrotateTranslation(_ t: CGSize, rotation: Int) -> CGSize {
 /// 合成层（ColorCompositor / 导出的 videoTransform）也是按旋转后的整幅尺寸 fit 的，
 /// 预览这边必须同步，否则画面转了、框还停在旋转前的位置上。
 /// 视频和图片共用一套。
-func rotatedFitSize(_ size: CGSize, rotation: Int) -> CGSize {
-    let rot = ((rotation % 360) + 360) % 360
-    return (rot == 90 || rot == 270) ? CGSize(width: size.height, height: size.width) : size
+func rotatedFitSize(_ size: CGSize, rotation: Double) -> CGSize {
+    let rot = rotation.truncatingRemainder(dividingBy: 360)
+    let norm = rot < 0 ? rot + 360 : rot
+    // **只有正 90°/270° 才换宽高**。任意角度按外接矩形算的话，
+    // 转的过程中画面会跟着一起缩放（转到 45° 最明显），旋转就不只是旋转了
+    if abs(norm - 90) < 0.01 || abs(norm - 270) < 0.01 {
+        return CGSize(width: size.height, height: size.width)
+    }
+    return size
 }
 
 // MARK: - Subtitle Overlay
@@ -931,15 +941,78 @@ private struct TextOverlay: View {
     }
 }
 
-private struct TextEditField: NSViewRepresentable {
+/// 文字的输入框。预览区双击进编辑态用它，封面弹窗也用同一份
+struct TextEditField: NSViewRepresentable {
     @Binding var text: String
     let clip: TextClip
     let scale: CGFloat
     let onCommit: () -> Void
 
+    /// 输入框自己那个 NSTextView。**边缘一圈不设输入光标** ——
+    /// 那一圈是外面拖框条的地盘，不让开的话鼠标一靠近边，
+    /// 光标就被它抢成输入光标，看不出这里能拖
+    /// 输入框自己那个 NSTextView。**边缘一圈是外面拖框条的地盘** ——
+    /// 光标要跟裁剪条一样是拉伸的样子。
+    ///
+    /// 这一圈落在 NSTextView 身上，SwiftUI 的 onHover 收不到（真实 AppKit 视图
+    /// 会先接走事件），只能由它自己来设。而且光走 `resetCursorRects` 不够：
+    /// NSTextView 每次布局都会重铺自己的光标区，实测会把边缘那圈盖回输入光标，
+    /// 所以还要接管 `cursorUpdate` 和 `mouseMoved`
+    private final class EdgeAwareTextView: NSTextView {
+        /// 边缘认定宽度，跟外面拖框条的热区对齐
+        private let edge: CGFloat = 8
+        private var edgeTracking: NSTrackingArea?
+
+        private func edgeCursor(at p: CGPoint) -> NSCursor? {
+            guard bounds.width > edge * 2, bounds.height > edge * 2 else { return nil }
+            if p.y < edge || p.y > bounds.height - edge { return .resizeUpDown }
+            if p.x < edge || p.x > bounds.width - edge { return .resizeLeftRight }
+            return nil
+        }
+
+        override func updateTrackingAreas() {
+            super.updateTrackingAreas()
+            if let a = edgeTracking { removeTrackingArea(a) }
+            let a = NSTrackingArea(
+                rect: .zero,
+                options: [.activeInKeyWindow, .mouseMoved, .cursorUpdate, .inVisibleRect],
+                owner: self, userInfo: nil)
+            addTrackingArea(a)
+            edgeTracking = a
+        }
+
+        override func cursorUpdate(with event: NSEvent) {
+            let p = convert(event.locationInWindow, from: nil)
+            if let c = edgeCursor(at: p) { c.set() } else { super.cursorUpdate(with: event) }
+        }
+
+        override func mouseMoved(with event: NSEvent) {
+            let p = convert(event.locationInWindow, from: nil)
+            if let c = edgeCursor(at: p) { c.set(); return }
+            super.mouseMoved(with: event)
+        }
+
+        override func resetCursorRects() {
+            let inner = bounds.insetBy(dx: edge, dy: edge)
+            guard inner.width > 0, inner.height > 0 else {
+                addCursorRect(bounds, cursor: .iBeam)
+                return
+            }
+            addCursorRect(inner, cursor: .iBeam)
+            addCursorRect(CGRect(x: 0, y: 0, width: bounds.width, height: edge), cursor: .resizeUpDown)
+            addCursorRect(CGRect(x: 0, y: bounds.height - edge, width: bounds.width, height: edge), cursor: .resizeUpDown)
+            addCursorRect(CGRect(x: 0, y: 0, width: edge, height: bounds.height), cursor: .resizeLeftRight)
+            addCursorRect(CGRect(x: bounds.width - edge, y: 0, width: edge, height: bounds.height), cursor: .resizeLeftRight)
+        }
+    }
+
     func makeNSView(context: Context) -> NSScrollView {
-        let sv = NSTextView.scrollableTextView()
-        let tv = sv.documentView as! NSTextView
+        let tv = EdgeAwareTextView(frame: NSRect(x: 0, y: 0, width: 200, height: 40))
+        tv.isVerticallyResizable = true
+        tv.autoresizingMask = [.width]
+        tv.minSize = NSSize(width: 0, height: 0)
+        let sv = NSScrollView(frame: tv.frame)
+        sv.documentView = tv
         tv.delegate = context.coordinator
         tv.isRichText = false
         tv.isAutomaticQuoteSubstitutionEnabled = false
@@ -950,12 +1023,10 @@ private struct TextEditField: NSViewRepresentable {
         sv.hasHorizontalScroller = false
         sv.borderType = .noBorder
         tv.textContainerInset = NSSize(width: 4 * scale, height: 2 * scale)
-        tv.textContainer?.widthTracksTextView = false
-        tv.textContainer?.size = NSSize(width: 10000, height: 10000)
         tv.maxSize = NSSize(width: 10000, height: 10000)
-        tv.isHorizontallyResizable = true
         tv.focusRingType = .none
         tv.string = text
+        applyWrap(tv)
         applyStyle(tv)
         DispatchQueue.main.async { tv.window?.makeFirstResponder(tv) }
         return sv
@@ -964,7 +1035,23 @@ private struct TextEditField: NSViewRepresentable {
     func updateNSView(_ sv: NSScrollView, context: Context) {
         guard let tv = sv.documentView as? NSTextView else { return }
         if tv.string != text { tv.string = text }
+        applyWrap(tv)
         applyStyle(tv)
+    }
+
+    /// 换行规则。拖过边定死了范围框，文字就得在框里换行，
+    /// 不能像原来那样一直往右顶出去
+    private func applyWrap(_ tv: NSTextView) {
+        if let bw = clip.boxWidth {
+            let w = max(CGFloat(bw) * scale, 20)
+            tv.textContainer?.widthTracksTextView = true
+            tv.textContainer?.size = NSSize(width: w, height: 10000)
+            tv.isHorizontallyResizable = false
+        } else {
+            tv.textContainer?.widthTracksTextView = false
+            tv.textContainer?.size = NSSize(width: 10000, height: 10000)
+            tv.isHorizontallyResizable = true
+        }
     }
 
     func sizeThatFits(_ proposal: ProposedViewSize, nsView: NSScrollView, context: Context) -> CGSize? {
@@ -973,8 +1060,13 @@ private struct TextEditField: NSViewRepresentable {
         lm.ensureLayout(for: tc)
         let r = lm.usedRect(for: tc)
         let pad = tv.textContainerInset
-        let w = max(ceil(r.width) + pad.width * 2, 50 * scale)
-        let h = max(ceil(r.height) + pad.height * 2, clip.fontSize * scale * 1.5)
+        // 拖过边改了文本框大小就按它走，编辑框才会跟着变换框一起变；
+        // 没拖过（boxWidth/boxHeight 是 nil）还是按文字自己撑开。
+        // 留白用 TextLabel 那套口径（横 10、竖 5），两种状态框大小才对得上
+        let w = clip.boxWidth.map { CGFloat($0) * scale + 20 * scale }
+            ?? max(ceil(r.width) + pad.width * 2, 50 * scale)
+        let h = clip.boxHeight.map { CGFloat($0) * scale + 10 * scale }
+            ?? max(ceil(r.height) + pad.height * 2, clip.fontSize * scale * 1.5)
         return CGSize(width: w, height: h)
     }
 
@@ -1008,13 +1100,23 @@ private struct TextEditField: NSViewRepresentable {
     }
 }
 
-private struct TextLabel: View {
+/// 文字图层的渲染本体。预览区和封面弹窗共用 ——
+/// 斜体的矩阵斜切、描边的四向阴影、背景色、对齐都在这儿，
+/// 封面另写一套的话这些属性就会「调了没反应」
+struct TextLabel: View {
     let clip: TextClip
     var scale: CGFloat = 1.0
     var selected: Bool = false
+    /// 是否自己转。ImageRenderer 出图时按未旋转的尺寸裁切，
+    /// 转过的部分会被切掉一角，所以渲染时关掉它、改由画布上下文旋转
+    var applyRotation: Bool = true
 
-    private var strokeRadius: CGFloat { max(0.6, clip.strokeWidth * 0.5) * scale }
-    private var strokeOffset: CGFloat { max(0.6, clip.strokeWidth * 0.4) * scale }
+    /// 描边模糊半径。**柔和度 0 时压到极小 = 硬边**，
+    /// 以前写死成宽度的一半，所以怎么调都是糊的
+    private var strokeRadius: CGFloat {
+        max(0.35, clip.strokeWidth * clip.strokeSoftness) * scale
+    }
+    private var strokeOffset: CGFloat { max(0.6, clip.strokeWidth) * scale }
 
     var body: some View {
         Text(clip.text.isEmpty ? " " : clip.text)
@@ -1022,16 +1124,21 @@ private struct TextLabel: View {
                     .weight(clip.bold ? .bold : .regular))
             .transformEffect(italicSkew(clip.italic, fontSize: clip.fontSize * scale))
             .foregroundColor(clip.textColor)
-            // 描边近似：四向阴影（strokeWidth>0 时不透明，否则淡阴影提升可读性）
-            .shadow(color: clip.strokeColor.opacity(clip.strokeWidth > 0 ? 1 : 0.6),
-                    radius: strokeRadius, x: strokeOffset, y: strokeOffset)
-            .shadow(color: clip.strokeColor.opacity(clip.strokeWidth > 0 ? 1 : 0.6),
-                    radius: strokeRadius, x: -strokeOffset, y: -strokeOffset)
+            // 描边近似：八向阴影堆出轮廓（四向在斜边上会露口子，跟图片描边一个做法）
+            .modifier(TextStroke(color: clip.strokeColor.opacity(clip.strokeWidth > 0 ? 1 : 0.6),
+                                 width: strokeOffset, radius: strokeRadius))
             .multilineTextAlignment(textAlign(clip.alignment))
+            // 文本框尺寸：没设过就跟着文字自适应（老行为）
+            .frame(width: clip.boxWidth.map { $0 * scale },
+                   height: clip.boxHeight.map { $0 * scale },
+                   alignment: boxAlign(clip.alignment))
             .padding(.horizontal, 10 * scale).padding(.vertical, 5 * scale)
             .background(clip.bgColor.opacity(clip.bgOpacity))
             .cornerRadius(4 * scale)
-            .rotationEffect(.degrees(clip.rotation))
+            // 裁剪排在旋转之前：裁完再转，裁剪边跟着一起转
+            .modifier(TextCropMask(clip: clip))
+            .scaleEffect(x: clip.mirrorH ? -1 : 1, y: clip.mirrorV ? -1 : 1)
+            .rotationEffect(.degrees(applyRotation ? clip.rotation : 0))
             .opacity(clip.opacity)
             .overlay(
                 selected
@@ -1042,6 +1149,52 @@ private struct TextLabel: View {
     }
     private func textAlign(_ a: String) -> TextAlignment {
         switch a { case "left": return .leading; case "right": return .trailing; default: return .center }
+    }
+    private func boxAlign(_ a: String) -> Alignment {
+        switch a { case "left": return .topLeading; case "right": return .topTrailing; default: return .top }
+    }
+}
+
+/// 文字描边：八向阴影堆叠近似轮廓，跟图片那套 `imageStroke` 同源。
+/// 硬边靠把 radius 压到极小、纯用偏移堆出来；柔和度才把 radius 放开
+private struct TextStroke: ViewModifier {
+    let color: Color
+    let width: CGFloat
+    let radius: CGFloat
+
+    func body(content: Content) -> some View {
+        let k = width * 0.707   // 斜向分量
+        content
+            .shadow(color: color, radius: radius, x:  width, y: 0)
+            .shadow(color: color, radius: radius, x: -width, y: 0)
+            .shadow(color: color, radius: radius, x: 0, y:  width)
+            .shadow(color: color, radius: radius, x: 0, y: -width)
+            .shadow(color: color, radius: radius, x:  k, y:  k)
+            .shadow(color: color, radius: radius, x: -k, y:  k)
+            .shadow(color: color, radius: radius, x:  k, y: -k)
+            .shadow(color: color, radius: radius, x: -k, y: -k)
+    }
+}
+
+/// 文字裁剪：按 0~1 比例从四边往里裁，用来做「只露半个字」这类效果。
+/// 没裁剪时原样返回 —— 每条文字都套一层 GeometryReader 太浪费
+private struct TextCropMask: ViewModifier {
+    let clip: TextClip
+
+    func body(content: Content) -> some View {
+        if clip.cropTop <= 0, clip.cropBottom <= 0, clip.cropLeft <= 0, clip.cropRight <= 0 {
+            content
+        } else {
+            content.mask(
+                GeometryReader { g in
+                    Rectangle()
+                        .padding(.top, g.size.height * clip.cropTop)
+                        .padding(.bottom, g.size.height * clip.cropBottom)
+                        .padding(.leading, g.size.width * clip.cropLeft)
+                        .padding(.trailing, g.size.width * clip.cropRight)
+                }
+            )
+        }
     }
 }
 
@@ -1440,59 +1593,6 @@ private struct VideoTransformOverlay: View {
         return UnitPoint(x: c.x / size.width, y: c.y / size.height)
     }
 
-    private func tapThrough(at pt: CGPoint, viewSize: CGSize) {
-        let t = clock.currentTime
-        let scale = viewSize.width / max(project.previewRenderSize.width, 1)
-        let shift = NSEvent.modifierFlags.contains(.shift)
-        for ref in project.overlayTrackOrder {
-            switch ref {
-            case .shape(let trackID):
-                guard let track = project.shapeTracks.first(where: { $0.id == trackID }),
-                      track.isVisible,
-                      let sc = track.clips.first(where: { $0.startTime <= t && $0.endTime > t }) else { continue }
-                let cx = viewSize.width * sc.posX, cy = viewSize.height * sc.posY
-                let w = sc.width * sc.scaleX * scale, h = sc.height * sc.scaleY * scale
-                guard CGRect(x: cx - w/2, y: cy - h/2, width: w, height: h).contains(pt) else { continue }
-                if shift { project.shiftToggleClip(sc.id) } else {
-                    project.editingTextClipID = nil
-                    project.selectedShapeClipID = sc.id
-                    project.selectedImageClipID = nil; project.selectedTextClipID = nil
-                    project.selectedVideoClipID = nil; project.selectedClipIDs = [sc.id]
-                }
-                return
-            case .text(let trackID):
-                guard let track = project.textTracks.first(where: { $0.id == trackID }),
-                      track.isVisible,
-                      let tc = track.clips.first(where: { $0.startTime <= t && $0.endTime > t }) else { continue }
-                let cx = viewSize.width * tc.posX, cy = viewSize.height * tc.posY
-                let sz = project.textClipViewSizes[tc.id] ?? CGSize(width: 100, height: 30)
-                guard CGRect(x: cx - sz.width/2, y: cy - sz.height/2, width: sz.width, height: sz.height).contains(pt) else { continue }
-                if shift { project.shiftToggleClip(tc.id) } else {
-                    project.editingTextClipID = nil
-                    project.selectedTextClipID = tc.id
-                    project.selectedImageClipID = nil; project.selectedShapeClipID = nil
-                    project.selectedVideoClipID = nil; project.selectedClipIDs = [tc.id]
-                }
-                return
-            case .image(let trackID):
-                guard let track = project.imageTracks.first(where: { $0.id == trackID }),
-                      track.isVisible,
-                      let ic = track.clips.first(where: { $0.startTime <= t && $0.endTime > t }) else { continue }
-                if shift { project.shiftToggleClip(ic.id) } else {
-                    project.editingTextClipID = nil
-                    project.selectedImageClipID = ic.id
-                    project.selectedShapeClipID = nil; project.selectedTextClipID = nil
-                    project.selectedVideoClipID = nil; project.selectedClipIDs = [ic.id]
-                }
-                return
-            default: continue
-            }
-        }
-        project.selectedImageClipID = nil; project.selectedShapeClipID = nil
-        project.selectedTextClipID = nil; project.selectedVideoClipID = nil
-        project.selectedClipIDs.removeAll()
-        project.editingTextClipID = nil
-    }
 
     @State private var multiStart: [UUID: CGPoint] = [:]
 
@@ -1548,7 +1648,8 @@ private struct VideoTransformOverlay: View {
                     dragMode = .none; didPushUndo = false; multiStart.removeAll()
                     NSCursor.openHand.set()
                 } else {
-                    tapThrough(at: value.location, viewSize: viewSize)
+                    project.tapThroughSelect(at: value.location, viewSize: viewSize,
+                                             time: clock.currentTime, currentClipID: clip.id)
                 }
             }
     }
@@ -1596,7 +1697,7 @@ private struct VideoTransformOverlay: View {
                 // 手势给的是屏幕坐标的位移，而 cropTop/cropLeft 说的是画面**自己**的
                 // 上下左右。画面转了 90° 之后两者差一个旋转，得先转回画面坐标，
                 // 否则拖上边的手柄画面从侧面被裁
-                let d = unrotateTranslation(value.translation, rotation: startClip.rotation)
+                let d = unrotateTranslation(value.translation, rotation: Double(startClip.rotation))
                 var delta: Double = 0
                 switch edge {
                 case 0: delta =  d.height / vidRect.height
@@ -1733,7 +1834,7 @@ private struct VideoTransformOverlay: View {
 
         // 素材在画布内等比摆放（合成层同样逻辑），裁剪框据此贴合素材边界。
         // 尺寸取旋转后的整幅画面，跟 ColorCompositor 第 5 步用的是同一个值
-        let fit = rotatedFitSize(CGSize(width: natW, height: natH), rotation: clip.rotation)
+        let fit = rotatedFitSize(CGSize(width: natW, height: natH), rotation: Double(clip.rotation))
         let baseScale = min(info.videoSize.width / fit.width, info.videoSize.height / fit.height)
         let finalSX = baseScale * CGFloat(clip.scaleX)
         let finalSY = baseScale * CGFloat(clip.scaleY)
@@ -1761,13 +1862,70 @@ private struct VideoTransformOverlay: View {
 
 // MARK: - Image Transform Overlay
 
+// MARK: - 变换手柄（图片片段和封面底图共用同一套）
+
+/// 四角缩放手柄 — 白色圆点
+struct TransformScaleDot: View {
+    var body: some View {
+        ZStack {
+            Circle().fill(Color.white).frame(width: 10, height: 10)
+            Circle().stroke(Color.accent, lineWidth: 1.5).frame(width: 10, height: 10)
+        }
+        .shadow(color: .black.opacity(0.3), radius: 2, x: 0, y: 1)
+        .frame(width: 22, height: 22)
+        .contentShape(Rectangle())
+        .onHover { h in
+            if h { NSCursor.crosshair.set() } else { NSCursor.arrow.set() }
+        }
+    }
+}
+
+/// 四边裁剪条 — 橙色长细条
+struct TransformCropBar: View {
+    let isHorizontal: Bool
+    let length: CGFloat
+    var body: some View {
+        RoundedRectangle(cornerRadius: 1.5)
+            .fill(Color.orange)
+            .frame(width: isHorizontal ? length : 3,
+                   height: isHorizontal ? 3 : length)
+            .shadow(color: .black.opacity(0.4), radius: 2, x: 0, y: 1)
+            // 跟图形边条同宽（10pt）。原来 28 等于向外各吃掉 12pt，
+            // 压着下层图层时会把人家露出来的窄区抢掉
+            .frame(width: isHorizontal ? length + 16 : 10,
+                   height: isHorizontal ? 10 : length + 16)
+            .contentShape(Rectangle())
+            .onHover { h in
+                if h { (isHorizontal ? NSCursor.resizeUpDown : NSCursor.resizeLeftRight).set() }
+                else { NSCursor.arrow.set() }
+            }
+    }
+}
+
+/// 旋转手柄 — 白底圆点加个转圈图标，跟图形/文字那两处一个样
+struct TransformRotateDot: View {
+    var body: some View {
+        ZStack {
+            Circle().fill(Color.white).frame(width: 14, height: 14)
+            Image(systemName: "arrow.triangle.2.circlepath")
+                .font(.system(size: 8, weight: .bold)).foregroundColor(Color.accent)
+        }
+        .shadow(color: .black.opacity(0.3), radius: 2, y: 1)
+        .frame(width: 28, height: 28)
+        .contentShape(Circle())
+    }
+}
+
 private struct ImageTransformOverlay: View {
     @EnvironmentObject private var project: ProjectState
     @EnvironmentObject private var clock: PlaybackClock
 
-    enum DragMode { case none, move, scale, crop }
+    enum DragMode { case none, move, scale, crop, rotate }
     @State private var dragMode: DragMode = .none
     @State private var didPushUndo = false
+    // Rotate — 起手时的角度快照，拖动只认「转了多少」
+    @State private var rotStartValue: Double = 0
+    @State private var rotStartAngle: Double = 0
     // Move
     @State private var dragStartOffset: CGPoint = .zero
     // Scale
@@ -1799,36 +1957,54 @@ private struct ImageTransformOverlay: View {
                         .gesture(moveDrag(clip: clip, info: info, rect: imgRect, viewSize: geo.size))
 
                     if !isMulti {
-                        // 边框（不接受事件）
-                        Rectangle()
-                            .stroke(Color.accent, lineWidth: 1.5)
-                            .frame(width: max(imgRect.width, 1), height: max(imgRect.height, 1))
-                            .position(x: imgRect.midX, y: imgRect.midY)
-                            .allowsHitTesting(false)
-
-                        // 四边裁剪手柄 — 橙色长细条
-                        ForEach(0..<4, id: \.self) { edge in
-                            let pos = edgeMidPos(edge, imgRect)
-                            let isH = edge < 2
-                            let barLen = isH ? max(min(imgRect.width * 0.35, 50), 20) : max(min(imgRect.height * 0.35, 50), 20)
-                            CropEdgeBar(isHorizontal: isH, length: barLen)
-                                .claimsDragFromWindow()   // 必须在 .position() 之前
-                                .position(x: pos.x, y: pos.y)
-                                .gesture(cropDrag(clip: clip, info: info, edge: edge))
-                        }
-
-                        // 四角缩放手柄 — 白色圆点
-                        ForEach(0..<4, id: \.self) { corner in
-                            let pos = cornerPos(corner, imgRect)
-                            ScaleHandleDot()
-                                .claimsDragFromWindow()   // 必须在 .position() 之前
-                                .position(x: pos.x, y: pos.y)
-                                .gesture(scaleDrag(clip: clip, info: info, corner: corner))
-                        }
+                        // 跟文字、图形同一个框组件：四角缩放、四边裁剪、上方旋转。
+                        // 它自己按 rotation 算几何，所以不能再包在外层 rotationEffect 里
+                        let full = computeImageRect(clip: clip, info: info, applyCrop: false)
+                        TransformBox(
+                            center: CGPoint(x: full.midX, y: full.midY),
+                            size: CGSize(width: max(full.width, 8), height: max(full.height, 8)),
+                            // 旋转交给外层那一下，这里按没转来算 ——
+                            // 移动区和手柄各转各的会对不上（拖着图片走的时候像在转）
+                            rotation: 0,
+                            crop: TransformCrop(top: clip.cropTop, bottom: clip.cropBottom,
+                                                left: clip.cropLeft, right: clip.cropRight),
+                            outerRotation: clip.rotation,
+                            onBegin: {
+                                pushUndoOnce()
+                                scaleStartValues = (clip.scaleX, clip.scaleY)
+                                rotStartValue = clip.rotation
+                            },
+                            onEnd: {
+                                didPushUndo = false
+                                project.rebuildTimelinePreview()
+                            },
+                            onScale: { ratio in
+                                project.updateImageClip(id: clip.id) {
+                                    $0.scaleX = max(0.05, scaleStartValues.sx * ratio)
+                                    $0.scaleY = max(0.05, scaleStartValues.sy * ratio)
+                                }
+                                project.rebuildTimelinePreviewDebounced()
+                            },
+                            onCrop: { e, value in
+                                project.updateImageClip(id: clip.id) {
+                                    switch e {
+                                    case 0: $0.cropTop = value
+                                    case 1: $0.cropBottom = value
+                                    case 2: $0.cropLeft = value
+                                    default: $0.cropRight = value
+                                    }
+                                }
+                                project.rebuildTimelinePreviewDebounced()
+                            },
+                            onRotate: { delta in
+                                project.updateImageClip(id: clip.id) { $0.rotation = rotStartValue + delta }
+                                project.rebuildTimelinePreviewDebounced()
+                            }
+                        )
                     }
                 }
-                // 框跟着画面转，锚点用画面中心（同视频那套）
-                .rotationEffect(.degrees(Double(clip.rotation)),
+                // 整层一起转（移动区 + 手柄），锚点用画面中心，同视频那套
+                .rotationEffect(.degrees(clip.rotation),
                                 anchor: imageRotationAnchor(clip: clip, info: info, in: geo.size))
             }
         }
@@ -1895,94 +2071,13 @@ private struct ImageTransformOverlay: View {
                     NSCursor.openHand.set()
                     project.rebuildTimelinePreview()
                 } else {
-                    tapThrough(at: value.location, viewSize: viewSize, currentClipID: clip.id)
+                    project.tapThroughSelect(at: value.location, viewSize: viewSize,
+                                             time: clock.currentTime, currentClipID: clip.id)
                 }
             }
     }
 
     // MARK: - 缩放手势
-    private func scaleDrag(clip: ImageClip, info: RenderInfo, corner: Int) -> some Gesture {
-        DragGesture(minimumDistance: 1)
-            .onChanged { value in
-                if dragMode == .none {
-                    pushUndoOnce()
-                    dragMode = .scale
-                    scaleStartValues = (clip.scaleX, clip.scaleY)
-                }
-                guard dragMode == .scale else { return }
-                let imgRect = computeImageRect(clip: clip, info: info)
-                let center = CGPoint(x: imgRect.midX, y: imgRect.midY)
-                let startDist = hypot(value.startLocation.x - center.x,
-                                      value.startLocation.y - center.y)
-                let curDist = hypot(value.location.x - center.x,
-                                    value.location.y - center.y)
-                guard startDist > 1 else { return }
-                let ratio = curDist / startDist
-                project.updateImageClip(id: clip.id) {
-                    $0.scaleX = max(0.05, scaleStartValues.sx * ratio)
-                    $0.scaleY = max(0.05, scaleStartValues.sy * ratio)
-                }
-                project.rebuildTimelinePreviewDebounced()
-            }
-            .onEnded { _ in
-                dragMode = .none; didPushUndo = false
-                project.rebuildTimelinePreview()
-            }
-    }
-
-    // MARK: - 裁剪手势（对面边自然不动，因为 scale 不随 crop 变化）
-    private func cropDrag(clip: ImageClip, info: RenderInfo, edge: Int) -> some Gesture {
-        DragGesture(minimumDistance: 1)
-            .onChanged { value in
-                if dragMode == .none {
-                    pushUndoOnce()
-                    dragMode = .crop
-                    cropEdge = edge
-                    cropStartClip = clip
-                }
-                guard dragMode == .crop, let startClip = cropStartClip else { return }
-
-                // 计算拖动的裁剪量：基于当前图片的实际渲染尺寸
-                let imgRect = computeImageRect(clip: startClip, info: info)
-                // 手势是屏幕坐标，cropTop/cropLeft 说的是图片自己的上下左右 ——
-                // 画面转过之后要先转回图片坐标（同视频那套）
-                let d = unrotateTranslation(value.translation, rotation: startClip.rotation)
-                var delta: Double = 0
-                switch edge {
-                case 0: delta =  d.height / imgRect.height  // 拖上
-                case 1: delta = -d.height / imgRect.height  // 拖下
-                case 2: delta =  d.width  / imgRect.width   // 拖左
-                case 3: delta = -d.width  / imgRect.width   // 拖右
-                default: break
-                }
-
-                let startVal: Double
-                switch edge {
-                case 0: startVal = startClip.cropTop
-                case 1: startVal = startClip.cropBottom
-                case 2: startVal = startClip.cropLeft
-                case 3: startVal = startClip.cropRight
-                default: startVal = 0
-                }
-                let newCrop = (startVal + delta).clamped(to: 0...0.99)
-
-                project.updateImageClip(id: clip.id) {
-                    switch edge {
-                    case 0: $0.cropTop    = newCrop
-                    case 1: $0.cropBottom = newCrop
-                    case 2: $0.cropLeft   = newCrop
-                    case 3: $0.cropRight  = newCrop
-                    default: break
-                    }
-                }
-                project.rebuildTimelinePreviewDebounced()
-            }
-            .onEnded { _ in
-                dragMode = .none; didPushUndo = false; cropStartClip = nil
-                project.rebuildTimelinePreview()
-            }
-    }
-
     // MARK: - 撤销
     private func pushUndoOnce() {
         guard !didPushUndo else { return }
@@ -1990,111 +2085,12 @@ private struct ImageTransformOverlay: View {
         didPushUndo = true
     }
 
-    // MARK: - Tap 穿透选择
-    private func tapThrough(at pt: CGPoint, viewSize: CGSize, currentClipID: UUID) {
-        let t = clock.currentTime
-        let scale = viewSize.width / max(project.previewRenderSize.width, 1)
-        let shift = NSEvent.modifierFlags.contains(.shift)
-        for ref in project.overlayTrackOrder {
-            switch ref {
-            case .shape(let trackID):
-                guard let track = project.shapeTracks.first(where: { $0.id == trackID }),
-                      track.isVisible,
-                      let sc = track.clips.first(where: { $0.startTime <= t && $0.endTime > t }) else { continue }
-                let cx = viewSize.width * sc.posX, cy = viewSize.height * sc.posY
-                let w = sc.width * sc.scaleX * scale, h = sc.height * sc.scaleY * scale
-                guard CGRect(x: cx - w/2, y: cy - h/2, width: w, height: h).contains(pt) else { continue }
-                if shift { project.shiftToggleClip(sc.id) } else {
-                    project.editingTextClipID = nil
-                    project.selectedShapeClipID = sc.id
-                    project.selectedImageClipID = nil; project.selectedTextClipID = nil
-                    project.selectedVideoClipID = nil; project.selectedClipIDs = [sc.id]
-                }
-                return
-            case .text(let trackID):
-                guard let track = project.textTracks.first(where: { $0.id == trackID }),
-                      track.isVisible,
-                      let tc = track.clips.first(where: { $0.startTime <= t && $0.endTime > t }) else { continue }
-                let cx = viewSize.width * tc.posX, cy = viewSize.height * tc.posY
-                let sz = project.textClipViewSizes[tc.id] ?? CGSize(width: 100, height: 30)
-                guard CGRect(x: cx - sz.width/2, y: cy - sz.height/2, width: sz.width, height: sz.height).contains(pt) else { continue }
-                if shift { project.shiftToggleClip(tc.id) } else {
-                    project.editingTextClipID = nil
-                    project.selectedTextClipID = tc.id
-                    project.selectedImageClipID = nil; project.selectedShapeClipID = nil
-                    project.selectedVideoClipID = nil; project.selectedClipIDs = [tc.id]
-                }
-                return
-            default: continue
-            }
-        }
-        project.selectedImageClipID = nil; project.selectedShapeClipID = nil
-        project.selectedTextClipID = nil; project.selectedVideoClipID = nil
-        project.selectedClipIDs.removeAll()
-        project.editingTextClipID = nil
-    }
-
     // MARK: - 手柄
 
-    /// 四角缩放手柄 — 白色圆点
-    private struct ScaleHandleDot: View {
-        var body: some View {
-            ZStack {
-                Circle().fill(Color.white).frame(width: 10, height: 10)
-                Circle().stroke(Color.accent, lineWidth: 1.5).frame(width: 10, height: 10)
-            }
-            .shadow(color: .black.opacity(0.3), radius: 2, x: 0, y: 1)
-            .frame(width: 22, height: 22)
-            .contentShape(Rectangle())
-            .onHover { h in
-                if h { NSCursor.crosshair.set() } else { NSCursor.arrow.set() }
-            }
-        }
-    }
 
     /// 四边裁剪手柄 — 橙色长细条，加大点击区域
-    private struct CropEdgeBar: View {
-        let isHorizontal: Bool
-        let length: CGFloat
-        var body: some View {
-            RoundedRectangle(cornerRadius: 1.5)
-                .fill(Color.orange)
-                .frame(width: isHorizontal ? length : 3,
-                       height: isHorizontal ? 3 : length)
-                .shadow(color: .black.opacity(0.4), radius: 2, x: 0, y: 1)
-                // 跟图形边条同宽（10pt）。原来 28 等于向外各吃掉 12pt，
-                // 压着下层图层时会把人家露出来的窄区抢掉
-                .frame(width: isHorizontal ? length + 16 : 10,
-                       height: isHorizontal ? 10 : length + 16)
-                .contentShape(Rectangle())
-                .onHover { h in
-                    if h { (isHorizontal ? NSCursor.resizeUpDown : NSCursor.resizeLeftRight).set() }
-                    else { NSCursor.arrow.set() }
-                }
-        }
-    }
 
     // MARK: - 位置计算
-
-    private func cornerPos(_ corner: Int, _ r: CGRect) -> CGPoint {
-        switch corner {
-        case 0: return CGPoint(x: r.minX, y: r.minY)
-        case 1: return CGPoint(x: r.maxX, y: r.minY)
-        case 2: return CGPoint(x: r.minX, y: r.maxY)
-        case 3: return CGPoint(x: r.maxX, y: r.maxY)
-        default: return r.origin
-        }
-    }
-
-    private func edgeMidPos(_ edge: Int, _ r: CGRect) -> CGPoint {
-        switch edge {
-        case 0: return CGPoint(x: r.midX, y: r.minY)
-        case 1: return CGPoint(x: r.midX, y: r.maxY)
-        case 2: return CGPoint(x: r.minX, y: r.midY)
-        case 3: return CGPoint(x: r.maxX, y: r.midY)
-        default: return r.origin
-        }
-    }
 
     struct RenderInfo {
         var renderArea: CGRect
@@ -2111,7 +2107,10 @@ private struct ImageTransformOverlay: View {
             videoSize: CGSize(width: videoW, height: videoH))
     }
 
-    private func computeImageRect(clip: ImageClip, info: RenderInfo) -> CGRect {
+    /// - Parameter applyCrop: false 时返回**裁剪之前**的整幅矩形。
+    ///   `TransformBox` 要的是完整框加裁剪比例，自己算露出来的那块
+    private func computeImageRect(clip: ImageClip, info: RenderInfo,
+                                  applyCrop: Bool = true) -> CGRect {
         let imgW = CGFloat(clip.imageWidth)
         let imgH = CGFloat(clip.imageHeight)
         guard imgW > 0, imgH > 0 else { return .zero }
@@ -2132,10 +2131,10 @@ private struct ImageTransformOverlay: View {
         let fullTop  = cy - fullH / 2
 
         // Crop region within the full image (in video coords)
-        let cropX = fullLeft + imgW * CGFloat(clip.cropLeft) * finalSX
-        let cropY = fullTop  + imgH * CGFloat(clip.cropTop)  * finalSY
-        let cropW = imgW * (1 - CGFloat(clip.cropLeft + clip.cropRight))  * finalSX
-        let cropH = imgH * (1 - CGFloat(clip.cropTop  + clip.cropBottom)) * finalSY
+        let cropX = applyCrop ? fullLeft + imgW * CGFloat(clip.cropLeft) * finalSX : fullLeft
+        let cropY = applyCrop ? fullTop  + imgH * CGFloat(clip.cropTop)  * finalSY : fullTop
+        let cropW = applyCrop ? imgW * (1 - CGFloat(clip.cropLeft + clip.cropRight))  * finalSX : fullW
+        let cropH = applyCrop ? imgH * (1 - CGFloat(clip.cropTop  + clip.cropBottom)) * finalSY : fullH
         guard cropW > 0, cropH > 0 else { return .zero }
 
         let vs = info.renderArea.width / info.videoSize.width
@@ -2173,16 +2172,41 @@ private struct ShapeShadow: ViewModifier {
     }
 }
 
+/// 图形裁剪：按 0~1 比例从四边往里裁。没裁剪时原样返回，
+/// 免得每个图形都白套一层 GeometryReader
+private struct ShapeCropMask: ViewModifier {
+    let clip: ShapeClip
+
+    func body(content: Content) -> some View {
+        if clip.cropTop <= 0, clip.cropBottom <= 0, clip.cropLeft <= 0, clip.cropRight <= 0 {
+            content
+        } else {
+            content.mask(
+                GeometryReader { g in
+                    Rectangle()
+                        .padding(.top, g.size.height * clip.cropTop)
+                        .padding(.bottom, g.size.height * clip.cropBottom)
+                        .padding(.leading, g.size.width * clip.cropLeft)
+                        .padding(.trailing, g.size.width * clip.cropRight)
+                }
+            )
+        }
+    }
+}
+
 struct ShapeClipView: View {
     let clip: ShapeClip
     let scale: CGFloat
     var selected: Bool = false
+    /// 同 `TextLabel.applyRotation`：渲染出图时关掉，交给画布上下文转
+    var applyRotation: Bool = true
 
     var body: some View {
         let w = max(clip.width * clip.scaleX * scale, 2)
         let h = max(clip.height * clip.scaleY * scale, 2)
         shapeBody(w: w, h: h)
             .frame(width: w, height: h)
+            .modifier(ShapeCropMask(clip: clip))
             .overlay {
                 if selected {
                     Rectangle().strokeBorder(Color.accent.opacity(0.9), lineWidth: 1.5)
@@ -2192,7 +2216,7 @@ struct ShapeClipView: View {
             .frame(width: max(w, 28), height: max(h, 28))   // 扩大点击热区（线段等细图形好点）
             .contentShape(Rectangle())
             .scaleEffect(x: clip.mirrorH ? -1 : 1, y: clip.mirrorV ? -1 : 1)
-            .rotationEffect(.degrees(clip.rotation))
+            .rotationEffect(.degrees(applyRotation ? clip.rotation : 0))
             .opacity(clip.opacity)
     }
 
@@ -2347,7 +2371,7 @@ private struct ShapeOverlay: View {
                         )
                         .onTapGesture {
                             if NSEvent.modifierFlags.contains(.shift) {
-                                project.shiftToggleClip(clip.id)
+                                project.shiftCycleOverlapping(clip.id)
                             } else {
                                 selectExclusive(clip.id)
                             }
@@ -2371,88 +2395,129 @@ private struct ShapeOverlay: View {
 
 // MARK: - Text Transform Overlay
 
-private struct TextTransformOverlay: View {
+/// 文字的选中框（四角圆点 + 四边横条 + 旋转手柄）。预览区和封面弹窗共用。
+///
+/// 横条**两种状态两种含义**：
+/// - 没进编辑态（无光标）：裁剪，可以只露出半个字，裁掉的不显示
+/// - 双击进编辑态（有光标）：拖文本框大小，字号不变
+///
+/// 四角圆点两种状态下都在（改字号）
+///
+/// 两个可选参数同 `PenDrawingOverlay`：画谁（`clipOverride`）、改动写给谁
+/// （`onUpdate`）。都不传就是预览区那条老路
+struct TextTransformOverlay: View {
+    var clipOverride: TextClip? = nil
+    var onUpdate: ((UUID, @escaping (inout TextClip) -> Void) -> Void)? = nil
+    /// 外部指定的编辑态。封面弹窗自己管输入框，走不了 `project.editingTextClipID`
+    var forceEditing = false
+
     @EnvironmentObject private var project: ProjectState
     @EnvironmentObject private var clock: PlaybackClock
 
-    @State private var dragMode = 0   // 0=none 1=scale 2=rotate
     @State private var didPushUndo = false
     @State private var startFontSize: CGFloat = 64
     @State private var startRotation = 0.0
-    @State private var startAngle = 0.0
+    // 起手时的文本框尺寸。拖过边之后框是定死的，四角缩放要连框一起放大，
+    // 否则字变大了框还在原地，跟图片、图形不是一个手感
+    @State private var startBoxW: Double? = nil
+    @State private var startBoxH: Double? = nil
 
     private let accent = Color.accent
 
     var body: some View {
         GeometryReader { geo in
-            if let clip = project.selectedTextClip,
-               clip.startTime <= clock.currentTime, clip.endTime > clock.currentTime,
-               project.selectedClipIDs.count <= 1 {
+            if let clip = resolvedClip {
                 let scale = geo.size.width / max(project.previewRenderSize.width, 1)
                 let center = CGPoint(x: geo.size.width * clip.posX, y: geo.size.height * clip.posY)
-                let sz = project.textClipViewSizes[clip.id] ?? textBoundsSize(clip: clip, scale: scale)
+                // 拖过边就**以范围框为准**，裁剪框跟着它走；
+                // 没拖过才用实测尺寸（文字自适应，测出来的才准）
+                let measured = (clip.boxWidth == nil && clip.boxHeight == nil && clipOverride == nil)
+                    ? project.textClipViewSizes[clip.id] : nil
+                let sz = measured ?? textBoundsSize(clip: clip, scale: scale)
                 let w = max(sz.width, 8)
                 let h = max(sz.height, 8)
 
-                ZStack {
-                    if project.editingTextClipID != clip.id {
-                        Rectangle().stroke(accent, lineWidth: 1.5)
-                            .frame(width: w, height: h)
-                            .rotationEffect(.degrees(clip.rotation))
-                            .position(center)
-                            .allowsHitTesting(false)
+                let editing = forceEditing || (clipOverride == nil && project.editingTextClipID == clip.id)
+                // 跟图片、图形同一个框组件。文字多的那个编辑态：
+                // 裁剪条收起来，四条边改成拖文本框大小
+                TransformBox(
+                    center: center,
+                    size: CGSize(width: w, height: h),
+                    rotation: clip.rotation,
+                    crop: TransformCrop(top: clip.cropTop, bottom: clip.cropBottom,
+                                        left: clip.cropLeft, right: clip.cropRight),
+                    editing: editing,
+                    showBorder: !editing,
+                    onBegin: {
+                        pushUndoOnce()
+                        startFontSize = clip.fontSize
+                        startRotation = clip.rotation
+                        startBoxW = clip.boxWidth
+                        startBoxH = clip.boxHeight
+                    },
+                    onEnd: { didPushUndo = false; startBoxW = nil; startBoxH = nil },
+                    onScale: { ratio in
+                        update(clip.id) {
+                            $0.fontSize = max(8, startFontSize * CGFloat(ratio))
+                            // 拖过边的文本框是定死尺寸的，得跟着一起放大
+                            if let bw = startBoxW { $0.boxWidth = max(8, bw * ratio) }
+                            if let bh = startBoxH { $0.boxHeight = max(8, bh * ratio) }
+                        }
+                    },
+                    onCrop: { e, value in
+                        update(clip.id) {
+                            switch e {
+                            case 0: $0.cropTop = value
+                            case 1: $0.cropBottom = value
+                            case 2: $0.cropLeft = value
+                            default: $0.cropRight = value
+                            }
+                        }
+                    },
+                    onRotate: { delta in
+                        update(clip.id) { $0.rotation = startRotation + delta }
+                    },
+                    onEdgeResize: { e, d in
+                        // 对边不动，只有拖的这条边跟着走，中心补到两边中点。
+                        // padding 是框比文字多出来的一圈，扣掉再写回 boxWidth/boxHeight
+                        let padH = 20 * scale, padV = 10 * scale
+                        let vertical = e < 2
+                        let half = vertical ? h / 2 : w / 2
+                        let fixed = (e == 0 || e == 2) ? half : -half
+                        let moving = min(max(vertical ? d.y : d.x, -half * 8), half * 8)
+                        let newLen = max(abs(moving - fixed), 16)
+                        let midLocal = (moving + fixed) / 2
+                        let back = rotate(vertical ? 0 : midLocal,
+                                          vertical ? midLocal : 0, clip.rotation)
+                        update(clip.id) {
+                            if vertical { $0.boxHeight = Double(max(newLen - padV, 8) / scale) }
+                            else { $0.boxWidth = Double(max(newLen - padH, 8) / scale) }
+                            $0.posX = min(1, max(0, Double((center.x + back.x) / max(geo.size.width, 1))))
+                            $0.posY = min(1, max(0, Double((center.y + back.y) / max(geo.size.height, 1))))
+                        }
                     }
-
-                    ForEach(0..<4, id: \.self) { i in
-                        handleDot()
-                            .position(rotatedCorner(i, center: center, w: w, h: h, rot: clip.rotation))
-                            .gesture(scaleGesture(clip: clip, center: center))
-                    }
-
-                    rotHandleView()
-                        .position(rotationHandlePos(center: center, h: h, rot: clip.rotation))
-                        .gesture(rotateGesture(clip: clip, center: center))
-                }
+                )
             }
         }
     }
 
-    private func handleDot() -> some View {
-        ZStack {
-            Circle().fill(Color.white).frame(width: 11, height: 11)
-            Circle().stroke(accent, lineWidth: 1.5).frame(width: 11, height: 11)
-        }
-        .shadow(color: .black.opacity(0.3), radius: 2, y: 1)
-        .frame(width: 26, height: 26)
-        .contentShape(Circle())
+    /// 画谁：外部指定优先，否则是时间轴上选中且当前时刻可见的那条
+    private var resolvedClip: TextClip? {
+        if let c = clipOverride { return c }
+        guard let c = project.selectedTextClip,
+              c.startTime <= clock.currentTime, c.endTime > clock.currentTime,
+              project.selectedClipIDs.count <= 1 else { return nil }
+        return c
     }
 
-    private func rotHandleView() -> some View {
-        ZStack {
-            Circle().fill(Color.white).frame(width: 14, height: 14)
-            Image(systemName: "arrow.triangle.2.circlepath")
-                .font(.system(size: 8, weight: .bold)).foregroundColor(accent)
-        }
-        .shadow(color: .black.opacity(0.3), radius: 2, y: 1)
-        .frame(width: 28, height: 28)
-        .contentShape(Circle())
+    /// 改动写给谁：外部接管就交出去，否则写时间轴
+    private func update(_ id: UUID, _ f: @escaping (inout TextClip) -> Void) {
+        if let onUpdate { onUpdate(id, f) } else { project.updateTextClip(id: id, f) }
     }
 
     private func rotate(_ dx: CGFloat, _ dy: CGFloat, _ deg: Double) -> CGPoint {
         let r = CGFloat(deg * .pi / 180)
         return CGPoint(x: dx * cos(r) - dy * sin(r), y: dx * sin(r) + dy * cos(r))
-    }
-
-    private func rotatedCorner(_ i: Int, center: CGPoint, w: CGFloat, h: CGFloat, rot: Double) -> CGPoint {
-        let hw = w / 2, hh = h / 2
-        let offs = [(-hw, -hh), (hw, -hh), (-hw, hh), (hw, hh)][i]
-        let p = rotate(offs.0, offs.1, rot)
-        return CGPoint(x: center.x + p.x, y: center.y + p.y)
-    }
-
-    private func rotationHandlePos(center: CGPoint, h: CGFloat, rot: Double) -> CGPoint {
-        let p = rotate(0, -h / 2 - 26, rot)
-        return CGPoint(x: center.x + p.x, y: center.y + p.y)
     }
 
     private func textBoundsSize(clip: TextClip, scale: CGFloat) -> CGSize {
@@ -2464,47 +2529,28 @@ private struct TextTransformOverlay: View {
         }
         let text = clip.text.isEmpty ? " " : clip.text
         let size = (text as NSString).size(withAttributes: [.font: font!])
-        return CGSize(width: size.width + 20 * scale, height: size.height + 10 * scale)
+        // 拖过边就以文本框尺寸为准，裁剪和手柄都跟着它走
+        return CGSize(width: clip.boxWidth.map { CGFloat($0) * scale + 20 * scale } ?? size.width + 20 * scale,
+                      height: clip.boxHeight.map { CGFloat($0) * scale + 10 * scale } ?? size.height + 10 * scale)
     }
 
     private func pushUndoOnce() {
+        // 外部接管时撤销由外部管（封面弹窗是取消/确认，没有撤销栈）
+        guard clipOverride == nil else { return }
         if !didPushUndo { project.pushUndo(); didPushUndo = true }
     }
 
-    private func scaleGesture(clip: TextClip, center: CGPoint) -> some Gesture {
-        DragGesture(minimumDistance: 1)
-            .onChanged { v in
-                if dragMode != 1 { pushUndoOnce(); dragMode = 1; startFontSize = clip.fontSize }
-                let d0 = hypot(v.startLocation.x - center.x, v.startLocation.y - center.y)
-                let d1 = hypot(v.location.x - center.x, v.location.y - center.y)
-                guard d0 > 1 else { return }
-                project.updateTextClip(id: clip.id) {
-                    $0.fontSize = max(8, startFontSize * (d1 / d0))
-                }
-            }
-            .onEnded { _ in dragMode = 0; didPushUndo = false }
-    }
-
-    private func rotateGesture(clip: TextClip, center: CGPoint) -> some Gesture {
-        DragGesture(minimumDistance: 1)
-            .onChanged { v in
-                if dragMode != 2 {
-                    pushUndoOnce(); dragMode = 2
-                    startRotation = clip.rotation
-                    startAngle = atan2(Double(v.startLocation.y - center.y),
-                                       Double(v.startLocation.x - center.x)) * 180 / .pi
-                }
-                let cur = atan2(Double(v.location.y - center.y),
-                                Double(v.location.x - center.x)) * 180 / .pi
-                project.updateTextClip(id: clip.id) { $0.rotation = startRotation + (cur - startAngle) }
-            }
-            .onEnded { _ in dragMode = 0; didPushUndo = false }
-    }
 }
 
 // MARK: - Shape Transform Overlay（选中边框；缩放/旋转手柄见 2b）
 
-private struct ShapeTransformOverlay: View {
+/// 图形的选中框（四角圆点 + 四边缩放条 + 旋转手柄）。预览区和封面弹窗共用。
+///
+/// 两个可选参数同 `TextTransformOverlay`：画谁、改动写给谁
+struct ShapeTransformOverlay: View {
+    var clipOverride: ShapeClip? = nil
+    var onUpdate: ((UUID, @escaping (inout ShapeClip) -> Void) -> Void)? = nil
+
     @EnvironmentObject private var project: ProjectState
     @EnvironmentObject private var clock: PlaybackClock
     @Environment(\.windowID) private var windowID
@@ -2520,53 +2566,75 @@ private struct ShapeTransformOverlay: View {
 
     var body: some View {
         GeometryReader { geo in
-            if let clip = project.selectedShapeClip,
-               clip.startTime <= clock.currentTime, clip.endTime > clock.currentTime,
-               !project.penDrawingMode, project.penEditingClipID != clip.id,
-               project.selectedClipIDs.count <= 1 {
+            if let clip = resolvedClip {
                 let scale = geo.size.width / max(project.previewRenderSize.width, 1)
                 let center = CGPoint(x: geo.size.width * clip.posX, y: geo.size.height * clip.posY)
                 let w = max(clip.width * clip.scaleX * scale, 8)
                 let h = max(clip.height * clip.scaleY * scale, 8)
+                // 框贴**裁剪后露出来的那块**，跟图片、文字一致
+                let vw = max(w * (1 - clip.cropLeft - clip.cropRight), 8)
+                let vh = max(h * (1 - clip.cropTop - clip.cropBottom), 8)
+                let coff = rotate(w * (clip.cropLeft - clip.cropRight) / 2,
+                                  h * (clip.cropTop - clip.cropBottom) / 2,
+                                  clip.rotation)
+                let vc = CGPoint(x: center.x + coff.x, y: center.y + coff.y)
                 ZStack {
-                    // 边框
-                    Rectangle().stroke(accent, lineWidth: 1.5)
-                        .frame(width: w, height: h)
-                        .rotationEffect(.degrees(clip.rotation))
-                        .position(center)
-                        .allowsHitTesting(false)
-
                     if clip.effectiveIsClosed || clip.type == .pen {
-                        // 四边单向缩放条（橙色，和图片一致）
-                        ForEach(0..<4, id: \.self) { e in
-                            let horiz = e < 2
-                            let len = horiz ? min(w * 0.4, 44) : min(h * 0.4, 44)
-                            edgeBar(horizontal: horiz, length: len, rot: clip.rotation)
-                                .position(edgeMid(e, center: center, w: w, h: h, rot: clip.rotation))
-                                .gesture(edgeScaleGesture(clip: clip, center: center, scale: scale, edge: e, geo: geo.size))
-                        }
-                        // 四角缩放手柄
-                        ForEach(0..<4, id: \.self) { i in
-                            handleDot()
-                                .position(rotatedCorner(i, center: center, w: w, h: h, rot: clip.rotation))
-                                .gesture(scaleGesture(clip: clip, center: center, scale: scale))
-                        }
+                        // 跟图片、文字同一个框组件：四角缩放、四边裁剪、上方旋转
+                        TransformBox(
+                            center: center,
+                            size: CGSize(width: w, height: h),
+                            rotation: clip.rotation,
+                            crop: TransformCrop(top: clip.cropTop, bottom: clip.cropBottom,
+                                                left: clip.cropLeft, right: clip.cropRight),
+                            onBegin: {
+                                pushUndoOnce()
+                                startClip = clip
+                                startRotation = clip.rotation
+                            },
+                            onEnd: { didPushUndo = false; startClip = nil },
+                            onScale: { ratio in
+                                guard let sc = startClip else { return }
+                                update(clip.id) {
+                                    $0.scaleX = max(0.05, sc.scaleX * ratio)
+                                    $0.scaleY = max(0.05, sc.scaleY * ratio)
+                                }
+                            },
+                            onCrop: { e, value in
+                                update(clip.id) {
+                                    switch e {
+                                    case 0: $0.cropTop = value
+                                    case 1: $0.cropBottom = value
+                                    case 2: $0.cropLeft = value
+                                    default: $0.cropRight = value
+                                    }
+                                }
+                            },
+                            onRotate: { delta in
+                                update(clip.id) { $0.rotation = startRotation + delta }
+                            }
+                        )
                     } else {
-                        // 线段/箭头：两端控制点（拖动改长度/方向/位置）
-                        let pL = endpoint(center: center, w: w, rot: clip.rotation, right: false)
-                        let pR = endpoint(center: center, w: w, rot: clip.rotation, right: true)
+                        // 线段、箭头没有面积，给的是两端控制点（拖动改长度/方向/位置）
+                        Rectangle().stroke(accent, lineWidth: 1.5)
+                            .frame(width: vw, height: vh)
+                            .rotationEffect(.degrees(clip.rotation))
+                            .position(vc)
+                            .allowsHitTesting(false)
+                        let pL = endpoint(center: vc, w: vw, rot: clip.rotation, right: false)
+                        let pR = endpoint(center: vc, w: vw, rot: clip.rotation, right: true)
                         handleDot().position(pL)
                             .gesture(endpointGesture(clip: clip, fixed: pR, draggingRight: false, scale: scale, geo: geo.size))
                         handleDot().position(pR)
                             .gesture(endpointGesture(clip: clip, fixed: pL, draggingRight: true, scale: scale, geo: geo.size))
-                    }
 
-                    // 旋转手柄
-                    rotHandleView()
-                        .position(rotationHandlePos(center: center, h: h, rot: clip.rotation))
-                        .gesture(rotateGesture(clip: clip, center: center))
+                        rotHandleView()
+                            .position(rotationHandlePos(center: vc, h: vh, rot: clip.rotation))
+                            .gesture(rotateGesture(clip: clip, center: center))
+                    }
                 }
-                .onAppear { installPenEnterMonitor() }
+                // 回车进钢笔编辑是时间轴那条路的事，封面弹窗不装这个监听
+                .onAppear { if clipOverride == nil { installPenEnterMonitor() } }
                 .onDisappear { removePenEnterMonitor() }
             }
         }
@@ -2659,7 +2727,24 @@ private struct ShapeTransformOverlay: View {
             .rotationEffect(.degrees(rot))
     }
 
+    /// 画谁：外部指定优先，否则是时间轴上选中且当前时刻可见的那条
+    private var resolvedClip: ShapeClip? {
+        if let c = clipOverride { return c }
+        guard let c = project.selectedShapeClip,
+              c.startTime <= clock.currentTime, c.endTime > clock.currentTime,
+              !project.penDrawingMode, project.penEditingClipID != c.id,
+              project.selectedClipIDs.count <= 1 else { return nil }
+        return c
+    }
+
+    /// 改动写给谁：外部接管就交出去，否则写时间轴
+    private func update(_ id: UUID, _ f: @escaping (inout ShapeClip) -> Void) {
+        if let onUpdate { onUpdate(id, f) } else { project.updateShapeClip(id: id, f) }
+    }
+
     private func pushUndoOnce() {
+        // 外部接管时撤销由外部管（封面弹窗是取消/确认，没有撤销栈）
+        guard clipOverride == nil else { return }
         if !didPushUndo { project.pushUndo(); didPushUndo = true }
     }
 
@@ -2668,24 +2753,24 @@ private struct ShapeTransformOverlay: View {
         return rotate(base.0, base.1, rot)
     }
 
-    // 四边单向缩放：对边固定，只拖动的那条边移动（和图片裁剪条一致的手感）
-    private func edgeScaleGesture(clip: ShapeClip, center: CGPoint, scale: CGFloat, edge: Int, geo: CGSize) -> some Gesture {
+    /// 拖四边横条 = 裁剪。比例相对**没裁之前**的完整框算，留 5% 免得裁没了。
+    ///
+    /// 以前这里是单向缩放（改 scaleX/scaleY），现在不等比缩放统一走属性区那两个滑块
+    private func edgeCropGesture(clip: ShapeClip, center: CGPoint,
+                                 edge: Int, w: CGFloat, h: CGFloat) -> some Gesture {
         DragGesture(minimumDistance: 1)
             .onChanged { v in
                 if dragMode != 1 { pushUndoOnce(); dragMode = 1; startClip = clip }
-                let vertical = edge < 2
-                let n = edgeNormal(edge, Double(clip.rotation))
-                let dimView = vertical ? clip.height * clip.scaleY * scale : clip.width * clip.scaleX * scale
-                let opp = CGPoint(x: center.x - dimView / 2 * n.x, y: center.y - dimView / 2 * n.y)
-                let t = (v.location.x - opp.x) * n.x + (v.location.y - opp.y) * n.y
-                let tt = max(t, 8)
-                let newCenter = CGPoint(x: opp.x + tt / 2 * n.x, y: opp.y + tt / 2 * n.y)
-                let baseDim = vertical ? clip.height : clip.width
-                let newScale = max(0.05, Double(tt) / (Double(max(baseDim, 1)) * Double(scale)))
-                project.updateShapeClip(id: clip.id) {
-                    if vertical { $0.scaleY = newScale } else { $0.scaleX = newScale }
-                    $0.posX = min(1, max(0, Double(newCenter.x) / Double(max(geo.width, 1))))
-                    $0.posY = min(1, max(0, Double(newCenter.y) / Double(max(geo.height, 1))))
+                guard let sc = startClip else { return }
+                // 转回图形自己的坐标系，转过角度之后拖边才跟手
+                let d = rotate(v.location.x - center.x, v.location.y - center.y, -clip.rotation)
+                update(clip.id) {
+                    switch edge {
+                    case 0: $0.cropTop = min(max(Double((d.y + h / 2) / h), 0), 1 - sc.cropBottom - 0.05)
+                    case 1: $0.cropBottom = min(max(Double((h / 2 - d.y) / h), 0), 1 - sc.cropTop - 0.05)
+                    case 2: $0.cropLeft = min(max(Double((d.x + w / 2) / w), 0), 1 - sc.cropRight - 0.05)
+                    default: $0.cropRight = min(max(Double((w / 2 - d.x) / w), 0), 1 - sc.cropLeft - 0.05)
+                    }
                 }
             }
             .onEnded { _ in dragMode = 0; didPushUndo = false; startClip = nil }
@@ -2702,7 +2787,7 @@ private struct ShapeTransformOverlay: View {
                 let d1 = hypot(v.location.x - center.x, v.location.y - center.y)
                 guard d0 > 1 else { return }
                 let ratio = d1 / d0
-                project.updateShapeClip(id: clip.id) {
+                update(clip.id) {
                     $0.scaleX = max(0.05, sc.scaleX * ratio)
                     $0.scaleY = max(0.05, sc.scaleY * ratio)
                 }
@@ -2719,7 +2804,7 @@ private struct ShapeTransformOverlay: View {
                     startAngle = atan2(Double(v.startLocation.y - center.y), Double(v.startLocation.x - center.x)) * 180 / .pi
                 }
                 let cur = atan2(Double(v.location.y - center.y), Double(v.location.x - center.x)) * 180 / .pi
-                project.updateShapeClip(id: clip.id) { $0.rotation = startRotation + (cur - startAngle) }
+                update(clip.id) { $0.rotation = startRotation + (cur - startAngle) }
             }
             .onEnded { _ in dragMode = 0; didPushUndo = false }
     }
@@ -2738,7 +2823,7 @@ private struct ShapeTransformOverlay: View {
                     : atan2(Double(fixed.y - drag.y), Double(fixed.x - drag.x))
                 let newCenter = CGPoint(x: (fixed.x + drag.x) / 2, y: (fixed.y + drag.y) / 2)
                 let newWidth = max(viewLen / (sc.scaleX * scale), 10)
-                project.updateShapeClip(id: clip.id) {
+                update(clip.id) {
                     $0.width = newWidth
                     $0.rotation = dir * 180 / .pi
                     $0.posX = min(1, max(0, newCenter.x / geo.width))

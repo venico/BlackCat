@@ -11,6 +11,9 @@ struct AIChatPanel: View {
     /// 而不是从空白开始
     @State private var showHistory = true
     @State private var swapHovering = false
+    /// 鼠标停在哪一条历史上。方法产出的行没法各自持 @State，只能记 id
+    @State private var hoverHistoryID: UUID?
+
     /// 正在重命名的历史会话
     @State private var renamingConversationID: UUID?
     @State private var renameDraft: String = ""
@@ -130,15 +133,18 @@ struct AIChatPanel: View {
                 .foregroundColor(Color.labelSecondary)
                 .textCase(.uppercase)
             Spacer()
-            // 可点的图标一律用 HoverIconButton，hover 有底色
-            HoverIconButton(icon: "clock", svgName: "chatHistory", tip: "历史会话") {
-                withAnimation(.easeInOut(duration: 0.18)) { showHistory.toggle() }
-            }
-            HoverIconButton(icon: "square.and.pencil", svgName: "newChat", tip: "新建对话") {
-                service.newConversation()
-                showHistory = false   // 建完直接进新会话，不留在列表里
+            // 进面板默认就停在历史列表上，这时候再放个「历史会话」图标是多余的；
+            // 进了某条会话（showHistory = false）才需要它退回列表。
+            // 新建那两个入口挪到下面的卡片上了，这儿不再重复
+            if !showHistory {
+                HoverIconButton(icon: "clock", svgName: "chatHistory", tip: "历史会话") {
+                    withAnimation(.easeInOut(duration: 0.18)) { showHistory = true }
+                }
             }
         }
+        // **高度按图标那 24pt 定死**：历史列表页不画右侧图标，
+        // 不撑着的话这一行会矮一截，两页之间标题就上下跳
+        .frame(height: 24)
         .padding(.leading, 10)
         .padding(.trailing, 8)
         // 顶部留白跟素材库那栏对齐（那边也是 8）——
@@ -149,14 +155,21 @@ struct AIChatPanel: View {
 
     // MARK: - 历史会话
 
-    /// 进画布的入口。原来这儿是「历史会话」折叠栏，历史挪到顶部图标了
+    /// 两个新建入口，并排放在会话区最上面
     private var canvasEntry: some View {
-        CanvasEntryButton {
-            let id = service.newCanvasConversation()
-            project.canvas.reset(conversationID: id)
-            project.showCanvas = true
+        HStack(spacing: 8) {
+            EntryCard(svgName: "freeCanvas", title: "新建画布") {
+                let id = service.newCanvasConversation()
+                project.canvas.reset(conversationID: id)
+                project.showCanvas = true
+            }
+            EntryCard(svgName: "newChat", title: "新建会话") {
+                service.newConversation()
+                showHistory = false   // 建完直接进新会话，不留在列表里
+            }
         }
         .padding(.horizontal, 8)
+        .padding(.bottom, 6)
     }
 
     /// 历史会话列表。展开时**铺满整个会话区** —— 之前限死 170pt，
@@ -171,7 +184,9 @@ struct AIChatPanel: View {
                 Spacer()
             } else {
                 ScrollView(showsIndicators: false) {
-                    VStack(spacing: 1) {
+                    // 间距走 VStack 的 spacing，不动每行自己的内边距 ——
+                    // 那样 hover / 选中的底色块高度不会跟着变
+                    VStack(spacing: 5) {
                         ForEach(service.history) { conv in
                             historyRow(conv)
                         }
@@ -257,11 +272,17 @@ struct AIChatPanel: View {
             }
             .padding(.horizontal, 8)
             .padding(.vertical, 5)
-            .background(isActive ? Color.white.opacity(0.1) : Color.clear)
+            .background(isActive ? Color.white.opacity(0.1)
+                                 : (hoverHistoryID == conv.id ? Color.white.opacity(0.06)
+                                                              : Color.clear))
             .cornerRadius(5)
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .onHover { inside in
+            if inside { hoverHistoryID = conv.id }
+            else if hoverHistoryID == conv.id { hoverHistoryID = nil }
+        }
         .contextMenu {
             Button { startRenaming(conv) } label: {
                 Image(nsImage: SidebarSVGIcon.load("rename", size: 14))
@@ -2217,21 +2238,24 @@ private final class ChatInputInner: ChatTextView {
 }
 
 
-/// 「新建自由画布」入口。可点的东西一律给 hover 反馈
-private struct CanvasEntryButton: View {
+/// 新建入口的小卡片。两个并排放在会话区最上面，可点的东西一律给 hover 反馈
+private struct EntryCard: View {
+    let svgName: String
+    let title: String
     let action: () -> Void
     @State private var hovering = false
 
     var body: some View {
         Button(action: action) {
             HStack(spacing: 6) {
-                Image(nsImage: SidebarSVGIcon.load("freeCanvas", size: 13))
+                Image(nsImage: SidebarSVGIcon.load(svgName, size: 13))
                     .renderingMode(.template)
                     .resizable()
                     .aspectRatio(contentMode: .fit)
                     .frame(width: 13, height: 13)
-                Text("新建自由画布")
+                Text(title)
                     .font(.system(size: 11, weight: .medium))
+                    .lineLimit(1)
             }
             .frame(maxWidth: .infinity)
             .foregroundColor(hovering ? .white : Color.labelPrimary)

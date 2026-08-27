@@ -84,12 +84,15 @@ struct ContentView: View {
                 .padding(.leading, 8)
                 .padding(.bottom, 8)
                 .transition(.move(edge: .leading).combined(with: .opacity))
-                // Sidebar right-edge drag handle (overlaps the 8px gap)
+                // 侧边栏右边缘的拖宽手柄。
+                //
+                // **不能再 offset 到边缘外面**：原来那儿有 8pt 空隙才推得出去，
+                // 现在紧挨着的就是预览区，而预览区在 HStack 里排在后面、画在上层，
+                // 推出去的部分会被它盖掉 —— 表现就是光标变了却拖不动
                 .overlay(alignment: .trailing) {
                     Color.clear
                         .frame(width: 8)
                         .contentShape(Rectangle())
-                        .offset(x: 8)
                         .zIndex(100)
                         .onContinuousHover { phase in
                             if case .active = phase { NSCursor.resizeLeftRight.set() } else { NSCursor.arrow.set() }
@@ -113,26 +116,30 @@ struct ContentView: View {
                 ZStack(alignment: .topLeading) {
                     VStack(spacing: 0) {
                         // Player + Inspector cards
-                        HStack(spacing: 8) {
+                        HStack(spacing: 0) {
                             PlayerView()
                                 .frame(maxWidth: .infinity)
-                                .background(Color.previewBg)
-                                // 预览区容器也要材质：容器透了却没铺材质的话，
-                                // 它和中间那块纯黑的画布就都是黑的，安全区边界看不出来
-                                .panelSurfaceClear(.content)
                                 .simultaneousGesture(TapGesture().onEnded {
                                     NSApp.keyWindow?.makeFirstResponder(nil)
                                 })
+                            // 预览区和属性区之间的分割线。**上下顶头** ——
+                            // 这一行的高度就是上半区的高度，线跟着占满
+                            Rectangle()
+                                .fill(Color.white.opacity(0.10))
+                                .frame(width: 1)
+                                .frame(maxHeight: .infinity)
+                                // 负边距把上半区自己的 8pt 顶部留白、以及下面那条
+                                // 8pt 拖动缝都补上，线才是真的上下顶头
+                                .padding(.top, -6)
+                                .padding(.bottom, -4)
                             InspectorView()
                                 .frame(width: inspectorWidth)
-                                .background(Color.panelBg)
-                                .panelSurfaceClear(.content)
-                                // Inspector left-edge drag handle (overlaps the 8px gap)
+                                // 拖宽度的热区**骑在线上**：左右各 4pt
                                 .overlay(alignment: .leading) {
                                     Color.clear
                                         .frame(width: 8)
                                         .contentShape(Rectangle())
-                                        .offset(x: -8)
+                                        .offset(x: -4)
                                         .zIndex(100)
                                         .onContinuousHover { phase in
                             if case .active = phase { NSCursor.resizeLeftRight.set() } else { NSCursor.arrow.set() }
@@ -152,12 +159,13 @@ struct ContentView: View {
                         }
                         .frame(height: topHeight)
                         .padding(.top, 8)
-                        .padding(.horizontal, 8)
 
-                        // Drag handle — the 8px gap between top and bottom cards
+                        // Drag handle — the 8px gap between top and bottom cards。
+                        // 缝里画一条分割线：三块都不铺底色了，全靠线划界
                         Color.clear
                             .frame(height: 8)
-                            .contentShape(Rectangle())
+                            .overlay(Rectangle().fill(Color.white.opacity(0.10)).frame(height: 1))
+                            .contentShape(Rectangle())   // 线在正中，热区上下各 4pt
                             .zIndex(100)
                             .onContinuousHover { phase in if case .active = phase { NSCursor.resizeUpDown.set() } else { NSCursor.arrow.set() } }
                             .gesture(DragGesture(minimumDistance: 1, coordinateSpace: .global)
@@ -182,13 +190,10 @@ struct ContentView: View {
                                 .fixedSize(horizontal: false, vertical: true)
                         }
                         .frame(maxHeight: .infinity)
-                        .background(Color.timelineBg)
-                        .panelSurfaceClear(.content)
                         .simultaneousGesture(TapGesture().onEnded {
                             NSApp.keyWindow?.makeFirstResponder(nil)
                         })
                         .padding(.bottom, 8)
-                        .padding(.horizontal, 8)
                     }
                     .onAppear {
                         topHeight = geo.size.height * 0.60

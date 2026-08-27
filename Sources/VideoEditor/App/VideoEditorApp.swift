@@ -326,7 +326,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate 
     @objc private func showAbout() {
         NSApp.orderFrontStandardAboutPanel(options: [
             .applicationName: "黑猫剪辑",
-            .applicationVersion: "5.3.0",
+            .applicationVersion: "5.3.5",
             .version: "",
             .credits: NSAttributedString(string: "")
         ])

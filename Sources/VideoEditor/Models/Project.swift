@@ -141,6 +141,10 @@ final class ProjectState: ObservableObject {
         }
         return false
     }
+    /// Shift 在重叠处是在「循环加选」还是「循环减选」。
+    /// 纯交互状态，不参与渲染，所以不用 @Published
+    var shiftCycleRemoving = false
+
     @Published var overlayTrackOrder: [OverlayTrackRef] = []
 
     // Codable：这两个要跟着项目文件存盘，否则复合片段重新打开后位置会跑掉

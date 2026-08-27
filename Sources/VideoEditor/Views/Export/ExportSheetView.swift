@@ -2204,6 +2204,26 @@ actor TimelineExporter {
             ciImg = ciImg.cropped(to: CGRect(x: cx, y: cy, width: cw, height: ch))
         }
 
+        // 圆角：切在裁剪之后、变换之前，跟预览里 clipShape 的位置对应。
+        // 用 CIRoundedRectangleGenerator 生成一张圆角白图当遮罩，
+        // 再拿它把图片的四角抠掉
+        if clip.corner > 0.01 {
+            let box = ciImg.extent
+            if box.width > 1, box.height > 1,
+               let gen = CIFilter(name: "CIRoundedRectangleGenerator") {
+                let r = min(CGFloat(clip.corner), min(box.width, box.height) / 2)
+                gen.setValue(CIVector(cgRect: box), forKey: "inputExtent")
+                gen.setValue(r, forKey: "inputRadius")
+                gen.setValue(CIColor.white, forKey: "inputColor")
+                if let mask = gen.outputImage?.cropped(to: box) {
+                    ciImg = ciImg.applyingFilter("CIBlendWithAlphaMask", parameters: [
+                        kCIInputBackgroundImageKey: CIImage.empty(),
+                        kCIInputMaskImageKey: mask
+                    ]).cropped(to: box)
+                }
+            }
+        }
+
         // 整幅画面（未裁剪）的范围。旋转锚点和 fit 尺寸都以它为准，
         // 裁剪只遮住一块、不改变画面的缩放和位置
         let fullExtent = CGRect(x: 0, y: 0, width: natW, height: natH)
@@ -2226,8 +2246,11 @@ actor TimelineExporter {
         // 旋转后整幅画面占的范围：90°/270° 时宽高互换，fit 据此按新方向适配画布
         let rotFull = fullExtent.applying(mt)
 
-        // 缩放：baseScale 让整幅画面 fit 画布，再乘用户 scaleX/scaleY
-        let baseScale = min(rw / rotFull.width, rh / rotFull.height)
+        // 缩放：baseScale 让整幅画面 fit 画布，再乘用户 scaleX/scaleY。
+        // **倍率按 `rotatedFitSize` 算，不是按 rotFull** —— 只有正 90°/270° 换宽高，
+        // 任意角度按外接矩形算的话画面会随着旋转一起缩放（预览侧同一套规则）
+        let fitBasis = rotatedFitSize(fullExtent.size, rotation: clip.rotation)
+        let baseScale = min(rw / fitBasis.width, rh / fitBasis.height)
         let sx = baseScale * CGFloat(clip.scaleX)
         let sy = baseScale * CGFloat(clip.scaleY)
 
@@ -2259,6 +2282,13 @@ actor TimelineExporter {
                                   width: CGFloat(clip.strokeW),
                                   color: clip.strokeColor,
                                   softness: clip.strokeSoft)
+
+        // 图层自身的不透明度，放在最后（描边也要一起变淡）
+        if clip.alpha < 0.999 {
+            ciImg = ciImg.applyingFilter("CIColorMatrix", parameters: [
+                "inputAVector": CIVector(x: 0, y: 0, z: 0, w: CGFloat(clip.alpha))
+            ])
+        }
 
         // 裁剪到画布范围
         ciImg = ciImg.cropped(to: CGRect(origin: .zero, size: renderSize))
@@ -2456,10 +2486,14 @@ actor TimelineExporter {
             ]
             let attrStr = NSAttributedString(string: clip.text.isEmpty ? " " : clip.text, attributes: attrs)
             let setter = CTFramesetterCreateWithAttributedString(attrStr)
-            let constraint = CGSize(width: maxW - padH * 2, height: CGFloat.greatestFiniteMagnitude)
+            // 设过文本框宽度就按它换行，没设才按文字自己撑开（跟预览一致）
+            let boxW = clip.boxWidth.map { CGFloat($0) * scale }
+            let boxH = clip.boxHeight.map { CGFloat($0) * scale }
+            let constraint = CGSize(width: boxW ?? (maxW - padH * 2),
+                                    height: CGFloat.greatestFiniteMagnitude)
             let textSize = CTFramesetterSuggestFrameSizeWithConstraints(setter, CFRange(), nil, constraint, nil)
-            let layerW = ceil(textSize.width) + padH * 2
-            let layerH = ceil(textSize.height) + padV * 2
+            let layerW = (boxW ?? ceil(textSize.width)) + padH * 2
+            let layerH = (boxH ?? ceil(textSize.height)) + padV * 2
 
             let centerX = CGFloat(w) * clip.posX
             let centerY = CGFloat(h) * clip.posY
@@ -2480,8 +2514,9 @@ actor TimelineExporter {
                 var sr: CGFloat = 0, sg: CGFloat = 0, sb: CGFloat = 0, sa: CGFloat = 0
                 sc.getRed(&sr, green: &sg, blue: &sb, alpha: &sa)
                 let strokeCG = CGColor(red: sr, green: sg, blue: sb, alpha: sa)
-                let r = max(0.6, clip.strokeWidth * 0.5) * scale
-                let off = max(0.6, clip.strokeWidth * 0.4) * scale
+                // 柔和度 0 = 硬边；以前 blur 写死成宽度的一半，怎么调都是糊的
+                let r = max(0.35, clip.strokeWidth * clip.strokeSoftness) * scale
+                let off = max(0.6, clip.strokeWidth) * scale
                 ctx.setShadow(offset: CGSize(width: off, height: off), blur: r, color: strokeCG)
             } else {
                 ctx.setShadow(offset: CGSize(width: 1 * scale, height: 1 * scale),
@@ -2563,6 +2598,13 @@ actor TimelineExporter {
                               color: cgc(clip.shadowColor, clip.shadowOpacity))
             }
             let rect = CGRect(x: cx - sw / 2, y: cy - sh / 2, width: sw, height: sh)
+            // 裁剪：比例相对整个图形框，跟预览里那层 mask 同一个口径
+            if clip.cropTop > 0 || clip.cropBottom > 0 || clip.cropLeft > 0 || clip.cropRight > 0 {
+                ctx.clip(to: CGRect(x: rect.minX + rect.width * clip.cropLeft,
+                                    y: rect.minY + rect.height * clip.cropTop,
+                                    width: rect.width * max(1 - clip.cropLeft - clip.cropRight, 0.01),
+                                    height: rect.height * max(1 - clip.cropTop - clip.cropBottom, 0.01)))
+            }
             if clip.type == .pen {
                 if let pts = clip.penPoints, pts.count >= 2 {
                     let penPath = ShapeGeometry.penPath(points: pts, closed: clip.penClosed, in: rect).cgPath
@@ -2888,16 +2930,38 @@ actor TimelineExporter {
                 ctx.rotate(by: -clip.rotation * .pi / 180)
                 ctx.translateBy(x: -centerX, y: -centerY)
             }
+            if clip.mirrorH || clip.mirrorV {
+                ctx.translateBy(x: centerX, y: centerY)
+                ctx.scaleBy(x: clip.mirrorH ? -1 : 1, y: clip.mirrorV ? -1 : 1)
+                ctx.translateBy(x: -centerX, y: -centerY)
+            }
 
-            // 描边阴影
+            // 裁剪：比例相对整个框（含内边距和背景），跟预览里那层 mask 同一个口径
+            if clip.cropTop > 0 || clip.cropBottom > 0 || clip.cropLeft > 0 || clip.cropRight > 0 {
+                ctx.clip(to: CGRect(x: xOrig + layerW * clip.cropLeft,
+                                    y: yOrig + layerH * clip.cropTop,
+                                    width: layerW * max(1 - clip.cropLeft - clip.cropRight, 0.01),
+                                    height: layerH * max(1 - clip.cropTop - clip.cropBottom, 0.01)))
+            }
+
+            // 描边阴影。CGContext 一次只能挂一个 shadow，所以八个方向靠**画八遍**堆出来
+            // （跟预览那层 TextStroke 同一套：硬边纯靠偏移，柔和度才放开模糊）
+            var strokeOffsets: [CGSize] = []
+            var strokeBlur: CGFloat = 0
+            var strokeCGColor: CGColor? = nil
             if clip.strokeWidth > 0 {
                 let sc = NSColor(clip.strokeColor).usingColorSpace(.sRGB) ?? .black
                 var sr: CGFloat = 0, sg: CGFloat = 0, sb: CGFloat = 0, sa: CGFloat = 0
                 sc.getRed(&sr, green: &sg, blue: &sb, alpha: &sa)
-                let strokeCG = CGColor(red: sr, green: sg, blue: sb, alpha: sa)
-                let r = max(0.6, clip.strokeWidth * 0.5) * scale
-                let off = max(0.6, clip.strokeWidth * 0.4) * scale
-                ctx.setShadow(offset: CGSize(width: off, height: off), blur: r, color: strokeCG)
+                strokeCGColor = CGColor(red: sr, green: sg, blue: sb, alpha: sa)
+                strokeBlur = max(0.35, clip.strokeWidth * clip.strokeSoftness) * scale
+                let w = max(0.6, clip.strokeWidth) * scale
+                let k = w * 0.707
+                strokeOffsets = [CGSize(width: w, height: 0), CGSize(width: -w, height: 0),
+                                 CGSize(width: 0, height: w), CGSize(width: 0, height: -w),
+                                 CGSize(width: k, height: k), CGSize(width: -k, height: k),
+                                 CGSize(width: k, height: -k), CGSize(width: -k, height: -k)]
+                ctx.setShadow(offset: strokeOffsets[0], blur: strokeBlur, color: strokeCGColor)
             } else {
                 ctx.setShadow(offset: CGSize(width: 1 * scale, height: 1 * scale),
                               blur: 1 * scale,
@@ -2925,6 +2989,14 @@ actor TimelineExporter {
                                   width: layerW - padH * 2, height: layerH - padV * 2)
             let ctFrame = CTFramesetterCreateFrame(setter, CFRange(),
                                                     CGPath(rect: textRect, transform: nil), nil)
+            // 有描边就先把八个方向各画一遍（每遍换一个 shadow 偏移），最后再画正文
+            if let strokeCGColor, !strokeOffsets.isEmpty {
+                for off in strokeOffsets {
+                    ctx.setShadow(offset: off, blur: strokeBlur, color: strokeCGColor)
+                    CTFrameDraw(ctFrame, ctx)
+                }
+                ctx.setShadow(offset: .zero, blur: 0, color: nil)
+            }
             CTFrameDraw(ctFrame, ctx)
             ctx.restoreGState()
 

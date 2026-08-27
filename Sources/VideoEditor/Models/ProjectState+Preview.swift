@@ -599,7 +599,7 @@ extension ProjectState {
                             colorAdjust: clip.colorAdjust,
                             mirrorH:     clip.mirrorH,
                             mirrorV:     clip.mirrorV,
-                            rotation:    clip.rotation,
+                            rotation:    Double(clip.rotation),
                             naturalSize: natSize,
                             sourceTransform: (try? await entry.track.load(.preferredTransform)) ?? .identity,
                             opacityRamp: nil,
@@ -685,6 +685,8 @@ extension ProjectState {
                             mirrorH:     iclip.mirrorH,
                             mirrorV:     iclip.mirrorV,
                             rotation:    iclip.rotation,
+                            cornerRadius: iclip.corner,
+                            baseOpacity: iclip.alpha,
                             opacityRamp: nil,
                             pushRamp:    nil)
                         entries.append(te)

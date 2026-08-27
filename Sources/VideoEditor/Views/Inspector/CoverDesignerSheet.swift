@@ -25,16 +25,33 @@ struct CoverDesignerSheet: View {
     /// 底图是视频时它有多长 —— 选帧轨道按它铺
     @State private var sourceDuration: Double = 0
     /// 选中的是封面上哪个图层。属性栏跟着它变
+    /// 主选中的那个。属性区单选时显示它的属性
     @State private var selection: LayerRef?
+    /// Shift 加选的其余项。**主选也算在选区里**，见 `allSelected`
+    @State private var extraSel: Set<LayerRef> = []
+    /// Shift 在重叠处是在循环加选还是循环减选
+    @State private var shiftRemoving = false
+    /// 一起拖动时各自的起手位置
+    @State private var dragStartAll: [LayerRef: CGPoint] = [:]
+    /// 正在改文字的那条。双击进来，点别处或回车提交
+    @State private var editingTextID: UUID?
+    /// Delete / Backspace 的键盘监听
+    @State private var deleteMonitor: Any?
+    @State private var editingText: String = ""
+
     /// 钢笔绘制态。非 nil 时封面上盖一层预览区的 `PenDrawingOverlay`
     @State private var penDraftID: UUID?
     /// 拖动图层时的起始位置（相对坐标）。跟裁剪框一个道理：
     /// `translation` 是累计值，基准必须是**起手那一刻**的位置，不能拿每帧变的当前值
     @State private var dragStart: CGPoint?
 
-    enum LayerRef: Equatable {
+    enum LayerRef: Hashable {
         case text(UUID)
         case shape(UUID)
+
+        var id: UUID {
+            switch self { case .text(let i), .shape(let i): return i }
+        }
     }
 
     enum Category: String, CaseIterable {
@@ -62,12 +79,12 @@ struct CoverDesignerSheet: View {
             }
             footer
         }
-        // 高度 700 不是随便定的：620 时预览区只剩约 290pt 高，
-        // 16:9 的封面被高度卡住、宽度撑不满，左右白白空一大块。
-        // 加到 700 之后高度不再是瓶颈，横版封面能吃满整条可用宽度
-        .frame(width: 980, height: 700)
+        // 高度 660：620 时预览区只剩约 290pt 高，横版封面吃不满宽度；
+        // 700 又偏高，在小屏上顶到边。660 是两头都够用的折中
+        .frame(width: 980, height: 660)
         .floatingPanelMaterial()
-        .onAppear { loadDraft() }
+        .onAppear { loadDraft(); installDeleteMonitor() }
+        .onDisappear { removeDeleteMonitor() }
     }
 
     // MARK: - 顶部 / 底部
@@ -276,9 +293,39 @@ struct CoverDesignerSheet: View {
 
     // MARK: - 中：封面预览
 
+    /// 封面框、上传按钮、选帧轨道**是一组**，整体垂直居中。
+    ///
+    /// 按钮和轨道的高度先从可用高度里扣掉，剩下的才拿去算封面框 ——
+    /// 这样封面比例一变（框跟着变大变小），三者之间的间距还是固定的
+    private static let previewGap: CGFloat = 12       // 封面框 → 上传按钮
+    private static let stripGap: CGFloat = 24        // 上传按钮 → 选帧轨道
+    private static let uploadBarHeight: CGFloat = 26
+    private static let stripHeight: CGFloat = 54
+    private static var previewReserved: CGFloat {
+        previewGap + uploadBarHeight + stripGap + stripHeight
+    }
+
     private var previewPane: some View {
-        VStack(spacing: 0) {
-            // 右上角：上传图片 + 缩放，跟画布卡片那排浮动按钮一个位置
+        GeometryReader { geo in
+            let box = fitSize(in: CGSize(width: geo.size.width,
+                                         height: geo.size.height - Self.previewReserved))
+            VStack(spacing: 0) {
+                coverBox(box: box)
+                uploadBar
+                    .padding(.top, Self.previewGap)
+                frameStripView
+                    .frame(width: box.width, height: Self.stripHeight)
+                    .padding(.top, Self.stripGap)
+            }
+            .frame(width: geo.size.width, height: geo.size.height)
+        }
+        // 中间这栏自己一套边距：**16**，跟左右两栏的 24 区分开，让封面尽量大
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+    }
+
+    /// 上传按钮。跟封面框居中对齐，排在框正下方
+    private var uploadBar: some View {
             HStack(spacing: 6) {
                 Spacer()
                 Button { uploadImage() } label: {
@@ -288,7 +335,7 @@ struct CoverDesignerSheet: View {
                             .resizable()
                             .aspectRatio(contentMode: .fit)
                             .frame(width: 12, height: 12)
-                        Text("上传图片").font(.system(size: 11))
+                        Text("上传封面").font(.system(size: 11))
                     }
                     .foregroundColor(Color.labelPrimary)
                     .padding(.horizontal, 10)
@@ -298,93 +345,16 @@ struct CoverDesignerSheet: View {
                 }
                 .buttonStyle(.plain)
                 .help("上传一张图片当封面，同时收进素材库")
+                Spacer()
             }
             // 中间这栏自己一套边距：**16**，跟下面封面框、选帧轨道的留白一致。
             // 左右两栏用 24（跟弹窗标题对齐），中间窄一点让封面更大
-            .padding(.horizontal, 16)
-            .padding(.top, 4)
+        .frame(height: Self.uploadBarHeight)
+    }
 
-            // 6pt 让预览框的上边缘跟左栏搜索框的上边缘齐平
-            // （左栏：12 顶 + 24 标签 + 8 间距 = 44；这边：12 顶 + 26 工具栏 + 6 = 44）
-            Spacer().frame(height: 6)
-
-            GeometryReader { geo in
-                let box = fitSize(in: geo.size)
-                ZStack {
-                    RoundedRectangle(cornerRadius: 8).fill(Color.black.opacity(0.35))
-                    if let img = baseImage {
-                        // **缩放只作用在画面上，不改框的大小** ——
-                        // 乘进 frame 里的话放大就直接溢出到弹窗外面（实测盖住了左栏）
-                        // 底图的位置/缩放/旋转/镜像/裁剪/色调，都跟外面图片片段那套属性对齐。
-                        // 裁剪用 mask 掉四条边（值是 0~1 的比例，跟片段一致）；
-                        // 色调直接用 SwiftUI 的滤镜，参数区间跟 ColorAdjust 对齐
-                        Image(nsImage: img)
-                            .resizable()
-                            .aspectRatio(contentMode: .fill)
-                            .frame(width: box.width, height: box.height)
-                            .scaleEffect(x: draft.baseScale * (draft.baseMirrorH ? -1 : 1),
-                                         y: draft.baseScale * (draft.baseMirrorV ? -1 : 1))
-                            .rotationEffect(.degrees(draft.baseRotation))
-                            .offset(x: box.width * draft.baseOffsetX,
-                                    y: box.height * draft.baseOffsetY)
-                            .brightness(draft.colorAdjust.brightness)
-                            .contrast(1 + draft.colorAdjust.contrast)
-                            .saturation(1 + draft.colorAdjust.saturation)
-                            .hueRotation(.degrees(draft.colorAdjust.hue))
-                            .mask(
-                                Rectangle()
-                                    .padding(.top, box.height * draft.cropTop)
-                                    .padding(.bottom, box.height * draft.cropBottom)
-                                    .padding(.leading, box.width * draft.cropLeft)
-                                    .padding(.trailing, box.width * draft.cropRight)
-                            )
-                            .clipped()
-                    } else {
-                        VStack(spacing: 12) {
-                            Image(nsImage: SidebarSVGIcon.load("image", size: 48))
-                                .renderingMode(.template)
-                                .resizable()
-                                .aspectRatio(contentMode: .fit)
-                                .frame(width: 48, height: 48)
-                                .foregroundColor(Color.labelSecondary.opacity(0.35))
-                            Text("选择视频或图片素材截取图片或上传图片制作封面")
-                                .font(.system(size: 12))
-                                .foregroundColor(Color.labelSecondary)
-                                .multilineTextAlignment(.center)
-                                .padding(.horizontal, 40)
-                        }
-                    }
-                    // 叠在封面上的文字和图形。点选、拖动都在这一层
-                    ForEach(draft.shapes) { shape in
-                        coverShape(shape, box: box)
-                    }
-                    ForEach(draft.texts) { text in
-                        coverText(text, box: box)
-                    }
-
-                    // 钢笔：**用的就是预览区那一层** PenDrawingOverlay，
-                    // 点击落点、拖出控制柄、回到起点闭合、回车结束全都一样。
-                    // 封面框和预览一样按项目比例走，所以它内部那套
-                    // previewRenderSize 坐标换算原样能用
-                    if let draftID = penDraftID {
-                        PenDrawingOverlay(forcedClipID: draftID) { pts, closed in
-                            finishPenDrawing(rawPoints: pts, closed: closed)
-                        }
-                        .frame(width: box.width, height: box.height)
-                    }
-                }
-                .frame(width: box.width, height: box.height)
-                .clipShape(RoundedRectangle(cornerRadius: 8))
-                .contentShape(RoundedRectangle(cornerRadius: 8))
-                // 点空白处取消选中
-                .onTapGesture { selection = nil }
-                .position(x: geo.size.width / 2, y: geo.size.height / 2)
-            }
-
-            Spacer(minLength: 8)
-
-            // 选帧轨道：底图是视频才有。**位置一直留着** ——
-            // 有没有轨道都占同样高度，否则选中视频前后预览框会一大一小
+    /// 选帧轨道：底图是视频才有。**位置一直留着** ——
+    /// 有没有轨道都占同样高度，否则选中视频前后预览框会一大一小
+    private var frameStripView: some View {
             Group {
                 if sourceDuration > 0, let path = draft.sourcePath {
                     CoverFrameStrip(url: URL(fileURLWithPath: path),
@@ -397,12 +367,95 @@ struct CoverDesignerSheet: View {
                     Color.clear
                 }
             }
-            .frame(height: 54)
-            .padding(.horizontal, 16)
-            .padding(.top, 6)
-            .padding(.bottom, 10)
+    }
+
+    /// 封面框本体
+    private func coverBox(box: CGSize) -> some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: 8).fill(Color.black.opacity(0.35))
+            if let img = baseImage {
+                // **缩放只作用在画面上，不改框的大小** ——
+                // 乘进 frame 里的话放大就直接溢出到弹窗外面（实测盖住了左栏）
+                // 底图的位置/缩放/旋转/镜像/裁剪/色调，都跟外面图片片段那套属性对齐。
+                // 裁剪用 mask 掉四条边（值是 0~1 的比例，跟片段一致）；
+                // 色调直接用 SwiftUI 的滤镜，参数区间跟 ColorAdjust 对齐
+                Image(nsImage: img)
+                    .resizable()
+                    .aspectRatio(contentMode: .fill)
+                    .frame(width: box.width, height: box.height)
+                    // **裁剪排在缩放/旋转/位移之前** —— 排在后面的话裁剪线
+                    // 是钉在封面框上的，画面一缩放一移动就跟裁剪框对不上了
+                    .mask(
+                        Rectangle()
+                            .padding(.top, box.height * draft.cropTop)
+                            .padding(.bottom, box.height * draft.cropBottom)
+                            .padding(.leading, box.width * draft.cropLeft)
+                            .padding(.trailing, box.width * draft.cropRight)
+                    )
+                    // 圆角切在描边之前，描边才会沿着圆角走。
+                    // 圆角值是渲染坐标的像素，要换算到框的尺度上
+                    .clipShape(RoundedRectangle(
+                        cornerRadius: CGFloat(draft.cornerRadius)
+                            * (box.width / max(project.previewRenderSize.width, 1))))
+                    // 描边跟预览区图片片段共用同一个实现（八向阴影）。
+                    // 少了这一层，描边就只有点确认渲染时才出现，
+                    // 在弹窗里拖宽度滑块完全看不到反应
+                    .imageStroke(width: (draft.strokeWidth ?? 0)
+                                    * (box.width / max(project.previewRenderSize.width, 1)),
+                                 color: Color(hex: draft.strokeColorHex ?? "#FFFFFF"),
+                                 softness: draft.strokeSoftness ?? 0)
+                    .scaleEffect(x: draft.baseScale * (draft.baseMirrorH ? -1 : 1),
+                                 y: (draft.baseScaleY ?? draft.baseScale) * (draft.baseMirrorV ? -1 : 1))
+                    .opacity(draft.baseOpacity)
+                    .rotationEffect(.degrees(draft.baseRotation))
+                    .offset(x: box.width * draft.baseOffsetX,
+                            y: box.height * draft.baseOffsetY)
+                    .brightness(draft.colorAdjust.brightness)
+                    .contrast(1 + draft.colorAdjust.contrast)
+                    .saturation(1 + draft.colorAdjust.saturation)
+                    .hueRotation(.degrees(draft.colorAdjust.hue))
+                    .clipped()
+            } else {
+                VStack(spacing: 12) {
+                    Image(nsImage: SidebarSVGIcon.load("image", size: 48))
+                        .renderingMode(.template)
+                        .resizable()
+                        .aspectRatio(contentMode: .fit)
+                        .frame(width: 48, height: 48)
+                        .foregroundColor(Color.labelSecondary.opacity(0.35))
+                    Text("选择视频或图片素材截取图片或上传图片制作封面")
+                        .font(.system(size: 12))
+                        .foregroundColor(Color.labelSecondary)
+                        .multilineTextAlignment(.center)
+                        .padding(.horizontal, 40)
+                }
+            }
+            // 叠在封面上的文字和图形。点选、拖动都在这一层
+            ForEach(draft.shapes) { shape in
+                coverShape(shape, box: box)
+            }
+            ForEach(draft.texts) { text in
+                coverText(text, box: box)
+            }
+
+            // 钢笔：**用的就是预览区那一层** PenDrawingOverlay，
+            // 点击落点、拖出控制柄、回到起点闭合、回车结束全都一样。
+            // 封面框和预览一样按项目比例走，所以它内部那套
+            // previewRenderSize 坐标换算原样能用
+            if let draftID = penDraftID {
+                PenDrawingOverlay(forcedClipID: draftID) { pts, closed in
+                    finishPenDrawing(rawPoints: pts, closed: closed)
+                }
+                .frame(width: box.width, height: box.height)
+            } else {
+                transformOverlay(box: box)
+            }
         }
-        .frame(maxWidth: .infinity)
+        .frame(width: box.width, height: box.height)
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .contentShape(RoundedRectangle(cornerRadius: 8))
+        // 点空白处取消选中（顺便把正在改的文字提交掉）
+        .onTapGesture { commitTextEdit(); clearSelection() }
     }
 
     /// 封面框：按项目比例塞进可用区域。**跟 zoom 无关** ——
@@ -437,43 +490,406 @@ struct CoverDesignerSheet: View {
     // MARK: - 封面上的图层（文字 / 图形）
 
     /// 一条文字。位置是 0~1 的相对坐标，跟时间轴那套一致，
-    /// 字号按封面实际宽度换算 —— 预览缩小了字也要跟着缩小，否则所见非所得
+    /// 字号按封面实际宽度换算 —— 预览缩小了字也要跟着缩小，否则所见非所得。
+    ///
+    /// 渲染**直接用预览区那份 `TextLabel`**，双击进的输入框也是那份 `TextEditField`：
+    /// 自己另画一版的话，斜体、描边、背景色、对齐这些属性调了都没反应
     @ViewBuilder
     private func coverText(_ t: TextClip, box: CGSize) -> some View {
-        let picked = selection == .text(t.id)
         let scale = box.width / max(project.previewRenderSize.width, 1)
-        Text(t.text)
-            .font(.system(size: t.fontSize * scale,
-                          weight: t.bold ? .bold : .regular))
-            .italic(t.italic)
-            .foregroundColor(t.textColor)
-            .opacity(t.opacity)
-            .rotationEffect(.degrees(t.rotation))
-            .padding(4)
-            .overlay(RoundedRectangle(cornerRadius: 3)
-                .strokeBorder(Color.accent.opacity(picked ? 0.9 : 0), lineWidth: 1))
-            .position(x: box.width * t.posX, y: box.height * t.posY)
-            .onTapGesture { selection = .text(t.id) }
-            .gesture(dragGesture(for: .text(t.id), box: box,
-                                 current: CGPoint(x: t.posX, y: t.posY)))
+        if editingTextID == t.id {
+            // 输入框跟预览区双击进去的是同一个
+            TextEditField(text: $editingText, clip: t, scale: scale,
+                          onCommit: { commitTextEdit() })
+                .fixedSize()
+                .overlay(RoundedRectangle(cornerRadius: 4 * scale)
+                    .strokeBorder(Color.accent, lineWidth: 1.5))
+                .position(x: box.width * t.posX, y: box.height * t.posY)
+        } else {
+            TextLabel(clip: t, scale: scale)
+                .overlay(allSelected.count > 1 && isSelected(.text(t.id))
+                         ? Rectangle().stroke(Color.accent, lineWidth: 1.5) : nil)
+                .position(x: box.width * t.posX, y: box.height * t.posY)
+                .onTapGesture(count: 2) {
+                    commitTextEdit()
+                    editingText = t.text
+                    editingTextID = t.id
+                    selection = .text(t.id)
+                    extraSel = []
+                }
+                .onTapGesture { pick(.text(t.id)) }
+                .gesture(dragGesture(for: .text(t.id), box: box,
+                                     current: CGPoint(x: t.posX, y: t.posY)))
+        }
+    }
+
+    // MARK: - 选区
+
+    /// 当前选中的全部图层（主选 + 加选）
+    private var allSelected: [LayerRef] {
+        guard let s = selection else { return Array(extraSel) }
+        return [s] + extraSel.filter { $0 != s }
+    }
+
+    private func isSelected(_ ref: LayerRef) -> Bool {
+        selection == ref || extraSel.contains(ref)
+    }
+
+    /// 点选。按住 Shift 或 ⌘ 是加选/取消选；
+    /// 不按修饰键时，**点在重叠处会沿叠放顺序轮换**（跟预览区一个手感）
+    private func pick(_ ref: LayerRef) {
+        let additive = NSEvent.modifierFlags.contains(.shift)
+            || NSEvent.modifierFlags.contains(.command)
+        guard additive else {
+            selection = nextOverlapping(from: ref)
+            extraSel = []
+            return
+        }
+        // 重叠处：先把叠在一起的挨个加进来，全加完了再点就挨个移出去；
+        // 不重叠就是普通的加选 / 减选
+        let stack = overlappingStack(ref)
+        let target: LayerRef
+        if stack.count > 1 {
+            // 一个都没选中就从加选重新开始
+            if !stack.contains(where: { isSelected($0) }) { shiftRemoving = false }
+            if shiftRemoving {
+                target = stack.first(where: { isSelected($0) }) ?? ref
+            } else {
+                target = stack.first(where: { !isSelected($0) }) ?? ref
+                // 这一下加完就满了 → 下次开始往外减
+                if stack.allSatisfy({ isSelected($0) || $0 == target }) { shiftRemoving = true }
+            }
+        } else {
+            target = ref
+            shiftRemoving = false
+        }
+
+        if isSelected(target) {
+            extraSel.remove(target)
+            if selection == target {
+                selection = extraSel.first
+                if let s = selection { extraSel.remove(s) }
+            }
+            if !stack.contains(where: { isSelected($0) }) { shiftRemoving = false }
+        } else {
+            if selection == nil { selection = target } else { extraSel.insert(target) }
+        }
+    }
+
+    /// 跟这个图层外接框相交的所有图层，按叠放顺序（图形在下、文字在上）
+    private func overlappingStack(_ ref: LayerRef) -> [LayerRef] {
+        let all: [LayerRef] = draft.shapes.map { .shape($0.id) } + draft.texts.map { .text($0.id) }
+        let hits = all.filter { overlaps($0, with: ref) }
+        return hits.isEmpty ? [ref] : hits
+    }
+
+    /// 点到的这个位置上还压着谁。当前选中的那个的**下一个**，到底了绕回第一个
+    private func nextOverlapping(from ref: LayerRef) -> LayerRef {
+        let hits = overlappingStack(ref)
+        guard hits.count > 1 else { return ref }
+        guard let cur = selection, let i = hits.firstIndex(of: cur) else { return hits[0] }
+        return hits[(i + 1) % hits.count]
+    }
+
+    /// 两个图层的外接框有没有交叠。判定用的是渲染坐标下的中心和尺寸
+    private func overlaps(_ a: LayerRef, with b: LayerRef) -> Bool {
+        guard let ra = layerRect(a), let rb = layerRect(b) else { return false }
+        return ra.intersects(rb)
+    }
+
+    private func layerRect(_ ref: LayerRef) -> CGRect? {
+        let rs = project.previewRenderSize
+        switch ref {
+        case .text(let id):
+            guard let t = draft.texts.first(where: { $0.id == id }) else { return nil }
+            let box = t.boxWidth.map {
+                CGSize(width: $0, height: t.boxHeight ?? estimatedTextBox(t).height)
+            } ?? estimatedTextBox(t)
+            return CGRect(x: t.posX * Double(rs.width) - Double(box.width) / 2,
+                          y: t.posY * Double(rs.height) - Double(box.height) / 2,
+                          width: Double(box.width), height: Double(box.height))
+        case .shape(let id):
+            guard let sh = draft.shapes.first(where: { $0.id == id }) else { return nil }
+            let w = sh.width * sh.scaleX, h = sh.height * sh.scaleY
+            return CGRect(x: sh.posX * Double(rs.width) - w / 2,
+                          y: sh.posY * Double(rs.height) - h / 2,
+                          width: w, height: h)
+        }
+    }
+
+    private func clearSelection() {
+        selection = nil
+        extraSel = []
+    }
+
+    /// 删掉选中的全部图层
+    private func deleteSelected() {
+        // 一个图层都没选中时，删除键的目标是底图本身
+        guard !allSelected.isEmpty else { clearBase(); return }
+        for ref in allSelected {
+            switch ref {
+            case .text(let id): draft.texts.removeAll { $0.id == id }
+            case .shape(let id): draft.shapes.removeAll { $0.id == id }
+            }
+        }
+        clearSelection()
+    }
+
+    // MARK: - 多选
+
+    /// 交给多选面板的图层句柄。跟预览区那套一个结构，只是读写的是 draft
+    private var coverMultiLayers: [MultiLayerHandle] {
+        let rs = project.previewRenderSize
+        let rw = Double(rs.width), rh = Double(rs.height)
+        guard rw > 0, rh > 0 else { return [] }
+
+        return allSelected.compactMap { ref -> MultiLayerHandle? in
+            switch ref {
+            case .text(let id):
+                guard let t = draft.texts.first(where: { $0.id == id }) else { return nil }
+                let box = t.boxWidth.map {
+                    CGSize(width: $0, height: t.boxHeight ?? Double(t.fontSize) * 1.4)
+                } ?? estimatedTextBox(t)
+                return MultiLayerHandle(
+                    id: id,
+                    center: CGPoint(x: t.posX * rw, y: t.posY * rh),
+                    size: box, opacity: t.opacity,
+                    scaleBy: { k in self.withText(id) {
+                        $0.fontSize = max(8, $0.fontSize * CGFloat(k))
+                        if let w = $0.boxWidth { $0.boxWidth = w * k }
+                        if let h = $0.boxHeight { $0.boxHeight = h * k }
+                    } },
+                    moveBy: { d in self.withText(id) {
+                        $0.posX = min(1, max(0, $0.posX + Double(d.x) / rw))
+                        $0.posY = min(1, max(0, $0.posY + Double(d.y) / rh))
+                    } },
+                    rotateBy: { d in self.withText(id) { $0.rotation += d } },
+                    setOpacity: { v in self.withText(id) { $0.opacity = v } })
+            case .shape(let id):
+                guard let sh = draft.shapes.first(where: { $0.id == id }) else { return nil }
+                return MultiLayerHandle(
+                    id: id,
+                    center: CGPoint(x: sh.posX * rw, y: sh.posY * rh),
+                    size: CGSize(width: sh.width * sh.scaleX, height: sh.height * sh.scaleY),
+                    opacity: sh.opacity,
+                    scaleBy: { k in self.withShape(id) { $0.scaleX *= k; $0.scaleY *= k } },
+                    moveBy: { d in self.withShape(id) {
+                        $0.posX = min(1, max(0, $0.posX + Double(d.x) / rw))
+                        $0.posY = min(1, max(0, $0.posY + Double(d.y) / rh))
+                    } },
+                    rotateBy: { d in self.withShape(id) { $0.rotation += d } },
+                    setOpacity: { v in self.withShape(id) { $0.opacity = v } })
+            }
+        }
+    }
+
+    private func withText(_ id: UUID, _ f: (inout TextClip) -> Void) {
+        if let i = draft.texts.firstIndex(where: { $0.id == id }) { f(&draft.texts[i]) }
+    }
+    private func withShape(_ id: UUID, _ f: (inout ShapeClip) -> Void) {
+        if let i = draft.shapes.firstIndex(where: { $0.id == id }) { f(&draft.shapes[i]) }
+    }
+
+    /// 多选对齐：对齐选中那几个的包围盒；只选一个就还是对齐封面框
+    private func alignSelected(_ mode: LayerAlignMode) {
+        let items = coverMultiLayers
+        guard items.count > 1 else {
+            if let ref = selection { alignLayer(mode, ref: ref) }
+            return
+        }
+        let left = items.map { Double($0.center.x) - Double($0.size.width) / 2 }.min()!
+        let right = items.map { Double($0.center.x) + Double($0.size.width) / 2 }.max()!
+        let top = items.map { Double($0.center.y) - Double($0.size.height) / 2 }.min()!
+        let bottom = items.map { Double($0.center.y) + Double($0.size.height) / 2 }.max()!
+
+        func moveTo(_ it: MultiLayerHandle, x: Double? = nil, y: Double? = nil) {
+            it.moveBy(CGPoint(x: (x ?? Double(it.center.x)) - Double(it.center.x),
+                              y: (y ?? Double(it.center.y)) - Double(it.center.y)))
+        }
+        switch mode {
+        case .left:    for it in items { moveTo(it, x: left + Double(it.size.width) / 2) }
+        case .hcenter: let c = (left + right) / 2; for it in items { moveTo(it, x: c) }
+        case .right:   for it in items { moveTo(it, x: right - Double(it.size.width) / 2) }
+        case .top:     for it in items { moveTo(it, y: top + Double(it.size.height) / 2) }
+        case .vcenter: let c = (top + bottom) / 2; for it in items { moveTo(it, y: c) }
+        case .bottom:  for it in items { moveTo(it, y: bottom - Double(it.size.height) / 2) }
+        case .hdist:
+            let sorted = items.sorted { $0.center.x < $1.center.x }
+            guard sorted.count >= 3 else { return }
+            let total = sorted.reduce(0.0) { $0 + Double($1.size.width) }
+            let gap = (right - left - total) / Double(sorted.count - 1)
+            var cur = left
+            for it in sorted { moveTo(it, x: cur + Double(it.size.width) / 2); cur += Double(it.size.width) + gap }
+        case .vdist:
+            let sorted = items.sorted { $0.center.y < $1.center.y }
+            guard sorted.count >= 3 else { return }
+            let total = sorted.reduce(0.0) { $0 + Double($1.size.height) }
+            let gap = (bottom - top - total) / Double(sorted.count - 1)
+            var cur = top
+            for it in sorted { moveTo(it, y: cur + Double(it.size.height) / 2); cur += Double(it.size.height) + gap }
+        }
+    }
+
+    // MARK: - 快捷键
+
+    /// Delete / Backspace 删掉选中的图层。
+    ///
+    /// **正在输入文字或画钢笔时不能删** —— 那两种状态下这两个键是给输入用的
+    private func installDeleteMonitor() {
+        removeDeleteMonitor()
+        deleteMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            guard project.showCoverDesigner else { return event }
+            guard editingTextID == nil, penDraftID == nil else { return event }
+            // 光标在输入框里时删除键归输入框（圆角、数值这些都是 TextField，
+            // 编辑中的 firstResponder 是它的 field editor，也是个 NSTextView）
+            if NSApp.keyWindow?.firstResponder is NSTextView { return event }
+            // 51 = Delete(退格)，117 = Fn+Delete(向前删)
+            guard event.keyCode == 51 || event.keyCode == 117 else { return event }
+            // 没选中图层时删的是底图；底图也没有就把事件放行
+            guard !allSelected.isEmpty || baseImage != nil else { return event }
+            deleteSelected()
+            return nil
+        }
+    }
+
+    private func removeDeleteMonitor() {
+        if let m = deleteMonitor { NSEvent.removeMonitor(m); deleteMonitor = nil }
+    }
+
+    // MARK: - 属性区小工具
+
+    /// 0~1 的值挂到 0~100 的滑块上
+    private func pctBinding(_ b: Binding<Double>) -> Binding<Double> {
+        Binding(get: { b.wrappedValue * 100 }, set: { b.wrappedValue = $0 / 100 })
+    }
+
+    /// 左旋 90°。屏幕坐标里正角度是顺时针，所以要减；结果规范化到 0~360
+    private func leftRotate90(_ deg: Double) -> Double {
+        (deg - 90 + 360).truncatingRemainder(dividingBy: 360)
+    }
+
+    /// 文字没设过范围框时，先按文字本身量一个尺寸给滑块当初值
+    private func estimatedTextBox(_ t: TextClip) -> CGSize {
+        var font = NSFont(name: t.fontName, size: t.fontSize) ?? NSFont.systemFont(ofSize: t.fontSize)
+        if t.bold { font = NSFontManager.shared.convert(font, toHaveTrait: .boldFontMask) }
+        let str = t.text.isEmpty ? " " : t.text
+        let sz = (str as NSString).size(withAttributes: [.font: font])
+        return CGSize(width: max(sz.width, 20), height: max(sz.height, 20))
+    }
+
+    /// 底图对齐封面框。画面按 baseScale 缩放后可能比框小，这时靠边才有意义
+    private func alignBase(_ mode: LayerAlignMode) {
+        // 画面相对封面框的半宽/半高（1 = 正好铺满）
+        let hw = draft.baseScale / 2
+        let hh = (draft.baseScaleY ?? draft.baseScale) / 2
+        switch mode {
+        case .left:    draft.baseOffsetX = hw - 0.5
+        case .hcenter: draft.baseOffsetX = 0
+        case .right:   draft.baseOffsetX = 0.5 - hw
+        case .top:     draft.baseOffsetY = hh - 0.5
+        case .vcenter: draft.baseOffsetY = 0
+        case .bottom:  draft.baseOffsetY = 0.5 - hh
+        case .hdist, .vdist: break
+        }
+    }
+
+    /// 把一个图层对齐到封面框。多选对齐留给后面那批
+    private func alignLayer(_ mode: LayerAlignMode, ref: LayerRef) {
+        let rs = project.previewRenderSize
+        guard rs.width > 0, rs.height > 0 else { return }
+
+        func apply(w: Double, h: Double, setX: (Double) -> Void, setY: (Double) -> Void) {
+            let hw = w / 2 / Double(rs.width), hh = h / 2 / Double(rs.height)
+            switch mode {
+            case .left:    setX(hw)
+            case .hcenter: setX(0.5)
+            case .right:   setX(1 - hw)
+            case .top:     setY(hh)
+            case .vcenter: setY(0.5)
+            case .bottom:  setY(1 - hh)
+            case .hdist, .vdist: break      // 一个元素谈不上分布
+            }
+        }
+
+        switch ref {
+        case .text(let id):
+            guard let i = draft.texts.firstIndex(where: { $0.id == id }) else { return }
+            let box = draft.texts[i].boxWidth.map {
+                CGSize(width: $0, height: draft.texts[i].boxHeight ?? estimatedTextBox(draft.texts[i]).height)
+            } ?? estimatedTextBox(draft.texts[i])
+            apply(w: Double(box.width), h: Double(box.height),
+                  setX: { draft.texts[i].posX = $0 }, setY: { draft.texts[i].posY = $0 })
+        case .shape(let id):
+            guard let i = draft.shapes.firstIndex(where: { $0.id == id }) else { return }
+            let sh = draft.shapes[i]
+            apply(w: sh.width * sh.scaleX, h: sh.height * sh.scaleY,
+                  setX: { draft.shapes[i].posX = $0 }, setY: { draft.shapes[i].posY = $0 })
+        }
+    }
+
+    /// 收尾文字输入。点别处、双击另一条、关弹窗都要先走这里
+    private func commitTextEdit() {
+        guard let id = editingTextID,
+              let i = draft.texts.firstIndex(where: { $0.id == id }) else { return }
+        draft.texts[i].text = editingText
+        editingTextID = nil
     }
 
     @ViewBuilder
     private func coverShape(_ sh: ShapeClip, box: CGSize) -> some View {
-        let picked = selection == .shape(sh.id)
         let scale = box.width / max(project.previewRenderSize.width, 1)
-        let w = sh.width * sh.scaleX * scale
-        let h = sh.height * sh.scaleY * scale
-        CoverShapeBody(shape: sh)
-            .frame(width: max(4, w), height: max(4, h))
-            .opacity(sh.opacity)
-            .rotationEffect(.degrees(sh.rotation))
-            .overlay(RoundedRectangle(cornerRadius: 3)
-                .strokeBorder(Color.accent.opacity(picked ? 0.9 : 0), lineWidth: 1))
+        return ShapeClipView(clip: sh, scale: scale)
+            // 多选时每个都画一圈框；只选一个时框由 TransformBox 画（带手柄）
+            .overlay(allSelected.count > 1 && isSelected(.shape(sh.id))
+                     ? Rectangle().stroke(Color.accent, lineWidth: 1.5) : nil)
             .position(x: box.width * sh.posX, y: box.height * sh.posY)
-            .onTapGesture { selection = .shape(sh.id) }
+            .onTapGesture { pick(.shape(sh.id)) }
             .gesture(dragGesture(for: .shape(sh.id), box: box,
                                  current: CGPoint(x: sh.posX, y: sh.posY)))
+    }
+
+    /// 选中图层的变换框。**用的是预览区那两个 overlay** ——
+    /// 四角圆点、四边缩放条、旋转手柄和那边一模一样，手感也一样。
+    ///
+    /// 抽成独立函数是因为直接塞进预览的 ZStack 里会让 body 太大，
+    /// 编译器类型检查超时（`CanvasOverlay` 和 `ContentView` 都栽过）
+    @ViewBuilder
+    private func transformOverlay(box: CGSize) -> some View {
+        // 多选时不画带手柄的框 —— 那时候各元素自己画了一圈边框
+        if allSelected.count > 1 {
+            EmptyView()
+        } else {
+        switch selection {
+        case .shape(let id):
+            if let sh = draft.shapes.first(where: { $0.id == id }) {
+                ShapeTransformOverlay(clipOverride: sh) { sid, apply in
+                    if let i = draft.shapes.firstIndex(where: { $0.id == sid }) {
+                        apply(&draft.shapes[i])
+                    }
+                }
+                .frame(width: box.width, height: box.height)
+            }
+        case .text(let id):
+            if let t = draft.texts.first(where: { $0.id == id }) {
+                TextTransformOverlay(
+                    clipOverride: t,
+                    onUpdate: { tid, apply in
+                        if let i = draft.texts.firstIndex(where: { $0.id == tid }) {
+                            apply(&draft.texts[i])
+                        }
+                    },
+                    forceEditing: editingTextID == t.id
+                )
+                .frame(width: box.width, height: box.height)
+            }
+        case .none:
+            // 没选图层时操作的是底图，跟预览区图片片段一套手柄
+            if baseImage != nil {
+                CoverBaseTransformOverlay(draft: $draft, box: box)
+                    .frame(width: box.width, height: box.height)
+            }
+        }
+        }
     }
 
     /// 拖动图层。基准记的是**起手那一刻**的位置 —— `translation` 是累计位移，
@@ -481,24 +897,46 @@ struct CoverDesignerSheet: View {
     private func dragGesture(for ref: LayerRef, box: CGSize, current: CGPoint) -> some Gesture {
         DragGesture(minimumDistance: 1)
             .onChanged { v in
-                if dragStart == nil { dragStart = current; selection = ref }
-                let base = dragStart ?? current
-                let nx = (base.x + v.translation.width / box.width).clamped(to: 0...1)
-                let ny = (base.y + v.translation.height / box.height).clamped(to: 0...1)
-                switch ref {
-                case .text(let id):
-                    if let i = draft.texts.firstIndex(where: { $0.id == id }) {
-                        draft.texts[i].posX = nx
-                        draft.texts[i].posY = ny
-                    }
-                case .shape(let id):
-                    if let i = draft.shapes.firstIndex(where: { $0.id == id }) {
-                        draft.shapes[i].posX = nx
-                        draft.shapes[i].posY = ny
-                    }
+                if dragStart == nil {
+                    dragStart = current
+                    // 拖的是选区里的元素 → 整个选区一起走；否则改成只选它
+                    if !isSelected(ref) { selection = ref; extraSel = [] }
+                    dragStartAll = Dictionary(uniqueKeysWithValues:
+                        allSelected.compactMap { r in position(of: r).map { (r, $0) } })
+                }
+                let dx = v.translation.width / box.width
+                let dy = v.translation.height / box.height
+                for (r, start) in dragStartAll {
+                    move(r, to: CGPoint(x: (start.x + dx).clamped(to: 0...1),
+                                        y: (start.y + dy).clamped(to: 0...1)))
                 }
             }
-            .onEnded { _ in dragStart = nil }
+            .onEnded { _ in dragStart = nil; dragStartAll = [:] }
+    }
+
+    /// 图层当前的中心位置（0~1）
+    private func position(of ref: LayerRef) -> CGPoint? {
+        switch ref {
+        case .text(let id):
+            guard let t = draft.texts.first(where: { $0.id == id }) else { return nil }
+            return CGPoint(x: t.posX, y: t.posY)
+        case .shape(let id):
+            guard let sh = draft.shapes.first(where: { $0.id == id }) else { return nil }
+            return CGPoint(x: sh.posX, y: sh.posY)
+        }
+    }
+
+    private func move(_ ref: LayerRef, to p: CGPoint) {
+        switch ref {
+        case .text(let id):
+            if let i = draft.texts.firstIndex(where: { $0.id == id }) {
+                draft.texts[i].posX = Double(p.x); draft.texts[i].posY = Double(p.y)
+            }
+        case .shape(let id):
+            if let i = draft.shapes.firstIndex(where: { $0.id == id }) {
+                draft.shapes[i].posX = Double(p.x); draft.shapes[i].posY = Double(p.y)
+            }
+        }
     }
 
     // MARK: - 右栏：图层属性
@@ -510,6 +948,16 @@ struct CoverDesignerSheet: View {
         ScrollView(showsIndicators: false) {
             // spacing 收到 2：ISection 自己带上下留白，再叠 10 就散得厉害
             VStack(alignment: .leading, spacing: 2) {
+                if allSelected.count > 1 {
+                    // 多选：跟预览区共用同一个面板
+                    paneTitle("已选 \(allSelected.count) 个") { deleteSelected() }
+                    MultiSelectInspector(
+                        layers: coverMultiLayers,
+                        canvasSize: project.previewRenderSize,
+                        onAlign: { mode in alignSelected(mode) },
+                        onDelete: { deleteSelected() }
+                    )
+                } else {
                 switch selection {
                 case .text(let id):
                     if let i = draft.texts.firstIndex(where: { $0.id == id }) {
@@ -524,6 +972,7 @@ struct CoverDesignerSheet: View {
                 case .none:
                     paneTitle("图片") { clearBase() }
                     baseInspector
+                }
                 }
             }
             // **内容宽度写死 220，右边留 10 给滚动条**。
@@ -544,7 +993,8 @@ struct CoverDesignerSheet: View {
     }
 
     /// 属性栏宽度。三种属性（图片/文字/图形）共用这一个数
-    static let inspectorWidth: CGFloat = 240
+    /// 属性区宽度。跟预览区那侧一致 —— 对齐那排八个按钮要放得下
+    static let inspectorWidth: CGFloat = 280
 
     /// 属性栏顶部的标题行，**右边是删除**：文字/图形删自己，图片删的是底图
     private func paneTitle(_ title: String, onDelete: @escaping () -> Void) -> some View {
@@ -591,60 +1041,41 @@ struct CoverDesignerSheet: View {
                 .font(.system(size: 11))
                 .foregroundColor(Color.labelSecondary.opacity(0.6))
         } else {
-            ISection(title: "变换") {
-                HStack(spacing: 8) {
-                    canvasBtn("mirrorH", label: "水平镜像", active: draft.baseMirrorH) {
-                        draft.baseMirrorH.toggle()
-                    }
-                    canvasBtn("mirrorV", label: "垂直镜像", active: draft.baseMirrorV) {
-                        draft.baseMirrorV.toggle()
-                    }
-                    canvasBtn("rotate", label: "旋转90°", active: draft.baseRotation != 0) {
-                        draft.baseRotation = (draft.baseRotation + 90).truncatingRemainder(dividingBy: 360)
-                    }
-                }
-            }
-
-            ISection(title: "位置") {
-                ISlider(label: "水平位置", value: Binding(
-                    get: { draft.baseOffsetX * 100 }, set: { draft.baseOffsetX = $0 / 100 }
-                ), range: -100...100, unit: "%", labelWidth: 44)
-                ISlider(label: "垂直位置", value: Binding(
-                    get: { draft.baseOffsetY * 100 }, set: { draft.baseOffsetY = $0 / 100 }
-                ), range: -100...100, unit: "%", labelWidth: 44)
-            }
-
-            ISection(title: "缩放与旋转") {
-                ISlider(label: "缩放", value: Binding(
-                    get: { draft.baseScale * 100 }, set: { draft.baseScale = $0 / 100 }
-                ), range: 20...400, unit: "%", labelWidth: 44)
-                ISlider(label: "旋转", value: $draft.baseRotation, range: -180...180, unit: "°", labelWidth: 44)
-            }
-
-            ISection(title: "裁剪") {
-                ISlider(label: "上", value: Binding(
-                    get: { draft.cropTop * 100 }, set: { draft.cropTop = $0 / 100 }
-                ), range: 0...90, unit: "%", labelWidth: 44)
-                ISlider(label: "下", value: Binding(
-                    get: { draft.cropBottom * 100 }, set: { draft.cropBottom = $0 / 100 }
-                ), range: 0...90, unit: "%", labelWidth: 44)
-                ISlider(label: "左", value: Binding(
-                    get: { draft.cropLeft * 100 }, set: { draft.cropLeft = $0 / 100 }
-                ), range: 0...90, unit: "%", labelWidth: 44)
-                ISlider(label: "右", value: Binding(
-                    get: { draft.cropRight * 100 }, set: { draft.cropRight = $0 / 100 }
-                ), range: 0...90, unit: "%", labelWidth: 44)
-            }
+            // 六组共同属性，跟文字、图形、预览区那三个面板同一份
+            LayerCommonSections(
+                mirrorH: $draft.baseMirrorH,
+                mirrorV: $draft.baseMirrorV,
+                rotation: $draft.baseRotation,
+                onRotate90: { draft.baseRotation = leftRotate90(draft.baseRotation) },
+                // 底图的位置是相对画面的偏移（0 = 居中），换算成 0~100 的位置
+                posX: Binding(get: { (draft.baseOffsetX + 0.5) * 100 },
+                              set: { draft.baseOffsetX = $0 / 100 - 0.5 }),
+                posY: Binding(get: { (draft.baseOffsetY + 0.5) * 100 },
+                              set: { draft.baseOffsetY = $0 / 100 - 0.5 }),
+                onCenter: { draft.baseOffsetX = 0; draft.baseOffsetY = 0 },
+                scaleW: Binding(get: { draft.baseScale * 100 },
+                                set: { draft.baseScale = $0 / 100 }),
+                scaleH: Binding(get: { (draft.baseScaleY ?? draft.baseScale) * 100 },
+                                set: { draft.baseScaleY = $0 / 100 }),
+                lockAspect: $draft.baseLockAspect,
+                cropTop: pctBinding($draft.cropTop),
+                cropBottom: pctBinding($draft.cropBottom),
+                cropLeft: pctBinding($draft.cropLeft),
+                cropRight: pctBinding($draft.cropRight),
+                opacity: pctBinding($draft.baseOpacity),
+                cornerRadius: $draft.cornerRadius,
+                onAlign: { alignBase($0) }
+            )
 
             ISection(title: "色调") {
                 ICapsuleSlider(label: "亮度", value: $draft.colorAdjust.brightness,
-                               range: -1...1, decimals: 2, labelWidth: 44)
+                               range: -1...1, decimals: 2)
                 ICapsuleSlider(label: "对比", value: $draft.colorAdjust.contrast,
-                               range: -1...1, decimals: 2, labelWidth: 44)
+                               range: -1...1, decimals: 2)
                 ICapsuleSlider(label: "饱和", value: $draft.colorAdjust.saturation,
-                               range: -1...1, decimals: 2, labelWidth: 44)
+                               range: -1...1, decimals: 2)
                 ICapsuleSlider(label: "色相", value: $draft.colorAdjust.hue,
-                               range: -180...180, unit: "°", labelWidth: 44)
+                               range: -180...180, unit: "°")
             }
 
             ISection(title: "描边") {
@@ -654,16 +1085,18 @@ struct CoverDesignerSheet: View {
                 ))
                 ICapsuleSlider(label: "宽度", value: Binding(
                     get: { draft.strokeWidth ?? 0 }, set: { draft.strokeWidth = $0 }
-                ), range: 0...20, decimals: 1, unit: "px", labelWidth: 44)
+                ), range: 0...100, decimals: 1, unit: "px")
                 ICapsuleSlider(label: "柔和", value: Binding(
                     get: { draft.strokeSoftness ?? 0 }, set: { draft.strokeSoftness = $0 }
-                ), range: 0...1, decimals: 2, labelWidth: 44)
+                ), range: 0...1, decimals: 2)
             }
 
             ISection(title: nil) {
                 Button {
                     draft.baseOffsetX = 0; draft.baseOffsetY = 0
-                    draft.baseScale = 1; draft.baseRotation = 0
+                    draft.baseScale = 1; draft.baseScaleY = nil
+                    draft.baseRotation = 0; draft.baseOpacity = 1
+                    draft.cornerRadius = 0
                     draft.baseMirrorH = false; draft.baseMirrorV = false
                     draft.cropTop = 0; draft.cropBottom = 0
                     draft.cropLeft = 0; draft.cropRight = 0
@@ -731,8 +1164,25 @@ struct CoverDesignerSheet: View {
                 }.frame(width: 92)
             }
             HStack(spacing: 8) {
-                styleToggle("粗体", isOn: draft.texts[i].bold) { draft.texts[i].bold.toggle() }
-                styleToggle("斜体", isOn: draft.texts[i].italic) { draft.texts[i].italic.toggle() }
+                styleGlyph("B", isOn: draft.texts[i].bold, weight: .bold) { draft.texts[i].bold.toggle() }
+                styleGlyph("I", isOn: draft.texts[i].italic, italic: true) { draft.texts[i].italic.toggle() }
+                    // 文字自己的多行对齐，跟 B / I 排在同一行
+                    ForEach([("alignLeft", "left"), ("alignVCenter", "center"),
+                             ("alignRight", "right")], id: \.1) { svg, val in
+                    Button { draft.texts[i].alignment = val } label: {
+                        Image(nsImage: SidebarSVGIcon.load(svg))
+                            .renderingMode(.template)
+                            .resizable()
+                            .aspectRatio(contentMode: .fit)
+                            .frame(width: 14, height: 14)
+                            .foregroundColor(draft.texts[i].alignment == val
+                                             ? Color.accent : Color.labelSecondary)
+                            .frame(width: 30, height: 26)
+                            .background(draft.texts[i].alignment == val
+                                        ? Color.accent.opacity(0.15) : Color.white.opacity(0.05))
+                            .cornerRadius(5)
+                    }.buttonStyle(.plain)
+                }
                 Spacer()
             }
             .padding(.top, 6)
@@ -741,87 +1191,81 @@ struct CoverDesignerSheet: View {
         ISection(title: "颜色与描边") {
             colorRow("文字颜色", $draft.texts[i].textColor)
             colorRow("描边颜色", $draft.texts[i].strokeColor)
-            ISlider(label: "描边宽度", value: $draft.texts[i].strokeWidth, range: 0...10, unit: "px", labelWidth: 44)
+            ISlider(label: "描边宽度", value: $draft.texts[i].strokeWidth, range: 0...100, unit: "px")
+            ISlider(label: "柔和", value: $draft.texts[i].strokeSoftness, range: 0...1, unit: "", decimals: 2)
             colorRow("背景颜色", $draft.texts[i].bgColor)
             ISlider(label: "不透明度", value: Binding(
                 get: { draft.texts[i].bgOpacity * 100 }, set: { draft.texts[i].bgOpacity = $0 / 100 }
-            ), range: 0...100, unit: "%", labelWidth: 44)
+            ), range: 0...100, unit: "%")
+        
         }
 
-        ISection(title: "位置与变换") {
-            ISlider(label: "水平位置", value: Binding(
-                get: { draft.texts[i].posX * 100 }, set: { draft.texts[i].posX = $0 / 100 }
-            ), range: 0...100, unit: "%", labelWidth: 44)
-            ISlider(label: "垂直位置", value: Binding(
-                get: { draft.texts[i].posY * 100 }, set: { draft.texts[i].posY = $0 / 100 }
-            ), range: 0...100, unit: "%", labelWidth: 44)
-            ISlider(label: "旋转", value: $draft.texts[i].rotation, range: -180...180, unit: "°", labelWidth: 44)
-            ISlider(label: "不透明度", value: Binding(
-                get: { draft.texts[i].opacity * 100 }, set: { draft.texts[i].opacity = $0 / 100 }
-            ), range: 0...100, unit: "%", labelWidth: 44)
-            HStack(spacing: 12) {
-                Text("对齐方式").font(.system(size: 11))
-                    .foregroundColor(Color.labelSecondary)
-                    .frame(width: 44, alignment: .leading)
-                HStack(spacing: 4) {
-                    ForEach([("alignLeft", "left"), ("alignVCenter", "center"),
-                             ("alignRight", "right")], id: \.1) { svg, val in
-                        Button { draft.texts[i].alignment = val } label: {
-                            Image(nsImage: SidebarSVGIcon.load(svg))
-                                .renderingMode(.template)
-                                .resizable()
-                                .aspectRatio(contentMode: .fit)
-                                .frame(width: 14, height: 14)
-                                .foregroundColor(draft.texts[i].alignment == val
-                                                 ? Color.accent : Color.labelSecondary)
-                                .frame(width: 34, height: 26)
-                                .background(draft.texts[i].alignment == val
-                                            ? Color.accent.opacity(0.15) : Color.white.opacity(0.05))
-                                .cornerRadius(5)
-                        }.buttonStyle(.plain)
+        // 六组共同属性，跟图片、图形、预览区那三个面板同一份
+        LayerCommonSections(
+            mirrorH: $draft.texts[i].mirrorH,
+            mirrorV: $draft.texts[i].mirrorV,
+            rotation: $draft.texts[i].rotation,
+            onRotate90: { draft.texts[i].rotation = leftRotate90(draft.texts[i].rotation) },
+            posX: pctBinding($draft.texts[i].posX),
+            posY: pctBinding($draft.texts[i].posY),
+            onCenter: { draft.texts[i].posX = 0.5; draft.texts[i].posY = 0.5 },
+            // 文字量的是**范围框**的像素宽高，不是百分比
+            scaleW: Binding(
+                get: { draft.texts[i].boxWidth ?? estimatedTextBox(draft.texts[i]).width },
+                set: { v in
+                    let old = draft.texts[i].boxWidth ?? estimatedTextBox(draft.texts[i]).width
+                    // 锁着比例时字号跟着一起放大，跟拖四角圆点的手感一致
+                    if draft.texts[i].lockBoxAspect, old > 0.01 {
+                        draft.texts[i].fontSize = max(8, draft.texts[i].fontSize * CGFloat(v / old))
                     }
-                    Spacer(minLength: 0)
+                    draft.texts[i].boxWidth = v
                 }
-            }
-        }
-
+            ),
+            scaleH: Binding(
+                get: { draft.texts[i].boxHeight ?? estimatedTextBox(draft.texts[i]).height },
+                set: { draft.texts[i].boxHeight = $0 }
+            ),
+            lockAspect: $draft.texts[i].lockBoxAspect,
+            scaleRange: 20...2000,
+            scaleUnit: "px",
+            cropTop: pctBinding($draft.texts[i].cropTop),
+            cropBottom: pctBinding($draft.texts[i].cropBottom),
+            cropLeft: pctBinding($draft.texts[i].cropLeft),
+            cropRight: pctBinding($draft.texts[i].cropRight),
+            opacity: pctBinding($draft.texts[i].opacity),
+            // 文字没有圆角（背景框的圆角跟着字号走）
+            cornerRadius: nil,
+            onAlign: { alignLayer($0, ref: .text(draft.texts[i].id)) }
+        )
     }
 
     /// 图形属性。字段跟**图形片段**一致，按要求**去掉片段信息和时间**
     @ViewBuilder
     private func shapeInspector(_ i: Int) -> some View {
-        ISection(title: "大小与位置") {
-            HStack(spacing: 8) {
-                Text("锁定比例").font(.system(size: 11))
-                    .foregroundColor(Color.labelSecondary)
-                Spacer(minLength: 0)
-                Toggle("", isOn: $draft.shapes[i].lockAspect)
-                    .inspectorSwitch()
-            }
-            if draft.shapes[i].lockAspect {
-                ISlider(label: "缩放", value: Binding(
-                    get: { draft.shapes[i].scaleX * 100 },
-                    set: { draft.shapes[i].scaleX = $0 / 100; draft.shapes[i].scaleY = $0 / 100 }
-                ), range: 5...400, unit: "%", labelWidth: 44)
-            } else {
-                ISlider(label: "宽度缩放", value: Binding(
-                    get: { draft.shapes[i].scaleX * 100 }, set: { draft.shapes[i].scaleX = $0 / 100 }
-                ), range: 5...400, unit: "%", labelWidth: 44)
-                ISlider(label: "高度缩放", value: Binding(
-                    get: { draft.shapes[i].scaleY * 100 }, set: { draft.shapes[i].scaleY = $0 / 100 }
-                ), range: 5...400, unit: "%", labelWidth: 44)
-            }
-            ISlider(label: "水平位置", value: Binding(
-                get: { draft.shapes[i].posX * 100 }, set: { draft.shapes[i].posX = $0 / 100 }
-            ), range: 0...100, unit: "%", labelWidth: 44)
-            ISlider(label: "垂直位置", value: Binding(
-                get: { draft.shapes[i].posY * 100 }, set: { draft.shapes[i].posY = $0 / 100 }
-            ), range: 0...100, unit: "%", labelWidth: 44)
-            ISlider(label: "旋转", value: $draft.shapes[i].rotation, range: -180...180, unit: "°", labelWidth: 44)
-            ISlider(label: "不透明度", value: Binding(
-                get: { draft.shapes[i].opacity * 100 }, set: { draft.shapes[i].opacity = $0 / 100 }
-            ), range: 0...100, unit: "%", labelWidth: 44)
-        }
+        // 六组共同属性，跟文字、图片、预览区那三个面板同一份
+        LayerCommonSections(
+            mirrorH: $draft.shapes[i].mirrorH,
+            mirrorV: $draft.shapes[i].mirrorV,
+            rotation: $draft.shapes[i].rotation,
+            onRotate90: { draft.shapes[i].rotation = leftRotate90(draft.shapes[i].rotation) },
+            posX: pctBinding($draft.shapes[i].posX),
+            posY: pctBinding($draft.shapes[i].posY),
+            onCenter: { draft.shapes[i].posX = 0.5; draft.shapes[i].posY = 0.5 },
+            scaleW: Binding(get: { draft.shapes[i].scaleX * 100 },
+                            set: { draft.shapes[i].scaleX = $0 / 100 }),
+            scaleH: Binding(get: { draft.shapes[i].scaleY * 100 },
+                            set: { draft.shapes[i].scaleY = $0 / 100 }),
+            lockAspect: $draft.shapes[i].lockAspect,
+            cropTop: pctBinding($draft.shapes[i].cropTop),
+            cropBottom: pctBinding($draft.shapes[i].cropBottom),
+            cropLeft: pctBinding($draft.shapes[i].cropLeft),
+            cropRight: pctBinding($draft.shapes[i].cropRight),
+            opacity: pctBinding($draft.shapes[i].opacity),
+            cornerRadius: $draft.shapes[i].cornerRadius,
+            // 圆角只有矩形、三角形、梯形、平行四边形有，其余灰掉
+            cornerEnabled: ShapeGeometry.supportsCorner(draft.shapes[i].type),
+            onAlign: { alignLayer($0, ref: .shape(draft.shapes[i].id)) }
+        )
 
         ISection(title: "填充") {
             HStack(spacing: 8) {
@@ -835,7 +1279,7 @@ struct CoverDesignerSheet: View {
                 ISlider(label: "不透明度", value: Binding(
                     get: { draft.shapes[i].fillOpacity * 100 },
                     set: { draft.shapes[i].fillOpacity = $0 / 100 }
-                ), range: 0...100, unit: "%", labelWidth: 44)
+                ), range: 0...100, unit: "%")
             }
         }
 
@@ -847,12 +1291,19 @@ struct CoverDesignerSheet: View {
                     .inspectorSwitch()
             }
             if draft.shapes[i].strokeEnabled {
+                // 样式（直线/虚线），跟预览区图形属性一致
+                IFieldRow(label: "样式") {
+                    IPicker(selection: Binding(
+                        get: { draft.shapes[i].strokeDashed ? "虚线" : "直线" },
+                        set: { draft.shapes[i].strokeDashed = ($0 == "虚线") }
+                    ), options: [("直线", "直线"), ("虚线", "虚线")])
+                }
                 colorRow("颜色", $draft.shapes[i].strokeColor)
-                ISlider(label: "粗细", value: $draft.shapes[i].strokeWidth, range: 1...30, unit: "px", labelWidth: 44)
+                ISlider(label: "粗细", value: $draft.shapes[i].strokeWidth, range: 1...30, unit: "px")
                 ISlider(label: "不透明度", value: Binding(
                     get: { draft.shapes[i].strokeOpacity * 100 },
                     set: { draft.shapes[i].strokeOpacity = $0 / 100 }
-                ), range: 0...100, unit: "%", labelWidth: 44)
+                ), range: 0...100, unit: "%")
             }
         }
 
@@ -861,13 +1312,11 @@ struct CoverDesignerSheet: View {
     // MARK: 属性区里的小控件（样式照 InspectorView 那套）
 
     private func colorRow(_ label: String, _ binding: Binding<Color>) -> some View {
-        HStack(spacing: 12) {
-            Text(label).font(.system(size: 11))
-                .foregroundColor(Color.labelSecondary)
-                .frame(width: 44, alignment: .leading)
-            Spacer(minLength: 0)
-            // 颜色块靠右，跟滑块那些行的右边缘对齐
-            ColorPicker("", selection: binding, supportsOpacity: false).labelsHidden()
+        // 色块左边缘跟滑块的滑轨对齐；大小缩到和开关一个量级
+        IFieldRow(label: label) {
+            ColorPicker("", selection: binding, supportsOpacity: false)
+                .labelsHidden()
+                .scaleEffect(0.6, anchor: .leading)
         }
     }
 
@@ -1060,6 +1509,7 @@ struct CoverDesignerSheet: View {
     }
 
     private func close() {
+        commitTextEdit()
         // 画到一半就关弹窗：绘制态是挂在 project 上的，不复位的话
         // 回到主界面预览区会莫名其妙进钢笔态
         if penDraftID != nil {
@@ -1072,6 +1522,7 @@ struct CoverDesignerSheet: View {
 
     /// 确认：把预览渲染成 PNG 存到项目旁边，路径记进项目文件
     private func confirm() {
+        commitTextEdit()
         draft.renderedPath = renderCover()
         project.cover = draft
         project.isSaved = false
@@ -1113,6 +1564,25 @@ struct CoverDesignerSheet: View {
             }
         }
 
+        // 圆角：跟预览那层 clipShape 同一个位置（描边之前），
+        // 做法跟图片片段导出那条链一致 —— 生成一张圆角白图当遮罩把四角抠掉
+        if draft.cornerRadius > 0.01 {
+            let boxRect = ci.extent
+            if boxRect.width > 1, boxRect.height > 1,
+               let gen = CIFilter(name: "CIRoundedRectangleGenerator") {
+                let r = min(CGFloat(draft.cornerRadius), min(boxRect.width, boxRect.height) / 2)
+                gen.setValue(CIVector(cgRect: boxRect), forKey: "inputExtent")
+                gen.setValue(r, forKey: "inputRadius")
+                gen.setValue(CIColor.white, forKey: "inputColor")
+                if let mask = gen.outputImage?.cropped(to: boxRect) {
+                    ci = ci.applyingFilter("CIBlendWithAlphaMask", parameters: [
+                        kCIInputBackgroundImageKey: CIImage.empty(),
+                        kCIInputMaskImageKey: mask
+                    ]).cropped(to: boxRect)
+                }
+            }
+        }
+
         // 描边：跟图片片段共用 ImageStroke，预览/导出一套实现
         if let w = draft.strokeWidth, w > 0.01 {
             ci = ImageStroke.apply(to: ci, width: w,
@@ -1128,60 +1598,47 @@ struct CoverDesignerSheet: View {
 
     /// 把叠在上面的图形和文字画进去。
     ///
+    /// **用的就是预览里那两个视图**（`ShapeClipView` / `TextLabel`）——
+    /// 之前这里另用 NSBezierPath / NSAttributedString 画了一遍，
+    /// 斜体、文字描边、背景色、对齐、图形阴影这些属性预览里有、出图里没有。
+    /// 现在渲染和预览同一份视图，不会再对不上
+    ///
     /// **坐标要翻**：`posY` 是 0=顶部（跟预览、时间轴一致），
     /// 而 `lockFocus` 的画布是 y 朝上、原点在左下 —— 不翻的话上下颠倒
+    @MainActor
     private func drawLayers(in size: CGSize) {
         for sh in draft.shapes {
-            let w = sh.width * sh.scaleX
-            let h = sh.height * sh.scaleY
-            let cx = size.width * sh.posX
-            let cy = size.height * (1 - sh.posY)      // 翻 y
-            let rect = NSRect(x: cx - w / 2, y: cy - h / 2, width: w, height: h)
-            // 钢笔按锚点连线画，其余按外接矩形。
-            // 不分开的话钢笔图形导出来会变成一个方块
-            let path: NSBezierPath
-            if sh.type == .pen, let pts = sh.penPoints, pts.count >= 2 {
-                let bp = NSBezierPath()
-                // 锚点的 y 是 0=上，AppKit 画布 y 朝上，所以要翻过来
-                func point(_ p: PenPoint) -> NSPoint {
-                    NSPoint(x: rect.minX + p.x * rect.width,
-                            y: rect.maxY - p.y * rect.height)
-                }
-                bp.move(to: point(pts[0]))
-                for i in 1..<pts.count { bp.line(to: point(pts[i])) }
-                if sh.penClosed { bp.close() }
-                path = bp
-            } else {
-                path = NSBezierPath(rect: rect)
-            }
-            if sh.fillEnabled {
-                NSColor(sh.fillColor).withAlphaComponent(sh.fillOpacity * sh.opacity).setFill()
-                path.fill()
-            }
-            if sh.strokeEnabled {
-                NSColor(sh.strokeColor).withAlphaComponent(sh.strokeOpacity * sh.opacity).setStroke()
-                path.lineWidth = max(1, sh.strokeWidth)
-                path.stroke()
-            }
+            // 旋转交给画布，出图时不带（带的话转出边界的部分会被裁掉）
+            guard let img = layerImage(ShapeClipView(clip: sh, scale: 1, applyRotation: false)) else { continue }
+            place(img, atX: sh.posX, y: sh.posY, rotation: sh.rotation, in: size)
         }
-
         for t in draft.texts {
-            let font = NSFont.systemFont(ofSize: t.fontSize, weight: t.bold ? .bold : .regular)
-            var attrs: [NSAttributedString.Key: Any] = [
-                .font: font,
-                .foregroundColor: NSColor(t.textColor).withAlphaComponent(t.opacity)
-            ]
-            if t.strokeWidth > 0 {
-                attrs[.strokeColor] = NSColor(t.strokeColor)
-                // 负值 = 描边同时保留填充，正值只描边不填
-                attrs[.strokeWidth] = -t.strokeWidth
-            }
-            let str = NSAttributedString(string: t.text, attributes: attrs)
-            let bounds = str.size()
-            let cx = size.width * t.posX
-            let cy = size.height * (1 - t.posY)       // 翻 y
-            str.draw(at: NSPoint(x: cx - bounds.width / 2, y: cy - bounds.height / 2))
+            guard let img = layerImage(TextLabel(clip: t, scale: 1, applyRotation: false)) else { continue }
+            place(img, atX: t.posX, y: t.posY, rotation: t.rotation, in: size)
         }
+    }
+
+    /// 把一个图层视图渲染成图。四周留白是给阴影和描边的 ——
+    /// ImageRenderer 按视图自身尺寸裁，不留白的话描边会缺一圈
+    @MainActor
+    private func layerImage<V: View>(_ view: V) -> NSImage? {
+        let r = ImageRenderer(content: view.padding(24))
+        r.scale = 2
+        return r.nsImage
+    }
+
+    /// 按中心点摆放一张图层图，顺带转角度
+    private func place(_ img: NSImage, atX px: Double, y py: Double,
+                       rotation: Double, in size: CGSize) {
+        let cx = size.width * px
+        let cy = size.height * (1 - py)          // 翻 y
+        let w = img.size.width, h = img.size.height
+        let ctx = NSGraphicsContext.current?.cgContext
+        ctx?.saveGState()
+        ctx?.translateBy(x: cx, y: cy)
+        ctx?.rotate(by: -rotation * .pi / 180)   // 画布 y 朝上，转向要反
+        img.draw(in: NSRect(x: -w / 2, y: -h / 2, width: w, height: h))
+        ctx?.restoreGState()
     }
 
     /// 把当前封面画成 PNG。存在项目文件旁边的 `.封面` 目录里，
@@ -1204,9 +1661,10 @@ struct CoverDesignerSheet: View {
                 // 否则确认出来的图跟看到的不是一回事
                 let fit = max(size.width / bs.width, size.height / bs.height)
                 let w = bs.width * fit * draft.baseScale
-                let h = bs.height * fit * draft.baseScale
+                let h = bs.height * fit * (draft.baseScaleY ?? draft.baseScale)
                 let ctx = NSGraphicsContext.current?.cgContext
                 ctx?.saveGState()
+                ctx?.setAlpha(CGFloat(draft.baseOpacity))
                 // 画布是 y 朝上，偏移的 y 要反号才跟预览一个方向
                 ctx?.translateBy(x: size.width / 2 + size.width * draft.baseOffsetX,
                                  y: size.height / 2 - size.height * draft.baseOffsetY)
@@ -1328,82 +1786,83 @@ private struct CoverFrameStrip: View {
 
 // MARK: - 图形的画法
 
-/// 把 `ShapeClip` 画出来。只画封面用得到的那几种，
-/// 钢笔那种自由路径封面里用不上（它靠时间轴上画出来的点）
-private struct CoverShapeBody: View {
-    let shape: ShapeClip
+// MARK: - 封面底图的变换框
+
+/// 底图的选中框。**用的就是预览区那个 `TransformBox`** ——
+/// 四角缩放、四边裁剪、上方旋转，跟图片片段一套手感。
+///
+/// 框贴着画面走：画面缩放、旋转、移动之后，裁剪框跟着一起动
+private struct CoverBaseTransformOverlay: View {
+    @Binding var draft: ProjectCover
+    let box: CGSize
+
+    @State private var startScale: Double = 1
+    @State private var startScaleY: Double = 1
+    @State private var startRotation: Double = 0
+    @State private var startOffset: CGPoint? = nil
 
     var body: some View {
-        GeometryReader { geo in
-            let w = geo.size.width, h = geo.size.height
-            let path = outline(w: w, h: h)
-            ZStack {
-                if shape.fillEnabled {
-                    path.fill(shape.fillColor.opacity(shape.fillOpacity))
-                }
-                if shape.strokeEnabled {
-                    path.stroke(shape.strokeColor.opacity(shape.strokeOpacity),
-                                lineWidth: max(1, shape.strokeWidth))
-                }
-            }
-        }
-    }
+        // 没裁之前的画面矩形：底图铺满封面框，再套上缩放和位移
+        // 高度得用 baseScaleY —— 属性区能把宽高分开调，
+        // 这儿还按 baseScale 算的话框就跟画面对不上了
+        let w = box.width * draft.baseScale
+        let h = box.height * (draft.baseScaleY ?? draft.baseScale)
+        let c = CGPoint(x: box.width / 2 + box.width * draft.baseOffsetX,
+                        y: box.height / 2 + box.height * draft.baseOffsetY)
+        ZStack {
+        // 拖着画面走。压在手柄下面一层，手柄优先
+        Color.white.opacity(0.001)
+            .frame(width: max(w, 8), height: max(h, 8))
+            .contentShape(Rectangle())
+            .onHover { if $0 { NSCursor.openHand.set() } else { NSCursor.arrow.set() } }
+            .claimsDragFromWindow()
+            .rotationEffect(.degrees(draft.baseRotation))
+            .position(c)
+            .gesture(
+                DragGesture(minimumDistance: 1)
+                    .onChanged { v in
+                        // 基准记起手那一刻，translation 是累计值，
+                        // 每帧拿当前位置再加一次会越拖越快
+                        if startOffset == nil {
+                            startOffset = CGPoint(x: draft.baseOffsetX, y: draft.baseOffsetY)
+                            NSCursor.closedHand.set()
+                        }
+                        let s = startOffset ?? .zero
+                        draft.baseOffsetX = Double(s.x + v.translation.width / max(box.width, 1))
+                        draft.baseOffsetY = Double(s.y + v.translation.height / max(box.height, 1))
+                    }
+                    .onEnded { _ in startOffset = nil; NSCursor.openHand.set() }
+            )
 
-    private func outline(w: CGFloat, h: CGFloat) -> Path {
-        var p = Path()
-        switch shape.type {
-        case .pen:
-            // 钢笔：按锚点连线。点存的是相对包围盒的归一化坐标，
-            // 有控制柄就走三次贝塞尔，没有就直线相连
-            let pts = shape.penPoints ?? []
-            guard let first = pts.first else { return p }
-            p.move(to: CGPoint(x: first.x * w, y: first.y * h))
-            for (i, pt) in pts.enumerated() where i > 0 {
-                let prev = pts[i - 1]
-                let to = CGPoint(x: pt.x * w, y: pt.y * h)
-                let c1 = CGPoint(x: (prev.x + prev.ctrlOutDX) * w, y: (prev.y + prev.ctrlOutDY) * h)
-                let c2 = CGPoint(x: (pt.x + pt.ctrlInDX) * w, y: (pt.y + pt.ctrlInDY) * h)
-                if prev.ctrlOutDX == 0, prev.ctrlOutDY == 0, pt.ctrlInDX == 0, pt.ctrlInDY == 0 {
-                    p.addLine(to: to)
-                } else {
-                    p.addCurve(to: to, control1: c1, control2: c2)
+        TransformBox(
+            center: c,
+            size: CGSize(width: max(w, 8), height: max(h, 8)),
+            rotation: draft.baseRotation,
+            crop: TransformCrop(top: draft.cropTop, bottom: draft.cropBottom,
+                                left: draft.cropLeft, right: draft.cropRight),
+            onBegin: {
+                startScale = draft.baseScale
+                startScaleY = draft.baseScaleY ?? draft.baseScale
+                startRotation = draft.baseRotation
+            },
+            onScale: { ratio in
+                // 拖四角是**等比**缩放，宽高都得跟着走。
+                // 只改 baseScale 的话，高度单独设过的图就只有宽度在变
+                draft.baseScale = min(max(startScale * ratio, 0.05), 8)
+                draft.baseScaleY = min(max(startScaleY * ratio, 0.05), 8)
+            },
+            onCrop: { e, value in
+                switch e {
+                case 0: draft.cropTop = value
+                case 1: draft.cropBottom = value
+                case 2: draft.cropLeft = value
+                default: draft.cropRight = value
                 }
+            },
+            onRotate: { delta in
+                draft.baseRotation = startRotation + delta
             }
-            if shape.penClosed { p.closeSubpath() }
-        case .ellipse:
-            p.addEllipse(in: CGRect(x: 0, y: 0, width: w, height: h))
-        case .triangle:
-            p.move(to: CGPoint(x: w / 2, y: 0))
-            p.addLine(to: CGPoint(x: w, y: h))
-            p.addLine(to: CGPoint(x: 0, y: h))
-            p.closeSubpath()
-        case .parallelogram:
-            p.move(to: CGPoint(x: w * 0.25, y: 0))
-            p.addLine(to: CGPoint(x: w, y: 0))
-            p.addLine(to: CGPoint(x: w * 0.75, y: h))
-            p.addLine(to: CGPoint(x: 0, y: h))
-            p.closeSubpath()
-        case .trapezoid:
-            p.move(to: CGPoint(x: w * 0.2, y: 0))
-            p.addLine(to: CGPoint(x: w * 0.8, y: 0))
-            p.addLine(to: CGPoint(x: w, y: h))
-            p.addLine(to: CGPoint(x: 0, y: h))
-            p.closeSubpath()
-        case .line:
-            p.move(to: CGPoint(x: 0, y: h / 2))
-            p.addLine(to: CGPoint(x: w, y: h / 2))
-        case .arrow:
-            p.move(to: CGPoint(x: 0, y: h * 0.4))
-            p.addLine(to: CGPoint(x: w * 0.7, y: h * 0.4))
-            p.addLine(to: CGPoint(x: w * 0.7, y: h * 0.15))
-            p.addLine(to: CGPoint(x: w, y: h / 2))
-            p.addLine(to: CGPoint(x: w * 0.7, y: h * 0.85))
-            p.addLine(to: CGPoint(x: w * 0.7, y: h * 0.6))
-            p.addLine(to: CGPoint(x: 0, y: h * 0.6))
-            p.closeSubpath()
-        default:
-            p.addRect(CGRect(x: 0, y: 0, width: w, height: h))
+        )
         }
-        return p
     }
 }

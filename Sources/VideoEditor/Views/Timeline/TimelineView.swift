@@ -443,6 +443,11 @@ struct TimelineView: View {
             guard WindowManager.shared.window(for: windowID)?.isKeyWindow == true else {
                 return event
             }
+            // **弹窗开着时键盘归弹窗**。封面设计里按删除键本来是要删封面上的图层，
+            // 这儿不让开的话事件先被吃掉，还会顺手把时间轴上选中的片段删了
+            if project.showCoverDesigner || project.showExportSheet {
+                return event
+            }
             // 文本编辑中不拦截（包括 NSTextField 的 field editor 和 SwiftUI TextEditor 的独立 NSTextView）
             if let tv = NSApp.keyWindow?.firstResponder as? NSTextView {
                 return event
@@ -4629,11 +4634,13 @@ struct TimelineToolbar: View {
     private func rotateClip() {
         project.pushUndo()
         if let id = project.selectedVideoClipID {
-            project.updateVideoClip(id: id) { $0.rotation = ($0.rotation + 90) % 360 }
+            project.updateVideoClip(id: id) { $0.rotation = ($0.rotation + 270) % 360 }
         } else if let id = project.selectedImageClipID {
-            project.updateImageClip(id: id) { $0.rotation = ($0.rotation + 90) % 360 }
+            project.updateImageClip(id: id) {
+                $0.rotation = ($0.rotation - 90 + 360).truncatingRemainder(dividingBy: 360)
+            }
         } else if let id = project.selectedShapeClipID {
-            project.updateShapeClip(id: id) { $0.rotation += 90 }
+            project.updateShapeClip(id: id) { $0.rotation -= 90 }
         }
         project.rebuildTimelinePreview()
     }

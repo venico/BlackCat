@@ -21,7 +21,20 @@ struct InspectorView: View {
             ScrollView(showsIndicators: false) {
                 // 统一给所有属性面板留出底部间距，各 Inspector 不必各自处理
                 Group {
-                    if let transID = project.selectedTransitionClipID {
+                    // 多选优先：只放三种元素都有、一起调有意义的那几项
+                    if project.selectedClipIDs.count > 1, !multiLayers.isEmpty {
+                        MultiSelectInspector(
+                            layers: multiLayers,
+                            canvasSize: project.previewRenderSize,
+                            onAlign: { mode in
+                                if let first = multiLayers.first {
+                                    project.alignLayers(mode, anchorID: first.id)
+                                }
+                            },
+                            onDelete: { project.deleteSelected() },
+                            onBeforeChange: { project.pushUndoThrottled() }
+                        )
+                    } else if let transID = project.selectedTransitionClipID {
                         TransitionInspector(clipID: transID)
                     } else if let clip = project.selectedTextClip {
                         TextInspector(clip: clip).id(clip.id)
@@ -67,31 +80,63 @@ struct InspectorView: View {
         case subtitle(SubtitleClip)
     }
 
+    /// 头部：左边是当前选中的东西叫什么，右边是删除。跟封面弹窗那套一致，
+    /// 各面板底部原来那个大红删除按钮就不用了
     private var header: some View {
         HStack {
-            Text("属性")
+            Text(tag)
                 .font(.system(size: 12, weight: .semibold))
                 .foregroundColor(Color.labelPrimary)
             Spacer()
-            Text(tag)
-                .font(.system(size: 10))
-                .foregroundColor(Color.labelSecondary)
+            if let del = deleteAction {
+                Button(action: del) {
+                    Image(nsImage: TimelineSVGIcon.load("delete"))
+                        .renderingMode(.template)
+                        .resizable()
+                        .aspectRatio(contentMode: .fit)
+                        .frame(width: 13, height: 13)
+                        .foregroundColor(Color.labelSecondary)
+                        // 图标贴右，才跟下面滑块行的右边缘齐
+                        .frame(width: 24, height: 24, alignment: .trailing)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help("删除")
+            }
         }
         .padding(.horizontal, 14)
         .padding(.top, 14)
         .padding(.bottom, 10)
     }
 
+    /// 多选里那些能一起调的图层。视频、音频、字幕不参与
+    private var multiLayers: [MultiLayerHandle] { project.multiLayerHandles() }
+
     private var tag: String {
+        if project.selectedClipIDs.count > 1 { return "已选 \(project.selectedClipIDs.count) 个" }
         if project.selectedTransitionClipID != nil { return "转场" }
-        if project.selectedTextClipID       != nil { return "文字片段" }
-        if project.selectedShapeClipID      != nil { return "图形片段" }
-        if project.selectedSubtitleClipID   != nil { return "字幕片段" }
-        if project.selectedImageClipID      != nil { return "图片片段" }
-        if project.selectedVideoClipID      != nil { return "视频片段" }
-        if project.selectedAudioClipID      != nil { return "音频片段" }
+        if project.selectedTextClipID       != nil { return "文字" }
+        if project.selectedShapeClipID      != nil { return "图形" }
+        if project.selectedSubtitleClipID   != nil { return "字幕" }
+        if project.selectedImageClipID      != nil { return "图片" }
+        if project.selectedVideoClipID      != nil { return "视频" }
+        if project.selectedAudioClipID      != nil { return "音频" }
         if project.selectedCompoundClipID   != nil { return "复合片段" }
-        return "项目设置"
+        return "项目"
+    }
+
+    /// 当前该删谁。项目设置那一档没有删除，返回 nil 就不画图标
+    private var deleteAction: (() -> Void)? {
+        // 除了文字和图形有各自的删除，其余（含多选）都走时间轴那个统一入口
+        if project.selectedClipIDs.count > 1 { return { project.deleteSelected() } }
+        if let id = project.selectedTextClipID { return { project.deleteTextClip(id: id) } }
+        if let id = project.selectedShapeClipID { return { project.deleteShapeClip(id: id) } }
+        if project.selectedImageClipID != nil || project.selectedVideoClipID != nil
+            || project.selectedAudioClipID != nil || project.selectedSubtitleClipID != nil
+            || project.selectedCompoundClipID != nil {
+            return { project.deleteSelected() }
+        }
+        return nil
     }
 }
 
@@ -236,7 +281,7 @@ private struct SubtitleInspector: View {
                         .foregroundColor(Color.labelSecondary)
                         .frame(width: 68, alignment: .leading)
                     Toggle("", isOn: $ls.mergeLineBreaks)
-                        .inspectorSwitch()
+                        .inspectorSwitch(anchor: .leading)
                         .onChange(of: ls.mergeLineBreaks) { _ in writeStyle() }
                     Spacer()
                 }
@@ -262,23 +307,13 @@ private struct SubtitleInspector: View {
 
             // ── 颜色 ──────────────────────────────────────
             ISection(title: "颜色") {
-                HStack(spacing: 12) {
-                    Text("文字颜色")
-                        .font(.system(size: 11))
-                        .foregroundColor(Color.labelSecondary)
-                        .frame(width: 68, alignment: .leading)
-                    ColorPicker("", selection: $ls.textColor).labelsHidden()
+                IFieldRow(label: "文字颜色") {
+                    ColorPicker("", selection: $ls.textColor).inspectorColorWell()
                         .onChange(of: ls.textColor) { _ in writeStyle() }
-                    Spacer(minLength: 0)
                 }
-                HStack(spacing: 12) {
-                    Text("背景颜色")
-                        .font(.system(size: 11))
-                        .foregroundColor(Color.labelSecondary)
-                        .frame(width: 68, alignment: .leading)
-                    ColorPicker("", selection: $ls.backgroundColor).labelsHidden()
+                IFieldRow(label: "背景颜色") {
+                    ColorPicker("", selection: $ls.backgroundColor).inspectorColorWell()
                         .onChange(of: ls.backgroundColor) { _ in writeStyle() }
-                    Spacer(minLength: 0)
                 }
 
                 ISlider(label: "背景不透明度",
@@ -310,7 +345,7 @@ private struct SubtitleInspector: View {
                                     .aspectRatio(contentMode: .fit)
                                     .frame(width: 14, height: 14)
                                     .foregroundColor(ls.alignment == val ? Color.accent : Color.labelSecondary)
-                                    .frame(width: 34, height: 26)
+                                    .frame(width: 30, height: 26)
                                     .background(ls.alignment == val ? Color.accent.opacity(0.15) : Color.white.opacity(0.05))
                                     .cornerRadius(5)
                             }.buttonStyle(.plain)
@@ -1125,6 +1160,7 @@ private struct TextInspector: View {
     @State private var textColor: Color = .white
     @State private var strokeColor: Color = .black
     @State private var strokeWidth: Double = 0
+    @State private var strokeSoftness: Double = 0
     @State private var bgColor: Color = .black
     @State private var bgOpacity: Double = 0
     @State private var alignment = "center"
@@ -1181,8 +1217,23 @@ private struct TextInspector: View {
                     }.frame(width: 92)
                 }
                 HStack(spacing: 8) {
-                    styleToggle("粗体", isOn: bold) { bold.toggle(); write { $0.bold = bold } }
-                    styleToggle("斜体", isOn: italic) { italic.toggle(); write { $0.italic = italic } }
+                    styleGlyph("B", isOn: bold, weight: .bold) { bold.toggle(); write { $0.bold = bold } }
+                    styleGlyph("I", isOn: italic, italic: true) { italic.toggle(); write { $0.italic = italic } }
+                    // 文字自己的多行对齐，跟 B / I 排在同一行
+                    ForEach([("alignLeft", "left"), ("alignVCenter", "center"),
+                             ("alignRight", "right")], id: \.1) { svg, val in
+                    Button { alignment = val; write { $0.alignment = val } } label: {
+                        Image(nsImage: SidebarSVGIcon.load(svg))
+                            .renderingMode(.template)
+                            .resizable()
+                            .aspectRatio(contentMode: .fit)
+                            .frame(width: 14, height: 14)
+                            .foregroundColor(alignment == val ? Color.accent : Color.labelSecondary)
+                            .frame(width: 30, height: 26)
+                            .background(alignment == val ? Color.accent.opacity(0.15) : Color.white.opacity(0.05))
+                            .cornerRadius(5)
+                    }.buttonStyle(.plain)
+                }
                     Spacer()
                 }
                 .padding(.top, 6)
@@ -1191,58 +1242,64 @@ private struct TextInspector: View {
             ISection(title: "颜色与描边") {
                 colorRow("文字颜色", $textColor) { write { $0.textColor = textColor } }
                 colorRow("描边颜色", $strokeColor) { write { $0.strokeColor = strokeColor } }
-                ISlider(label: "描边宽度", value: $strokeWidth, range: 0...10, unit: "px")
+                ISlider(label: "描边宽度", value: $strokeWidth, range: 0...100, unit: "px")
                     .onChange(of: strokeWidth) { _ in write { $0.strokeWidth = strokeWidth } }
+                ISlider(label: "柔和", value: $strokeSoftness, range: 0...1, unit: "", decimals: 2)
+                    .onChange(of: strokeSoftness) { _ in write { $0.strokeSoftness = strokeSoftness } }
                 colorRow("背景颜色", $bgColor) { write { $0.bgColor = bgColor } }
                 ISlider(label: "背景不透明", value: Binding(get:{bgOpacity*100}, set:{bgOpacity=$0/100}), range: 0...100, unit: "%")
                     .onChange(of: bgOpacity) { _ in write { $0.bgOpacity = bgOpacity } }
+            
             }
 
-            ISection(title: "位置与变换") {
-                ISlider(label: "水平位置", value: Binding(get:{posX*100}, set:{posX=$0/100}), range: 0...100, unit: "%")
-                    .onChange(of: posX) { _ in write { $0.posX = posX } }
-                ISlider(label: "垂直位置", value: Binding(get:{posY*100}, set:{posY=$0/100}), range: 0...100, unit: "%")
-                    .onChange(of: posY) { _ in write { $0.posY = posY } }
-                ISlider(label: "旋转", value: $rotation, range: -180...180, unit: "°")
-                    .onChange(of: rotation) { _ in write { $0.rotation = rotation } }
-                ISlider(label: "不透明度", value: Binding(get:{opacity*100}, set:{opacity=$0/100}), range: 0...100, unit: "%")
-                    .onChange(of: opacity) { _ in write { $0.opacity = opacity } }
-                HStack(spacing: 12) {
-                    Text("对齐方式").font(.system(size:11)).foregroundColor(Color.labelSecondary).frame(width:68, alignment:.leading)
-                    HStack(spacing: 4) {
-                        ForEach([("alignLeft","left"),("alignVCenter","center"),("alignRight","right")], id:\.1) { svg, val in
-                            Button { alignment = val; write { $0.alignment = val } } label: {
-                                Image(nsImage: SidebarSVGIcon.load(svg))
-                                    .renderingMode(.template)
-                                    .resizable()
-                                    .aspectRatio(contentMode: .fit)
-                                    .frame(width: 14, height: 14)
-                                    .foregroundColor(alignment==val ? Color.accent : Color.labelSecondary)
-                                    .frame(width:34,height:26)
-                                    .background(alignment==val ? Color.accent.opacity(0.15) : Color.white.opacity(0.05))
-                                    .cornerRadius(5)
-                            }.buttonStyle(.plain)
+            // 六组共同属性，跟图片、图形、封面那三个面板同一份
+            LayerCommonSections(
+                mirrorH: Binding(get: { clip.mirrorH }, set: { v in write { $0.mirrorH = v } }),
+                mirrorV: Binding(get: { clip.mirrorV }, set: { v in write { $0.mirrorV = v } }),
+                rotation: Binding(get: { rotation }, set: { rotation = $0; write { $0.rotation = rotation } }),
+                onRotate90: {
+                    rotation = (rotation - 90 + 360).truncatingRemainder(dividingBy: 360)
+                    write { $0.rotation = rotation }
+                },
+                posX: Binding(get: { posX * 100 }, set: { posX = $0 / 100; write { $0.posX = posX } }),
+                posY: Binding(get: { posY * 100 }, set: { posY = $0 / 100; write { $0.posY = posY } }),
+                onCenter: { posX = 0.5; posY = 0.5; write { $0.posX = 0.5; $0.posY = 0.5 } },
+                // 文字量的是**范围框**的像素宽高，不是百分比
+                scaleW: Binding(
+                    get: { clip.boxWidth ?? Double(clip.fontSize) * Double(max(clip.text.count, 1)) },
+                    set: { v in
+                        let old = clip.boxWidth ?? Double(clip.fontSize) * Double(max(clip.text.count, 1))
+                        // 锁着比例时字号跟着一起放大，跟拖四角圆点的手感一致
+                        if clip.lockBoxAspect, old > 0.01 {
+                            write { $0.fontSize = max(8, $0.fontSize * CGFloat(v / old)) }
                         }
-                        Spacer(minLength:0)
-                    }
-                }
-            }
+                        write { $0.boxWidth = v }
+                    }),
+                scaleH: Binding(
+                    get: { clip.boxHeight ?? Double(clip.fontSize) * 1.4 },
+                    set: { v in write { $0.boxHeight = v } }),
+                lockAspect: Binding(get: { clip.lockBoxAspect },
+                                    set: { v in write { $0.lockBoxAspect = v } }),
+                scaleRange: 20...2000,
+                scaleUnit: "px",
+                cropTop: Binding(get: { clip.cropTop * 100 }, set: { v in write { $0.cropTop = v / 100 } }),
+                cropBottom: Binding(get: { clip.cropBottom * 100 }, set: { v in write { $0.cropBottom = v / 100 } }),
+                cropLeft: Binding(get: { clip.cropLeft * 100 }, set: { v in write { $0.cropLeft = v / 100 } }),
+                cropRight: Binding(get: { clip.cropRight * 100 }, set: { v in write { $0.cropRight = v / 100 } }),
+                opacity: Binding(get: { opacity * 100 },
+                                 set: { opacity = $0 / 100; write { $0.opacity = opacity } }),
+                // 文字没有圆角（背景框的圆角跟着字号走）
+                cornerRadius: nil,
+                onAlign: { project.alignLayers($0, anchorID: clip.id) },
+                canDistribute: project.selectedClipIDs.count >= 3,
+                onBeforeChange: { project.pushUndo() }
+            )
 
             ISection(title: "入场动画") {
                 IPicker(selection: $animation, options: TextAnimation.allCases.map { ($0, $0.label) })
                     .onChange(of: animation) { _ in write { $0.animation = animation } }
             }
 
-            ISection(title: nil) {
-                Button { project.deleteTextClip(id: clip.id) } label: {
-                    HStack { Spacer(); Image(nsImage: TimelineSVGIcon.load("delete")).renderingMode(.template).resizable().aspectRatio(contentMode: .fit).frame(width: 12, height: 12); Text("删除文字"); Spacer() }
-                        .font(.system(size: 12, weight: .medium))
-                        .foregroundColor(.red.opacity(0.9))
-                        .frame(height: 32)
-                        .background(Color.red.opacity(0.12))
-                        .clipShape(RoundedRectangle(cornerRadius: 8))
-                }.buttonStyle(.plain)
-            }
         }
         .onAppear { syncAll() }
         .onChange(of: clip.id) { _ in syncAll() }
@@ -1283,10 +1340,10 @@ private struct TextInspector: View {
     }
 
     @ViewBuilder private func colorRow(_ label: String, _ binding: Binding<Color>, _ onChange: @escaping () -> Void) -> some View {
-        HStack(spacing: 12) {
-            Text(label).font(.system(size: 11)).foregroundColor(Color.labelSecondary).frame(width: 68, alignment: .leading)
-            ColorPicker("", selection: binding).labelsHidden().onChange(of: binding.wrappedValue) { _ in onChange() }
-            Spacer(minLength: 0)
+        IFieldRow(label: label) {
+            ColorPicker("", selection: binding)
+                .inspectorColorWell()
+                .onChange(of: binding.wrappedValue) { _ in onChange() }
         }
     }
     @ViewBuilder private func styleToggle(_ label: String, isOn: Bool, _ action: @escaping () -> Void) -> some View {
@@ -1358,65 +1415,36 @@ private struct ShapeInspector: View {
                 }
             }
 
-            ISection(title: "大小与位置") {
-                HStack(spacing: 8) {
-                    IField(label: "宽") {
-                        MiniStepper(value: Binding(
-                            get: { (clipNow.width * clipNow.scaleX).rounded() },
-                            set: { nw in write { $0.width = nw / max($0.scaleX, 0.01) } }
-                        ), step: 1, decimals: 0, minValue: 1, maxValue: 8000)
-                    }
-                    IField(label: "高") {
-                        MiniStepper(value: Binding(
-                            get: { (clipNow.height * clipNow.scaleY).rounded() },
-                            set: { nh in write { $0.height = nh / max($0.scaleY, 0.01) } }
-                        ), step: 1, decimals: 0, minValue: 1, maxValue: 8000)
-                    }
-                }
-                HStack {
-                    Text("等比缩放").font(.system(size: 11)).foregroundColor(Color.labelSecondary)
-                    Spacer()
-                    Toggle("", isOn: $lockAspect).inspectorSwitch()
-                        .onChange(of: lockAspect) { _ in write { $0.lockAspect = lockAspect } }
-                }
-                if lockAspect {
-                    ISlider(label: "缩放", value: $scale, range: 5...400, unit: "%")
-                        .onChange(of: scale) { _ in
-                            scaleXPct = scale; scaleYPct = scale
-                            write { $0.scaleX = scale / 100; $0.scaleY = scale / 100 }
-                        }
-                        .dimNonUniform(dim(\.scaleX))
-                } else {
-                    ISlider(label: "宽度缩放", value: $scaleXPct, range: 5...400, unit: "%")
-                        .onChange(of: scaleXPct) { _ in write { $0.scaleX = scaleXPct / 100 } }
-                    ISlider(label: "高度缩放", value: $scaleYPct, range: 5...400, unit: "%")
-                        .onChange(of: scaleYPct) { _ in write { $0.scaleY = scaleYPct / 100 } }
-                }
-                ISlider(label: "水平位置", value: Binding(get: { posX * 100 }, set: { posX = $0 / 100 }), range: 0...100, unit: "%")
-                    .onChange(of: posX) { _ in write { $0.posX = posX } }
-                ISlider(label: "垂直位置", value: Binding(get: { posY * 100 }, set: { posY = $0 / 100 }), range: 0...100, unit: "%")
-                    .onChange(of: posY) { _ in write { $0.posY = posY } }
-                ISlider(label: "旋转", value: $rotation, range: -180...180, unit: "°")
-                    .onChange(of: rotation) { _ in write { $0.rotation = rotation } }
-                ISlider(label: "不透明度", value: Binding(get: { opacity * 100 }, set: { opacity = $0 / 100 }), range: 0...100, unit: "%")
-                    .onChange(of: opacity) { _ in write { $0.opacity = opacity } }
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("对齐").font(.system(size: 11)).foregroundColor(Color.labelSecondary)
-                    HStack(spacing: 3) {
-                        alignBtn("", .left, svgName: "alignLeft")
-                        alignBtn("", .hcenter, svgName: "alignHCenter")
-                        alignBtn("", .right, svgName: "alignRight")
-                        alignBtn("", .top, svgName: "alignTop")
-                        alignBtn("", .vcenter, svgName: "alignVCenter")
-                        alignBtn("", .bottom, svgName: "alignBottom")
-                        Rectangle().fill(Color.white.opacity(0.15)).frame(width: 1, height: 18).padding(.horizontal, 2)
-                        alignBtn("", .hdist, svgName: "hDistribute")
-                        alignBtn("", .vdist, svgName: "vDistribute")
-                        Spacer(minLength: 0)
-                    }
-                }
-            }
+            // 六组共同属性，跟图片、文字、封面那三个面板同一份
+            LayerCommonSections(
+                mirrorH: Binding(get: { clip.mirrorH }, set: { v in write { $0.mirrorH = v } }),
+                mirrorV: Binding(get: { clip.mirrorV }, set: { v in write { $0.mirrorV = v } }),
+                rotation: Binding(get: { rotation }, set: { rotation = $0; write { $0.rotation = rotation } }),
+                onRotate90: {
+                    rotation = (rotation - 90 + 360).truncatingRemainder(dividingBy: 360)
+                    write { $0.rotation = rotation }
+                },
+                posX: Binding(get: { posX * 100 }, set: { posX = $0 / 100; write { $0.posX = posX } }),
+                posY: Binding(get: { posY * 100 }, set: { posY = $0 / 100; write { $0.posY = posY } }),
+                onCenter: { posX = 0.5; posY = 0.5; write { $0.posX = 0.5; $0.posY = 0.5 } },
+                scaleW: Binding(get: { scaleXPct }, set: { scaleXPct = $0; write { $0.scaleX = scaleXPct / 100 } }),
+                scaleH: Binding(get: { scaleYPct }, set: { scaleYPct = $0; write { $0.scaleY = scaleYPct / 100 } }),
+                lockAspect: Binding(get: { lockAspect }, set: { lockAspect = $0; write { $0.lockAspect = lockAspect } }),
+                cropTop: Binding(get: { clip.cropTop * 100 }, set: { v in write { $0.cropTop = v / 100 } }),
+                cropBottom: Binding(get: { clip.cropBottom * 100 }, set: { v in write { $0.cropBottom = v / 100 } }),
+                cropLeft: Binding(get: { clip.cropLeft * 100 }, set: { v in write { $0.cropLeft = v / 100 } }),
+                cropRight: Binding(get: { clip.cropRight * 100 }, set: { v in write { $0.cropRight = v / 100 } }),
+                opacity: Binding(get: { opacity * 100 }, set: { opacity = $0 / 100; write { $0.opacity = opacity } }),
+                cornerRadius: Binding(get: { cornerRadius },
+                                      set: { cornerRadius = $0; write { $0.cornerRadius = cornerRadius } }),
+                // 圆角只有矩形、三角形、梯形、平行四边形有，其余灰掉
+                cornerEnabled: ShapeGeometry.supportsCorner(clip.type),
+                onAlign: { project.alignLayers($0, anchorID: clip.id) },
+                canDistribute: project.selectedClipIDs.count >= 3,
+                onBeforeChange: { project.pushUndo() }
+            )
 
+            // 填充只对有面积的图形有意义（线段、箭头没有）
             if clip.effectiveIsClosed {
                 ISection(title: "填充") {
                     toggleRow("启用填充", $fillEnabled, dimKP: \.fillEnabled) { write { $0.fillEnabled = fillEnabled } }
@@ -1431,8 +1459,7 @@ private struct ShapeInspector: View {
             ISection(title: "描边") {
                 toggleRow("启用描边", $strokeEnabled, dimKP: \.strokeEnabled) { write { $0.strokeEnabled = strokeEnabled } }
                 if strokeEnabled {
-                    HStack(spacing: 12) {
-                        Text("样式").font(.system(size: 11)).foregroundColor(Color.labelSecondary).frame(width: 68, alignment: .leading)
+                    IFieldRow(label: "样式") {
                         IPicker(selection: Binding(
                             get: { strokeDashed ? "虚线" : "直线" },
                             set: { strokeDashed = ($0 == "虚线"); write { $0.strokeDashed = strokeDashed } }
@@ -1445,25 +1472,16 @@ private struct ShapeInspector: View {
                     ISlider(label: "不透明度", value: Binding(get: { strokeOpacity * 100 }, set: { strokeOpacity = $0 / 100 }), range: 0...100, unit: "%")
                         .onChange(of: strokeOpacity) { _ in write { $0.strokeOpacity = strokeOpacity } }
                     if !clip.type.isClosed && clip.type != .pen {
-                        HStack(spacing: 12) {
-                            Text("起点").font(.system(size: 11)).foregroundColor(Color.labelSecondary).frame(width: 68, alignment: .leading)
+                        IFieldRow(label: "起点") {
                             IPicker(selection: Binding(get: { capStartV.label }, set: { setCap($0, start: true) }), options: LineCapStyle.allCases.map { ($0.label, $0.label) })
                         }
-                        HStack(spacing: 12) {
-                            Text("终点").font(.system(size: 11)).foregroundColor(Color.labelSecondary).frame(width: 68, alignment: .leading)
+                        IFieldRow(label: "终点") {
                             IPicker(selection: Binding(get: { capEndV.label }, set: { setCap($0, start: false) }), options: LineCapStyle.allCases.map { ($0.label, $0.label) })
                         }
                     }
                 }
             }
 
-            if [.rectangle, .triangle, .parallelogram, .trapezoid].contains(clip.type) {
-                ISection(title: "圆角") {
-                    ISlider(label: "圆角", value: $cornerRadius, range: 0...200, unit: "px")
-                        .onChange(of: cornerRadius) { _ in write { $0.cornerRadius = cornerRadius } }
-                        .dimNonUniform(dim(\.cornerRadius))
-                }
-            }
 
             ISection(title: "投影") {
                 toggleRow("启用投影", $shadowEnabled, dimKP: \.shadowEnabled) { write { $0.shadowEnabled = shadowEnabled } }
@@ -1501,16 +1519,6 @@ private struct ShapeInspector: View {
                 }
             }
 
-            ISection(title: nil) {
-                Button { project.deleteShapeClip(id: clip.id) } label: {
-                    HStack { Spacer(); Image(nsImage: TimelineSVGIcon.load("delete")).renderingMode(.template).resizable().aspectRatio(contentMode: .fit).frame(width: 12, height: 12); Text("删除图形"); Spacer() }
-                        .font(.system(size: 12, weight: .medium))
-                        .foregroundColor(.red.opacity(0.9))
-                        .frame(height: 32)
-                        .background(Color.red.opacity(0.12))
-                        .clipShape(RoundedRectangle(cornerRadius: 8))
-                }.buttonStyle(.plain)
-            }
         }
         .onAppear { syncAll() }
         .onChange(of: clip.id) { _ in syncAll() }
@@ -1640,7 +1648,8 @@ private struct ShapeInspector: View {
         posX = clip.posX; posY = clip.posY; rotation = clip.rotation; opacity = clip.opacity
         fillEnabled = clip.fillEnabled; fillColor = clip.fillColor; fillOpacity = clip.fillOpacity
         strokeEnabled = clip.strokeEnabled; strokeColor = clip.strokeColor
-        strokeWidth = clip.strokeWidth; strokeOpacity = clip.strokeOpacity; strokeDashed = clip.strokeDashed
+        strokeWidth = clip.strokeWidth
+        strokeOpacity = clip.strokeOpacity; strokeDashed = clip.strokeDashed
         capStartV = clip.capStart; capEndV = clip.capEnd
         cornerRadius = clip.cornerRadius
         shadowEnabled = clip.shadowEnabled; shadowColor = clip.shadowColor
@@ -1652,10 +1661,10 @@ private struct ShapeInspector: View {
     }
 
     @ViewBuilder private func colorRow(_ label: String, _ binding: Binding<Color>, dimKP: KeyPath<ShapeClip, Color>? = nil, _ onChange: @escaping () -> Void) -> some View {
-        HStack(spacing: 12) {
-            Text(label).font(.system(size: 11)).foregroundColor(Color.labelSecondary).frame(width: 68, alignment: .leading)
-            ColorPicker("", selection: binding).labelsHidden().onChange(of: binding.wrappedValue) { _ in onChange() }
-            Spacer(minLength: 0)
+        IFieldRow(label: label) {
+            ColorPicker("", selection: binding)
+                .inspectorColorWell()
+                .onChange(of: binding.wrappedValue) { _ in onChange() }
         }
         .dimNonUniform(dimKP.map { isMulti && !uniform($0) } ?? false)
     }
@@ -1715,106 +1724,63 @@ private struct ImageInspector: View {
                 InfoRow(label: "时长",   value: String(format: "%.1f 秒", clip.duration))
             }
 
-            ISection(title: "变换") {
-                HStack(spacing: 4) {
-                    imgCanvasBtn(.mirrorH, label: "水平镜像", active: clip.mirrorH) {
-                        project.updateImageClip(id: clip.id) { $0.mirrorH.toggle() }
-                        project.rebuildTimelinePreview()
+            // 六组共同属性，跟文字、图形、封面那三个面板同一份
+            LayerCommonSections(
+                mirrorH: Binding(get: { clip.mirrorH },
+                                 set: { v in
+                                     project.updateImageClip(id: clip.id) { $0.mirrorH = v }
+                                     project.rebuildTimelinePreview()
+                                 }),
+                mirrorV: Binding(get: { clip.mirrorV },
+                                 set: { v in
+                                     project.updateImageClip(id: clip.id) { $0.mirrorV = v }
+                                     project.rebuildTimelinePreview()
+                                 }),
+                rotation: Binding(get: { clip.rotation },
+                                  set: { v in
+                                      project.updateImageClip(id: clip.id) { $0.rotation = v }
+                                      project.rebuildTimelinePreviewDebounced()
+                                  }),
+                onRotate90: {
+                    project.updateImageClip(id: clip.id) {
+                        $0.rotation = ($0.rotation - 90 + 360).truncatingRemainder(dividingBy: 360)
                     }
-                    imgCanvasBtn(.mirrorV, label: "垂直镜像", active: clip.mirrorV) {
-                        project.updateImageClip(id: clip.id) { $0.mirrorV.toggle() }
-                        project.rebuildTimelinePreview()
-                    }
-                    imgCanvasBtn(.rotate, label: "旋转90°", active: clip.rotation != 0) {
-                        project.updateImageClip(id: clip.id) { $0.rotation = ($0.rotation + 90) % 360 }
-                        project.rebuildTimelinePreview()
-                    }
-                    Spacer()
-                }
-                if clip.rotation != 0 {
-                    Text("旋转 \(clip.rotation)°")
-                        .font(.system(size: 10))
-                        .foregroundColor(Color.labelSecondary)
-                }
-            }
-
-            ISection(title: nil) {
-                imgSectionHeader("位置") {
-                    Button { offsetX = 0; offsetY = 0; applyTransform() } label: {
-                        Text("居中")
-                            .font(.system(size: 9, weight: .medium))
-                            .foregroundColor(hasOffset ? .black : Color.labelSecondary)
-                            .padding(.horizontal, 6).padding(.vertical, 2)
-                            .background(hasOffset ? Color(hex: "#E8A54B") : Color.white.opacity(0.08))
-                            .clipShape(RoundedRectangle(cornerRadius: 4))
-                    }.buttonStyle(.plain).disabled(!hasOffset)
-                }
-                HStack(spacing: 10) {
-                    imgDualSlider("X", value: $offsetX, range: -1.0...1.0) { _ in applyTransform() }
-                    imgDualSlider("Y", value: $offsetY, range: -1.0...1.0) { _ in applyTransform() }
-                }
-            }
-
-            ISection(title: nil) {
-                imgSectionHeader("缩放") {
-                    Button { lockAspect.toggle(); syncLock() } label: {
-                        Image(systemName: lockAspect ? "lock.fill" : "lock.open")
-                            .font(.system(size: 10))
-                            .foregroundColor(lockAspect ? Color.accent : Color.labelSecondary)
-                    }.buttonStyle(.plain)
-                }
-                HStack(spacing: 10) {
-                    imgDualSlider("宽", value: $scaleX, range: 0.1...3.0, unit: "%", scale: 100) { v in
-                        if lockAspect { scaleY = v }; applyTransform()
-                    }
-                    imgDualSlider("高", value: $scaleY, range: 0.1...3.0, unit: "%", scale: 100) { v in
-                        if lockAspect { scaleX = v }; applyTransform()
-                    }
-                }
-            }
-
-            ISection(title: nil) {
-                imgSectionHeader("裁剪") {
-                    Button { cropTop = 0; cropBottom = 0; cropLeft = 0; cropRight = 0; applyTransform() } label: {
-                        Text("重置")
-                            .font(.system(size: 9, weight: .medium))
-                            .foregroundColor(hasCrop ? .black : Color.labelSecondary)
-                            .padding(.horizontal, 6).padding(.vertical, 2)
-                            .background(hasCrop ? Color(hex: "#E8A54B") : Color.white.opacity(0.08))
-                            .clipShape(RoundedRectangle(cornerRadius: 4))
-                    }.buttonStyle(.plain).disabled(!hasCrop)
-                }
-                VStack(spacing: 8) {
-                    cropSlider(label: "上", value: $cropTop, edge: 0)
-                    cropSlider(label: "下", value: $cropBottom, edge: 1)
-                    cropSlider(label: "左", value: $cropLeft, edge: 2)
-                    cropSlider(label: "右", value: $cropRight, edge: 3)
-                }
-            }
-
-            ISection(title: nil) {
-                imgSectionHeader("色调") {
-                    Button {
-                        brightness = 0; contrast = 0; saturation = 0; hue = 0
-                        applyColorAdjust()
-                    } label: {
-                        Text("重置")
-                            .font(.system(size: 9, weight: .medium))
-                            .foregroundColor(hasColorAdj ? .black : Color.labelSecondary)
-                            .padding(.horizontal, 6).padding(.vertical, 2)
-                            .background(hasColorAdj ? Color(hex: "#E8A54B") : Color.white.opacity(0.08))
-                            .clipShape(RoundedRectangle(cornerRadius: 4))
-                    }.buttonStyle(.plain).disabled(!hasColorAdj)
-                }
-                ICapsuleSlider(label: "亮度", value: $brightness, range: -1.0...1.0,
-                               decimals: 2, labelWidth: 28, onChange: { _ in applyColorAdjust() })
-                ICapsuleSlider(label: "对比", value: $contrast,   range: -1.0...1.0,
-                               decimals: 2, labelWidth: 28, onChange: { _ in applyColorAdjust() })
-                ICapsuleSlider(label: "饱和", value: $saturation, range: -1.0...1.0,
-                               decimals: 2, labelWidth: 28, onChange: { _ in applyColorAdjust() })
-                ICapsuleSlider(label: "色相", value: $hue,        range: -180.0...180.0,
-                               decimals: 0, unit: "°", labelWidth: 28, onChange: { _ in applyColorAdjust() })
-            }
+                    project.rebuildTimelinePreview()
+                },
+                // 图片的位置存的是相对画面的偏移（0 = 居中），换算成 0~100 的位置
+                posX: Binding(get: { (offsetX + 0.5) * 100 },
+                              set: { offsetX = $0 / 100 - 0.5; applyTransform() }),
+                posY: Binding(get: { (offsetY + 0.5) * 100 },
+                              set: { offsetY = $0 / 100 - 0.5; applyTransform() }),
+                onCenter: { offsetX = 0; offsetY = 0; applyTransform() },
+                scaleW: Binding(get: { scaleX * 100 },
+                                set: { scaleX = $0 / 100; applyTransform() }),
+                scaleH: Binding(get: { scaleY * 100 },
+                                set: { scaleY = $0 / 100; applyTransform() }),
+                lockAspect: Binding(get: { lockAspect },
+                                    set: { lockAspect = $0; applyTransform() }),
+                cropTop: Binding(get: { cropTop * 100 },
+                                 set: { cropTop = $0 / 100; applyTransform() }),
+                cropBottom: Binding(get: { cropBottom * 100 },
+                                    set: { cropBottom = $0 / 100; applyTransform() }),
+                cropLeft: Binding(get: { cropLeft * 100 },
+                                  set: { cropLeft = $0 / 100; applyTransform() }),
+                cropRight: Binding(get: { cropRight * 100 },
+                                   set: { cropRight = $0 / 100; applyTransform() }),
+                opacity: Binding(get: { clip.alpha * 100 },
+                                 set: { v in
+                                     project.updateImageClip(id: clip.id) { $0.opacity = v / 100 }
+                                     project.rebuildTimelinePreviewDebounced()
+                                 }),
+                cornerRadius: Binding(get: { clip.corner },
+                                      set: { v in
+                                          project.updateImageClip(id: clip.id) { $0.cornerRadius = v }
+                                          project.rebuildTimelinePreviewDebounced()
+                                      }),
+                onAlign: { project.alignLayers($0, anchorID: clip.id) },
+                canDistribute: project.selectedClipIDs.count >= 3,
+                onBeforeChange: { project.pushUndo() }
+            )
 
             ISection(title: nil) {
                 imgSectionHeader("描边") {
@@ -1827,21 +1793,16 @@ private struct ImageInspector: View {
                             .clipShape(RoundedRectangle(cornerRadius: 4))
                     }.buttonStyle(.plain).disabled(strokeWidth <= 0.01)
                 }
-                HStack(spacing: 12) {
-                    Text("颜色")
-                        .font(.system(size: 11))
-                        .foregroundColor(Color.labelSecondary)
-                        .frame(width: 28, alignment: .leading)
+                IFieldRow(label: "颜色") {
                     ColorPicker("", selection: $strokeColor)
-                        .labelsHidden()
+                        .inspectorColorWell()
                         .onChange(of: strokeColor) { _ in applyStroke() }
-                    Spacer()
                 }
-                ICapsuleSlider(label: "宽度", value: $strokeWidth, range: 0...20,
-                               decimals: 1, unit: "px", labelWidth: 28,
+                ICapsuleSlider(label: "宽度", value: $strokeWidth, range: 0...100,
+                               decimals: 1, unit: "px",
                                onChange: { _ in applyStroke() })
                 ICapsuleSlider(label: "柔和", value: $strokeSoftness, range: 0...1,
-                               decimals: 2, labelWidth: 28,
+                               decimals: 2,
                                onChange: { _ in applyStroke() })
                 // 去背图片会沿主体轮廓描边，未去背的矩形图片则沿画面边缘
                 Text("描边沿图片不透明区域的轮廓生成，柔和 0 为硬边")
@@ -1880,7 +1841,7 @@ private struct ImageInspector: View {
     @ViewBuilder
     private func cropSlider(label: String, value: Binding<Double>, edge: Int) -> some View {
         ICapsuleSlider(label: label, value: value, range: 0...0.99,
-                       unit: "%", displayScale: 100, labelWidth: 14,
+                       unit: "%", displayScale: 100,
                        onChange: { _ in applyCropWithCompensation(edge: edge) })
     }
 
@@ -1983,7 +1944,7 @@ private struct ImageInspector: View {
                               unit: String = "", scale: Double = 100,
                               onChange: @escaping (Double) -> Void) -> some View {
         ICapsuleSlider(label: label, value: value, range: range,
-                       unit: unit, displayScale: scale, labelWidth: 14,
+                       unit: unit, displayScale: scale,
                        onChange: onChange)
     }
 
@@ -2109,7 +2070,7 @@ private struct VideoInspector: View {
                         }
                         project.rebuildTimelinePreview()
                     }
-                ), range: 0.1...4.0, decimals: 2, unit: "×", labelWidth: 28)
+                ), range: 0.1...4.0, decimals: 2, unit: "×")
                 if abs(clip.speed - 1.0) > 0.01 {
                     HStack(spacing: 4) {
                         Image(systemName: "waveform")
@@ -2134,7 +2095,7 @@ private struct VideoInspector: View {
                         project.rebuildTimelinePreview()
                     }
                     canvasBtn(.rotate, label: "旋转90°", active: clip.rotation != 0) {
-                        project.updateVideoClip(id: clip.id) { $0.rotation = ($0.rotation + 90) % 360 }
+                        project.updateVideoClip(id: clip.id) { $0.rotation = ($0.rotation + 270) % 360 }
                         project.rebuildTimelinePreview()
                     }
                     canvasBtn(.reverse, label: "倒放", active: clip.reversed) {
@@ -2242,13 +2203,13 @@ private struct VideoInspector: View {
                     }.buttonStyle(.plain).disabled(!hasColorAdj)
                 }
                 ICapsuleSlider(label: "亮度", value: $brightness, range: -1.0...1.0,
-                               decimals: 2, labelWidth: 28, onChange: { _ in applyColorAdjust() })
+                               decimals: 2, onChange: { _ in applyColorAdjust() })
                 ICapsuleSlider(label: "对比", value: $contrast,   range: -1.0...1.0,
-                               decimals: 2, labelWidth: 28, onChange: { _ in applyColorAdjust() })
+                               decimals: 2, onChange: { _ in applyColorAdjust() })
                 ICapsuleSlider(label: "饱和", value: $saturation, range: -1.0...1.0,
-                               decimals: 2, labelWidth: 28, onChange: { _ in applyColorAdjust() })
+                               decimals: 2, onChange: { _ in applyColorAdjust() })
                 ICapsuleSlider(label: "色相", value: $hue,        range: -180.0...180.0,
-                               decimals: 0, unit: "°", labelWidth: 28, onChange: { _ in applyColorAdjust() })
+                               decimals: 0, unit: "°", onChange: { _ in applyColorAdjust() })
             }
         }
         .onAppear { loadMeta(); syncFromClip() }
@@ -2296,14 +2257,14 @@ private struct VideoInspector: View {
                             unit: String = "", scale: Double = 100,
                             onChange: @escaping (Double) -> Void) -> some View {
         ICapsuleSlider(label: label, value: value, range: range,
-                       unit: unit, displayScale: scale, labelWidth: 14,
+                       unit: unit, displayScale: scale,
                        onChange: onChange)
     }
 
     @ViewBuilder
     private func videoCropSlider(label: String, value: Binding<Double>, edge: Int) -> some View {
         ICapsuleSlider(label: label, value: value, range: 0...0.99,
-                       unit: "%", displayScale: 100, labelWidth: 14,
+                       unit: "%", displayScale: 100,
                        onChange: { _ in applyTransform() })
     }
 
@@ -2484,8 +2445,7 @@ private struct TransitionInspector: View {
                         ),
                         range: 0.1...2.0,
                         decimals: 1,
-                        unit: "秒",
-                        labelWidth: 28
+                        unit: "秒"
                     )
                 }
             } else {
@@ -2575,7 +2535,7 @@ private struct AudioInspector: View {
                         }
                         project.rebuildTimelinePreview()
                     }
-                ), range: 0.1...4.0, decimals: 2, unit: "×", labelWidth: 28)
+                ), range: 0.1...4.0, decimals: 2, unit: "×")
                 if abs(clip.speed - 1.0) > 0.01 {
                     HStack(spacing: 4) {
                         Image(systemName: "waveform")
@@ -2608,7 +2568,7 @@ private struct AudioInspector: View {
                             project.rebuildTimelinePreview()
                         }
                     ))
-                    .inspectorSwitch()
+                    .inspectorSwitch(anchor: .leading)
                     Spacer()
                 }
                 if clip.fadeInEnabled {
@@ -2638,7 +2598,7 @@ private struct AudioInspector: View {
                             project.rebuildTimelinePreview()
                         }
                     ))
-                    .inspectorSwitch()
+                    .inspectorSwitch(anchor: .leading)
                     Spacer()
                 }
                 if clip.fadeOutEnabled {
@@ -2701,13 +2661,24 @@ private struct AudioInspector: View {
 /// 属性区里所有开关统一走这个：**小一号 + 开启时是主题黄**。
 ///
 /// 原来各处自己写 `.scaleEffect(0.8)` / `.scaleEffect(0.7, anchor: .leading)`，
-/// 大小不一，开启时还是系统蓝，跟界面里别的选中态（橙黄）对不上
+/// 大小不一，开启时还是系统蓝，跟界面里别的选中态（橙黄）对不上。
+///
+/// anchor 默认 `.trailing`：开关基本都在行尾，`scaleEffect` 不改变布局尺寸，
+/// 按 leading 缩会把右边缘往里收，跟下面滑块胶囊的右边缘差出十几个点。
+/// 少数开关排在标签右边、后面还跟着 Spacer（合并换行、淡入淡出），那几处传 `.leading`
 extension View {
-    func inspectorSwitch() -> some View {
+    /// 属性区里的颜色入口。缩到跟开关一个量级，右边缘跟滑块对齐
+    /// （`scaleEffect` 不改布局尺寸，占位还是原来那么宽，所以右边缘照样齐）
+    func inspectorColorWell() -> some View {
+        // 色块左边缘要跟滑轨对齐，所以按左边缘缩
+        self.labelsHidden().scaleEffect(0.6, anchor: .leading)
+    }
+
+    func inspectorSwitch(anchor: UnitPoint = .trailing) -> some View {
         self.labelsHidden()
             .toggleStyle(.switch)
             .tint(Color.accent)
-            .scaleEffect(0.7, anchor: .leading)
+            .scaleEffect(0.53, anchor: anchor)
     }
 }
 
@@ -2759,8 +2730,8 @@ struct ISlider: View {
     let range: ClosedRange<Double>
     let unit: String
     var decimals: Int = 0
-    /// 标签占多宽。默认 64 是属性区那套；封面弹窗窄，传四个字的宽度换更长的滑条
-    var labelWidth: CGFloat = 64
+    /// 标签占多宽。**统一五个字**，六个面板一个样，滑轨起点才对得齐
+    var labelWidth: CGFloat = ILayout.labelWidth
 
     var body: some View {
         ICapsuleSlider(label: label, value: $value, range: range,
@@ -2770,6 +2741,56 @@ struct ISlider: View {
 
 /// 胶囊式滑块：标签(左) + 滑块 + 可编辑数值(右)，整体浅色圆角胶囊。
 /// 参考 Sketch 属性面板：滑块与数值并存，可拖动也可点击数值直接输入。
+/// 粗体、斜体这种字形开关。样子跟画布文字卡片那排一致 —— B 就是粗的 B，I 就是斜的 I
+func styleGlyph(_ text: String, isOn: Bool,
+                weight: Font.Weight = .regular, italic: Bool = false,
+                action: @escaping () -> Void) -> some View {
+    Button(action: action) {
+        Text(text)
+            .font(.system(size: 13, weight: weight))
+            .italic(italic)
+            .foregroundColor(isOn ? .black : Color.labelSecondary)
+            .frame(width: 30, height: 26)
+            .background(isOn ? Color(hex: "#E8A54B") : Color.white.opacity(0.08))
+            .cornerRadius(5)
+    }
+    .buttonStyle(.plain)
+}
+
+/// 属性区的排版基准。六个面板都照这套走，滑轨、色块、下拉框才对得成一条线
+enum ILayout {
+    /// 标签宽度：五个字
+    static let labelWidth: CGFloat = 52
+    /// 胶囊滑块的左右内边距
+    static let hPadding: CGFloat = 8
+    /// 标签和控件之间的间距
+    static let gap: CGFloat = 6
+    /// 控件（滑轨、色块、下拉框、输入框）的左边缘，相对整行左边缘
+    static var contentInset: CGFloat { hPadding + labelWidth + gap }
+}
+
+/// 「左标题 + 右控件」的一行。控件左边缘跟滑块的滑轨对齐
+struct IFieldRow<Content: View>: View {
+    let label: String
+    var trailing = false      // true = 控件靠右（开关那种）
+    @ViewBuilder var content: Content
+
+    var body: some View {
+        HStack(spacing: ILayout.gap) {
+            // 标题**从整行最左边开始**，跟滑块那个胶囊背景的左边缘齐；
+            // 宽度多算上胶囊的内边距，后面的控件左边缘正好落在滑轨起点上
+            Text(label)
+                .font(.system(size: 10))
+                .foregroundColor(Color.labelSecondary)
+                .frame(width: ILayout.labelWidth + ILayout.hPadding, alignment: .leading)
+                .lineLimit(1)
+            if trailing { Spacer(minLength: 0) }
+            content
+            if !trailing { Spacer(minLength: 0) }
+        }
+    }
+}
+
 struct ICapsuleSlider: View {
     let label: String
     @Binding var value: Double
@@ -2777,7 +2798,7 @@ struct ICapsuleSlider: View {
     var decimals: Int = 0
     var unit: String = ""
     var displayScale: Double = 1    // 显示值 = value × displayScale（如 offset -1...1 显示为 -100...100）
-    var labelWidth: CGFloat = 18
+    var labelWidth: CGFloat = ILayout.labelWidth
     var onChange: ((Double) -> Void)? = nil
     // (reserved for future use)
 
@@ -2800,6 +2821,9 @@ struct ICapsuleSlider: View {
             CustomSlider(value: $value, range: range, onDragging: { d in
                 dragging = d
             })
+            .frame(maxWidth: .infinity)
+            // 数值区**固定宽度 + fixedSize**：滑轨那头是个 GeometryReader，
+            // 在 HStack 里会一路撑开，不把这头钉死的话「344°」会被压到滑轨底下
             HStack(spacing: 1) {
                 TextField("", text: $editText)
                     .font(.system(size: 10).monospacedDigit())
@@ -2807,7 +2831,7 @@ struct ICapsuleSlider: View {
                     .multilineTextAlignment(.trailing)
                     .textFieldStyle(.plain)
                     .focused($focused)
-                    .frame(width: 30)
+                    .frame(width: 34)
                     .onAppear { editText = fmt }
                     .onChange(of: value) { v in if !focused { editText = fmt }; if dragging { onChange?(v) } }
                     .onSubmit { commit() }
@@ -2816,10 +2840,13 @@ struct ICapsuleSlider: View {
                     Text(unit)
                         .font(.system(size: 10))
                         .foregroundColor(Color.labelSecondary)
+                        .fixedSize()
                 }
             }
+            .fixedSize()
+            .layoutPriority(1)
         }
-        .padding(.horizontal, 8)
+        .padding(.horizontal, ILayout.hPadding)
         .frame(height: 28)
         .background(Color.white.opacity(0.06))
         .cornerRadius(6)
@@ -2886,7 +2913,10 @@ struct CustomSlider: View {
         GeometryReader { geo in
             let w = geo.size.width
             let span = range.upperBound - range.lowerBound
-            let frac = span > 0 ? CGFloat((value - range.lowerBound) / span) : 0
+            let rawFrac = span > 0 ? CGFloat((value - range.lowerBound) / span) : 0
+            // **必须钳住**：值越出 range 时（比如旋转 344° 配 -180...180 的区间）
+            // 比例会大于 1，橙色轨道一路画到数值区上面去，看着就是「数字和滑轨重合」
+            let frac = max(0, min(1, rawFrac))
             let fillW = frac * w   // 填充宽度（0 ~ w）
 
             ZStack(alignment: .leading) {

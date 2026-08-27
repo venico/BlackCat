@@ -54,7 +54,11 @@ struct CompositorTrackEntry {
     var colorAdjust: ColorAdjust
     var mirrorH: Bool = false
     var mirrorV: Bool = false
-    var rotation: Int = 0
+    var rotation: Double = 0
+    /// 画面圆角（px，源坐标）。0 = 不切
+    var cornerRadius: Double = 0
+    /// 图层自身的不透明度（跟转场的 opacityRamp 是两回事，两者相乘）
+    var baseOpacity: Double = 1
     var naturalSize: CGSize?
     /// 素材自带的方向（手机竖拍视频 naturalSize 是横的，靠它转正）。
     /// AVFoundation 只在**没有**自定义 compositor 时才自动应用 preferredTransform，
@@ -73,9 +77,17 @@ struct CompositorTrackEntry {
 
     /// 根据实际 source buffer 尺寸在 render 空间中计算 CIImage 变换。
     /// 公式和导出 videoTransform 一致（y-down 语义），由 ColorCompositor 统一做 y 翻转。
-    func fitTransform(srcSize: CGSize, renderSize: CGSize, at t: Double) -> CGAffineTransform {
+    /// - Parameters:
+    ///   - srcSize: 图像实际占的范围，用来居中
+    ///   - scaleBasis: 算贴合倍率用的尺寸，默认同 srcSize。
+    ///     自由旋转时传**转之前**的尺寸 —— 按转完的外接矩形算倍率的话，
+    ///     转的过程中画面会一起缩放
+    func fitTransform(srcSize: CGSize, renderSize: CGSize, at t: Double,
+                      scaleBasis: CGSize? = nil) -> CGAffineTransform {
         guard srcSize.width > 0, srcSize.height > 0 else { return .identity }
-        let baseScale = min(renderSize.width / srcSize.width, renderSize.height / srcSize.height)
+        let basis = scaleBasis ?? srcSize
+        guard basis.width > 0, basis.height > 0 else { return .identity }
+        let baseScale = min(renderSize.width / basis.width, renderSize.height / basis.height)
         let sx = baseScale * userScaleX
         let sy = baseScale * userScaleY
         let tx = (renderSize.width  - srcSize.width  * sx) / 2 + userOffsetX * renderSize.width
@@ -314,6 +326,24 @@ final class ColorCompositor: NSObject, AVVideoCompositing {
                 ci = ci.cropped(to: cropRect)
             }
 
+            // 3.5 圆角：裁剪之后、变换之前，跟预览的 clipShape、导出那条链同一个位置
+            if entry.cornerRadius > 0.01 {
+                let box = ci.extent
+                if box.width > 1, box.height > 1,
+                   let gen = CIFilter(name: "CIRoundedRectangleGenerator") {
+                    let r = min(CGFloat(entry.cornerRadius), min(box.width, box.height) / 2)
+                    gen.setValue(CIVector(cgRect: box), forKey: "inputExtent")
+                    gen.setValue(r, forKey: "inputRadius")
+                    gen.setValue(CIColor.white, forKey: "inputColor")
+                    if let mask = gen.outputImage?.cropped(to: box) {
+                        ci = ci.applyingFilter("CIBlendWithAlphaMask", parameters: [
+                            kCIInputBackgroundImageKey: CIImage.empty(),
+                            kCIInputMaskImageKey: mask
+                        ]).cropped(to: box)
+                    }
+                }
+            }
+
             // 4. 镜像 / 旋转，绕**整幅画面**的中心（不是裁剪后那块的中心，
             //    否则裁过的画面转起来会自己跑位）
             var rotT = CGAffineTransform.identity
@@ -336,11 +366,12 @@ final class ColorCompositor: NSObject, AVVideoCompositing {
                                                       y: -rotFull.origin.y))
             let fitT = entry.fitTransform(
                 srcSize: rotFull.size,
-                renderSize: renderSize, at: t)
+                renderSize: renderSize, at: t,
+                scaleBasis: rotatedFitSize(fullExtent.size, rotation: entry.rotation))
             ci = ci.transformed(by: fitT)
 
-            // 5. 不透明度
-            let op = entry.effectiveOpacity(at: t)
+            // 5. 不透明度（图层自己的 × 转场的）
+            let op = entry.effectiveOpacity(at: t) * Float(entry.baseOpacity)
             if op < 0.999 {
                 ci = ci.applyingFilter("CIColorMatrix", parameters: [
                     "inputAVector": CIVector(x: 0, y: 0, z: 0, w: CGFloat(op))

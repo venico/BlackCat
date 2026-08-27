@@ -110,6 +110,14 @@ extension View {
         }
     }
 
+    /// 完全没有描边的面板。预览区、属性区、轨道区用它 ——
+    /// Liquid Glass 那圈边缘高光去不掉，所以这三块统一走材质，
+    /// 只留材质底色和圆角，靠明暗差划界
+    func panelSurfacePlain(_ kind: PanelKind = .content, cornerRadius: CGFloat = 12) -> some View {
+        background(VisualEffectBackground(material: kind.material))
+            .clipShape(RoundedRectangle(cornerRadius: cornerRadius))
+    }
+
     /// 柔和阴影。给需要"浮起来"的面板用（素材栏、欢迎页侧栏）
     func softPanelShadow() -> some View {
         shadow(color: .black.opacity(0.38), radius: 14, x: 0, y: 4)
