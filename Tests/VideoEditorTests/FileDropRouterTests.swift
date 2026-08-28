@@ -36,14 +36,15 @@ final class FileDropRouterTests: XCTestCase {
             win, kind: .timeline, rect: tlRect,
             accepts: {
                 switch $0 {
-                case .asset, .shape: return true
-                case .files:         return false
+                case .asset, .shape, .filter, .adjust: return true
+                case .files:                           return false
                 }
             },
             onDrop: { payload, local in
                 switch payload {
                 case .asset(let id): onAsset(id, local)
                 case .shape(let t):  onShape(t, local)
+                case .filter, .adjust: break
                 case .files:         break
                 }
             },

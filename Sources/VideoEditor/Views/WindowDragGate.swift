@@ -65,6 +65,8 @@ enum FileDropRouter {
         case files([URL])
         case asset(UUID)
         case shape(ShapeType)
+        case filter(FilterKind)
+        case adjust
     }
 
     /// 接收区。素材区收文件，时间轴收素材 id —— 两边收的载荷类型不同，
@@ -111,6 +113,11 @@ enum FileDropRouter {
     /// 图形拖的是 "shape:rectangle"，靠这个前缀区分
     static let shapePrefix = "shape:"
     static func pasteboardString(for type: ShapeType) -> String { shapePrefix + type.rawValue }
+    /// 滤镜卡片拖出去的载荷，同理带前缀区分
+    static let filterPrefix = "filter:"
+    static func pasteboardString(for kind: FilterKind) -> String { filterPrefix + kind.rawValue }
+    /// 调节只有一种，载荷是个固定串
+    static let adjustPasteboardString = "adjust:default"
 
     private static func zone(at point: CGPoint, for payload: Payload,
                              in id: WindowID) -> Zone? {
@@ -185,6 +192,11 @@ final class GatedHostingView<Content: View>: NSHostingView<Content> {
                let t = ShapeType(rawValue: String(s.dropFirst(FileDropRouter.shapePrefix.count))) {
                 return .shape(t)
             }
+            if s == FileDropRouter.adjustPasteboardString { return .adjust }
+            if s.hasPrefix(FileDropRouter.filterPrefix),
+               let k = FilterKind(rawValue: String(s.dropFirst(FileDropRouter.filterPrefix.count))) {
+                return .filter(k)
+            }
         }
         // Finder 拖进来的文件。只认 file:// —— 别把应用内那些串当成 URL
         if let urls = pb.readObjects(forClasses: [NSURL.self],
@@ -239,6 +251,8 @@ final class GatedHostingView<Content: View>: NSHostingView<Content> {
         case .files(let urls): what = "文件=\(urls.count)"
         case .asset(let id):   what = "素材=\(id.uuidString.prefix(8))"
         case .shape(let t):    what = "图形=\(t.rawValue)"
+        case .filter(let k):   what = "滤镜=\(k.rawValue)"
+        case .adjust:          what = "调节"
         }
         DiagLog.log("[拖入] 落点=\(pt) \(what) 接收=\(accepted)")
         return accepted

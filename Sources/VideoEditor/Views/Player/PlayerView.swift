@@ -47,9 +47,7 @@ struct PlayerView: View {
                         let fitH = rs.height * fitScale
                         Color.clear.contentShape(Rectangle())
                             .onTapGesture {
-                                project.selectedShapeClipID = nil; project.selectedImageClipID = nil
-                                project.selectedTextClipID = nil; project.selectedVideoClipID = nil
-                                project.selectedSubtitleClipID = nil; project.selectedClipIDs.removeAll()
+                                project.clearClipSelections(); project.selectedClipIDs.removeAll()
                                 if project.editingTextClipID != nil { project.editingTextClipID = nil }
                             }
                         OverlayStack()
@@ -207,28 +205,24 @@ private struct OverlayStack: View {
             Color.clear.contentShape(Rectangle())
                 .onTapGesture {
                     if project.editingTextClipID != nil { commitTextEdit() }
-                    project.selectedShapeClipID = nil
-                    project.selectedImageClipID = nil
-                    project.selectedTextClipID = nil
-                    project.selectedVideoClipID = nil
-                    project.selectedSubtitleClipID = nil
+                    project.clearClipSelections()
                     project.selectedClipIDs.removeAll()
                 }
                 .zIndex(-1)
 
-            ForEach(Array(layersBottomUp.enumerated()), id: \.element.trackID) { i, ref in
-                let z = Double(i)
-                switch ref {
-                case .image(let id):
-                    imageTrackView(trackID: id).zIndex(z)
-                case .subtitle(let id):
-                    subtitleTrackView(trackID: id).zIndex(z)
-                case .text(let id):
-                    textTrackView(trackID: id).zIndex(z)
-                case .shape(let id):
-                    shapeTrackView(trackID: id).zIndex(z)
-                case .compound(let id):
-                    compoundOverlayView(trackID: id).zIndex(z)
+            // 没有滤镜时按老样子平铺 —— 嵌套那条路每层都套 AnyView，
+            // 会丢掉 SwiftUI 的视图身份，白白拖累拖拽手感
+            if layersBottomUp.contains(where: {
+                if case .filter = $0 { return true }
+                if case .adjust = $0 { return true }
+                return false
+            }) {
+                // 有滤镜：**从底往上一层层套**。滤镜只作用于排在它下面的图层，
+                // 所以走到滤镜那层时，把「已经堆好的部分」整个套一层效果再往上叠
+                overlayChain(layersBottomUp)
+            } else {
+                ForEach(Array(layersBottomUp.enumerated()), id: \.element.trackID) { i, ref in
+                    layerView(ref).zIndex(Double(i))
                 }
             }
         }
@@ -266,6 +260,48 @@ private struct OverlayStack: View {
                         .position(x: imgRect.midX, y: imgRect.midY)
                 }
             }
+        }
+    }
+
+    /// 从底到顶把图层叠起来。遇到滤镜就把下面那坨整个套一层
+    private func overlayChain(_ layers: [ProjectState.OverlayTrackRef]) -> AnyView {
+        layers.reduce(AnyView(Color.clear)) { acc, ref in
+            if case .adjust(let id) = ref {
+                let clips = project.adjustTracks.first { $0.id == id }
+                    .map { t in
+                        t.isVisible
+                        ? t.clips.filter { $0.startTime <= clock.currentTime && $0.endTime > clock.currentTime }
+                        : []
+                    } ?? []
+                let fs = clips.flatMap(\.adjust.ciFilters)
+                guard !fs.isEmpty else { return acc }
+                return AnyView(CILayerEffect(filters: fs) { acc })
+            }
+            if case .filter(let id) = ref {
+                let clips = project.filterTracks.first { $0.id == id }
+                    .map { t in
+                        t.isVisible
+                        ? t.clips.filter { $0.startTime <= clock.currentTime && $0.endTime > clock.currentTime }
+                        : []
+                    } ?? []
+                return AnyView(acc.modifier(OverlayFilterEffect(clips: clips)))
+            }
+            return AnyView(ZStack {
+                acc
+                layerView(ref)
+            })
+        }
+    }
+
+    @ViewBuilder
+    private func layerView(_ ref: ProjectState.OverlayTrackRef) -> some View {
+        switch ref {
+        case .image(let id):    imageTrackView(trackID: id)
+        case .subtitle(let id): subtitleTrackView(trackID: id)
+        case .text(let id):     textTrackView(trackID: id)
+        case .shape(let id):    shapeTrackView(trackID: id)
+        case .compound(let id): compoundOverlayView(trackID: id)
+        case .filter, .adjust:  EmptyView()   // 滤镜/调节在 overlayChain 里单独处理
         }
     }
 
@@ -562,6 +598,8 @@ private struct OverlayStack: View {
             if isFirstSubtitle {
                 compoundSubtitles(compound: compound, it: it, geo: geo)
             }
+        case .filter, .adjust:
+            EmptyView()   // 复合片段内部没有滤镜/调节轨道
         case .compound(let id):
             nestedCompoundOverlay(compound: compound, trackID: id, it: it, geo: geo)
         }
@@ -747,11 +785,10 @@ private struct ImageLayerView: View {
                         // 完整图左上角相对裁剪框左上角的偏移
                         .offset(x: -imgW * CGFloat(clip.cropLeft) * finalSX * vs,
                                 y: -imgH * CGFloat(clip.cropTop)  * finalSY * vs)
-                        .brightness(adj.brightness)
-                        .contrast(1 + adj.contrast)
-                        .saturation(1 + adj.saturation)
-                        .hueRotation(.degrees(adj.hue))
                 }
+                // 调色走真的 CIFilter：曝光/伽马/高光阴影/色温这些
+                // SwiftUI 的修饰器没有对应项，只用修饰器的话滑块拖了没反应
+                .modifier(CIAdjustEffect(adjust: adj))
                 .frame(width: cropW * vs, height: cropH * vs, alignment: .topLeading)
                 .clipped()
                 // 圆角切在描边之前，描边才会沿着圆角走
@@ -3346,6 +3383,71 @@ final class PlayerController: ObservableObject {
             pause()
         } else {
             onTime?(cur)
+        }
+    }
+}
+
+// MARK: - 叠加层的滤镜
+
+/// 给预览区的叠加层（图片 / 文字 / 图形）套滤镜。
+///
+/// **是近似不是精确**：合成器那边用的是 CIFilter，这里只有 SwiftUI 的几个
+/// 颜色修饰器可用。导出走的是 CIFilter 那条链，所以成片是准的 ——
+/// 这一层只为了让预览里叠加的内容跟着一起变，不至于「视频黑白了、字还是彩的」
+/// 给叠加层（图片/文字/图形都是 SwiftUI 画的，不经过合成器）套滤镜。
+///
+/// 走 CALayer.filters 挂**真的 CIFilter**，跟视频画面用的是同一份 FilterEngine ——
+/// 之前用 grayscale/saturation 这些修饰器近似，漫画、色阶、LUT 根本近似不出来。
+///
+/// 强度靠上下两层叠加：底下一层原样、上面一层套滤镜按强度调透明度，
+/// 效果等同于线性混合。**交互留给下面那层**，否则强度拉满时预览区就点不动了
+struct OverlayFilterEffect: ViewModifier {
+    let clips: [FilterClip]
+
+    func body(content: Content) -> some View {
+        clips.reduce(AnyView(content)) { view, clip in
+            let k = min(max(clip.intensity, 0), 1)
+            let fs = FilterEngine.ciFilters(for: clip)
+            guard k > 0.001, !fs.isEmpty else { return view }
+            return AnyView(ZStack {
+                view
+                CILayerEffect(filters: fs) { view }
+                    .opacity(k)
+                    .allowsHitTesting(false)
+            })
+        }
+    }
+}
+
+/// macOS 上给任意视图挂 CIFilter 的唯一现成通道：CALayer.filters
+struct CILayerEffect<Content: View>: NSViewRepresentable {
+    let filters: [CIFilter]
+    @ViewBuilder let content: () -> Content
+
+    func makeNSView(context: Context) -> NSHostingView<Content> {
+        let v = NSHostingView(rootView: content())
+        v.wantsLayer = true
+        v.layer?.backgroundColor = NSColor.clear.cgColor
+        return v
+    }
+
+    func updateNSView(_ v: NSHostingView<Content>, context: Context) {
+        v.rootView = content()
+        v.layer?.filters = filters
+    }
+}
+
+
+/// 给 SwiftUI 视图套一份 ColorAdjust。跟导出用的是同一条 CIFilter 链
+struct CIAdjustEffect: ViewModifier {
+    let adjust: ColorAdjust
+
+    func body(content: Content) -> some View {
+        let fs = adjust.ciFilters
+        if fs.isEmpty {
+            content
+        } else {
+            CILayerEffect(filters: fs) { content }
         }
     }
 }

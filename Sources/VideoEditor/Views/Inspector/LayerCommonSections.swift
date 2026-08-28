@@ -319,3 +319,103 @@ struct LayerCommonSections: View {
         .buttonStyle(.plain)
     }
 }
+
+
+// MARK: - 调节参数（片段属性区和调节轨道共用这一份）
+
+/// 十一个调节滑块。**两个入口同一套控件**：
+/// 片段属性区里挂在某一个片段上（默认折叠），调节轨道上覆盖一段时间的所有画面（默认展开）
+struct AdjustSliders: View {
+    @Binding var adjust: ColorAdjust
+    /// 折叠态由外面给，两个入口的默认值不一样
+    @State var expanded: Bool
+    let onChange: () -> Void
+
+    init(adjust: Binding<ColorAdjust>, expandedByDefault: Bool, onChange: @escaping () -> Void) {
+        self._adjust = adjust
+        self._expanded = State(initialValue: expandedByDefault)
+        self.onChange = onChange
+    }
+
+    private var isNeutral: Bool { adjust.isIdentity }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Button {
+                    withAnimation(.easeInOut(duration: 0.15)) { expanded.toggle() }
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: "chevron.right")
+                            .font(.system(size: 8, weight: .bold))
+                            .rotationEffect(.degrees(expanded ? 90 : 0))
+                        Text("调节")
+                            .font(.system(size: 11, weight: .semibold))
+                            .tracking(0.2)
+                    }
+                    .foregroundColor(Color.labelPrimary)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                Spacer()
+                Button {
+                    adjust = .identity
+                    onChange()
+                } label: {
+                    Text("重置")
+                        .font(.system(size: 9, weight: .medium))
+                        .foregroundColor(isNeutral ? Color.labelSecondary : .black)
+                        .padding(.horizontal, 6).padding(.vertical, 2)
+                        .background(isNeutral ? Color.white.opacity(0.08) : Color(hex: "#E8A54B"))
+                        .clipShape(RoundedRectangle(cornerRadius: 4))
+                }
+                .buttonStyle(.plain)
+                .disabled(isNeutral)
+            }
+
+            if expanded {
+                group("基础")
+                slider("亮度", $adjust.brightness, -1...1)
+                slider("对比", $adjust.contrast, -1...1)
+                slider("饱和", $adjust.saturation, -1...1)
+                slider("自然饱和", $adjust.vibrance, -1...1)
+
+                group("光影")
+                slider("曝光", $adjust.exposure, -2...2)
+                slider("伽马", $adjust.gamma, 0.25...4)
+                slider("高光", $adjust.highlight, -1...1)
+                slider("阴影", $adjust.shadow, -1...1)
+
+                group("色彩")
+                slider("色温", $adjust.temperature, -1...1)
+                slider("色调", $adjust.tint, -1...1)
+                slider("色相", $adjust.hue, -180...180, decimals: 0, unit: "°")
+            }
+        }
+    }
+
+    private func group(_ t: String) -> some View {
+        Text(t)
+            .font(.system(size: 9, weight: .medium))
+            .foregroundColor(Color.labelSecondary)
+            .padding(.top, 2)
+    }
+
+    private func slider(_ label: String, _ value: Binding<Double>,
+                        _ range: ClosedRange<Double>,
+                        decimals: Int = 2, unit: String = "") -> some View {
+        ICapsuleSlider(label: label, value: value, range: range,
+                       decimals: decimals, unit: unit, onChange: { _ in onChange() })
+    }
+}
+
+/// 属性区的宽度范围。
+///
+/// 下限不是随便定的：视频面板的「速度」那一组是五个预设按钮并排，
+/// 再窄就摆不下，内容会溢出容器、左边一整列被裁掉（按钮和滑块标签都缺一截）。
+/// 图片、文字那些面板的控件都能压缩，所以看不出问题 —— 下限得按最挤的那个面板定
+enum InspectorLayout {
+    static let minWidth: CGFloat = 260
+    static let maxWidth: CGFloat = 450
+    static let defaultWidth: CGFloat = 300
+}

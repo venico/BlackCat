@@ -42,7 +42,7 @@ struct ContentView: View {
     @State private var isDraggingH = false
     @State private var sidebarVisible = true
     @State private var sidebarWidth: CGFloat = 260
-    @State private var inspectorWidth: CGFloat = 280
+    @State private var inspectorWidth: CGFloat = InspectorLayout.defaultWidth
     // Drag origin tracking (prevents cumulative translation bug)
     @State private var dragOriginSidebar: CGFloat = 260
     @State private var isDraggingSidebar = false
@@ -52,7 +52,9 @@ struct ContentView: View {
     @State private var settingsVisible = false
 
     // Height of the shared "title-bar" row that contains traffic lights + toggle
-    private let toolbarH: CGFloat = 28
+    /// 侧边栏顶部标题栏行的高度。34 = 交通灯 12pt + 上下各 11pt ——
+    /// 那一行是居中排的，改这个数就等于改交通灯距上边缘的距离
+    private let toolbarH: CGFloat = 34
 
     var body: some View {
         HStack(spacing: 0) {
@@ -63,10 +65,10 @@ struct ContentView: View {
                     // 标题栏行：自定义交通灯（SwiftUI）+ toggle 按钮
                     HStack(spacing: 0) {
                         TrafficLightsView()
-                            .padding(.leading, 12)
+                            .padding(.leading, 11)
                         Spacer()
                         toggleButton
-                            .padding(.trailing, 12)
+                            .padding(.trailing, 11)
                     }
                     .frame(height: toolbarH)
 
@@ -75,7 +77,7 @@ struct ContentView: View {
                 }
                 .frame(width: sidebarWidth)
                 .frame(maxHeight: .infinity)
-                .panelSurface(.sidebar)
+                .panelSurface(.sidebar, cornerRadius: 18)
                 .softPanelShadow()
                 .simultaneousGesture(TapGesture().onEnded {
                     NSApp.keyWindow?.makeFirstResponder(nil)
@@ -123,17 +125,20 @@ struct ContentView: View {
                                     NSApp.keyWindow?.makeFirstResponder(nil)
                                 })
                             // 预览区和属性区之间的分割线。**上下顶头** ——
-                            // 这一行的高度就是上半区的高度，线跟着占满
-                            Rectangle()
-                                .fill(Color.white.opacity(0.10))
-                                .frame(width: 1)
-                                .frame(maxHeight: .infinity)
-                                // 负边距把上半区自己的 8pt 顶部留白、以及下面那条
-                                // 8pt 拖动缝都补上，线才是真的上下顶头
-                                .padding(.top, -6)
-                                .padding(.bottom, -4)
                             InspectorView()
                                 .frame(width: inspectorWidth)
+                                // 分割线**画在属性区左边缘上**，不占 HStack 的一格 ——
+                                // 占一格的话属性区左边就比右边多出这 1pt，
+                                // 里面所有标题和控件都跟着偏 1pt
+                                .overlay(alignment: .leading) {
+                                    Rectangle()
+                                        .fill(Color.white.opacity(0.10))
+                                        .frame(width: 1)
+                                        // 负边距把上半区自己的 8pt 顶部留白、以及下面那条
+                                        // 8pt 拖动缝都补上，线才是真的上下顶头
+                                        .padding(.top, -6)
+                                        .padding(.bottom, -4)
+                                }
                                 // 拖宽度的热区**骑在线上**：左右各 4pt
                                 .overlay(alignment: .leading) {
                                     Color.clear
@@ -148,7 +153,9 @@ struct ContentView: View {
                                             .onChanged { v in
                                                 if !isDraggingInspector { dragOriginInspector = inspectorWidth }
                                                 isDraggingInspector = true
-                                                inspectorWidth = min(max(dragOriginInspector - v.translation.width, 200), 450)
+                                                inspectorWidth = min(max(dragOriginInspector - v.translation.width,
+                                                                         InspectorLayout.minWidth),
+                                                                     InspectorLayout.maxWidth)
                                             }
                                             .onEnded { _ in
                                                 isDraggingInspector = false

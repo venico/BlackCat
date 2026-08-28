@@ -29,6 +29,10 @@ extension ProjectState {
         let aTracks = audioTracks
         let sTracks = subtitleTracks
         let cTracks = compoundTracks
+        // 跟上面几条一样先快照。异步任务里直接读 self 的话，
+        // 隐藏/显示这种一改就要立刻见效的开关容易慢一拍
+        let fTracks = filterTracks
+        let adjTracks = adjustTracks
         let vSectionOrder = videoSectionOrder
         let restoreTime = seekTo ?? currentTime
         let tTracks = textTracks
@@ -53,6 +57,17 @@ extension ProjectState {
         hasher.combine(cTracks.flatMap(\.clips).map { "\($0.id)\($0.startTime)\($0.endTime)\($0.internalStart)" }.joined())
         hasher.combine(cTracks.map { "\($0.isVisible)\($0.isMuted)" }.joined())
         hasher.combine(vSectionOrder.map { "\($0.trackID)" }.joined())
+        // 滤镜轨道也要入指纹：**不加的话加滤镜、调强度、切显隐在它看来都是「没变化」**，
+        // 重建被直接 return 掉，画面要等下一次别的改动才跟上
+        hasher.combine(fTracks.flatMap(\.clips)
+            .map { "\($0.id)\($0.kind.rawValue)\($0.startTime)\($0.endTime)\($0.intensity)\($0.lutPath ?? "")" }
+            .joined())
+        hasher.combine(fTracks.map { "\($0.isVisible)" }.joined())
+        // 调节也得进指纹，漏了的话新加/改参数会被当成「没变化」直接跳过重建
+        hasher.combine(adjTracks.flatMap(\.clips).map {
+            "\($0.id)\($0.startTime)\($0.endTime)\($0.adjust)"
+        }.joined())
+        hasher.combine(adjTracks.map { "\($0.isVisible)" }.joined())
         // 画布尺寸是合成的 renderSize，不入指纹的话切分辨率/比例会被当成「无变化」跳过重建
         let rs = previewRenderSize
         hasher.combine("\(rs.width)x\(rs.height)")
@@ -528,6 +543,10 @@ extension ProjectState {
             // Build AVVideoComposition to layer image tracks on top of video tracks.
             let allVideoTracks = videoCompTracks.map(\.track) + imageCompTracks.map(\.track)
             var videoComposition: AVMutableVideoComposition? = nil
+            // 没有视频轨时也要清掉静态存的滤镜，不然上一个项目的还留着
+            if allVideoTracks.isEmpty {
+                ColorCompositor.setFilterTracks([]); ColorCompositor.setAdjustTracks([])
+            }
             if !allVideoTracks.isEmpty && composition.duration.seconds > 0.01 {
                 let vc = AVMutableVideoComposition()
                 vc.renderSize = renderSize
@@ -562,6 +581,9 @@ extension ProjectState {
 
                 vc.customVideoCompositorClass = ColorCompositor.self
                 ColorCompositor.clearStore()
+                // 滤镜单独存一份静态的：合成器有条「透传」快路径拿不到指令数据
+                ColorCompositor.setFilterTracks(fTracks)
+                ColorCompositor.setAdjustTracks(adjTracks)
                 var colorInstructions: [AVVideoCompositionInstruction] = []
                 for i in 0..<(sortedCM.count - 1) {
                     let segStartCM = sortedCM[i]
@@ -701,12 +723,13 @@ extension ProjectState {
                     let colorData = ColorCompositionData()
                     colorData.entries    = entries
                     colorData.renderSize = renderSize
+                    // 滤镜在所有画面合成完之后统一套，所以整份轨道原样带过去
+                    colorData.filterTracks = fTracks
                     let key = CMTimeConvertScale(segStartCM, timescale: 600, method: .default).value
                     ColorCompositor.setData(colorData, forStartValue: key)
 
                     colorInstructions.append(instr)
                 }
-
                 if !colorInstructions.isEmpty {
                     vc.instructions = colorInstructions
                     videoComposition = vc

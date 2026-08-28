@@ -106,6 +106,14 @@ final class WindowManager: NSObject {
         order.append(id)
         window.contentView = hosting
 
+        // 整个窗口的圆角。**必须排在挂 contentView 之后** ——
+        // 挂之前设的是系统那个默认空 view，随后会被 SwiftUI 的宿主整个换掉
+        hosting.wantsLayer = true
+        hosting.layer?.cornerRadius = 27
+        hosting.layer?.cornerCurve = .continuous
+        hosting.layer?.masksToBounds = true
+        window.invalidateShadow()   // 阴影按新形状重画，四角才不会漏出直角的影子
+
         window.makeKeyAndOrderFront(nil)
         // 必须显式激活 app。关掉最后一个窗口后 app 会退到后台，那时再开窗，
         // makeKeyAndOrderFront 只是把窗口显示出来，键盘焦点仍在别的 app——

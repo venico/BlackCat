@@ -17,6 +17,8 @@ extension ProjectState {
         subtitleTracks = [ProjectState.makeEmptySubtitleTrack()]
         textTracks = [Track(label: "文字")]
         shapeTracks = [Track(label: "图形")]
+        filterTracks = []
+        adjustTracks = []
         overlayTrackOrder.removeAll()
         cover = nil
         videoSectionOrder.removeAll()
@@ -114,6 +116,8 @@ extension ProjectState {
         textTracks = doc.textTracks ?? []
         textTemplates = doc.textTemplates ?? []
         shapeTracks = doc.shapeTracks ?? []
+        filterTracks = doc.filterTracks ?? []
+        adjustTracks = doc.adjustTracks ?? []
         subtitleBottomMargin = doc.subtitleBottomMargin ?? doc.subtitleStyles.first?.bottomMargin ?? 5
         subtitleLineSpacing = doc.subtitleLineSpacing ?? doc.subtitleStyles.first?.lineSpacing ?? 6
         overlayTrackOrder = doc.overlayTrackOrder ?? []
@@ -215,6 +219,8 @@ extension ProjectState {
             textTracks: textTracks,
             textTemplates: textTemplates.isEmpty ? nil : textTemplates,
             shapeTracks: shapeTracks.isEmpty ? nil : shapeTracks,
+            filterTracks: filterTracks.isEmpty ? nil : filterTracks,
+            adjustTracks: adjustTracks.isEmpty ? nil : adjustTracks,
             // 素材库已全局化（v5.1.0），项目文件不再存素材清单。
             // 字段留着写空数组、不改成 optional —— 老版本 app 那边它是必需字段，
             // 省掉这个键会让旧版本直接解析失败、项目打不开

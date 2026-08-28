@@ -204,10 +204,10 @@ struct CoverDesignerSheet: View {
                 }
             case .text:
                 // 文字模板跟侧边栏同一份数据、同一个组件，点了往封面加
-                TextLayerPanel(onPick: { tmpl in addText(from: tmpl) }, hPadding: 24)
+                TextLayerPanel(onPick: { tmpl in addText(from: tmpl) }, hLeading: 24, hTrailing: 24)
             case .shape:
                 // 八种图形也是同一个组件
-                ShapePanel(onPick: { type in addShape(type) }, hPadding: 24)
+                ShapePanel(onPick: { type in addShape(type) }, hLeading: 24, hTrailing: 24)
             }
         }
         .frame(width: 220)

@@ -637,6 +637,8 @@ struct ExportSheetView: View {
             imageTracks: project.imageTracks,
             textTracks: project.textTracks,
             shapeTracks: project.shapeTracks,
+            filterTracks: project.filterTracks,
+            adjustTracks: project.adjustTracks,
             compoundTracks: project.compoundTracks,
             overlayTrackOrder: project.overlayTrackOrder,
             subtitleBottomMargin: project.subtitleBottomMargin,
@@ -665,6 +667,8 @@ struct ExportInput {
     let imageTracks:    [Track<ImageClip>]
     let textTracks:     [Track<TextClip>]
     let shapeTracks:    [Track<ShapeClip>]
+    let filterTracks:   [Track<FilterClip>]
+    let adjustTracks:   [Track<AdjustClip>]
     let compoundTracks: [Track<CompoundClip>]
     let overlayTrackOrder: [ProjectState.OverlayTrackRef]
     let subtitleBottomMargin: Double
@@ -1497,6 +1501,8 @@ actor TimelineExporter {
                 imageTracks: input.imageTracks,
                 textTracks: input.textTracks,
                 shapeTracks: input.shapeTracks,
+                filterTracks: input.filterTracks,
+                adjustTracks: input.adjustTracks,
                 compoundTracks: input.compoundTracks,
                 colorRanges: colorRanges,
                 fps: fps,
@@ -1662,6 +1668,8 @@ actor TimelineExporter {
         imageTracks: [Track<ImageClip>],
         textTracks: [Track<TextClip>],
         shapeTracks: [Track<ShapeClip>],
+        filterTracks: [Track<FilterClip>],
+        adjustTracks: [Track<AdjustClip>],
         compoundTracks: [Track<CompoundClip>],
         colorRanges: [(start: Double, end: Double, adj: ColorAdjust)],
         fps: Int, bitrate: Int,
@@ -1801,6 +1809,7 @@ actor TimelineExporter {
             overlayTrackOrder: overlayTrackOrder,
             imageTracks: imageTracks, subtitleTracks: subtitleInfo.tracks.map(\.track),
             textTracks: textTracks, shapeTracks: shapeTracks,
+            filterTracks: filterTracks, adjustTracks: adjustTracks,
             compoundTracks: compoundTracks)
         let videoQueue = DispatchQueue(label: "export.video")
         let audioQueue = DispatchQueue(label: "export.audio")
@@ -1975,6 +1984,27 @@ actor TimelineExporter {
                                                        atTime: targetTime, clips: clips,
                                                        scale: subtitleInfo.fontScale, renderSize: renderSize) {
                                                     image = overlay.composited(over: image)
+                                                }
+                                            case .filter(let trackID):
+                                                // 滤镜只作用于**已经合成到这一层为止**的画面，
+                                                // 排在它上面的图层不受影响
+                                                if let track = filterTracks.first(where: { $0.id == trackID }),
+                                                   track.isVisible {
+                                                    for clip in track.clips
+                                                    where clip.startTime <= targetTime && clip.endTime > targetTime {
+                                                        image = FilterEngine.apply(clip, to: image)
+                                                            .cropped(to: CGRect(origin: .zero, size: renderSize))
+                                                    }
+                                                }
+                                            case .adjust(let trackID):
+                                                // 跟滤镜一样，只作用于合成到这一层为止的画面
+                                                if let track = adjustTracks.first(where: { $0.id == trackID }),
+                                                   track.isVisible {
+                                                    for clip in track.clips
+                                                    where clip.startTime <= targetTime && clip.endTime > targetTime {
+                                                        image = ColorAdjust.apply(image, clip.adjust)
+                                                            .cropped(to: CGRect(origin: .zero, size: renderSize))
+                                                    }
                                                 }
                                             case .compound(let trackID):
                                                 image = self.composeCompoundOverlays(
@@ -2159,6 +2189,8 @@ actor TimelineExporter {
                                                     renderSize: renderSize) {
                     image = overlay.composited(over: image)
                 }
+            case .filter, .adjust:
+                break   // 复合片段内部没有滤镜/调节轨道
             case .compound(let tid):
                 // flattened() 已经把嵌套摊平了，正常走不到这条；真有残留就递归处理
                 image = composeCompoundOverlays(

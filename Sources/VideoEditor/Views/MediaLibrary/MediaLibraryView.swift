@@ -20,6 +20,8 @@ struct MediaLibraryView: View {
 
     /// 素材库里六个标签页，按用户定的顺序
     private static let libraryCategories = ["video", "audio", "image", "subtitle", "text", "shape"]
+    /// 「效果」栏下的四个分类。滤镜、特效、调节先占位
+    private static let effectCategories = ["effTransition", "effFilter", "effEffect", "effAdjust"]
 
     private var selectedAssetType: AssetType {
         switch project.libraryCategory {
@@ -66,7 +68,7 @@ struct MediaLibraryView: View {
             VStack(spacing: 0) {
             // Section header
             HStack {
-                Text(isTransitionTab ? "转场" : "素材库")
+                Text(isTransitionTab ? "效果" : "素材库")
                     .font(.system(size: 11, weight: .semibold))
                     .foregroundColor(Color.labelSecondary)
                     .textCase(.uppercase)
@@ -83,13 +85,15 @@ struct MediaLibraryView: View {
                     project.refreshMediaLibrary()
                 }
             }
-            .padding(.leading, 10)
-            .padding(.trailing, 8)
+            .padding(.leading, 3)
+            .padding(.trailing, 10)
             .padding(.top, 8)
             .padding(.bottom, 8)
 
             // 六个分类标签页。样式跟画布素材库那套一致：胶囊底 + 选中态填充
-            if !isTransitionTab {
+            if isTransitionTab {
+                effectTabBar
+            } else {
                 libraryTabBar
             }
 
@@ -134,7 +138,7 @@ struct MediaLibraryView: View {
                         showSortNSMenu(project: project)
                     }
                 }
-                .padding(.horizontal, 8)
+                .padding(.leading, 3).padding(.trailing, 10)
                 .padding(.bottom, 6)
             }
 
@@ -145,7 +149,13 @@ struct MediaLibraryView: View {
                 } else if isTextTab {
                     TextLayerPanel()
                 } else if isTransitionTab {
-                    TransitionPanel()
+                    switch project.effectCategory {
+                    case "effTransition": TransitionPanel()
+                    case "effFilter": FilterPanel()
+                    case "effAdjust": AdjustPanel()
+                    // 特效还没做，先占个位
+                    default: effectPlaceholder
+                    }
                 } else if filteredAssets.isEmpty {
                     emptyState
                 } else {
@@ -159,7 +169,7 @@ struct MediaLibraryView: View {
                                     AssetRow(assetID: asset.id)
                                 }
                             }
-                            .padding(.horizontal, 8)
+                            .padding(.leading, 3).padding(.trailing, 10)
                             .padding(.bottom, 8)
                         } else {
                             VStack(spacing: 2) {
@@ -167,7 +177,7 @@ struct MediaLibraryView: View {
                                     AssetRow(assetID: asset.id)
                                 }
                             }
-                            .padding(.horizontal, 8)
+                            .padding(.leading, 3).padding(.trailing, 10)
                             .padding(.bottom, 8)
                         }
                     }
@@ -223,10 +233,19 @@ struct MediaLibraryView: View {
     /// 素材库里的六个分类标签页。跟画布素材库那套一个样式：胶囊底 + 选中态填充。
     /// 六个挤在窄侧栏里，字号和内边距都收紧一档
     private var libraryTabBar: some View {
+        tabBar(Self.libraryCategories, selection: $project.libraryCategory)
+    }
+
+    /// 「效果」栏的分类标签
+    private var effectTabBar: some View {
+        tabBar(Self.effectCategories, selection: $project.effectCategory)
+    }
+
+    private func tabBar(_ items: [String], selection: Binding<String>) -> some View {
         HStack(spacing: 0) {
-            ForEach(Self.libraryCategories, id: \.self) { cat in
-                let isOn = project.libraryCategory == cat
-                Button { project.libraryCategory = cat } label: {
+            ForEach(items, id: \.self) { cat in
+                let isOn = selection.wrappedValue == cat
+                Button { selection.wrappedValue = cat } label: {
                     Text(tabName(cat))
                         .font(.system(size: 10, weight: .medium))
                         .foregroundColor(isOn ? .white : Color.labelSecondary)
@@ -241,8 +260,21 @@ struct MediaLibraryView: View {
         }
         .background(Color.white.opacity(0.06))
         .clipShape(Capsule())
-        .padding(.horizontal, 8)
+        .padding(.leading, 3).padding(.trailing, 10)
         .padding(.bottom, 8)
+    }
+
+    /// 还没做的那几个分类
+    private var effectPlaceholder: some View {
+        VStack(spacing: 8) {
+            Image(systemName: "wand.and.stars")
+                .font(.system(size: 22))
+                .foregroundColor(Color.labelSecondary.opacity(0.35))
+            Text("\(tabName(project.effectCategory))即将上线")
+                .font(.system(size: 11))
+                .foregroundColor(Color.labelSecondary)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     private func tabName(_ tab: String) -> String {
@@ -251,7 +283,11 @@ struct MediaLibraryView: View {
         case "audio": return "音频"
         case "image": return "图片"
         case "subtitle": return "字幕"
-        case "transition": return "转场"
+        case "transition": return "效果"
+        case "effTransition": return "转场"
+        case "effFilter": return "滤镜"
+        case "effEffect": return "特效"
+        case "effAdjust": return "调节"
         case "text": return "文字"
         case "shape": return "图形"
         case "library": return "素材库"
@@ -631,7 +667,7 @@ private struct AssetRow: View {
                 }
             }
         }
-        .padding(.horizontal, 8)
+        .padding(.leading, 3).padding(.trailing, 10)
         .padding(.vertical, 7)
     }
 
@@ -1724,8 +1760,9 @@ private extension Character {
 struct TextLayerPanel: View {
     @EnvironmentObject private var project: ProjectState
     var onPick: ((TextTemplate) -> Void)? = nil
-    /// 同 `ShapePanel`：侧边栏 8，封面弹窗 24
-    var hPadding: CGFloat = 8
+    /// 同 `ShapePanel`：侧边栏 3 / 10，封面弹窗两边都 24
+    var hLeading: CGFloat = 3
+    var hTrailing: CGFloat = 10
 
     var body: some View {
         VStack(spacing: 0) {
@@ -1752,7 +1789,7 @@ struct TextLayerPanel: View {
                             TextTemplateCard(template: tmpl, onPick: onPick)
                         }
                     }
-                    .padding(.horizontal, hPadding)
+                    .padding(.leading, hLeading).padding(.trailing, hTrailing)
                     .padding(.top, 6)
                     .padding(.bottom, 8)
                 }
@@ -1805,7 +1842,7 @@ private struct TextTemplateCard: View {
                 }
             }
         }
-        .padding(.horizontal, 8)
+        .padding(.leading, 3).padding(.trailing, 10)
         .padding(.vertical, 6)
         .background(
             RoundedRectangle(cornerRadius: 6)
@@ -1845,7 +1882,7 @@ private struct TransitionPanel: View {
                     Text("选择转场")
                         .font(.system(size: 10, weight: .medium))
                         .foregroundColor(Color.labelSecondary)
-                        .padding(.horizontal, 10)
+                        .padding(.leading, 3).padding(.trailing, 10)
                         .padding(.top, 4)
                 }
 
@@ -1870,9 +1907,10 @@ private struct TransitionPanel: View {
                         )
                     }
                 }
-                .padding(.horizontal, 8)
+                .padding(.leading, 3).padding(.trailing, 10)
             }
-            .padding(.top, 6)
+            // 不留上边距：标题行自己的 8pt 就够了，加了这 6 转场这栏
+            // 比素材库、AI 创作宽出一截
             .padding(.bottom, 8)
         }
     }
@@ -1891,12 +1929,16 @@ private struct TransitionPreviewCard: View {
     var body: some View {
         Button(action: onSelect) {
             VStack(spacing: 4) {
-                ZStack {
-                    // 底层灰色色块
-                    RoundedRectangle(cornerRadius: 4)
-                        .fill(Color(white: 0.22))
-                    // 叠加层：灰白色块做转场动画
-                    transitionOverlay
+                GeometryReader { geo in
+                    ZStack {
+                        // 底层：转场**前**的画面
+                        Image(nsImage: TransitionPreviewFrames.before)
+                            .resizable()
+                            .aspectRatio(contentMode: .fill)
+                        // 叠加层：转场**后**的画面，按转场类型演示进场方式
+                        transitionOverlay(in: geo.size)
+                    }
+                    .frame(width: geo.size.width, height: geo.size.height)
                 }
                 // **固定 16:9**。原来只钉死高度 44，侧边栏一拉宽封面就越来越扁
                 .aspectRatio(16.0 / 9.0, contentMode: .fit)
@@ -1939,64 +1981,66 @@ private struct TransitionPreviewCard: View {
         }
     }
 
+    /// 转场后的那张画面。各个 case 拿它做位移、缩放、淡入
+    private var afterFrame: some View {
+        Image(nsImage: TransitionPreviewFrames.after)
+            .resizable()
+            .aspectRatio(contentMode: .fill)
+    }
+
     @ViewBuilder
-    private var transitionOverlay: some View {
+    private func transitionOverlay(in size: CGSize) -> some View {
         let p = phase
+        // 位移量按卡片尺寸的八成算：**静止时要露出两成的上层帧**，
+        // 不然看不出这个转场是从哪个方向进来的（原来纵向写死 50，
+        // 差不多等于整个卡片高度，上下那四种就全看不见了）
+        let dx = size.width * 0.8
+        let dy = size.height * 0.8
         switch type {
         case .dissolve:
             // 右侧浅灰块淡入淡出
-            RoundedRectangle(cornerRadius: 4)
-                .fill(Color(white: 0.55))
+            afterFrame
                 .opacity(p)
         case .fadeToBlack:
             // 黑色遮罩淡入淡出
             Color.black.opacity(p)
         case .pushLeft:
             // 浅灰块从右推入
-            RoundedRectangle(cornerRadius: 4)
-                .fill(Color(white: 0.55))
-                .offset(x: (1 - p) * 80)
+            afterFrame
+                .offset(x: (1 - p) * dx)
         case .pushRight:
             // 浅灰块从左推入
-            RoundedRectangle(cornerRadius: 4)
-                .fill(Color(white: 0.55))
-                .offset(x: -(1 - p) * 80)
+            afterFrame
+                .offset(x: -(1 - p) * dx)
         case .pushUp:
             // 浅灰块从下推入
-            RoundedRectangle(cornerRadius: 4)
-                .fill(Color(white: 0.55))
-                .offset(y: (1 - p) * 50)
+            afterFrame
+                .offset(y: (1 - p) * dy)
         case .pushDown:
             // 浅灰块从上推入
-            RoundedRectangle(cornerRadius: 4)
-                .fill(Color(white: 0.55))
-                .offset(y: -(1 - p) * 50)
+            afterFrame
+                .offset(y: -(1 - p) * dy)
         case .zoom:
             // 浅灰块从放大缩回 + 淡入
-            RoundedRectangle(cornerRadius: 4)
-                .fill(Color(white: 0.55))
+            afterFrame
                 .scaleEffect(1.5 - 0.5 * p)
                 .opacity(p)
         case .slideLeft:
             // 浅灰块从右滑入覆盖
-            RoundedRectangle(cornerRadius: 4)
-                .fill(Color(white: 0.55))
-                .offset(x: (1 - p) * 80)
+            afterFrame
+                .offset(x: (1 - p) * dx)
         case .slideRight:
             // 浅灰块从左滑入覆盖
-            RoundedRectangle(cornerRadius: 4)
-                .fill(Color(white: 0.55))
-                .offset(x: -(1 - p) * 80)
+            afterFrame
+                .offset(x: -(1 - p) * dx)
         case .slideUp:
             // 浅灰块从下滑入覆盖
-            RoundedRectangle(cornerRadius: 4)
-                .fill(Color(white: 0.55))
-                .offset(y: (1 - p) * 50)
+            afterFrame
+                .offset(y: (1 - p) * dy)
         case .slideDown:
             // 浅灰块从上滑入覆盖
-            RoundedRectangle(cornerRadius: 4)
-                .fill(Color(white: 0.55))
-                .offset(y: -(1 - p) * 50)
+            afterFrame
+                .offset(y: -(1 - p) * dy)
         }
     }
 }
@@ -2085,8 +2129,10 @@ private struct MediaToolBtn: View {
 struct ShapePanel: View {
     @EnvironmentObject private var project: ProjectState
     var onPick: ((ShapeType) -> Void)? = nil
-    /// 左右内边距。侧边栏是 8，封面弹窗要跟它那排标签对齐所以传 24
-    var hPadding: CGFloat = 8
+    /// 左右内边距。侧边栏那两侧的**可视间距**要各 10pt：左边被 44 宽的图标栏
+    /// 占着（按钮右边缘落在 37），所以 leading 只给 3；封面弹窗两边都传 24
+    var hLeading: CGFloat = 3
+    var hTrailing: CGFloat = 10
     var body: some View {
         ScrollView(showsIndicators: false) {
             LazyVGrid(columns: [GridItem(.flexible(), spacing: 8),
@@ -2098,7 +2144,7 @@ struct ShapePanel: View {
                     }
                 }
             }
-            .padding(.horizontal, hPadding)
+            .padding(.leading, hLeading).padding(.trailing, hTrailing)
             .padding(.top, 6)
             .padding(.bottom, 8)
         }
@@ -2287,8 +2333,17 @@ enum SidebarSVGIcon {
         "subtitle": """
         <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path fill-rule="nonzero" d="M19.815962,4.43597392 L20.0914373,4.59032027 C20.7180217,4.97464681 21.2284693,5.52547068 21.5640261,6.184038 C21.9553296,6.95201441 22,7.49875384 22,9.8 L22,14.2 C22,16.5012462 21.9553296,17.0479856 21.5640261,17.815962 C21.1805326,18.5686104 20.5686104,19.1805326 19.815962,19.5640261 C19.0479856,19.9553296 18.5012462,20 16.2,20 L7.8,20 C5.49875384,20 4.95201441,19.9553296 4.184038,19.5640261 C3.43138963,19.1805326 2.8194674,18.5686104 2.4359739,17.815962 C2.04467038,17.0479856 2,16.5012462 2,14.2 L2,9.8 C2,7.49875384 2.04467038,6.95201441 2.4359739,6.184038 C2.8194674,5.43138963 3.43138963,4.8194674 4.184038,4.4359739 C4.91926163,4.06135875 5.5459482,4.00165717 7.494397,4.00007988 L7.80000001,4.00000001 L16.2,4 C18.5012462,4 19.0479856,4.04467038 19.815962,4.43597392 Z M7.49546806,6.00007952 C5.9054993,6.00136674 5.42785554,6.04686969 5.092019,6.21798695 C4.71569481,6.4097337 4.4097337,6.71569481 4.21798695,7.092019 C4.03707473,7.44707923 4,7.90085237 4,9.8 L4,14.2 C4,16.0991476 4.03707473,16.5529208 4.21798695,16.907981 C4.4097337,17.2843052 4.71569481,17.5902663 5.092019,17.782013 C5.44707923,17.9629253 5.90085237,18 7.8,18 L16.2,18 C18.0991476,18 18.5529208,17.9629253 18.907981,17.782013 C19.2843052,17.5902663 19.5902663,17.2843052 19.782013,16.907981 C19.9629253,16.5529208 20,16.0991476 20,14.2 L20,9.8 C20,7.90085237 19.9629253,7.44707923 19.782013,7.092019 C19.5902663,6.71569481 19.2843052,6.4097337 18.907981,6.21798697 L18.8399216,6.18572544 C18.4905531,6.03258521 17.9804509,6 16.2,6 L7.80026148,5.99999997 Z M8,13 L16,13 C16.5522847,13 17,13.4477153 17,14 C17,14.5522847 16.5522847,15 16,15 L8,15 C7.44771525,15 7,14.5522847 7,14 C7,13.4477153 7.44771525,13 8,13 Z" fill="black"/></svg>
         """,
+        // 调节轨道的图标：一上一下两根带滑钮的推杆
+        "adjust": """
+        <svg width="24px" height="24px" viewBox="0 0 24 24" version="1.1" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink"><title>调节</title><g id="调节" stroke="none" fill="none"><g id="24px参考"></g><path d="M12,4 C12.3760389,4 12.7202884,4.21095639 12.8910065,4.5460095 C13,4.75992124 13,5.03994749 13,5.6 L13.0010775,11.2681881 C13.5982846,11.6141507 14,12.2601625 14,13 C14,13.7398375 13.5982846,14.3858493 13.0010775,14.7318119 L13,18.4 C13,18.9600525 13,19.2400788 12.8910065,19.4539905 C12.7202884,19.7890436 12.3760389,20 12,20 C11.6239611,20 11.2797116,19.7890436 11.1089935,19.4539905 C11,19.2400788 11,18.9600525 11,18.4 L10.9999275,14.7323937 C10.4021661,14.3865739 10,13.7402524 10,13 C10,12.2597476 10.4021661,11.6134261 10.9999275,11.2676063 L11,5.6 C11,5.03994749 11,4.75992124 11.1089935,4.5460095 C11.2797116,4.21095639 11.6239611,4 12,4 Z M5,6 C5.37603889,6 5.72028844,6.21095639 5.89100652,6.5460095 C6,6.75992124 6,7.03994749 6,7.6 L6.00007248,9.26760632 C6.59783388,9.61342606 7,10.2597476 7,11 C7,11.7402524 6.59783388,12.3865739 6.00007248,12.7323937 L6,16.4 C6,16.9600525 6,17.2400788 5.89100652,17.4539905 C5.72028844,17.7890436 5.37603889,18 5,18 C4.62396111,18 4.27971156,17.7890436 4.10899348,17.4539905 C4,17.2400788 4,16.9600525 4,16.4 L3.9989225,12.7318119 C3.40171539,12.3858493 3,11.7398375 3,11 C3,10.2601625 3.40171539,9.61415066 3.9989225,9.26818814 L4,7.6 C4,7.03994749 4,6.75992124 4.10899348,6.5460095 C4.27971156,6.21095639 4.62396111,6 5,6 Z M19,6 C19.3760389,6 19.7202884,6.21095639 19.8910065,6.5460095 C20,6.75992124 20,7.03994749 20,7.6 L20.0010775,9.26818814 C20.5982846,9.61415066 21,10.2601625 21,11 C21,11.7398375 20.5982846,12.3858493 20.0010775,12.7318119 L20,16.4 C20,16.9600525 20,17.2400788 19.8910065,17.4539905 C19.7202884,17.7890436 19.3760389,18 19,18 C18.6239611,18 18.2797116,17.7890436 18.1089935,17.4539905 C18,17.2400788 18,16.9600525 18,16.4 L17.9999275,12.7323937 C17.4021661,12.3865739 17,11.7402524 17,11 C17,10.2597476 17.4021661,9.61342606 17.9999275,9.26760632 L18,7.6 C18,7.03994749 18,6.75992124 18.1089935,6.5460095 C18.2797116,6.21095639 18.6239611,6 19,6 Z" id="形状结合" fill="#FFFFFF" fill-rule="evenodd"></path></g></svg>
+        """,
+        // 滤镜轨道的图标
+        "filter": """
+        <svg width="24px" height="24px" viewBox="0 0 24 24" version="1.1" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink"><title>滤镜</title><g id="滤镜" stroke="none" fill="none"><g id="24px参考"></g><circle id="椭圆形-2" fill="#FFFFFF" fill-rule="evenodd" cx="11.5" cy="8.5" r="6.5"></circle><path d="M3.25519841,10.5772904 C3.79744255,12.7352109 5.16501987,14.5662108 7.00301936,15.7143335 L7,15.5 C7,17.9156912 8.00771954,20.0960168 9.62571471,21.643533 C8.96059086,21.874688 8.24492953,22 7.5,22 C3.91014913,22 1,19.0898509 1,15.5 C1,13.5325398 1.87412659,11.7692429 3.25519841,10.5772904 Z M19.7445414,10.5765048 L19.7793455,10.6073157 C21.1404333,11.7987507 22,13.5489941 22,15.5 C22,19.0898509 19.0898509,22 15.5,22 C12.3049202,22 9.64827013,19.6947086 9.10261205,16.656688 C9.86248944,16.88025 10.6672602,17 11.5,17 C15.4781026,17 18.8179241,14.2671939 19.7445414,10.5765048 Z M11.5,2 C15.0898509,2 18,4.91014913 18,8.5 C18,12.0898509 15.0898509,15 11.5,15 C7.91014913,15 5,12.0898509 5,8.5 C5,4.91014913 7.91014913,2 11.5,2 Z" id="形状结合" fill="#FFFFFF" fill-rule="evenodd"></path></g></svg>
+        """,
+        // 侧边栏「效果」按钮的图标
         "transition": """
-        <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path fill-rule="evenodd" d="M18.6167689,4.70645855 C19.8886673,3.48853479 22,4.39000644 22,6.15099022 L22,17.8490098 C22,19.6099936 19.8886673,20.5114652 18.6167689,19.2935414 L12.6906977,13.6193034 C12.303938,13.2489794 11.6941061,13.2490254 11.3074024,13.6194078 L5.38323109,19.2935414 C4.11133267,20.5114652 2,19.6099936 2,17.8490098 L2,6.15099022 C2,4.39000644 4.11133267,3.48853479 5.38323109,4.70645855 L11.3074593,10.3797512 C11.6941482,10.7500609 12.3038959,10.750107 12.6906407,10.3798556 L18.6167689,4.70645855 Z" fill="black"/></svg>
+        <svg width="24px" height="24px" viewBox="0 0 24 24" version="1.1" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink"><title>特效</title><g id="特效" stroke="none" fill="none" fill-rule="evenodd"><path d="M11.0519818,1.25648246 C11.4023452,1.45184709 11.5371808,1.88907053 11.806852,2.7635174 L13.2782079,7.53459598 C13.4544579,8.10611137 13.5425829,8.39186907 13.6756793,8.60812195 C13.7936364,8.79977678 13.9430943,8.97014883 14.1177559,9.11205999 C14.3148346,9.27218483 14.5866826,9.39677258 15.1303787,9.6459481 L17.8652067,10.8993177 C18.6094708,11.2404133 18.9816029,11.4109612 19.1386603,11.7308311 C19.2751484,12.0088087 19.2751484,12.3343371 19.1386603,12.6123147 C18.9816029,12.9321846 18.6094708,13.1027324 17.8652067,13.4438281 L15.1303787,14.6971977 C14.5866826,14.9463732 14.3148346,15.0709609 14.1177559,15.2310858 C13.9430943,15.3729969 13.7936364,15.543369 13.6756793,15.7350238 C13.5425829,15.9512767 13.4544579,16.2370344 13.2782079,16.8085498 L11.806852,21.5796283 C11.5371808,22.4540752 11.4023452,22.8912987 11.0519818,23.0866633 C10.7492495,23.2554686 10.3806928,23.2554686 10.0779605,23.0866633 C9.72759714,22.8912987 9.59276153,22.4540752 9.32309031,21.5796283 L7.85173439,16.8085498 C7.67548439,16.2370344 7.5873594,15.9512767 7.45426299,15.7350238 C7.33630587,15.543369 7.18684802,15.3729969 7.01218641,15.2310858 C6.81510776,15.0709609 6.5432597,14.9463732 5.99956358,14.6971977 L3.26473558,13.4438281 C2.52047147,13.1027324 2.14833942,12.9321846 1.99128204,12.6123147 C1.85479394,12.3343371 1.85479394,12.0088087 1.99128204,11.7308311 C2.14833942,11.4109612 2.52047147,11.2404133 3.26473558,10.8993177 L5.99956358,9.6459481 C6.5432597,9.39677258 6.81510776,9.27218483 7.01218641,9.11205999 C7.18684802,8.97014883 7.33630587,8.79977678 7.45426299,8.60812195 C7.5873594,8.39186907 7.67548439,8.10611137 7.85173439,7.53459598 L9.32309031,2.7635174 C9.59276153,1.88907053 9.72759714,1.45184709 10.0779605,1.25648246 C10.3806928,1.08767714 10.7492495,1.08767714 11.0519818,1.25648246 Z M18.2435053,2.1889014 C18.418687,2.28658372 18.4861048,2.50519544 18.6209404,2.94241887 L18.8866425,3.80399532 C18.930705,3.94687417 18.9527363,4.01831359 18.9860104,4.07237681 C19.0154997,4.12029052 19.0528641,4.16288353 19.0965295,4.19836132 C19.1457992,4.23839253 19.2137612,4.26953947 19.3496852,4.33183335 L19.7939625,4.53544528 C20.1660945,4.70599311 20.3521606,4.79126703 20.4306893,4.95120198 C20.4989333,5.09019078 20.4989333,5.25295497 20.4306893,5.39194377 C20.3521606,5.55187872 20.1660945,5.63715264 19.7939625,5.80770047 L19.3496852,6.0113124 C19.2137612,6.07360628 19.1457992,6.10475322 19.0965295,6.14478443 C19.0528641,6.18026222 19.0154997,6.22285523 18.9860104,6.27076894 C18.9527363,6.32483216 18.930705,6.39627158 18.8866425,6.53915043 L18.6209404,7.40072688 C18.4861048,7.83795032 18.418687,8.05656203 18.2435053,8.15424435 C18.0921392,8.23864701 17.9078608,8.23864701 17.7564947,8.15424435 C17.581313,8.05656203 17.5138952,7.83795032 17.3790596,7.40072688 L17.1133575,6.53915043 C17.069295,6.39627158 17.0472637,6.32483216 17.0139896,6.27076894 C16.9845003,6.22285523 16.9471359,6.18026222 16.9034705,6.14478443 C16.8542008,6.10475322 16.7862388,6.07360628 16.6503148,6.0113124 L16.2060375,5.80770047 C15.8339055,5.63715264 15.6478394,5.55187872 15.5693107,5.39194377 C15.5010667,5.25295497 15.5010667,5.09019078 15.5693107,4.95120198 C15.6478394,4.79126703 15.8339055,4.70599311 16.2060375,4.53544528 L16.6503148,4.33183335 C16.7862388,4.26953947 16.8542008,4.23839253 16.9034705,4.19836132 C16.9471359,4.16288353 16.9845003,4.12029052 17.0139896,4.07237681 C17.0472637,4.01831359 17.069295,3.94687417 17.1133575,3.80399532 L17.3790596,2.94241887 C17.5138952,2.50519544 17.581313,2.28658372 17.7564947,2.1889014 C17.9078608,2.10449874 18.0921392,2.10449874 18.2435053,2.1889014 Z" id="形状结合" fill="#FFFFFF"></path></g></svg>
         """,
         "text": """
         <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path fill-rule="evenodd" d="M19.3619715,3.32698043 C19.9264578,3.61460055 20.3853994,4.07354222 20.6730196,4.6380285 C21,5.27976372 21,6.11984248 21,7.8 L21,16.2 C21,17.8801575 21,18.7202363 20.6730196,19.3619715 C20.3853994,19.9264578 19.9264578,20.3853994 19.3619715,20.6730196 C18.7202363,21 17.8801575,21 16.2,21 L7.8,21 C6.11984248,21 5.27976372,21 4.6380285,20.6730196 C4.07354222,20.3853994 3.61460055,19.9264578 3.32698043,19.3619715 C3,18.7202363 3,17.8801575 3,16.2 L3,7.8 C3,6.11984248 3,5.27976372 3.32698043,4.6380285 C3.61460055,4.07354222 4.07354222,3.61460055 4.6380285,3.32698043 C5.27976372,3 6.11984248,3 7.8,3 L16.2,3 C17.8801575,3 18.7202363,3 19.3619715,3.32698043 Z M15,8 L9,8 C8.44771525,8 8,8.44771525 8,9 C8,9.55228475 8.44771525,10 9,10 L11,10 L11,16 C11,16.5522847 11.4477153,17 12,17 C12.5522847,17 13,16.5522847 13,16 L13,10 L15,10 C15.5522847,10 16,9.55228475 16,9 C16,8.44771525 15.5522847,8 15,8 Z" fill="black"/></svg>
@@ -2442,5 +2497,182 @@ enum TaskETA {
         let h = total / 3600, m = (total % 3600) / 60, sec = total % 60
         return h > 0 ? String(format: "约 %d:%02d:%02d", h, m, sec)
                      : String(format: "约 %02d:%02d", m, sec)
+    }
+}
+
+// MARK: - Filter Panel（效果 → 滤镜）
+
+/// 滤镜列表。卡片的封面是**那帧素材套上各自滤镜**的实拍效果，
+/// 不是画个示意图 —— 一眼能看出这个滤镜到底把画面变成什么样
+struct FilterPanel: View {
+    @EnvironmentObject private var project: ProjectState
+    @State private var importHover = false
+
+    var body: some View {
+        VStack(spacing: 0) {
+            ScrollView(showsIndicators: false) {
+                LazyVGrid(columns: [GridItem(.flexible(), spacing: 6),
+                                    GridItem(.flexible(), spacing: 6)], spacing: 6) {
+                    ForEach(FilterKind.builtins, id: \.self) { kind in
+                        FilterCard(kind: kind) { project.addFilter(kind: kind) }
+                    }
+                }
+                .padding(.leading, 3).padding(.trailing, 10)
+                .padding(.bottom, 8)
+            }
+            // 导入 LUT。吸在底部，列表滚多长都在
+            Button(action: importLUT) {
+                HStack(spacing: 5) {
+                    Image(systemName: "square.and.arrow.down")
+                        .font(.system(size: 11))
+                    Text("导入 LUT")
+                        .font(.system(size: 11, weight: .medium))
+                }
+                .foregroundColor(importHover ? .white : Color.labelPrimary)
+                .frame(maxWidth: .infinity)
+                .frame(height: 28)
+                .background(RoundedRectangle(cornerRadius: 6)
+                    .fill(Color.white.opacity(importHover ? 0.12 : 0.06)))
+                .contentShape(RoundedRectangle(cornerRadius: 6))
+            }
+            .buttonStyle(.plain)
+            .onHover { importHover = $0 }
+            .help("导入 .cube 格式的 LUT，加到时间轴上")
+            .padding(.leading, 3).padding(.trailing, 10)
+            .padding(.bottom, 8)
+        }
+    }
+
+    /// 选一个 .cube 文件，直接在播放头上加一段 LUT 滤镜
+    private func importLUT() {
+        let panel = NSOpenPanel()
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        panel.allowedFileTypes = ["cube", "CUBE"]
+        panel.message = "选一个 .cube 格式的 LUT 文件"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        // 先解析一遍：格式不对就别往时间轴上加个不起作用的片段
+        guard LUTCache.shared.cube(at: url.path) != nil else {
+            project.showSuccessToast(icon: "exclamationmark.triangle", iconColor: .orange,
+                                     title: "LUT 读不了",
+                                     subtitle: "\(url.lastPathComponent) 不是有效的 .cube 文件")
+            return
+        }
+        project.addFilter(kind: .lut, lutPath: url.path)
+    }
+}
+
+// MARK: - Adjust Panel（效果 → 调节）
+
+/// 调节只有一张卡片：加一段调节片段，参数在属性区里调。
+/// 卡片封面直接拿那帧素材演示一个偏暖提亮的调子，比画个图标直观
+struct AdjustPanel: View {
+    @EnvironmentObject private var project: ProjectState
+
+    var body: some View {
+        ScrollView(showsIndicators: false) {
+            LazyVGrid(columns: [GridItem(.flexible(), spacing: 6),
+                                GridItem(.flexible(), spacing: 6)], spacing: 6) {
+                AdjustCard { project.addAdjust() }
+            }
+            .padding(.leading, 3).padding(.trailing, 10)
+            .padding(.bottom, 8)
+        }
+    }
+}
+
+private struct AdjustCard: View {
+    let onAdd: () -> Void
+    @State private var hover = false
+
+    var body: some View {
+        VStack(spacing: 4) {
+            ZStack {
+                Color.white.opacity(0.08)
+                Image(nsImage: SidebarSVGIcon.load("adjust", size: 22))
+                    .renderingMode(.template)
+                    .foregroundColor(Color.labelSecondary)
+            }
+            .aspectRatio(16.0 / 9.0, contentMode: .fit)
+            .clipShape(RoundedRectangle(cornerRadius: 4))
+            .overlay(alignment: .bottomTrailing) {
+                if hover { VideoMiniBtnView(icon: "plus.circle", action: onAdd).padding(2) }
+            }
+
+            Text("自定义调节")
+                .font(.system(size: 9))
+                .foregroundColor(Color.labelSecondary)
+                .lineLimit(1)
+        }
+        .padding(6)
+        .background(hover ? Color.white.opacity(0.08) : Color.clear)
+        .cornerRadius(6)
+        .contentShape(Rectangle())
+        // 拖拽必须排在双击手势之前，反了起始事件会被点击手势抢走
+        .onDrag { NSItemProvider(object: FileDropRouter.adjustPasteboardString as NSString) }
+        .onHover { hover = $0 }
+        .gesture(TapGesture(count: 2).onEnded { onAdd() })
+        .help("双击添加调节，或拖到时间轴")
+    }
+}
+
+private struct FilterCard: View {
+    let kind: FilterKind
+    let onAdd: () -> Void
+    @State private var hover = false
+
+    var body: some View {
+        VStack(spacing: 4) {
+            ZStack {
+                Image(nsImage: FilterThumbnails.image(for: kind))
+                    .resizable()
+                    .aspectRatio(contentMode: .fill)
+            }
+            .aspectRatio(16.0 / 9.0, contentMode: .fit)
+            .clipShape(RoundedRectangle(cornerRadius: 4))
+            // 悬停时右下角出 +，跟素材卡片一个位置
+            .overlay(alignment: .bottomTrailing) {
+                if hover {
+                    VideoMiniBtnView(icon: "plus.circle", action: onAdd)
+                        .padding(2)
+                }
+            }
+
+            Text(kind.label)
+                .font(.system(size: 9))
+                .foregroundColor(Color.labelSecondary)
+                .lineLimit(1)
+        }
+        .padding(6)
+        .background(hover ? Color.white.opacity(0.08) : Color.clear)
+        .cornerRadius(6)
+        .contentShape(Rectangle())
+        // 拖到时间轴按落点插入。**必须排在双击手势之前**，
+        // 写反了拖拽的起始事件会被点击手势抢走（图形卡片踩过这个坑）
+        .onDrag { NSItemProvider(object: FileDropRouter.pasteboardString(for: kind) as NSString) }
+        .onHover { hover = $0 }
+        .gesture(TapGesture(count: 2).onEnded { onAdd() })
+        .help("双击添加\(kind.label)，或拖到时间轴")
+    }
+}
+
+/// 滤镜卡片的封面。拿转场那帧素材实时套一遍滤镜，算完缓存住
+enum FilterThumbnails {
+    private static var cache: [FilterKind: NSImage] = [:]
+    private static let ctx = CIContext(options: [.useSoftwareRenderer: false])
+
+    static func image(for kind: FilterKind) -> NSImage {
+        if let hit = cache[kind] { return hit }
+        let base = TransitionPreviewFrames.before
+        guard let tiff = base.tiffRepresentation,
+              let ci = CIImage(data: tiff) else { return base }
+
+        var clip = FilterClip(kind: kind, startTime: 0, endTime: 1)
+        clip.intensity = 1
+        let out = FilterEngine.apply(clip, to: ci)
+        guard let cg = ctx.createCGImage(out, from: ci.extent) else { return base }
+        let img = NSImage(cgImage: cg, size: ci.extent.size)
+        cache[kind] = img
+        return img
     }
 }

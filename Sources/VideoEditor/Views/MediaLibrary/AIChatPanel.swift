@@ -145,8 +145,8 @@ struct AIChatPanel: View {
         // **高度按图标那 24pt 定死**：历史列表页不画右侧图标，
         // 不撑着的话这一行会矮一截，两页之间标题就上下跳
         .frame(height: 24)
-        .padding(.leading, 10)
-        .padding(.trailing, 8)
+        .padding(.leading, 3)
+        .padding(.trailing, 10)
         // 顶部留白跟素材库那栏对齐（那边也是 8）——
         // 两栏切换时标题行不该上下跳
         .padding(.top, 8)
@@ -168,7 +168,7 @@ struct AIChatPanel: View {
                 showHistory = false   // 建完直接进新会话，不留在列表里
             }
         }
-        .padding(.horizontal, 8)
+        .padding(.leading, 3).padding(.trailing, 10)
         .padding(.bottom, 6)
     }
 
@@ -186,12 +186,12 @@ struct AIChatPanel: View {
                 ScrollView(showsIndicators: false) {
                     // 间距走 VStack 的 spacing，不动每行自己的内边距 ——
                     // 那样 hover / 选中的底色块高度不会跟着变
-                    VStack(spacing: 5) {
+                    VStack(spacing: 8) {
                         ForEach(service.history) { conv in
                             historyRow(conv)
                         }
                     }
-                    .padding(.horizontal, 6)
+                    .padding(.leading, 3).padding(.trailing, 10)
                     .padding(.vertical, 6)
                 }
                 // 点列表空白处：正在重命名就提交。失焦本身也会提交（见 TextField
@@ -226,6 +226,7 @@ struct AIChatPanel: View {
                 if let snap = conv.canvas {
                     project.canvas.restore(from: snap, conversationID: conv.id, title: conv.title)
                 }
+                service.currentConversationId = conv.id
                 project.showCanvas = true
             } else {
                 service.loadConversation(conv.id)
@@ -233,6 +234,7 @@ struct AIChatPanel: View {
             }
         } label: {
             HStack(spacing: 6) {
+                HistoryStatusDot(state: dotState(conv))
                 VStack(alignment: .leading, spacing: 3) {
                     HStack(spacing: 5) {
                         if isRenaming {
@@ -264,14 +266,17 @@ struct AIChatPanel: View {
                                 .background(Capsule().fill(Color.white.opacity(0.10)))
                         }
                     }
-                    Text(formatDate(conv.createdAt))
-                        .font(.system(size: 9))
-                        .foregroundColor(Color.labelSecondary)
                 }
-                Spacer()
+                Spacer(minLength: 6)
+                // 时间挪到行尾，hover 才露出来 —— 平时那一行只留标题，干净些
+                Text(formatDate(conv.createdAt))
+                    .font(.system(size: 9))
+                    .foregroundColor(Color.labelSecondary)
+                    .lineLimit(1)
+                    .opacity(hoverHistoryID == conv.id ? 1 : 0)
             }
-            .padding(.horizontal, 8)
-            .padding(.vertical, 5)
+            .padding(.leading, 6).padding(.trailing, 10)
+            .padding(.vertical, 8)
             .background(isActive ? Color.white.opacity(0.1)
                                  : (hoverHistoryID == conv.id ? Color.white.opacity(0.06)
                                                               : Color.clear))
@@ -293,6 +298,16 @@ struct AIChatPanel: View {
                 Text("删除")
             }
         }
+    }
+
+    /// 这条记录的圆点该显示成什么状态。
+    /// 正在跑的任务从 runningTasks 认（实时），成功/失败从画布快照里认（存过盘的）
+    private func dotState(_ conv: AIVideoService.ConversationRecord) -> HistoryDotState {
+        if service.runningTasks.values.contains(where: { $0.convId == conv.id }) { return .running }
+        guard let canvas = conv.canvas else { return .idle }
+        if canvas.nodes.contains(where: { $0.failure != nil }) { return .failed }
+        if !canvas.producedAssets.isEmpty { return .done }
+        return .idle
     }
 
     private func startRenaming(_ conv: AIVideoService.ConversationRecord) {
@@ -434,13 +449,13 @@ struct AIChatPanel: View {
                                     .font(.system(size: 7, weight: .bold))
                             }
                             .foregroundColor(Color.labelSecondary)
-                            .padding(.horizontal, 6)
+                            .padding(.leading, 3).padding(.trailing, 10)
                             .padding(.vertical, 3)
                         }
                         .buttonStyle(.plain)
                     }
                 }
-                .padding(.horizontal, 8)
+                .padding(.leading, 3).padding(.trailing, 10)
                 .padding(.top, 8)
 
                 ChatInputTextView(
@@ -451,7 +466,7 @@ struct AIChatPanel: View {
                 )
                     .frame(height: inputHeight)
                     .animation(nil, value: inputHeight)
-                    .padding(.horizontal, 6)
+                    .padding(.leading, 3).padding(.trailing, 10)
                     .padding(.top, 2)
                     .overlay(alignment: .topLeading) {
                         if inputText.isEmpty {
@@ -513,7 +528,7 @@ struct AIChatPanel: View {
                                     .font(.system(size: 10))
                             }
                             .foregroundColor(service.webSearchEnabled ? Color.accent : Color.labelSecondary)
-                            .padding(.horizontal, 6)
+                            .padding(.leading, 3).padding(.trailing, 10)
                             .padding(.vertical, 3)
                             .background(service.webSearchEnabled ? Color.accent.opacity(0.15) : Color.white.opacity(0.06))
                             .clipShape(Capsule())
@@ -549,7 +564,7 @@ struct AIChatPanel: View {
                     .buttonStyle(.plain)
                     .disabled(!canSend)
                 }
-                .padding(.horizontal, 8)
+                .padding(.leading, 3).padding(.trailing, 10)
                 .padding(.bottom, 6)
                 .clipped()
             }
@@ -590,7 +605,7 @@ struct AIChatPanel: View {
                             }
                     )
             }
-            .padding(.horizontal, 8)
+            .padding(.leading, 3).padding(.trailing, 10)
             .padding(.top, 8)
             .padding(.bottom, 8)
         }
@@ -603,7 +618,7 @@ struct AIChatPanel: View {
                 .lineLimit(1)
                 .truncationMode(.tail)
                 .foregroundColor(active ? Color.accent : Color.labelSecondary)
-                .padding(.horizontal, 6)
+                .padding(.leading, 3).padding(.trailing, 10)
                 .padding(.vertical, 3)
                 .background(active ? Color.accent.opacity(0.15) : Color.white.opacity(0.06))
                 .clipShape(Capsule())
@@ -2266,5 +2281,36 @@ private struct EntryCard: View {
         }
         .buttonStyle(.plain)
         .onHover { hovering = $0 }
+    }
+}
+
+// MARK: - 历史列表的状态圆点
+
+enum HistoryDotState { case idle, running, done, failed }
+
+/// 历史会话每行标题前的圆点。**不区分画布和普通会话**，只表示状态：
+/// 正在生成时呼吸，画布还带上次生成的结果 —— 绿=有产物，红=有节点失败了
+struct HistoryStatusDot: View {
+    let state: HistoryDotState
+    @State private var dim = false
+
+    private var color: Color {
+        switch state {
+        case .done:   return .green
+        case .failed: return .red
+        case .idle, .running: return Color.labelSecondary
+        }
+    }
+
+    var body: some View {
+        Circle().strokeBorder(color, lineWidth: 1.2)
+            .frame(width: 7, height: 7)
+        .opacity(dim ? 0.25 : 1)
+        .animation(state == .running
+                   ? .easeInOut(duration: 0.9).repeatForever(autoreverses: true)
+                   : .linear(duration: 0.15),
+                   value: dim)
+        .onAppear { dim = (state == .running) }
+        .onChange(of: state) { _, s in dim = (s == .running) }
     }
 }

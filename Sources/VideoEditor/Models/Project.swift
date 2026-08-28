@@ -27,6 +27,11 @@ final class ProjectState: ObservableObject {
     @Published var textTracks: [Track<TextClip>] = [Track(label: "文字")]
     @Published var textTemplates: [TextTemplate] = []  // 文字样式模板
     @Published var shapeTracks: [Track<ShapeClip>] = [Track(label: "图形")]  // 图形图层
+    /// 滤镜轨道。多条 = 叠加，从下往上依次套
+    @Published var filterTracks: [Track<FilterClip>] = []
+    @Published var selectedFilterClipID: UUID? = nil
+    @Published var adjustTracks: [Track<AdjustClip>] = []
+    @Published var selectedAdjustClipID: UUID? = nil
     @Published var compoundTracks: [Track<CompoundClip>] = []
     @Published var selectedMarkerID: UUID? = nil
 
@@ -51,11 +56,14 @@ final class ProjectState: ObservableObject {
         case subtitle(UUID)
         case text(UUID)
         case shape(UUID)
+        case filter(UUID)
+        case adjust(UUID)
         case compound(UUID)
 
         var trackID: UUID {
             switch self {
-            case .image(let id), .subtitle(let id), .text(let id), .shape(let id), .compound(let id): return id
+            case .image(let id), .subtitle(let id), .text(let id), .shape(let id),
+                 .filter(let id), .adjust(let id), .compound(let id): return id
             }
         }
     }
@@ -79,6 +87,8 @@ final class ProjectState: ObservableObject {
         subtitleTracks: [Track<SubtitleClip>] = [],
         textTracks: [Track<TextClip>] = [],
         shapeTracks: [Track<ShapeClip>] = [],
+        filterTracks: [Track<FilterClip>] = [],
+        adjustTracks: [Track<AdjustClip>] = [],
         compoundTracks: [Track<CompoundClip>] = []
     ) -> [OverlayTrackRef] {
         // 没登记的一律补进来，压在最底下。不只是复合轨道——任何一条轨道只要
@@ -98,6 +108,12 @@ final class ProjectState: ObservableObject {
         for t in shapeTracks where t.isVisible && !listed.contains(t.id) {
             unlisted.append(.shape(t.id))
         }
+        for t in filterTracks where t.isVisible && !listed.contains(t.id) {
+            unlisted.append(.filter(t.id))
+        }
+        for t in adjustTracks where t.isVisible && !listed.contains(t.id) {
+            unlisted.append(.adjust(t.id))
+        }
         for t in compoundTracks where t.isVisible && !listed.contains(t.id) {
             unlisted.append(.compound(t.id))
         }
@@ -111,6 +127,7 @@ final class ProjectState: ObservableObject {
             overlayTrackOrder: overlayTrackOrder,
             imageTracks: imageTracks, subtitleTracks: subtitleTracks,
             textTracks: textTracks, shapeTracks: shapeTracks,
+            filterTracks: filterTracks, adjustTracks: adjustTracks,
             compoundTracks: compoundTracks)
     }
 
@@ -194,6 +211,8 @@ final class ProjectState: ObservableObject {
         for t in subtitleTracks { currentIDs.insert(t.id) }
         for t in textTracks { currentIDs.insert(t.id) }
         for t in shapeTracks { currentIDs.insert(t.id) }
+        for t in filterTracks { currentIDs.insert(t.id) }
+        for t in adjustTracks { currentIDs.insert(t.id) }
         for t in compoundTracks where compoundTrackKind(t) == .overlay { currentIDs.insert(t.id) }
         for ref in overlayTrackOrder {
             let rid: UUID
@@ -202,6 +221,8 @@ final class ProjectState: ObservableObject {
             case .subtitle(let id): rid = id
             case .text(let id): rid = id
             case .shape(let id): rid = id
+            case .filter(let id): rid = id
+            case .adjust(let id): rid = id
             case .compound(let id): rid = id
             }
             if currentIDs.contains(rid) { newOrder.append(ref); currentIDs.remove(rid) }
@@ -210,6 +231,8 @@ final class ProjectState: ObservableObject {
         for t in imageTracks where currentIDs.contains(t.id) { newRefs.append(.image(t.id)); currentIDs.remove(t.id) }
         for t in subtitleTracks where currentIDs.contains(t.id) { newRefs.append(.subtitle(t.id)); currentIDs.remove(t.id) }
         for t in textTracks where currentIDs.contains(t.id) { newRefs.append(.text(t.id)); currentIDs.remove(t.id) }
+        for t in filterTracks where currentIDs.contains(t.id) { newRefs.append(.filter(t.id)); currentIDs.remove(t.id) }
+        for t in adjustTracks where currentIDs.contains(t.id) { newRefs.append(.adjust(t.id)); currentIDs.remove(t.id) }
         for t in shapeTracks where currentIDs.contains(t.id) { newRefs.append(.shape(t.id)); currentIDs.remove(t.id) }
         for t in compoundTracks where currentIDs.contains(t.id) { newRefs.append(.compound(t.id)); currentIDs.remove(t.id) }
         overlayTrackOrder = newRefs + newOrder
@@ -930,6 +953,8 @@ final class ProjectState: ObservableObject {
     /// 素材库里的六个分类标签：video / audio / image / subtitle / text / shape。
     /// 原来这六类各占一个侧边栏图标，v5.3.0 合并进素材库，改成里面的标签页
     @Published var libraryCategory: String = "video"
+    /// 「效果」栏下的分类：转场 / 滤镜 / 特效 / 调节
+    @Published var effectCategory: String = "transition"
     /// 素材库用缩略图还是列表看。侧边栏和画布素材库**共用这一份**，
     /// 一边切了另一边跟着变（跟排序设置一个待遇）
     @Published var mediaGridMode: Bool = true

@@ -6,34 +6,145 @@ import ObjectiveC
 // MARK: - ColorAdjust
 
 struct ColorAdjust: Codable, Equatable {
-    var brightness: Double = 0   // -1 ~ 1
-    var contrast:   Double = 0   // -1 ~ 1
-    var saturation: Double = 0   // -1 ~ 1
-    var hue:        Double = 0   // degrees -180 ~ 180
+    // 基础
+    var brightness: Double = 0    // -1 ~ 1
+    var contrast:   Double = 0    // -1 ~ 1
+    var saturation: Double = 0    // -1 ~ 1
+    var vibrance:   Double = 0    // -1 ~ 1，自然饱和（只提低饱和的部分，肤色不容易过）
+    // 光影
+    var exposure:   Double = 0    // -2 ~ 2 EV
+    var gamma:      Double = 1    // 0.25 ~ 4，**中性值是 1 不是 0**
+    var highlight:  Double = 0    // -1 ~ 1
+    var shadow:     Double = 0    // -1 ~ 1
+    // 色彩
+    var temperature: Double = 0   // -1 ~ 1，负=冷 正=暖
+    var tint:        Double = 0   // -1 ~ 1，负=绿 正=品红
+    var hue:         Double = 0   // degrees -180 ~ 180
 
     var isIdentity: Bool {
-        brightness == 0 && contrast == 0 && saturation == 0 && abs(hue) < 0.01
+        brightness == 0 && contrast == 0 && saturation == 0 && vibrance == 0
+        && exposure == 0 && abs(gamma - 1) < 0.001 && highlight == 0 && shadow == 0
+        && temperature == 0 && tint == 0 && abs(hue) < 0.01
     }
     static let identity = ColorAdjust()
 
+    // 老项目文件里没有新增的这些键。**自动合成的 Codable 遇到缺键会整个解不开**，
+    // 所以这里手写一份，缺的一律走默认值
+    enum CodingKeys: String, CodingKey {
+        case brightness, contrast, saturation, vibrance
+        case exposure, gamma, highlight, shadow
+        case temperature, tint, hue
+    }
+
+    init(brightness: Double = 0, contrast: Double = 0, saturation: Double = 0,
+         vibrance: Double = 0, exposure: Double = 0, gamma: Double = 1,
+         highlight: Double = 0, shadow: Double = 0,
+         temperature: Double = 0, tint: Double = 0, hue: Double = 0) {
+        self.brightness = brightness; self.contrast = contrast
+        self.saturation = saturation; self.vibrance = vibrance
+        self.exposure = exposure; self.gamma = gamma
+        self.highlight = highlight; self.shadow = shadow
+        self.temperature = temperature; self.tint = tint; self.hue = hue
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        brightness  = try c.decodeIfPresent(Double.self, forKey: .brightness) ?? 0
+        contrast    = try c.decodeIfPresent(Double.self, forKey: .contrast) ?? 0
+        saturation  = try c.decodeIfPresent(Double.self, forKey: .saturation) ?? 0
+        vibrance    = try c.decodeIfPresent(Double.self, forKey: .vibrance) ?? 0
+        exposure    = try c.decodeIfPresent(Double.self, forKey: .exposure) ?? 0
+        gamma       = try c.decodeIfPresent(Double.self, forKey: .gamma) ?? 1
+        highlight   = try c.decodeIfPresent(Double.self, forKey: .highlight) ?? 0
+        shadow      = try c.decodeIfPresent(Double.self, forKey: .shadow) ?? 0
+        temperature = try c.decodeIfPresent(Double.self, forKey: .temperature) ?? 0
+        tint        = try c.decodeIfPresent(Double.self, forKey: .tint) ?? 0
+        hue         = try c.decodeIfPresent(Double.self, forKey: .hue) ?? 0
+    }
+
+    /// 给 CALayer.filters 用的同一条链。叠加层（图片/文字/图形是 SwiftUI 画的，
+    /// 不经过合成器）靠它拿到跟视频一致的效果
+    var ciFilters: [CIFilter] {
+        guard !isIdentity else { return [] }
+        var out: [CIFilter] = []
+        func add(_ name: String, _ params: [String: Any]) {
+            guard let f = CIFilter(name: name) else { return }
+            for (k, v) in params { f.setValue(v, forKey: k) }
+            out.append(f)
+        }
+        if exposure != 0 { add("CIExposureAdjust", ["inputEV": exposure]) }
+        if abs(gamma - 1) > 0.001 { add("CIGammaAdjust", ["inputPower": max(0.05, gamma)]) }
+        if highlight != 0 || shadow != 0 {
+            let sh = 0.25 * max(min(shadow, 1), -1)
+            let hi = 0.25 * max(min(highlight, 1), -1)
+            add("CIToneCurve", [
+                "inputPoint0": CIVector(x: 0, y: 0),
+                "inputPoint1": CIVector(x: 0.25, y: min(max(0.25 + sh, 0), 1)),
+                "inputPoint2": CIVector(x: 0.5, y: 0.5),
+                "inputPoint3": CIVector(x: 0.75, y: min(max(0.75 + hi, 0), 1)),
+                "inputPoint4": CIVector(x: 1, y: 1)])
+        }
+        if brightness != 0 || contrast != 0 || saturation != 0 {
+            add("CIColorControls", [kCIInputBrightnessKey: brightness,
+                                    kCIInputContrastKey: 1.0 + contrast,
+                                    kCIInputSaturationKey: 1.0 + saturation])
+        }
+        if vibrance != 0 { add("CIVibrance", ["inputAmount": vibrance]) }
+        if temperature != 0 || tint != 0 {
+            add("CITemperatureAndTint", [
+                "inputNeutral": CIVector(x: 6500 + temperature * 3000, y: tint * 100),
+                "inputTargetNeutral": CIVector(x: 6500, y: 0)])
+        }
+        if abs(hue) > 0.01 { add("CIHueAdjust", [kCIInputAngleKey: hue * .pi / 180.0]) }
+        return out
+    }
+
+    /// 调色链。顺序照专业调色的习惯走：曝光 → 影调 → 颜色
     static func apply(_ img: CIImage, _ adj: ColorAdjust) -> CIImage {
         guard !adj.isIdentity else { return img }
         var out = img
+
+        if adj.exposure != 0 {
+            out = out.applyingFilter("CIExposureAdjust", parameters: ["inputEV": adj.exposure])
+        }
+        if abs(adj.gamma - 1) > 0.001 {
+            out = out.applyingFilter("CIGammaAdjust", parameters: ["inputPower": max(0.05, adj.gamma)])
+        }
+        // 高光/阴影走色调曲线的两个控制点：往上抬是提亮、往下拉是压暗。
+        // 比 CIHighlightShadowAdjust 省一个模糊半径，而且两个方向都能调
+        if adj.highlight != 0 || adj.shadow != 0 {
+            let s = 0.25 * max(min(adj.shadow, 1), -1)
+            let h = 0.25 * max(min(adj.highlight, 1), -1)
+            out = out.applyingFilter("CIToneCurve", parameters: [
+                "inputPoint0": CIVector(x: 0, y: 0),
+                "inputPoint1": CIVector(x: 0.25, y: min(max(0.25 + s, 0), 1)),
+                "inputPoint2": CIVector(x: 0.5, y: 0.5),
+                "inputPoint3": CIVector(x: 0.75, y: min(max(0.75 + h, 0), 1)),
+                "inputPoint4": CIVector(x: 1, y: 1)
+            ])
+        }
         if adj.brightness != 0 || adj.contrast != 0 || adj.saturation != 0 {
-            if let f = CIFilter(name: "CIColorControls") {
-                f.setValue(out,                                    forKey: kCIInputImageKey)
-                f.setValue(NSNumber(value: adj.brightness),        forKey: kCIInputBrightnessKey)
-                f.setValue(NSNumber(value: 1.0 + adj.contrast),    forKey: kCIInputContrastKey)
-                f.setValue(NSNumber(value: 1.0 + adj.saturation),  forKey: kCIInputSaturationKey)
-                if let o = f.outputImage { out = o }
-            }
+            out = out.applyingFilter("CIColorControls", parameters: [
+                kCIInputBrightnessKey: adj.brightness,
+                kCIInputContrastKey:   1.0 + adj.contrast,
+                kCIInputSaturationKey: 1.0 + adj.saturation
+            ])
+        }
+        if adj.vibrance != 0 {
+            out = out.applyingFilter("CIVibrance", parameters: ["inputAmount": adj.vibrance])
+        }
+        // 色温色调：inputNeutral 说的是「这张图现在的白点」，
+        // 把它报得比 6500 高，滤镜就会往回压成暖色 —— 所以正值 = 暖
+        if adj.temperature != 0 || adj.tint != 0 {
+            out = out.applyingFilter("CITemperatureAndTint", parameters: [
+                "inputNeutral": CIVector(x: 6500 + adj.temperature * 3000,
+                                         y: adj.tint * 100),
+                "inputTargetNeutral": CIVector(x: 6500, y: 0)
+            ])
         }
         if abs(adj.hue) > 0.01 {
-            if let f = CIFilter(name: "CIHueAdjust") {
-                f.setValue(out, forKey: kCIInputImageKey)
-                f.setValue(NSNumber(value: Float(adj.hue * .pi / 180.0)), forKey: kCIInputAngleKey)
-                if let o = f.outputImage { out = o }
-            }
+            out = out.applyingFilter("CIHueAdjust",
+                                     parameters: [kCIInputAngleKey: adj.hue * .pi / 180.0])
         }
         return out
     }
@@ -122,6 +233,8 @@ struct CompositorTrackEntry {
 final class ColorCompositionData: NSObject {
     var entries:    [CompositorTrackEntry] = []
     var renderSize: CGSize = .zero
+    /// 滤镜轨道。**在所有画面合成完之后**统一套上去
+    var filterTracks: [Track<FilterClip>] = []
 }
 
 // AVMutableVideoCompositionInstruction extension（仅用于其他代码兼容）
@@ -144,6 +257,10 @@ final class ColorCompositor: NSObject, AVVideoCompositing {
     private static let lock = NSLock()
     private static var store: [Int64: ColorCompositionData] = [:]
     private static var dragOffsets: [CMPersistentTrackID: (x: CGFloat, y: CGFloat)] = [:]
+    /// 当前的滤镜轨道。**不能只挂在合成指令上** —— 单轨无转场时合成器走的是
+    /// 「透传」快路径，那条路拿不到指令数据，滤镜会整个失效
+    nonisolated(unsafe) private static var liveFilterTracks: [Track<FilterClip>] = []
+    nonisolated(unsafe) private static var liveAdjustTracks: [Track<AdjustClip>] = []
     /// 拖色调滑块时的实时覆盖值。走这条就不用重建整个 composition ——
     /// 重建要重新 load playerItem，代价大到只能防抖，表现就是"松手才变"
     private static var liveColorAdjusts: [CMPersistentTrackID: ColorAdjust] = [:]
@@ -160,6 +277,37 @@ final class ColorCompositor: NSObject, AVVideoCompositing {
         store.removeAll()
         dragOffsets.removeAll()
         liveColorAdjusts.removeAll()
+    }
+
+    static func setFilterTracks(_ tracks: [Track<FilterClip>]) {
+        lock.lock(); defer { lock.unlock() }
+        liveFilterTracks = tracks
+    }
+
+    static func getFilterTracks() -> [Track<FilterClip>] {
+        lock.lock(); defer { lock.unlock() }
+        return liveFilterTracks
+    }
+
+    static func setAdjustTracks(_ tracks: [Track<AdjustClip>]) {
+        lock.lock(); defer { lock.unlock() }
+        liveAdjustTracks = tracks
+    }
+
+    static func getAdjustTracks() -> [Track<AdjustClip>] {
+        lock.lock(); defer { lock.unlock() }
+        return liveAdjustTracks
+    }
+
+    /// 把某一刻生效的调节全套上去。多条轨道从下往上依次作用
+    static func applyAdjustTracks(_ img: CIImage, at time: Double) -> CIImage {
+        var out = img
+        for track in getAdjustTracks() where track.isVisible {
+            for clip in track.clips where clip.startTime <= time && clip.endTime > time {
+                out = ColorAdjust.apply(out, clip.adjust)
+            }
+        }
+        return out
     }
 
     static func setDragOffset(trackID: CMPersistentTrackID, offsetX: CGFloat, offsetY: CGFloat) {
@@ -234,6 +382,15 @@ final class ColorCompositor: NSObject, AVVideoCompositing {
                 ci = ci.transformed(by: CGAffineTransform(scaleX: scale, y: scale)
                     .concatenating(CGAffineTransform(translationX: tx, y: ty)))
                 ci = ci.cropped(to: CGRect(x: 0, y: 0, width: outW, height: outH))
+                let box = CGRect(x: 0, y: 0, width: outW, height: outH)
+                let t = req.compositionTime.seconds
+                let tracks = Self.getFilterTracks()
+                if !tracks.isEmpty {
+                    ci = FilterEngine.apply(ci, tracks: tracks, at: t).cropped(to: box)
+                }
+                if !Self.getAdjustTracks().isEmpty {
+                    ci = Self.applyAdjustTracks(ci, at: t).cropped(to: box)
+                }
                 Self.sharedCtx.render(ci, to: outBuf,
                                       bounds: CGRect(x: 0, y: 0, width: outW, height: outH),
                                       colorSpace: CGColorSpaceCreateDeviceRGB())
@@ -383,6 +540,16 @@ final class ColorCompositor: NSObject, AVVideoCompositing {
 
             // 7. 叠加
             result = ci.composited(over: result)
+        }
+
+        // 8. 滤镜：全部画面合成完之后再套，所以这段时间内谁都跑不掉。
+        //    取静态存储而不是 data，跟上面那条透传路径同一个来源
+        let filters = Self.getFilterTracks()
+        if !filters.isEmpty {
+            result = FilterEngine.apply(result, tracks: filters, at: t).cropped(to: bounds)
+        }
+        if !Self.getAdjustTracks().isEmpty {
+            result = Self.applyAdjustTracks(result, at: t).cropped(to: bounds)
         }
 
         Self.sharedCtx.render(result, to: outBuf,

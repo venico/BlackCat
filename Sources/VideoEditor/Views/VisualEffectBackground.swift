@@ -45,7 +45,7 @@ extension Color {
 /// 模拟光从上方打下来，所以上沿有明显高光、下沿几乎看不见。
 /// 之前用 separatorColor 是均匀的、而且太暗，完全没有那种亮度感。
 struct PanelBorder: ViewModifier {
-    var cornerRadius: CGFloat = 12
+    var cornerRadius: CGFloat = 16
     func body(content: Content) -> some View {
         content.overlay(
             RoundedRectangle(cornerRadius: cornerRadius)
@@ -59,10 +59,6 @@ struct PanelBorder: ViewModifier {
         )
     }
 }
-
-/// 玻璃的压暗量。Liquid Glass 默认透得很厉害，浅色墙纸下整个界面会发白，
-/// 这个 app 是深色主题，需要往下压。数值集中在这里，调一处全局生效
-private let kGlassTint = Color.black.opacity(0.58)
 
 /// 窗口最底层（面板之间的缝隙）的压暗量。材质本身没法调暗度，只能在它上面
 /// 叠一层半透明黑。跟 kGlassTint 分开：底层要比面板更暗才拉得开层次
@@ -86,9 +82,10 @@ extension View {
     /// 玻璃的折射、高光、边缘都由系统给，跟系统 app 天然一致；
     /// 26 以下回退到 NSVisualEffectView 材质 + 手工渐变描边这套近似实现。
     @ViewBuilder
-    func panelSurface(_ kind: PanelKind = .content, cornerRadius: CGFloat = 12) -> some View {
+    func panelSurface(_ kind: PanelKind = .content, cornerRadius: CGFloat = 16) -> some View {
         if #available(macOS 26.0, *) {
-            glassEffect(.regular.tint(kGlassTint), in: .rect(cornerRadius: cornerRadius))
+            // 不再往玻璃上压黑：压暗之后比系统 app 的侧栏深一大截
+            glassEffect(.regular, in: .rect(cornerRadius: cornerRadius))
         } else {
             background(VisualEffectBackground(material: kind.material))
                 .clipShape(RoundedRectangle(cornerRadius: cornerRadius))
@@ -101,9 +98,9 @@ extension View {
     /// 26 以下回退到纯材质（无描边），靠跟底层的明暗差划界
     @ViewBuilder
     func panelSurfaceClear(_ kind: PanelKind = .content,
-                           cornerRadius: CGFloat = 12) -> some View {
+                           cornerRadius: CGFloat = 16) -> some View {
         if #available(macOS 26.0, *) {
-            glassEffect(.clear.tint(kGlassTint), in: .rect(cornerRadius: cornerRadius))
+            glassEffect(.clear, in: .rect(cornerRadius: cornerRadius))
         } else {
             background(VisualEffectBackground(material: kind.material))
                 .clipShape(RoundedRectangle(cornerRadius: cornerRadius))
@@ -113,7 +110,7 @@ extension View {
     /// 完全没有描边的面板。预览区、属性区、轨道区用它 ——
     /// Liquid Glass 那圈边缘高光去不掉，所以这三块统一走材质，
     /// 只留材质底色和圆角，靠明暗差划界
-    func panelSurfacePlain(_ kind: PanelKind = .content, cornerRadius: CGFloat = 12) -> some View {
+    func panelSurfacePlain(_ kind: PanelKind = .content, cornerRadius: CGFloat = 16) -> some View {
         background(VisualEffectBackground(material: kind.material))
             .clipShape(RoundedRectangle(cornerRadius: cornerRadius))
     }
@@ -124,7 +121,7 @@ extension View {
     }
 
     /// 面板描边，带光照渐变。26 以下的回退路径用
-    func panelBorder(cornerRadius: CGFloat = 12) -> some View {
+    func panelBorder(cornerRadius: CGFloat = 16) -> some View {
         modifier(PanelBorder(cornerRadius: cornerRadius))
     }
 

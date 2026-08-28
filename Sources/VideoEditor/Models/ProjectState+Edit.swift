@@ -105,6 +105,8 @@ extension ProjectState {
                         subtitleTracks: subtitleTracks,
                         textTracks: textTracks,
                         shapeTracks: shapeTracks,
+                        filterTracks: filterTracks,
+                        adjustTracks: adjustTracks,
                         compoundTracks: compoundTracks,
                         overlayTrackOrder: overlayTrackOrder,
                         videoSectionOrder: videoSectionOrder,
@@ -116,6 +118,8 @@ extension ProjectState {
     }
 
     func applySnapshot(_ s: ProjectSnapshot) {
+        filterTracks   = s.filterTracks
+        adjustTracks   = s.adjustTracks
         videoTracks    = s.videoTracks
         audioTracks    = s.audioTracks
         imageTracks    = s.imageTracks
@@ -567,6 +571,8 @@ extension ProjectState {
                 case .subtitle: affected = subtitleTracks.first(where: { $0.id == tid })?.clips.contains { ids.contains($0.id) } ?? false
                 case .text: affected = textTracks.first(where: { $0.id == tid })?.clips.contains { ids.contains($0.id) } ?? false
                 case .shape: affected = shapeTracks.first(where: { $0.id == tid })?.clips.contains { ids.contains($0.id) } ?? false
+                case .filter: affected = filterTracks.first(where: { $0.id == tid })?.clips.contains { ids.contains($0.id) } ?? false
+                case .adjust: affected = adjustTracks.first(where: { $0.id == tid })?.clips.contains { ids.contains($0.id) } ?? false
                 case .compound: affected = compoundTracks.first(where: { $0.id == tid })?.clips.contains { ids.contains($0.id) } ?? false
                 }
                 if affected { anchorOverlayIdx = oi; break }
@@ -1006,6 +1012,8 @@ extension ProjectState {
         if let id = selectedSubtitleClipID { ids.insert(id) }
         if let id = selectedTextClipID     { ids.insert(id) }
         if let id = selectedShapeClipID    { ids.insert(id) }
+        if let id = selectedFilterClipID   { ids.insert(id) }
+        if let id = selectedAdjustClipID   { ids.insert(id) }
         if let id = selectedCompoundClipID { ids.insert(id) }
         guard !ids.isEmpty else { return }
 
@@ -1039,6 +1047,16 @@ extension ProjectState {
             shapeTracks[i].clips.removeAll { ids.contains($0.id) }
             if shapeTracks[i].clips.count != before { changed = true }
         }
+        for i in filterTracks.indices {
+            let before = filterTracks[i].clips.count
+            filterTracks[i].clips.removeAll { ids.contains($0.id) }
+            if filterTracks[i].clips.count != before { changed = true }
+        }
+        for i in adjustTracks.indices {
+            let before = adjustTracks[i].clips.count
+            adjustTracks[i].clips.removeAll { ids.contains($0.id) }
+            if adjustTracks[i].clips.count != before { changed = true }
+        }
         for i in compoundTracks.indices {
             let before = compoundTracks[i].clips.count
             compoundTracks[i].clips.removeAll { ids.contains($0.id) }
@@ -1050,6 +1068,7 @@ extension ProjectState {
         selectedAudioClipID    = nil
         selectedSubtitleClipID = nil
         selectedTextClipID     = nil
+        selectedFilterClipID   = nil
         selectedShapeClipID    = nil
         selectedCompoundClipID = nil
         selectedClipIDs.removeAll()

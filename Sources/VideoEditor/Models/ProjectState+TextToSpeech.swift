@@ -120,6 +120,12 @@ extension ProjectState {
     /// 两处必须避开主线程，否则界面会整个卡死：
     ///   · 量时长：mp3 得扫码流才能定时长，几十条串行量能堵很久 → 挪到后台并发做
     ///   · 写轨道：逐条改 mediaAssets / audioTracks，每次都触发素材库和时间轴全量重绘 → 攒够一次性提交
+    ///
+    /// **写轨道这步必须回主线程**：不标 @MainActor 的话，await 之后整个函数体都跑在
+    /// 后台线程上，改的却是主线程的 @Published 状态 —— 撞上主线程正在加载波形就是野指针。
+    /// 卡顿靠的是「攒够一次性提交」，不是离开主线程；量时长那两步是 nonisolated static，
+    /// 仍旧在后台并发跑，主线程只是在 await 上等着
+    @MainActor
     @discardableResult
     private func addSpeechClips(_ items: [(clip: SubtitleClip, url: URL)]) async -> Int {
         guard !items.isEmpty else { return 0 }
@@ -385,6 +391,7 @@ extension ProjectState {
 
     /// 给测试用的入口 —— 批量插入是卡死过的地方，得能单独量
     @discardableResult
+    @MainActor
     func testHook_addSpeechClips(_ items: [(clip: SubtitleClip, url: URL)]) async -> Int {
         await addSpeechClips(items)
     }

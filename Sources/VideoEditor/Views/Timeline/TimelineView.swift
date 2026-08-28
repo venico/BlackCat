@@ -198,6 +198,8 @@ struct TimelineView: View {
         case moveSubtitle(id: UUID, originStart: Double, originDur: Double, srcTrack: Int)
         case moveText(id: UUID, originStart: Double, originDur: Double, srcTrack: Int)
         case moveShape(id: UUID, originStart: Double, originDur: Double, srcTrack: Int)
+        case moveFilter(id: UUID, originStart: Double, originDur: Double, srcTrack: Int)
+        case moveAdjust(id: UUID, originStart: Double, originDur: Double, srcTrack: Int)
         case moveCompound(id: UUID, originStart: Double, originDur: Double, srcTrack: Int)
         case moveMulti(items: [DragItem])
         case trimVideoLeft(id: UUID, originStart: Double, originEnd: Double, originTrimStart: Double, assetDur: Double)
@@ -212,6 +214,10 @@ struct TimelineView: View {
         case trimTextRight(id: UUID, originStart: Double, originEnd: Double)
         case trimShapeLeft(id: UUID, originStart: Double, originEnd: Double)
         case trimShapeRight(id: UUID, originStart: Double, originEnd: Double)
+        case trimFilterLeft(id: UUID, originStart: Double, originEnd: Double)
+        case trimFilterRight(id: UUID, originStart: Double, originEnd: Double)
+        case trimAdjustLeft(id: UUID, originStart: Double, originEnd: Double)
+        case trimAdjustRight(id: UUID, originStart: Double, originEnd: Double)
         case trimCompoundLeft(id: UUID, originStart: Double, originEnd: Double, originInternalStart: Double)
         case trimCompoundRight(id: UUID, originStart: Double, originEnd: Double)
         case movingPlayhead
@@ -236,29 +242,31 @@ struct TimelineView: View {
         case subtitle(id: UUID, start: Double, dur: Double)
         case text(id: UUID, start: Double, dur: Double)
         case shape(id: UUID, start: Double, dur: Double)
+        case filter(id: UUID, start: Double, dur: Double)
+        case adjust(id: UUID, start: Double, dur: Double)
         case compound(id: UUID, start: Double, dur: Double, trackIndex: Int, clipIndex: Int)
 
         var id: UUID {
             switch self {
-            case .video(let id, _, _), .image(let id, _, _), .audio(let id, _, _), .subtitle(let id, _, _), .text(let id, _, _), .shape(let id, _, _), .compound(let id, _, _, _, _):
+            case .video(let id, _, _), .image(let id, _, _), .audio(let id, _, _), .subtitle(let id, _, _), .text(let id, _, _), .shape(let id, _, _), .filter(let id, _, _), .adjust(let id, _, _), .compound(let id, _, _, _, _):
                 return id
             }
         }
         var start: Double {
             switch self {
-            case .video(_, let s, _), .image(_, let s, _), .audio(_, let s, _), .subtitle(_, let s, _), .text(_, let s, _), .shape(_, let s, _), .compound(_, let s, _, _, _):
+            case .video(_, let s, _), .image(_, let s, _), .audio(_, let s, _), .subtitle(_, let s, _), .text(_, let s, _), .shape(_, let s, _), .filter(_, let s, _), .adjust(_, let s, _), .compound(_, let s, _, _, _):
                 return s
             }
         }
         var duration: Double {
             switch self {
-            case .video(_, _, let d), .image(_, _, let d), .audio(_, _, let d), .subtitle(_, _, let d), .text(_, _, let d), .shape(_, _, let d), .compound(_, _, let d, _, _):
+            case .video(_, _, let d), .image(_, _, let d), .audio(_, _, let d), .subtitle(_, _, let d), .text(_, _, let d), .shape(_, _, let d), .filter(_, _, let d), .adjust(_, _, let d), .compound(_, _, let d, _, _):
                 return d
             }
         }
     }
 
-    private enum TrackKind: Equatable { case image(Int), video(Int), audio(Int), subtitle(Int), text(Int), shape(Int), compound(Int) }
+    private enum TrackKind: Equatable { case image(Int), video(Int), audio(Int), subtitle(Int), text(Int), shape(Int), filter(Int), adjust(Int), compound(Int) }
     private enum ClipTrimEdge { case left, right }
 
     // Custom trim cursors: trapezoid + triangle indicating direction
@@ -681,7 +689,7 @@ struct TimelineView: View {
     }
 
     private struct ResolvedOverlay {
-        enum Kind { case image, subtitle, text, shape, compound }
+        enum Kind { case image, subtitle, text, shape, filter, adjust, compound }
         let kind: Kind
         let index: Int
         let trackID: UUID
@@ -702,6 +710,12 @@ struct TimelineView: View {
             case .shape(let id):
                 guard let i = project.shapeTracks.firstIndex(where: { $0.id == id }) else { return nil }
                 return ResolvedOverlay(kind: .shape, index: i, trackID: id)
+            case .filter(let id):
+                guard let i = project.filterTracks.firstIndex(where: { $0.id == id }) else { return nil }
+                return ResolvedOverlay(kind: .filter, index: i, trackID: id)
+            case .adjust(let id):
+                guard let i = project.adjustTracks.firstIndex(where: { $0.id == id }) else { return nil }
+                return ResolvedOverlay(kind: .adjust, index: i, trackID: id)
             case .compound(let id):
                 guard let i = project.compoundTracks.firstIndex(where: { $0.id == id }),
                       project.compoundTrackKind(project.compoundTracks[i]) == .overlay else { return nil }
@@ -717,6 +731,7 @@ struct TimelineView: View {
             case .subtitle: return project.showSubtitleTracks
             case .text: return project.showTextTracks
             case .shape: return project.showShapeTracks
+            case .filter, .adjust: return true   // 滤镜/调节轨道没有单独的显隐开关
             case .compound: return project.showCompoundTracks
             }
         }
@@ -728,6 +743,7 @@ struct TimelineView: View {
         case .subtitle: return subH(entry.index)
         case .text: return txtH(entry.index)
         case .shape: return shpH(entry.index)
+        case .filter, .adjust: return defaultSubTrackH   // 固定用字幕那一档
         case .compound: return cmpH(entry.index)
         }
     }
@@ -886,6 +902,28 @@ struct TimelineView: View {
                        onMute: nil,
                        onVis:  { project.pushUndo(); project.shapeTracks[i].isVisible.toggle() },
                        onDel:  { project.pushUndo(); project.shapeTracks.remove(at:i); project.syncOverlayOrder() },
+                       onDragChanged: { handleDragChanged(type: .overlay, index: ovIdx, offsetY: $0) },
+                       onDragEnded:   { handleDragEnded(type: .overlay, index: ovIdx, offsetY: $0) })
+        case .filter:
+            TrackLabel(icon:"filter", title: project.filterTracks[i].label.isEmpty ? "滤镜" : project.filterTracks[i].label,
+                       count: project.filterTracks[i].clips.count, hasMute: false,
+                       isMuted: false, isVis: project.filterTracks[i].isVisible,
+                       onMute: nil,
+                       onVis:  { project.pushUndo(); project.filterTracks[i].isVisible.toggle(); project.rebuildTimelinePreview() },
+                       onDel:  { project.pushUndo(); project.filterTracks.remove(at:i)
+                                 project.clearClipSelections()
+                                 project.syncOverlayOrder(); project.rebuildTimelinePreview() },
+                       onDragChanged: { handleDragChanged(type: .overlay, index: ovIdx, offsetY: $0) },
+                       onDragEnded:   { handleDragEnded(type: .overlay, index: ovIdx, offsetY: $0) })
+        case .adjust:
+            TrackLabel(icon:"adjust", title: project.adjustTracks[i].label.isEmpty ? "调节" : project.adjustTracks[i].label,
+                       count: project.adjustTracks[i].clips.count, hasMute: false,
+                       isMuted: false, isVis: project.adjustTracks[i].isVisible,
+                       onMute: nil,
+                       onVis:  { project.pushUndo(); project.adjustTracks[i].isVisible.toggle(); project.rebuildTimelinePreview() },
+                       onDel:  { project.pushUndo(); project.adjustTracks.remove(at:i)
+                                 project.clearClipSelections()
+                                 project.syncOverlayOrder(); project.rebuildTimelinePreview() },
                        onDragChanged: { handleDragChanged(type: .overlay, index: ovIdx, offsetY: $0) },
                        onDragEnded:   { handleDragEnded(type: .overlay, index: ovIdx, offsetY: $0) })
         case .compound:
@@ -1246,8 +1284,8 @@ struct TimelineView: View {
                 guard let op = dragOp else { return }
                 // Track ghost position for move ops (offset so clip stays under grab point)
                 switch op {
-                case .moveVideo, .moveImage, .moveAudio, .moveSubtitle, .moveText, .moveShape, .moveCompound,
-                     .moveMulti:
+                case .moveVideo, .moveImage, .moveAudio, .moveSubtitle, .moveText, .moveShape,
+                     .moveFilter, .moveAdjust, .moveCompound, .moveMulti:
                     dragGhostPos = CGPoint(x: v.location.x - dragGhostOffset.width,
                                            y: v.location.y - dragGhostOffset.height)
                 default: break
@@ -1318,7 +1356,8 @@ struct TimelineView: View {
                         } else if isShift {
                             switch hit {
                             case .video(let id, _, _), .image(let id, _, _),
-                                 .audio(let id, _, _), .subtitle(let id, _, _), .text(let id, _, _), .shape(let id, _, _):
+                                 .audio(let id, _, _), .subtitle(let id, _, _), .text(let id, _, _),
+                                 .shape(let id, _, _), .filter(let id, _, _), .adjust(let id, _, _):
                                 project.shiftToggleClip(id)
                             case .compound(let id, _, _, _, _):
                                 project.shiftToggleClip(id)
@@ -1328,6 +1367,8 @@ struct TimelineView: View {
                             project.selectedTransitionClipID = nil
                             project.selectedShapeClipID = nil
                             project.selectedCompoundClipID = nil
+                            project.selectedFilterClipID = nil
+                            project.selectedAdjustClipID = nil
                             switch hit {
                             case .video(let id, _, _):
                                 project.selectedVideoClipID = id
@@ -1366,6 +1407,12 @@ struct TimelineView: View {
                                 project.selectedAudioClipID = nil
                                 project.selectedSubtitleClipID = nil
                                 project.selectedTextClipID = nil
+                            case .filter(let id, _, _):
+                                project.clearClipSelections()
+                                project.selectedFilterClipID = id
+                            case .adjust(let id, _, _):
+                                project.clearClipSelections()
+                                project.selectedAdjustClipID = id
                             case .compound(let id, _, _, _, _):
                                 project.selectedCompoundClipID = id
                                 project.selectedVideoClipID = nil
@@ -1377,15 +1424,11 @@ struct TimelineView: View {
                             }
                         }
                     } else if !hitTransition {
-                        // 点击空白区域：取消选择 + seek
+                        // 点击空白区域：取消选择 + seek。
+                        // **走统一的清空**：这里原先是挨个列的，滤镜漏在外面，
+                        // 结果点了空白属性区还认为选着滤镜
+                        project.clearClipSelections()
                         project.selectedClipIDs.removeAll()
-                        project.selectedVideoClipID      = nil
-                        project.selectedImageClipID      = nil
-                        project.selectedAudioClipID      = nil
-                        project.selectedSubtitleClipID   = nil
-                        project.selectedTextClipID       = nil
-                        project.selectedShapeClipID      = nil
-                        project.selectedCompoundClipID   = nil
                         project.selectedTransitionClipID = nil
                         let t = max(0, Double(v.startLocation.x) / project.pixelsPerSecond)
                         project.requestSeek(to: t)
@@ -1434,6 +1477,14 @@ struct TimelineView: View {
                     case .moveShape(let id, _, _, let srcTrack):
                         if let dst = destTrack.shapeIndex, dst != srcTrack {
                             project.moveShapeClipToTrack(id: id, from: srcTrack, to: dst)
+                        }
+                    case .moveFilter(let id, _, _, let srcTrack):
+                        if let dst = destTrack.filterIndex, dst != srcTrack {
+                            project.moveFilterClipToTrack(id: id, from: srcTrack, to: dst)
+                        }
+                    case .moveAdjust(let id, _, _, let srcTrack):
+                        if let dst = destTrack.adjustIndex, dst != srcTrack {
+                            project.moveAdjustClipToTrack(id: id, from: srcTrack, to: dst)
                         }
                     case .moveCompound(let id, _, _, let srcTrack):
                         if let dst = destTrack.compoundIndex, dst != srcTrack {
@@ -1751,6 +1802,32 @@ struct TimelineView: View {
                 project.selectedAudioClipID = nil; project.selectedSubtitleClipID = nil; project.selectedTextClipID = nil
                 dragOp = .trimShapeRight(id: id, originStart: s, originEnd: s + d)
                 Self.trimRightCursor.set()
+            case (.filter(let id, let s, let d), nil):
+                selectFilterExclusively(id)
+                let ti = project.filterTracks.firstIndex { $0.clips.contains { $0.id == id } } ?? 0
+                draggingClipID = id
+                dragOp = .moveFilter(id: id, originStart: s, originDur: d, srcTrack: ti)
+            case (.filter(let id, let s, let d), .left):
+                selectFilterExclusively(id)
+                dragOp = .trimFilterLeft(id: id, originStart: s, originEnd: s + d)
+                Self.trimLeftCursor.set()
+            case (.adjust(let id, let s, let d), nil):
+                selectAdjustExclusively(id)
+                let ti = project.adjustTracks.firstIndex { $0.clips.contains { $0.id == id } } ?? 0
+                draggingClipID = id
+                dragOp = .moveAdjust(id: id, originStart: s, originDur: d, srcTrack: ti)
+            case (.adjust(let id, let s, let d), .left):
+                selectAdjustExclusively(id)
+                dragOp = .trimAdjustLeft(id: id, originStart: s, originEnd: s + d)
+                Self.trimLeftCursor.set()
+            case (.adjust(let id, let s, let d), .right):
+                selectAdjustExclusively(id)
+                dragOp = .trimAdjustRight(id: id, originStart: s, originEnd: s + d)
+                Self.trimRightCursor.set()
+            case (.filter(let id, let s, let d), .right):
+                selectFilterExclusively(id)
+                dragOp = .trimFilterRight(id: id, originStart: s, originEnd: s + d)
+                Self.trimRightCursor.set()
             case (.compound(let id, let s, let d, let ti, _), nil):
                 project.selectedCompoundClipID = id
                 project.selectedVideoClipID = nil; project.selectedImageClipID = nil
@@ -1935,6 +2012,16 @@ struct TimelineView: View {
             let (ns, sp) = snapStart(raw, duration: d, excluding: [id])
             activeSnapTime = sp
             project.updateShapeTime(id: id, start: ns, end: ns + d)
+        case .moveFilter(let id, let s, let d, _):
+            let raw = max(0, s + dt)
+            let (ns, sp) = snapStart(raw, duration: d, excluding: [id])
+            activeSnapTime = sp
+            project.updateFilterClip(id: id) { $0.startTime = ns; $0.endTime = ns + d }
+        case .moveAdjust(let id, let s, let d, _):
+            let raw = max(0, s + dt)
+            let (ns, sp) = snapStart(raw, duration: d, excluding: [id])
+            activeSnapTime = sp
+            project.updateAdjustClip(id: id) { $0.startTime = ns; $0.endTime = ns + d }
         case .moveCompound(let id, let s, let d, _):
             let raw = max(0, s + dt)
             let (ns, sp) = snapStart(raw, duration: d, excluding: [id])
@@ -2049,6 +2136,26 @@ struct TimelineView: View {
             let (snapped, sp) = snapEdge(ne, excluding: [id])
             ne = snapped; activeSnapTime = sp
             project.updateShapeTime(id: id, end: ne)
+        case .trimAdjustLeft(let id, let originStart, let originEnd):
+            let raw = min(originStart + dt, originEnd - 0.1)
+            let (ns, sp) = snapEdge(max(0, raw), excluding: [id])
+            activeSnapTime = sp
+            project.updateAdjustClip(id: id) { $0.startTime = ns }
+        case .trimAdjustRight(let id, let originStart, let originEnd):
+            let raw = max(originEnd + dt, originStart + 0.1)
+            let (ne, sp) = snapEdge(raw, excluding: [id])
+            activeSnapTime = sp
+            project.updateAdjustClip(id: id) { $0.endTime = ne }
+        case .trimFilterLeft(let id, let originStart, let originEnd):
+            var ns = max(0, min(originStart + dt, originEnd - 0.1))
+            let (snapped, sp) = snapEdge(ns, excluding: [id])
+            ns = snapped; activeSnapTime = sp
+            project.updateFilterClip(id: id) { $0.startTime = ns }
+        case .trimFilterRight(let id, let originStart, let originEnd):
+            var ne = max(originStart + 0.1, originEnd + dt)
+            let (snapped, sp) = snapEdge(ne, excluding: [id])
+            ne = snapped; activeSnapTime = sp
+            project.updateFilterClip(id: id) { $0.endTime = ne }
             if ne > clock.duration { clock.duration = ne }
         case .trimCompoundLeft(let id, let originStart, let originEnd, let originInternalStart):
             var ns = max(0, min(originStart + dt, originEnd - 0.1))
@@ -2076,6 +2183,7 @@ struct TimelineView: View {
                 case .subtitle(let i): dragOriginTrackH = subH(i)
                 case .text(let i):     dragOriginTrackH = txtH(i)
                 case .shape(let i):    dragOriginTrackH = shpH(i)
+                case .filter, .adjust: dragOriginTrackH = defaultSubTrackH
                 case .compound(let i): dragOriginTrackH = cmpH(i)
                 }
             }
@@ -2087,6 +2195,7 @@ struct TimelineView: View {
             case .subtitle(let i): subtitleTrackHeights[i] = newH
             case .text(let i):     textTrackHeights[i] = newH
             case .shape(let i):    shapeTrackHeights[i] = newH
+            case .filter, .adjust: break   // 滤镜/调节轨道高度固定
             case .compound(let i): compoundTrackHeights[i] = newH
             }
         case .box:
@@ -2144,8 +2253,8 @@ struct TimelineView: View {
             windowID, kind: .timeline, rect: rect,
             accepts: {
                 switch $0 {
-                case .asset, .shape: return true
-                case .files:         return false   // Finder 拖的文件归素材区
+                case .asset, .shape, .filter, .adjust: return true
+                case .files:                           return false   // Finder 拖的文件归素材区
                 }
             },
             onDrop: { payload, local in
@@ -2159,11 +2268,27 @@ struct TimelineView: View {
                     project.addToTimelineAt(asset, time: time)
                 case .shape(let type):
                     project.addShape(type: type, at: time)
+                case .filter(let kind):
+                    project.addFilter(kind: kind, at: time)
+                case .adjust:
+                    project.addAdjust(at: time)
                 case .files:
                     break
                 }
             },
             onTargetChange: { isLibraryDragOver = $0 })
+    }
+
+    /// 只选中这一段滤镜，其余选中态清空
+    private func selectFilterExclusively(_ id: UUID) {
+        project.clearClipSelections()
+        project.selectedFilterClipID = id
+    }
+
+    /// 只选中这一段调节
+    private func selectAdjustExclusively(_ id: UUID) {
+        project.clearClipSelections()
+        project.selectedAdjustClipID = id
     }
 
     private func findClipTarget(at pt: CGPoint) -> (hit: ClipHit, trimEdge: ClipTrimEdge?)? {
@@ -2236,6 +2361,14 @@ struct TimelineView: View {
                 case .text:
                     if let m = bestMatch(project.textTracks[entry.index].clips, x: pt.x,
                         { c, _, _ in .text(id: c.id, start: c.startTime, dur: c.duration) },
+                        { $0.startTime }, { $0.endTime }) { return m }
+                case .adjust:
+                    if let m = bestMatch(project.adjustTracks[entry.index].clips, x: pt.x,
+                        { c, _, _ in .adjust(id: c.id, start: c.startTime, dur: c.duration) },
+                        { $0.startTime }, { $0.endTime }) { return m }
+                case .filter:
+                    if let m = bestMatch(project.filterTracks[entry.index].clips, x: pt.x,
+                        { c, _, _ in .filter(id: c.id, start: c.startTime, dur: c.duration) },
                         { $0.startTime }, { $0.endTime }) { return m }
                 case .shape:
                     if let m = bestMatch(project.shapeTracks[entry.index].clips, x: pt.x,
@@ -2325,6 +2458,16 @@ struct TimelineView: View {
                     let xEnd = max(c.startTime*pps, c.endTime*pps)
                     if rectIntersects(rect, xRange: (c.startTime*pps)...xEnd, yRange: yRange) { ids.insert(c.id) }
                 }
+            case .adjust:
+                for c in project.adjustTracks[entry.index].clips {
+                    let xEnd = max(c.startTime*pps, c.endTime*pps)
+                    if rectIntersects(rect, xRange: (c.startTime*pps)...xEnd, yRange: yRange) { ids.insert(c.id) }
+                }
+            case .filter:
+                for c in project.filterTracks[entry.index].clips {
+                    let xEnd = max(c.startTime*pps, c.endTime*pps)
+                    if rectIntersects(rect, xRange: (c.startTime*pps)...xEnd, yRange: yRange) { ids.insert(c.id) }
+                }
             case .compound:
                 for c in project.compoundTracks[entry.index].clips {
                     let xEnd = max(c.startTime*pps, c.endTime*pps)
@@ -2398,6 +2541,8 @@ struct TimelineView: View {
             case .subtitle: if abs(y - top) <= threshold { return .subtitle(entry.index) }
             case .text: if abs(y - top) <= threshold { return .text(entry.index) }
             case .shape: if abs(y - top) <= threshold { return .shape(entry.index) }
+            case .filter, .adjust: break   // 滤镜/调节轨道高度固定，不给拖
+
             case .compound: if abs(y - top) <= threshold { return .compound(entry.index) }
             }
         }
@@ -2484,7 +2629,7 @@ struct TimelineView: View {
 
     private var trackRows: some View {
         VStack(spacing: 1) {
-        // Overlay tracks (image/subtitle/text) — unified order
+        // Overlay tracks (image/subtitle/text/filter) — unified order
         ForEach(Array(visibleOverlays.enumerated()), id:\.element.trackID) { ovIdx, entry in
             overlayClipRow(entry: entry)
                 .offset(y: isTrackDragging(.overlay, ovIdx) ? trackLabelDragOffset : 0)
@@ -2679,6 +2824,34 @@ struct TimelineView: View {
                 clipMarkerPins(project.shapeTracks[i].clips, pps: project.pixelsPerSecond,
                                trackHeight: shpH(i), startTime: \.startTime, markers: \.markers)
             }
+        case .filter:
+            trackRow(height: defaultSubTrackH,
+                     hidden: !project.filterTracks[i].isVisible,
+                     tint: Color(hex: "#6FBF8F")) {
+                ForEach(project.filterTracks[i].clips.filter {
+                    isClipVisible(startTime: $0.startTime, endTime: $0.endTime)
+                }) { clip in
+                    FilterTimelineClipView(clip: clip, pps: project.pixelsPerSecond,
+                                           h: defaultSubTrackH,
+                                           sel: isSelected(clip.id, primary: project.selectedFilterClipID),
+                                           isDragging: isDraggingClip(clip.id),
+                                           scrollOffsetX: scrollOffsetX)
+                }
+            }
+        case .adjust:
+            trackRow(height: defaultSubTrackH,
+                     hidden: !project.adjustTracks[i].isVisible,
+                     tint: Color(hex: "#7E8FD6")) {
+                ForEach(project.adjustTracks[i].clips.filter {
+                    isClipVisible(startTime: $0.startTime, endTime: $0.endTime)
+                }) { clip in
+                    AdjustTimelineClipView(clip: clip, pps: project.pixelsPerSecond,
+                                           h: defaultSubTrackH,
+                                           sel: isSelected(clip.id, primary: project.selectedAdjustClipID),
+                                           isDragging: isDraggingClip(clip.id),
+                                           scrollOffsetX: scrollOffsetX)
+                }
+            }
         case .compound:
             trackRow(height: cmpH(i), hidden: !project.compoundTracks[i].isVisible,
                      muted: project.compoundTracks[i].isMuted, tint: Color(hex: "#FF9F43")) {
@@ -2859,6 +3032,16 @@ struct TimelineView: View {
             guard let clip = project.subtitleTracks.flatMap(\.clips).first(where: { $0.id == id }) else { return nil }
             let ti = project.subtitleTracks.firstIndex { $0.clips.contains { $0.id == id } } ?? 0
             return GhostInfo(name: clip.text.components(separatedBy: "\n").first ?? clip.text, duration: clip.duration, color: Color(hex: "#7B6FC4"), height: subH(ti) - 4, isSubtitle: true, markers: clip.markers ?? [])
+        case .moveFilter(let id, _, _, _):
+            guard let clip = project.filterTracks.flatMap(\.clips).first(where: { $0.id == id }) else { return nil }
+            return GhostInfo(name: clip.name, duration: clip.duration,
+                             color: Color(hex: "#3F8F6B"), height: defaultSubTrackH - 4,
+                             isSubtitle: false, markers: [])
+        case .moveAdjust(let id, _, _, _):
+            guard let clip = project.adjustTracks.flatMap(\.clips).first(where: { $0.id == id }) else { return nil }
+            return GhostInfo(name: clip.name, duration: clip.duration,
+                             color: Color(hex: "#7E8FD6"), height: defaultSubTrackH - 4,
+                             isSubtitle: false, markers: [])
         case .moveText(let id, _, _, _):
             guard let clip = project.textTracks.flatMap(\.clips).first(where: { $0.id == id }) else { return nil }
             let ti = project.textTracks.firstIndex { $0.clips.contains { $0.id == id } } ?? 0
@@ -2887,6 +3070,8 @@ struct TimelineView: View {
         var subtitleIndex: Int?
         var textIndex: Int?
         var shapeIndex: Int?
+        var filterIndex: Int?
+        var adjustIndex: Int?
         var compoundIndex: Int?
     }
 
@@ -2895,6 +3080,14 @@ struct TimelineView: View {
         let oCount = overlays.count
         let vs = resolvedVideoSection
         switch hit {
+        case .filter(let id, _, _):
+            let ti = project.filterTracks.firstIndex { $0.clips.contains { $0.id == id } } ?? 0
+            let trackID = project.filterTracks[ti].id
+            return overlays.firstIndex { $0.trackID == trackID } ?? 0
+        case .adjust(let id, _, _):
+            let ti = project.adjustTracks.firstIndex { $0.clips.contains { $0.id == id } } ?? 0
+            let trackID = project.adjustTracks[ti].id
+            return overlays.firstIndex { $0.trackID == trackID } ?? 0
         case .image(let id, _, _):
             let ti = project.imageTracks.firstIndex { $0.clips.contains { $0.id == id } } ?? 0
             let trackID = project.imageTracks[ti].id
@@ -2971,6 +3164,8 @@ struct TimelineView: View {
                 case .subtitle: return TrackTarget(subtitleIndex: entry.index)
                 case .text: return TrackTarget(textIndex: entry.index)
                 case .shape: return TrackTarget(shapeIndex: entry.index)
+                case .filter: return TrackTarget(filterIndex: entry.index)
+                case .adjust: return TrackTarget(adjustIndex: entry.index)
                 case .compound: return TrackTarget(compoundIndex: entry.index)
                 }
             }
@@ -4587,6 +4782,12 @@ struct TimelineToolbar: View {
         project.selectedTextClipID != nil || project.selectedShapeClipID != nil ||
         project.selectedCompoundClipID != nil || !project.selectedClipIDs.isEmpty
     }
+    /// 能删的范围比能分割的大：滤镜和调节片段可以删，但
+    /// splitAtPlayhead / alignSelectedToPlayhead 都不处理这两条轨道，
+    /// 跟着一起亮起来就会变成「按钮能点但没反应」
+    private var canDelete: Bool {
+        hasSelection || project.selectedFilterClipID != nil || project.selectedAdjustClipID != nil
+    }
     private var canSplit: Bool { hasSelection }
 
     private var canMirrorRotate: Bool {
@@ -4662,7 +4863,7 @@ struct TimelineToolbar: View {
                 SplitBtn(style: .center, help: "在播放头分割片段", enabled: canSplit) { project.splitAtPlayhead() }
                 SplitBtn(style: .keepLeft, help: "裁掉右边", enabled: canSplit) { project.splitKeepLeft() }
                 SplitBtn(style: .keepRight, help: "裁掉左边", enabled: canSplit) { project.splitKeepRight() }
-                TBtn(icon:"delete",            help:"删除选中片段", enabled: hasSelection)   { project.deleteSelected() }
+                TBtn(icon:"delete",            help:"删除选中片段", enabled: canDelete)   { project.deleteSelected() }
                 TBtn(icon:"alignPlayhead",   help:"对齐到播放头", enabled: hasSelection) { project.alignSelectedToPlayhead() }
                 TBtn(icon:"subtitle", help:"新建字幕") { project.insertSubtitleAtPlayhead() }
                 TBtn(icon:"text", help:"新建标题文字") { project.addTextAtPlayhead() }
@@ -4823,6 +5024,7 @@ private struct TranslateToolGroup: View {
     var body: some View {
         HStack(spacing: 2) {
             // 目标语言下拉。悬停反馈跟 AI 工具那个下拉保持一致
+            let langOn = !project.isEffectClipSelected
             Button { showLangMenu() } label: {
                 HStack(spacing: 3) {
                     Text(shortLang(project.translationTargetLang))
@@ -4830,15 +5032,17 @@ private struct TranslateToolGroup: View {
                     Image(systemName: "chevron.down")
                         .font(.system(size: 7, weight: .semibold))
                 }
-                .foregroundColor(langHov ? Color.labelPrimary : Color.labelSecondary)
+                .foregroundColor(langOn ? (langHov ? Color.labelPrimary : Color.labelSecondary)
+                                        : Color.labelSecondary.opacity(0.35))
                 .padding(.horizontal, 6)
                 .frame(height: 28)
-                .background(langHov ? Color.white.opacity(0.08) : Color.clear)
+                .background((langOn && langHov) ? Color.white.opacity(0.08) : Color.clear)
                 .cornerRadius(5)
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .onHover { langHov = $0 }
+            .disabled(!langOn)
+            .onHover { langHov = $0 && langOn }
 
             TBtn(icon: "translate", help: "翻译选中字幕",
                  enabled: project.selectedSubtitleClipID != nil) { translateCurrent() }
@@ -5707,6 +5911,9 @@ private struct AIToolsMenuBtn: View {
     @State private var hov = false
 
     var body: some View {
+        // 滤镜/调节片段选中时整个下拉都置灰：里面每一项要的都是
+        // 视频、音频或字幕，对这两类片段没有一项能用
+        let on = !project.isEffectClipSelected
         Button { showMenu() } label: {
             HStack(spacing: 2) {
                 Image(nsImage: TimelineSVGIcon.load("aiTools"))
@@ -5717,12 +5924,14 @@ private struct AIToolsMenuBtn: View {
                 Image(systemName: "chevron.down")
                     .font(.system(size: 7, weight: .semibold))
             }
-            .foregroundColor(hov ? Color.labelPrimary : Color.labelSecondary)
+            .foregroundColor(on ? (hov ? Color.labelPrimary : Color.labelSecondary)
+                                : Color.labelSecondary.opacity(0.35))
             .frame(height: 28)
             .padding(.horizontal, 5)
-            .background(hov ? Color.white.opacity(0.08) : Color.clear)
+            .background((on && hov) ? Color.white.opacity(0.08) : Color.clear)
             .cornerRadius(5)
         }
+        .disabled(!on)
         .buttonStyle(.plain)
         .onHover { hov = $0 }
         .help("AI 工具")
@@ -5902,5 +6111,97 @@ private struct ClipMissingOverlay: View {
                 .padding(3)
             }
         }
+    }
+}
+
+private struct AdjustTimelineClipView: View {
+    let clip: AdjustClip
+    let pps: Double
+    let h: CGFloat
+    let sel: Bool
+    var isDragging: Bool = false
+    var scrollOffsetX: CGFloat = 0
+    @EnvironmentObject var project: ProjectState
+
+    /// 片段左边被滚出去时标题跟着贴边（跟其它片段一个做法）
+    private var stickyTitleX: CGFloat {
+        let w = max(clip.duration * pps, 4)
+        let clipStart = CGFloat(clip.startTime * pps) + 1
+        let leftInViewport = clipStart - scrollOffsetX
+        if leftInViewport < 4 { return max(0, min(-leftInViewport + 4, w - 40)) }
+        return 4
+    }
+
+    var body: some View {
+        let w = max(clip.duration * pps, 4)
+        ZStack(alignment: .leading) {
+            RoundedRectangle(cornerRadius: 6)
+                .fill(Color(hex: "#7E8FD6").opacity(0.85))
+                .overlay(RoundedRectangle(cornerRadius: 6)
+                    .stroke(sel ? Color.white : Color(hex: "#9FAEE8").opacity(0.4), lineWidth: 1))
+            if w > TimelineClipMetrics.labelMinWidth {
+                HStack(spacing: 3) {
+                    Image(nsImage: SidebarSVGIcon.load("adjust", size: 9))
+                        .renderingMode(.template)
+                    Text(clip.name)
+                        .font(.system(size: 8, weight: .medium))
+                        .lineLimit(1)
+                }
+                .foregroundColor(.white.opacity(0.9))
+                .padding(.leading, stickyTitleX)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+        .frame(width: w, height: h - 6)
+        .opacity(isDragging ? 0 :
+                 (project.clipboardIsCut && project.clipboardSourceIDs.contains(clip.id) ? 0.35 : 1.0))
+        .offset(x: clip.startTime * pps + 1)
+        .allowsHitTesting(false)
+    }
+}
+
+private struct FilterTimelineClipView: View {
+    let clip: FilterClip
+    let pps: Double
+    let h: CGFloat
+    let sel: Bool
+    var isDragging: Bool = false
+    var scrollOffsetX: CGFloat = 0
+    @EnvironmentObject var project: ProjectState
+
+    /// 片段左边被滚出去时标题跟着贴边，别跟着滚没了（跟其它片段一个做法）
+    private var stickyTitleX: CGFloat {
+        let w = max(clip.duration * pps, 4)
+        let clipStart = CGFloat(clip.startTime * pps) + 1
+        let leftInViewport = clipStart - scrollOffsetX
+        if leftInViewport < 4 { return max(0, min(-leftInViewport + 4, w - 40)) }
+        return 4
+    }
+
+    var body: some View {
+        let w = max(clip.duration * pps, 4)
+        ZStack(alignment: .leading) {
+            RoundedRectangle(cornerRadius: 6)
+                .fill(Color(hex: "#3F8F6B").opacity(0.85))
+                .overlay(RoundedRectangle(cornerRadius: 6)
+                    .stroke(sel ? Color.white : Color(hex: "#6FBF8F").opacity(0.4), lineWidth: 1))
+            if w > TimelineClipMetrics.labelMinWidth {
+                HStack(spacing: 3) {
+                    Image(nsImage: SidebarSVGIcon.load("filter", size: 9))
+                        .renderingMode(.template)
+                    Text(clip.name)
+                        .font(.system(size: 8, weight: .medium))
+                        .lineLimit(1)
+                }
+                .foregroundColor(.white.opacity(0.9))
+                .padding(.leading, stickyTitleX)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+        .frame(width: w, height: h - 6)
+        .opacity(isDragging ? 0 :
+                 (project.clipboardIsCut && project.clipboardSourceIDs.contains(clip.id) ? 0.35 : 1.0))
+        .offset(x: clip.startTime * pps + 1)
+        .allowsHitTesting(false)
     }
 }

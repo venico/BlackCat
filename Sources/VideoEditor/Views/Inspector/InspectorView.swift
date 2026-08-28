@@ -18,7 +18,8 @@ struct InspectorView: View {
     var body: some View {
         VStack(spacing: 0) {
             header
-            ScrollView(showsIndicators: false) {
+            GeometryReader { geo in
+              ScrollView(showsIndicators: false) {
                 // 统一给所有属性面板留出底部间距，各 Inspector 不必各自处理
                 Group {
                     // 多选优先：只放三种元素都有、一起调有意义的那几项
@@ -34,6 +35,10 @@ struct InspectorView: View {
                             onDelete: { project.deleteSelected() },
                             onBeforeChange: { project.pushUndoThrottled() }
                         )
+                    } else if let clip = project.selectedAdjustClip {
+                        AdjustInspector(clip: clip).id(clip.id)
+                    } else if let clip = project.selectedFilterClip {
+                        FilterInspector(clip: clip).id(clip.id)
                     } else if let transID = project.selectedTransitionClipID {
                         TransitionInspector(clipID: transID)
                     } else if let clip = project.selectedTextClip {
@@ -56,6 +61,11 @@ struct InspectorView: View {
                     }
                 }
                 .padding(.bottom, 16)
+                // **宽度写死成容器宽度**，不让 ScrollView 自己推断。
+                // alignment 必须给 leading：不给的话默认居中，内容一旦比容器宽
+                // 就往两边溢出，左边那一列（按钮、滑块标签）直接被裁掉
+                .frame(width: geo.size.width, alignment: .leading)
+              }
             }
         }
     }
@@ -104,8 +114,11 @@ struct InspectorView: View {
                 .help("删除")
             }
         }
-        .padding(.horizontal, 14)
+        // **边距不自己写死**：跟下面每一组内容走同一个容器的同一份内边距，
+        // 各写各的迟早会差那么一两个点，肉眼还真看得出来
+        .padding(.horizontal, ISectionMetrics.hPadding)
         .padding(.top, 14)
+        .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.bottom, 10)
     }
 
@@ -114,6 +127,8 @@ struct InspectorView: View {
 
     private var tag: String {
         if project.selectedClipIDs.count > 1 { return "已选 \(project.selectedClipIDs.count) 个" }
+        if project.selectedAdjustClipID != nil { return "调节" }
+        if project.selectedFilterClipID != nil { return "滤镜" }
         if project.selectedTransitionClipID != nil { return "转场" }
         if project.selectedTextClipID       != nil { return "文字" }
         if project.selectedShapeClipID      != nil { return "图形" }
@@ -129,6 +144,8 @@ struct InspectorView: View {
     private var deleteAction: (() -> Void)? {
         // 除了文字和图形有各自的删除，其余（含多选）都走时间轴那个统一入口
         if project.selectedClipIDs.count > 1 { return { project.deleteSelected() } }
+        if let id = project.selectedAdjustClipID { return { project.deleteAdjustClip(id: id) } }
+        if let id = project.selectedFilterClipID { return { project.deleteFilterClip(id: id) } }
         if let id = project.selectedTextClipID { return { project.deleteTextClip(id: id) } }
         if let id = project.selectedShapeClipID { return { project.deleteShapeClip(id: id) } }
         if project.selectedImageClipID != nil || project.selectedVideoClipID != nil
@@ -199,7 +216,7 @@ private struct CompoundInspector: View {
                 .buttonStyle(.plain)
             }
         }
-        .padding(.horizontal, 14)
+        .padding(.horizontal, ISectionMetrics.hPadding)
         .onAppear { editName = clip.name }
         .onChange(of: clip.id) { _ in editName = clip.name }
     }
@@ -1698,11 +1715,8 @@ private struct ImageInspector: View {
     @State private var cropLeft: Double = 0
     @State private var cropRight: Double = 0
     @State private var hasPushedUndo = false
-    // 色调调节
-    @State private var brightness: Double = 0
-    @State private var contrast:   Double = 0
-    @State private var saturation: Double = 0
-    @State private var hue:        Double = 0
+    // 色调调节。跟调节轨道共用同一个结构和同一套滑块
+    @State private var colorAdj = ColorAdjust.identity
     // 描边
     @State private var strokeColor: Color = .white
     @State private var strokeWidth: Double = 0
@@ -1809,6 +1823,13 @@ private struct ImageInspector: View {
                     .font(.system(size: 9))
                     .foregroundColor(Color.labelSecondary.opacity(0.6))
             }
+
+            ISection(title: nil) {
+                // 跟视频属性区、调节轨道同一个组件，这边默认收起来
+                AdjustSliders(adjust: $colorAdj, expandedByDefault: false) {
+                    applyColorAdjust()
+                }
+            }
         }
         .onAppear { syncFromClip() }
         .onChange(of: clip.id) { _ in syncFromClip() }
@@ -1820,10 +1841,7 @@ private struct ImageInspector: View {
         .onChange(of: clip.cropBottom) { v in if abs(v - cropBottom) > 0.001 { cropBottom = v } }
         .onChange(of: clip.cropLeft)   { v in if abs(v - cropLeft)   > 0.001 { cropLeft   = v } }
         .onChange(of: clip.cropRight)  { v in if abs(v - cropRight)  > 0.001 { cropRight  = v } }
-        .onChange(of: clip.colorAdjust.brightness) { v in if abs(v - brightness) > 0.001 { brightness = v } }
-        .onChange(of: clip.colorAdjust.contrast)   { v in if abs(v - contrast)   > 0.001 { contrast   = v } }
-        .onChange(of: clip.colorAdjust.saturation) { v in if abs(v - saturation) > 0.001 { saturation = v } }
-        .onChange(of: clip.colorAdjust.hue)        { v in if abs(v - hue)        > 0.1   { hue        = v } }
+        .onChange(of: clip.colorAdjust) { v in if v != colorAdj { colorAdj = v } }
     }
 
     private var hasOffset: Bool {
@@ -1832,10 +1850,6 @@ private struct ImageInspector: View {
 
     private var hasCrop: Bool {
         cropTop > 0.001 || cropBottom > 0.001 || cropLeft > 0.001 || cropRight > 0.001
-    }
-
-    private var hasColorAdj: Bool {
-        abs(brightness) > 0.01 || abs(contrast) > 0.01 || abs(saturation) > 0.01 || abs(hue) > 0.5
     }
 
     @ViewBuilder
@@ -1855,10 +1869,7 @@ private struct ImageInspector: View {
         cropBottom = clip.cropBottom
         cropLeft = clip.cropLeft
         cropRight = clip.cropRight
-        brightness = clip.colorAdjust.brightness
-        contrast   = clip.colorAdjust.contrast
-        saturation = clip.colorAdjust.saturation
-        hue        = clip.colorAdjust.hue
+        colorAdj = clip.colorAdjust
         strokeColor = clip.strokeColor
         strokeWidth = clip.strokeW
         strokeSoftness = clip.strokeSoft
@@ -1908,12 +1919,8 @@ private struct ImageInspector: View {
             hasPushedUndo = true
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { hasPushedUndo = false }
         }
-        project.updateImageClip(id: clip.id) {
-            $0.colorAdjust.brightness = brightness
-            $0.colorAdjust.contrast   = contrast
-            $0.colorAdjust.saturation = saturation
-            $0.colorAdjust.hue        = hue
-        }
+        let adj = colorAdj
+        project.updateImageClip(id: clip.id) { $0.colorAdjust = adj }
         project.rebuildTimelinePreviewDebounced()
     }
 
@@ -1998,11 +2005,8 @@ private struct VideoInspector: View {
     @State private var cropLeft: Double = 0
     @State private var cropRight: Double = 0
     @State private var hasPushedUndo = false
-    // 色调调节
-    @State private var brightness: Double = 0
-    @State private var contrast:   Double = 0
-    @State private var saturation: Double = 0
-    @State private var hue:        Double = 0
+    // 色调调节。整份存着，跟调节轨道共用同一个结构
+    @State private var colorAdj = ColorAdjust.identity
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -2145,10 +2149,9 @@ private struct VideoInspector: View {
                             .clipShape(RoundedRectangle(cornerRadius: 4))
                     }.buttonStyle(.plain).disabled(!hasOffset)
                 }
-                HStack(spacing: 10) {
-                    dualSlider("X", value: $offsetX, range: -1.0...1.0) { _ in applyTransform() }
-                    dualSlider("Y", value: $offsetY, range: -1.0...1.0) { _ in applyTransform() }
-                }
+                // 一行一个。两个并排的话属性区一窄，右边那个就被挤出容器
+                dualSlider("X", value: $offsetX, range: -1.0...1.0) { _ in applyTransform() }
+                dualSlider("Y", value: $offsetY, range: -1.0...1.0) { _ in applyTransform() }
             }
 
             ISection(title: nil) {
@@ -2159,13 +2162,11 @@ private struct VideoInspector: View {
                             .foregroundColor(lockAspect ? Color.accent : Color.labelSecondary)
                     }.buttonStyle(.plain)
                 }
-                HStack(spacing: 10) {
-                    dualSlider("宽", value: $scaleX, range: 0.1...3.0, unit: "%", scale: 100) { v in
-                        if lockAspect { scaleY = v }; applyTransform()
-                    }
-                    dualSlider("高", value: $scaleY, range: 0.1...3.0, unit: "%", scale: 100) { v in
-                        if lockAspect { scaleX = v }; applyTransform()
-                    }
+                dualSlider("宽", value: $scaleX, range: 0.1...3.0, unit: "%", scale: 100) { v in
+                    if lockAspect { scaleY = v }; applyTransform()
+                }
+                dualSlider("高", value: $scaleY, range: 0.1...3.0, unit: "%", scale: 100) { v in
+                    if lockAspect { scaleX = v }; applyTransform()
                 }
             }
 
@@ -2189,27 +2190,11 @@ private struct VideoInspector: View {
             }
 
             ISection(title: nil) {
-                sectionHeader("色调") {
-                    Button {
-                        brightness = 0; contrast = 0; saturation = 0; hue = 0
-                        applyColorAdjust()
-                    } label: {
-                        Text("重置")
-                            .font(.system(size: 9, weight: .medium))
-                            .foregroundColor(hasColorAdj ? .black : Color.labelSecondary)
-                            .padding(.horizontal, 6).padding(.vertical, 2)
-                            .background(hasColorAdj ? Color(hex: "#E8A54B") : Color.white.opacity(0.08))
-                            .clipShape(RoundedRectangle(cornerRadius: 4))
-                    }.buttonStyle(.plain).disabled(!hasColorAdj)
+                // 跟调节轨道用的是同一个组件，这边默认收起来 ——
+                // 挂在单个片段上的调节属于「进阶」，不该一上来就占满属性区
+                AdjustSliders(adjust: $colorAdj, expandedByDefault: false) {
+                    applyColorAdjust()
                 }
-                ICapsuleSlider(label: "亮度", value: $brightness, range: -1.0...1.0,
-                               decimals: 2, onChange: { _ in applyColorAdjust() })
-                ICapsuleSlider(label: "对比", value: $contrast,   range: -1.0...1.0,
-                               decimals: 2, onChange: { _ in applyColorAdjust() })
-                ICapsuleSlider(label: "饱和", value: $saturation, range: -1.0...1.0,
-                               decimals: 2, onChange: { _ in applyColorAdjust() })
-                ICapsuleSlider(label: "色相", value: $hue,        range: -180.0...180.0,
-                               decimals: 0, unit: "°", onChange: { _ in applyColorAdjust() })
             }
         }
         .onAppear { loadMeta(); syncFromClip() }
@@ -2222,10 +2207,7 @@ private struct VideoInspector: View {
         .onChange(of: clip.cropBottom) { v in if abs(v - cropBottom) > 0.001 { cropBottom = v } }
         .onChange(of: clip.cropLeft)   { v in if abs(v - cropLeft)   > 0.001 { cropLeft   = v } }
         .onChange(of: clip.cropRight)  { v in if abs(v - cropRight)  > 0.001 { cropRight  = v } }
-        .onChange(of: clip.colorAdjust.brightness) { v in if abs(v - brightness) > 0.001 { brightness = v } }
-        .onChange(of: clip.colorAdjust.contrast)   { v in if abs(v - contrast)   > 0.001 { contrast   = v } }
-        .onChange(of: clip.colorAdjust.saturation) { v in if abs(v - saturation) > 0.001 { saturation = v } }
-        .onChange(of: clip.colorAdjust.hue)        { v in if abs(v - hue)        > 0.1   { hue        = v } }
+        .onChange(of: clip.colorAdjust) { v in if v != colorAdj { colorAdj = v } }
     }
 
     private var hasOffset: Bool {
@@ -2236,9 +2218,6 @@ private struct VideoInspector: View {
         cropTop > 0.001 || cropBottom > 0.001 || cropLeft > 0.001 || cropRight > 0.001
     }
 
-    private var hasColorAdj: Bool {
-        abs(brightness) > 0.01 || abs(contrast) > 0.01 || abs(saturation) > 0.01 || abs(hue) > 0.5
-    }
 
     @ViewBuilder
     private func sectionHeader<Trailing: View>(_ title: String, @ViewBuilder trailing: () -> Trailing) -> some View {
@@ -2278,10 +2257,7 @@ private struct VideoInspector: View {
         cropBottom = clip.cropBottom
         cropLeft = clip.cropLeft
         cropRight = clip.cropRight
-        brightness = clip.colorAdjust.brightness
-        contrast   = clip.colorAdjust.contrast
-        saturation = clip.colorAdjust.saturation
-        hue        = clip.colorAdjust.hue
+        colorAdj = clip.colorAdjust
         hasPushedUndo = false
     }
 
@@ -2319,8 +2295,7 @@ private struct VideoInspector: View {
             hasPushedUndo = true
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { hasPushedUndo = false }
         }
-        let adj = ColorAdjust(brightness: brightness, contrast: contrast,
-                              saturation: saturation, hue: hue)
+        let adj = colorAdj
         project.updateVideoClip(id: clip.id) { $0.colorAdjust = adj }
         // 视频的色调在 compositor 里逐帧算，光改 clip 要等 rebuild 才可见（防抖 0.15s，
         // 表现就是"松手才变"）。这里照位移滑块的做法把值直接喂给 compositor
@@ -2682,6 +2657,11 @@ extension View {
     }
 }
 
+/// 属性区的横向内边距。标题栏和每一组内容都取这里，避免两边各写各的
+enum ISectionMetrics {
+    static let hPadding: CGFloat = 14
+}
+
 struct ISection<Content: View>: View {
     let title: String?
     @ViewBuilder let content: Content
@@ -2695,7 +2675,7 @@ struct ISection<Content: View>: View {
             }
             content
         }
-        .padding(.horizontal, 14)
+        .padding(.horizontal, ISectionMetrics.hPadding)
         .padding(.top, 12)
         .padding(.bottom, 4)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -3198,4 +3178,114 @@ private extension View {
 private func fmtDur(_ t: Double) -> String {
     let m = Int(t)/60%60; let s = Int(t)%60; let ms = Int((t-Double(Int(t)))*1000)
     return String(format: "%02d:%02d.%03d", m, s, ms)
+}
+
+// MARK: - Filter Inspector
+
+/// 滤镜片段的属性。只有名称和强度 —— 具体是哪个滤镜在效果栏里选，
+/// 想换就删了重加，跟剪映一个路子
+/// 调节片段的属性。参数那块跟片段属性区是同一个组件，只是这里默认展开
+struct AdjustInspector: View {
+    let clip: AdjustClip
+    @EnvironmentObject private var project: ProjectState
+
+    @State private var adjust = ColorAdjust.identity
+    @State private var startTime: Double = 0
+    @State private var duration: Double = 3
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            ISection(title: nil) {
+                AdjustSliders(adjust: $adjust, expandedByDefault: true) {
+                    project.updateAdjustClip(id: clip.id) { $0.adjust = adjust }
+                }
+            }
+
+            ISection(title: "时间") {
+                let span = max(project.contentEndTime, 1)
+                ISlider(label: "开始", value: $startTime, range: 0...span, unit: "秒", decimals: 2)
+                    .onChange(of: startTime) { _ in
+                        let s = max(0, startTime)
+                        project.updateAdjustClip(id: clip.id) { $0.startTime = s; $0.endTime = s + duration }
+                    }
+                ISlider(label: "持续", value: $duration, range: 0.1...span, unit: "秒", decimals: 2)
+                    .onChange(of: duration) { _ in
+                        let d = max(0.1, duration)
+                        project.updateAdjustClip(id: clip.id) { $0.endTime = $0.startTime + d }
+                    }
+            }
+        }
+        .onAppear { sync() }
+        .onChange(of: clip.id) { _ in sync() }
+        .onChange(of: clip.startTime) { v in if abs(v - startTime) > 0.001 { startTime = v } }
+        .onChange(of: clip.endTime) { _ in
+            if abs(clip.duration - duration) > 0.001 { duration = clip.duration }
+        }
+    }
+
+    private func sync() {
+        adjust = clip.adjust
+        startTime = clip.startTime
+        duration = clip.duration
+    }
+}
+
+struct FilterInspector: View {
+    let clip: FilterClip
+    @EnvironmentObject private var project: ProjectState
+
+    @State private var intensity: Double = 100
+    @State private var startTime: Double = 0
+    @State private var endTime: Double = 0
+    @State private var duration: Double = 3
+    @State private var syncing = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            ISection(title: "滤镜") {
+                IFieldRow(label: "名称") {
+                    Text(clip.name)
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundColor(Color.labelPrimary)
+                }
+                ISlider(label: "强度", value: $intensity, range: 0...100, unit: "%")
+                    .onChange(of: intensity) { _ in write { $0.intensity = intensity / 100 } }
+            }
+
+            ISection(title: "时间") {
+                let span = max(project.contentEndTime, 1)
+                ISlider(label: "开始", value: $startTime, range: 0...span, unit: "秒", decimals: 2)
+                    .onChange(of: startTime) { _ in
+                        // 起点不能越过终点，至少留 0.1 秒
+                        let s = max(0, min(startTime, endTime - 0.1))
+                        write { $0.startTime = s }
+                    }
+                ISlider(label: "持续", value: $duration, range: 0.1...span, unit: "秒", decimals: 2)
+                    .onChange(of: duration) { _ in
+                        endTime = startTime + max(duration, 0.1)
+                        write { $0.endTime = endTime }
+                    }
+            }
+        }
+        .onAppear { sync() }
+        .onChange(of: clip.id) { _ in sync() }
+        // 在时间轴上拖片段改了起止时间，属性区这几个数也得跟着回填
+        .onChange(of: clip.startTime) { _ in sync() }
+        .onChange(of: clip.endTime) { _ in sync() }
+    }
+
+    private func sync() {
+        syncing = true
+        intensity = clip.intensity * 100
+        startTime = clip.startTime
+        endTime = clip.endTime
+        duration = max(clip.duration, 0.1)
+        DispatchQueue.main.async { syncing = false }
+    }
+
+    private func write(_ mutate: @escaping (inout FilterClip) -> Void) {
+        guard !syncing else { return }
+        project.pushUndoThrottled()
+        project.updateFilterClip(id: clip.id, mutate)
+    }
 }

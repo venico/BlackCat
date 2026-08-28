@@ -89,10 +89,11 @@ struct WelcomeView: View {
             // 交通灯行。欢迎页现在铺满整个窗口，没有它就没法关/最小化窗口
             HStack {
                 TrafficLightsView()
-                    .padding(.leading, 12)
+                    .padding(.leading, 11)
                 Spacer()
             }
-            .frame(height: 28)
+            // 34 = 交通灯 12pt + 上下各 11pt，跟主界面侧边栏那行同一套数
+            .frame(height: 34)
 
             Spacer().frame(height: 18)
 
@@ -113,7 +114,7 @@ struct WelcomeView: View {
         }
         .frame(width: 220)
         .frame(maxHeight: .infinity)
-        .panelSurface(.sidebar)
+        .panelSurface(.sidebar, cornerRadius: 18)
         .softPanelShadow()
         .padding(8)
     }

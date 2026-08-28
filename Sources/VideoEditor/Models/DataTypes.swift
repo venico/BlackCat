@@ -792,6 +792,121 @@ struct Marker: Identifiable, Equatable, Codable {
     }
 }
 
+// MARK: - Filter Clip（滤镜片段）
+
+/// 内置滤镜。都用 Core Image 现成的，不引第三方库 ——
+/// 系统自带两百多个 CIFilter，而且导出和预览本来就跑在 CIImage 这条链上
+enum FilterKind: String, Codable, CaseIterable {
+    // 彩色系
+    case vibrance   // 鲜艳
+    case chrome     // 明艳
+    case instant    // 拍立得
+    case process    // 冲印
+    case transfer   // 胶片
+    case fade       // 褪色
+    case sepia      // 怀旧
+    case cool       // 冷调
+    // 黑白系（对比从强到弱）
+    case noir       // 黑白
+    case mono       // 灰白
+    case tonal      // 灰调
+    // 特殊
+    case posterize  // 色阶
+    case comic      // 漫画
+    case vignette   // 暗角
+    case lut        // 外部 .cube 文件
+
+    var label: String {
+        switch self {
+        case .vibrance: return "鲜艳"
+        case .chrome: return "明艳"
+        case .instant: return "拍立得"
+        case .process: return "冲印"
+        case .transfer: return "胶片"
+        case .fade: return "褪色"
+        case .sepia: return "怀旧"
+        case .cool: return "冷调"
+        case .noir: return "黑白"
+        case .mono: return "灰白"
+        case .tonal: return "灰调"
+        case .posterize: return "色阶"
+        case .comic: return "漫画"
+        case .vignette: return "暗角"
+        case .lut: return "LUT"
+        }
+    }
+
+    /// 列表里显示的那些（LUT 是导入进来的，不进内置列表）
+    static var builtins: [FilterKind] { allCases.filter { $0 != .lut } }
+}
+
+/// 时间轴上的一段滤镜。**覆盖这段时间内的整幅画面** ——
+/// 跟文字、图形那种「叠一个图层上去」不一样，它是在所有内容合成完之后才套上去的
+struct FilterClip: Identifiable, Equatable, Codable {
+    var id = UUID()
+    var kind: FilterKind = .noir
+    var startTime: Double
+    var endTime: Double
+    var duration: Double { endTime - startTime }
+    /// 强度 0~1。靠原图和滤镜结果按比例混合实现，所有滤镜统一这一个参数
+    var intensity: Double = 1
+    /// LUT 文件路径（仅 kind == .lut）
+    var lutPath: String? = nil
+    /// 显示名。LUT 用文件名，内置的用 kind 的名字
+    var name: String {
+        if kind == .lut, let p = lutPath {
+            return (p as NSString).lastPathComponent
+        }
+        return kind.label
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case id, kind, startTime, endTime, intensity, lutPath
+    }
+    init(kind: FilterKind = .noir, startTime: Double, endTime: Double) {
+        self.kind = kind; self.startTime = startTime; self.endTime = endTime
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(UUID.self, forKey: .id)
+        kind = (try? c.decode(FilterKind.self, forKey: .kind)) ?? .noir
+        startTime = try c.decode(Double.self, forKey: .startTime)
+        endTime = try c.decode(Double.self, forKey: .endTime)
+        intensity = (try? c.decode(Double.self, forKey: .intensity)) ?? 1
+        lutPath = try? c.decode(String.self, forKey: .lutPath)
+    }
+}
+
+/// 调节片段。跟滤镜一样是独立轨道上的一段，只作用于排在它下面的图层。
+///
+/// 参数直接复用 `ColorAdjust` —— 片段属性区里那组「调节」和这里是同一套东西，
+/// 只是入口不同：那边挂在某一个片段上，这里覆盖一段时间内的所有画面
+struct AdjustClip: Identifiable, Equatable, Codable {
+    var id = UUID()
+    var startTime: Double
+    var endTime: Double
+    var duration: Double { endTime - startTime }
+    var adjust: ColorAdjust = .identity
+    /// 显示名。默认「调节」，可以改
+    var customName: String? = nil
+    var name: String { customName ?? "调节" }
+
+    enum CodingKeys: String, CodingKey {
+        case id, startTime, endTime, adjust, customName
+    }
+    init(startTime: Double, endTime: Double) {
+        self.startTime = startTime; self.endTime = endTime
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(UUID.self, forKey: .id)
+        startTime = try c.decode(Double.self, forKey: .startTime)
+        endTime = try c.decode(Double.self, forKey: .endTime)
+        adjust = (try? c.decode(ColorAdjust.self, forKey: .adjust)) ?? .identity
+        customName = try? c.decode(String.self, forKey: .customName)
+    }
+}
+
 struct Track<Clip: Identifiable & Equatable & Codable>: Identifiable, Equatable, Codable {
     var id = UUID()
     var clips: [Clip]   = []
@@ -986,6 +1101,8 @@ struct ProjectDocument: Codable {
     var textTracks: [Track<TextClip>]?     // 文字/标题图层（向后兼容：旧 .bcj 无此字段）
     var textTemplates: [TextTemplate]?    // 文字样式模板（向后兼容）
     var shapeTracks: [Track<ShapeClip>]?   // 图形图层（向后兼容：旧 .bcj 无此字段）
+    var filterTracks: [Track<FilterClip>]? // 滤镜轨道（同上，可选是为了兼容旧文件）
+    var adjustTracks: [Track<AdjustClip>]? // 调节轨道（同上）
     var mediaAssets: [MediaAsset]
     var exportSettings: ExportSettings
     var previewResolution: String
@@ -1162,6 +1279,9 @@ struct ProjectSnapshot {
     var subtitleTracks: [Track<SubtitleClip>]
     var textTracks: [Track<TextClip>]
     var shapeTracks: [Track<ShapeClip>]
+    /// 滤镜轨道。可选是为了不动那些逐字段构造快照的老代码
+    var filterTracks: [Track<FilterClip>] = []
+    var adjustTracks: [Track<AdjustClip>] = []
     var compoundTracks: [Track<CompoundClip>]
     var overlayTrackOrder: [ProjectState.OverlayTrackRef]
     var videoSectionOrder: [ProjectState.VideoSectionRef] = []

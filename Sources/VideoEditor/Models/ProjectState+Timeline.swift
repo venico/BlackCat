@@ -60,6 +60,22 @@ extension ProjectState {
         shapeTracks[to].clips.append(clip)
     }
 
+    func moveAdjustClipToTrack(id: UUID, from: Int, to: Int) {
+        guard adjustTracks.indices.contains(from), adjustTracks.indices.contains(to) else { return }
+        guard let idx = adjustTracks[from].clips.firstIndex(where: { $0.id == id }) else { return }
+        pushUndoThrottled()
+        let clip = adjustTracks[from].clips.remove(at: idx)
+        adjustTracks[to].clips.append(clip)
+    }
+
+    func moveFilterClipToTrack(id: UUID, from: Int, to: Int) {
+        guard filterTracks.indices.contains(from), filterTracks.indices.contains(to) else { return }
+        guard let idx = filterTracks[from].clips.firstIndex(where: { $0.id == id }) else { return }
+        pushUndoThrottled()
+        let clip = filterTracks[from].clips.remove(at: idx)
+        filterTracks[to].clips.append(clip)
+    }
+
     // MARK: - Overlap resolution
 
     /// 检查片段是否与同轨道其他片段重叠，如果重叠则自动新建轨道并移过去
@@ -1395,5 +1411,161 @@ extension ProjectState {
                 shiftCycleRemoving = true
             }
         }
+    }
+}
+
+// MARK: - 滤镜
+
+extension ProjectState {
+    /// 滤镜片段的默认时长
+    static let defaultFilterDuration: Double = 3
+
+    /// 往时间轴上加一段滤镜。
+    ///
+    /// 落到**第一条这段时间空着的轨道**上；都占着就新开一条 ——
+    /// 多条轨道就是叠加，所以不用挤在一条里
+    @discardableResult
+    func addFilter(kind: FilterKind, at time: Double? = nil, lutPath: String? = nil) -> UUID {
+        pushUndo()
+        let start = max(0, time ?? currentTime)
+        var clip = FilterClip(kind: kind, startTime: start,
+                              endTime: start + Self.defaultFilterDuration)
+        clip.lutPath = lutPath
+
+        func free(_ track: Track<FilterClip>) -> Bool {
+            !track.clips.contains { $0.startTime < clip.endTime && $0.endTime > clip.startTime }
+        }
+        if let i = filterTracks.firstIndex(where: free) {
+            filterTracks[i].clips.append(clip)
+        } else {
+            filterTracks.append(Track(clips: [clip], label: "滤镜"))
+            syncOverlayOrder()
+        }
+        selectedFilterClipID = clip.id
+        selectedClipIDs = [clip.id]
+        isSaved = false
+        rebuildTimelinePreview()
+        return clip.id
+    }
+
+    func updateFilterClip(id: UUID, _ mutate: (inout FilterClip) -> Void) {
+        for ti in filterTracks.indices {
+            if let ci = filterTracks[ti].clips.firstIndex(where: { $0.id == id }) {
+                mutate(&filterTracks[ti].clips[ci])
+                isSaved = false
+                // 拖强度滑块是连续的，每次都立刻重建会让播放器一直在重置，
+                // 画面反而卡着不动 —— 这里要防抖
+                rebuildTimelinePreviewDebounced()
+                return
+            }
+        }
+    }
+
+    func deleteFilterClip(id: UUID) {
+        pushUndo()
+        for ti in filterTracks.indices {
+            filterTracks[ti].clips.removeAll { $0.id == id }
+        }
+        if selectedFilterClipID == id { selectedFilterClipID = nil }
+        selectedClipIDs.remove(id)
+        isSaved = false
+        rebuildTimelinePreviewDebounced()
+    }
+
+    /// 选中的是效果类片段（滤镜/调节）。
+    /// 这两类既没有音轨也没有画面内容，翻译、语音识别、去背景那些工具对它们都没意义
+    var isEffectClipSelected: Bool {
+        selectedFilterClipID != nil || selectedAdjustClipID != nil
+    }
+
+    /// 清掉所有片段的选中态。
+    ///
+    /// 选中态有九种，各处「选中 A 就把 B…H 挨个置空」很容易漏 —— 滤镜就漏过：
+    /// 删掉整条滤镜轨道时没清 id，属性区标题还认为选着滤镜，内容却掉回项目设置
+    func clearClipSelections() {
+        selectedVideoClipID = nil
+        selectedImageClipID = nil
+        selectedAudioClipID = nil
+        selectedSubtitleClipID = nil
+        selectedTextClipID = nil
+        selectedShapeClipID = nil
+        selectedFilterClipID = nil
+        selectedAdjustClipID = nil
+        selectedCompoundClipID = nil
+    }
+
+    // MARK: - 调节
+
+    @discardableResult
+    func addAdjust(at time: Double? = nil) -> UUID {
+        pushUndo()
+        let start = max(0, time ?? currentTime)
+        let clip = AdjustClip(startTime: start, endTime: start + Self.defaultFilterDuration)
+
+        func free(_ track: Track<AdjustClip>) -> Bool {
+            !track.clips.contains { $0.startTime < clip.endTime && $0.endTime > clip.startTime }
+        }
+        if let i = adjustTracks.firstIndex(where: free) {
+            adjustTracks[i].clips.append(clip)
+        } else {
+            adjustTracks.append(Track(clips: [clip], label: "调节"))
+            syncOverlayOrder()
+        }
+        selectedAdjustClipID = clip.id
+        selectedClipIDs = [clip.id]
+        isSaved = false
+        rebuildTimelinePreview()
+        return clip.id
+    }
+
+    func updateAdjustClip(id: UUID, _ mutate: (inout AdjustClip) -> Void) {
+        for ti in adjustTracks.indices {
+            if let ci = adjustTracks[ti].clips.firstIndex(where: { $0.id == id }) {
+                mutate(&adjustTracks[ti].clips[ci])
+                isSaved = false
+                // 滑块是连着拖的，每动一下都重建会把播放器一直按在重置上
+                rebuildTimelinePreviewDebounced()
+                return
+            }
+        }
+    }
+
+    func deleteAdjustClip(id: UUID) {
+        pushUndo()
+        for ti in adjustTracks.indices {
+            adjustTracks[ti].clips.removeAll { $0.id == id }
+        }
+        if selectedAdjustClipID == id { selectedAdjustClipID = nil }
+        selectedClipIDs.remove(id)
+        isSaved = false
+        rebuildTimelinePreviewDebounced()
+    }
+
+    var selectedAdjustClip: AdjustClip? {
+        guard let id = selectedAdjustClipID else { return nil }
+        return adjustTracks.flatMap(\.clips).first { $0.id == id }
+    }
+
+    var selectedFilterClip: FilterClip? {
+        guard let id = selectedFilterClipID else { return nil }
+        return filterTracks.flatMap(\.clips).first { $0.id == id }
+    }
+}
+
+extension ProjectState {
+    /// 某一时刻正在生效的滤镜（按轨道顺序，下层在前）
+    /// 某一时刻正在生效的调节（按轨道顺序，下层在前）
+    func activeAdjustClips(at time: Double) -> [AdjustClip] {
+        adjustTracks
+            .filter(\.isVisible)
+            .flatMap { $0.clips }
+            .filter { $0.startTime <= time && $0.endTime > time }
+    }
+
+    func activeFilterClips(at time: Double) -> [FilterClip] {
+        filterTracks
+            .filter(\.isVisible)
+            .flatMap { $0.clips }
+            .filter { $0.startTime <= time && $0.endTime > time }
     }
 }

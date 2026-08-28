@@ -924,6 +924,8 @@ final class AIVideoService: ObservableObject {
         let id = UUID()
         history.insert(ConversationRecord(id: id, title: "未命名画布", createdAt: Date(),
                                           entries: [], canvas: .init()), at: 0)
+        // 画布跟聊天一样算「当前会话」，否则历史列表的高亮会一直停在上次那条对话上
+        currentConversationId = id
         saveHistoryToDisk()
         return id
     }
