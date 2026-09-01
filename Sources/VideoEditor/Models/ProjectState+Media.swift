@@ -907,7 +907,10 @@ extension ProjectState {
             subtitleTracks[i].clips.removeAll { $0.assetID == assetID }
         }
         mediaThumbnails.removeValue(forKey: assetID)
-        undoStack.append(snap)
+        // Agent 跑一轮期间不打快照，整轮共用开跑前那一个
+        if !suppressUndoPush {
+            undoStack.append(snap)
+        }
         if undoStack.count > 30 { undoStack.removeFirst() }
         redoStack.removeAll()
         undoCount = undoStack.count

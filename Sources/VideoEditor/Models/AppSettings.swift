@@ -45,6 +45,7 @@ final class AppSettings: ObservableObject {
         static let llmProvider = "settings.llm.provider"
         static let llmAPIKey = "settings.llm.apiKey"
         static let searchEngine = "settings.ai.searchEngine"
+        static let agentMode = "settings.agent.mode"
         static let bingSearchKey = "settings.ai.bing.searchKey"
         static let googleSearchKey = "settings.ai.google.searchKey"
         static let googleSearchCX = "settings.ai.google.searchCX"
@@ -312,6 +313,14 @@ final class AppSettings: ObservableObject {
     var llmAPIKey: String {
         get { providerAPIKey(for: llmProvider.sharedProviderKey) }
         set { setProviderAPIKey(newValue, for: llmProvider.sharedProviderKey) }
+    }
+
+    /// Agent 的运行模式。**默认自动** —— 计划模式什么都做不了，
+    /// 全权模式一上来就放开删除权限，两个都不适合当默认
+    @Published var agentMode: AgentMode = {
+        AgentMode(rawValue: UserDefaults.standard.string(forKey: K.agentMode) ?? "") ?? .auto
+    }() {
+        didSet { UserDefaults.standard.set(agentMode.rawValue, forKey: K.agentMode) }
     }
 
     // MARK: - AI 视频生成

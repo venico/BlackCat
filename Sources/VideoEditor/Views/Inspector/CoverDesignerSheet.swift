@@ -37,10 +37,18 @@ struct CoverDesignerSheet: View {
     @State private var editingTextID: UUID?
     /// Delete / Backspace 的键盘监听
     @State private var deleteMonitor: Any?
+    // 弹窗自己的撤销栈，跟外面主项目那套分开 —— 封面改到一半按 ⌘Z
+    // 不该把时间轴上的操作也撤了
+    @State private var undoStack: [ProjectCover] = []
+    @State private var redoStack: [ProjectCover] = []
+    @State private var lastUndoPush = Date.distantPast
+    @State private var restoringHistory = false
     @State private var editingText: String = ""
 
     /// 钢笔绘制态。非 nil 时封面上盖一层预览区的 `PenDrawingOverlay`
     @State private var penDraftID: UUID?
+    /// 正在编辑锚点的那条钢笔图形
+    @State private var penEditingID: UUID?
     /// 拖动图层时的起始位置（相对坐标）。跟裁剪框一个道理：
     /// `translation` 是累计值，基准必须是**起手那一刻**的位置，不能拿每帧变的当前值
     @State private var dragStart: CGPoint?
@@ -48,9 +56,16 @@ struct CoverDesignerSheet: View {
     enum LayerRef: Hashable {
         case text(UUID)
         case shape(UUID)
+        /// 底图。它不是数组里的一条，没有真 id，用一个固定值占位
+        case base
+
+        static let baseID = UUID(uuidString: "00000000-0000-0000-0000-0000000000B6")!
 
         var id: UUID {
-            switch self { case .text(let i), .shape(let i): return i }
+            switch self {
+            case .text(let i), .shape(let i): return i
+            case .base: return Self.baseID
+            }
         }
     }
 
@@ -84,6 +99,8 @@ struct CoverDesignerSheet: View {
         .frame(width: 980, height: 660)
         .floatingPanelMaterial()
         .onAppear { loadDraft(); installDeleteMonitor() }
+        // 盯住整份 draft：一变就把变之前那份收进撤销栈
+        .onChange(of: draft) { old, _ in recordUndo(old) }
         .onDisappear { removeDeleteMonitor() }
     }
 
@@ -381,7 +398,10 @@ struct CoverDesignerSheet: View {
                 // 色调直接用 SwiftUI 的滤镜，参数区间跟 ColorAdjust 对齐
                 Image(nsImage: img)
                     .resizable()
-                    .aspectRatio(contentMode: .fill)
+                    // **fit 不是 fill**：刚选进来时要看到整张原图、保持原比例。
+                    // fill 会按封面框的比例先裁一刀，竖图进 16:9 的框只剩中间一条，
+                    // 用户还没开始调就已经丢了大半画面
+                    .aspectRatio(contentMode: .fit)
                     .frame(width: box.width, height: box.height)
                     // **裁剪排在缩放/旋转/位移之前** —— 排在后面的话裁剪线
                     // 是钉在封面框上的，画面一缩放一移动就跟裁剪框对不上了
@@ -447,6 +467,19 @@ struct CoverDesignerSheet: View {
                     finishPenDrawing(rawPoints: pts, closed: closed)
                 }
                 .frame(width: box.width, height: box.height)
+            } else if let editID = penEditingID,
+                      let sh = draft.shapes.first(where: { $0.id == editID }) {
+                // 钢笔锚点编辑。**用的就是预览区那个 PenEditOverlay** ——
+                // 数据源和写回都指到 draft 上
+                PenEditOverlay(
+                    clipOverride: sh,
+                    onUpdate: { sid, apply in
+                        if let i = draft.shapes.firstIndex(where: { $0.id == sid }) {
+                            apply(&draft.shapes[i])
+                        }
+                    },
+                    onExit: { penEditingID = nil })
+                    .frame(width: box.width, height: box.height)
             } else {
                 transformOverlay(box: box)
             }
@@ -454,8 +487,13 @@ struct CoverDesignerSheet: View {
         .frame(width: box.width, height: box.height)
         .clipShape(RoundedRectangle(cornerRadius: 8))
         .contentShape(RoundedRectangle(cornerRadius: 8))
-        // 点空白处取消选中（顺便把正在改的文字提交掉）
-        .onTapGesture { commitTextEdit(); clearSelection() }
+        // 点封面上没有图形/文字的地方，落在底图身上 —— 底图本身也是一个图层。
+        // 真的什么都没有（连底图都没上传）才清空选中
+        .onTapGesture {
+            commitTextEdit()
+            if penEditingID != nil { penEditingID = nil; return }
+            if baseImage != nil { pick(.base) } else { clearSelection() }
+        }
     }
 
     /// 封面框：按项目比例塞进可用区域。**跟 zoom 无关** ——
@@ -578,7 +616,9 @@ struct CoverDesignerSheet: View {
 
     /// 跟这个图层外接框相交的所有图层，按叠放顺序（图形在下、文字在上）
     private func overlappingStack(_ ref: LayerRef) -> [LayerRef] {
-        let all: [LayerRef] = draft.shapes.map { .shape($0.id) } + draft.texts.map { .text($0.id) }
+        // 底图排在最底下：循环选中转到最后才轮到它，跟图层叠放顺序一致
+        var all: [LayerRef] = draft.shapes.map { .shape($0.id) } + draft.texts.map { .text($0.id) }
+        if baseImage != nil { all.append(.base) }
         let hits = all.filter { overlaps($0, with: ref) }
         return hits.isEmpty ? [ref] : hits
     }
@@ -614,6 +654,11 @@ struct CoverDesignerSheet: View {
             return CGRect(x: sh.posX * Double(rs.width) - w / 2,
                           y: sh.posY * Double(rs.height) - h / 2,
                           width: w, height: h)
+        case .base:
+            // 底图铺满整个封面框，任何位置都算命中它
+            guard baseImage != nil else { return nil }
+            return CGRect(origin: .zero, size: CGSize(width: Double(rs.width),
+                                                      height: Double(rs.height)))
         }
     }
 
@@ -630,6 +675,7 @@ struct CoverDesignerSheet: View {
             switch ref {
             case .text(let id): draft.texts.removeAll { $0.id == id }
             case .shape(let id): draft.shapes.removeAll { $0.id == id }
+            case .base: clearBase()
             }
         }
         clearSelection()
@@ -645,6 +691,7 @@ struct CoverDesignerSheet: View {
 
         return allSelected.compactMap { ref -> MultiLayerHandle? in
             switch ref {
+            case .base: return nil   // 底图铺满画面，跟其它图层一起做对齐/缩放没有意义
             case .text(let id):
                 guard let t = draft.texts.first(where: { $0.id == id }) else { return nil }
                 let box = t.boxWidth.map {
@@ -740,9 +787,19 @@ struct CoverDesignerSheet: View {
         deleteMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
             guard project.showCoverDesigner else { return event }
             guard editingTextID == nil, penDraftID == nil else { return event }
+            // 锚点编辑态下 Esc 退出，其余键放行给编辑层
+            if penEditingID != nil {
+                if event.keyCode == 53 { penEditingID = nil; return nil }
+                return event
+            }
             // 光标在输入框里时删除键归输入框（圆角、数值这些都是 TextField，
             // 编辑中的 firstResponder 是它的 field editor，也是个 NSTextView）
             if NSApp.keyWindow?.firstResponder is NSTextView { return event }
+            if event.modifierFlags.contains(.command),
+               event.charactersIgnoringModifiers?.lowercased() == "z" {
+                if event.modifierFlags.contains(.shift) { redo() } else { undo() }
+                return nil
+            }
             // 51 = Delete(退格)，117 = Fn+Delete(向前删)
             guard event.keyCode == 51 || event.keyCode == 117 else { return event }
             // 没选中图层时删的是底图；底图也没有就把事件放行
@@ -750,6 +807,60 @@ struct CoverDesignerSheet: View {
             deleteSelected()
             return nil
         }
+    }
+
+    // MARK: - 撤销 / 重做
+
+    /// draft 一变就把**变之前**那份存下来。
+    ///
+    /// 238 处改动点逐个埋 pushUndo 太容易漏，改成盯住整份 draft 的变化。
+    /// 拖滑块一次会连着产生几十个中间态，所以要节流 —— 只留下这一串的第一份，
+    /// 撤销时才是一步退回拖动前，而不是一帧一帧往回爬
+    private func recordUndo(_ old: ProjectCover) {
+        guard !restoringHistory else { return }
+        let now = Date()
+        if now.timeIntervalSince(lastUndoPush) < 0.4, !undoStack.isEmpty { return }
+        lastUndoPush = now
+        undoStack.append(old)
+        if undoStack.count > 50 { undoStack.removeFirst() }
+        redoStack.removeAll()
+    }
+
+    private func undo() {
+        guard let prev = undoStack.popLast() else { return }
+        restoringHistory = true
+        redoStack.append(draft)
+        draft = prev
+        dropDanglingSelection()
+        DispatchQueue.main.async { restoringHistory = false }
+    }
+
+    private func redo() {
+        guard let next = redoStack.popLast() else { return }
+        restoringHistory = true
+        undoStack.append(draft)
+        draft = next
+        dropDanglingSelection()
+        DispatchQueue.main.async { restoringHistory = false }
+    }
+
+    /// 撤销可能把选中的那条图层撤没了，留着会指向一个不存在的 id
+    private func dropDanglingSelection() {
+        commitTextEdit()
+        editingTextID = nil
+        penDraftID = nil
+        if let id = penEditingID, !draft.shapes.contains(where: { $0.id == id }) {
+            penEditingID = nil
+        }
+        let alive: (LayerRef) -> Bool = { ref in
+            switch ref {
+            case .text(let id):  return draft.texts.contains { $0.id == id }
+            case .shape(let id): return draft.shapes.contains { $0.id == id }
+            case .base:          return baseImage != nil
+            }
+        }
+        if let sel = selection, !alive(sel) { selection = nil }
+        extraSel = extraSel.filter(alive)
     }
 
     private func removeDeleteMonitor() {
@@ -824,6 +935,8 @@ struct CoverDesignerSheet: View {
             let sh = draft.shapes[i]
             apply(w: sh.width * sh.scaleX, h: sh.height * sh.scaleY,
                   setX: { draft.shapes[i].posX = $0 }, setY: { draft.shapes[i].posY = $0 })
+        case .base:
+            break   // 底图铺满画面，没有可对齐的边
         }
     }
 
@@ -843,6 +956,10 @@ struct CoverDesignerSheet: View {
             .overlay(allSelected.count > 1 && isSelected(.shape(sh.id))
                      ? Rectangle().stroke(Color.accent, lineWidth: 1.5) : nil)
             .position(x: box.width * sh.posX, y: box.height * sh.posY)
+            // 双击钢笔图形进锚点编辑，跟预览区一个操作
+            .onTapGesture(count: 2) {
+                if sh.type == .pen { penEditingID = sh.id }
+            }
             .onTapGesture { pick(.shape(sh.id)) }
             .gesture(dragGesture(for: .shape(sh.id), box: box,
                                  current: CGPoint(x: sh.posX, y: sh.posY)))
@@ -860,6 +977,9 @@ struct CoverDesignerSheet: View {
             EmptyView()
         } else {
         switch selection {
+        case .base:
+            if baseImage != nil { CoverBaseTransformOverlay(draft: $draft, box: box,
+                                      imageSize: baseImage?.size ?? box) }
         case .shape(let id):
             if let sh = draft.shapes.first(where: { $0.id == id }) {
                 ShapeTransformOverlay(clipOverride: sh) { sid, apply in
@@ -885,7 +1005,8 @@ struct CoverDesignerSheet: View {
         case .none:
             // 没选图层时操作的是底图，跟预览区图片片段一套手柄
             if baseImage != nil {
-                CoverBaseTransformOverlay(draft: $draft, box: box)
+                CoverBaseTransformOverlay(draft: $draft, box: box,
+                                      imageSize: baseImage?.size ?? box)
                     .frame(width: box.width, height: box.height)
             }
         }
@@ -923,6 +1044,10 @@ struct CoverDesignerSheet: View {
         case .shape(let id):
             guard let sh = draft.shapes.first(where: { $0.id == id }) else { return nil }
             return CGPoint(x: sh.posX, y: sh.posY)
+        case .base:
+            // 底图存的是相对画面的偏移量（0 居中），换算成跟其它图层一样的 0~1 位置
+            guard baseImage != nil else { return nil }
+            return CGPoint(x: 0.5 + draft.baseOffsetX, y: 0.5 + draft.baseOffsetY)
         }
     }
 
@@ -936,6 +1061,9 @@ struct CoverDesignerSheet: View {
             if let i = draft.shapes.firstIndex(where: { $0.id == id }) {
                 draft.shapes[i].posX = Double(p.x); draft.shapes[i].posY = Double(p.y)
             }
+        case .base:
+            draft.baseOffsetX = Double(p.x) - 0.5
+            draft.baseOffsetY = Double(p.y) - 0.5
         }
     }
 
@@ -969,7 +1097,7 @@ struct CoverDesignerSheet: View {
                         paneTitle("图形") { draft.shapes.remove(at: i); selection = nil }
                         shapeInspector(i)
                     }
-                case .none:
+                case .base, .none:
                     paneTitle("图片") { clearBase() }
                     baseInspector
                 }
@@ -1040,6 +1168,9 @@ struct CoverDesignerSheet: View {
             Text("先选一张图片或视频")
                 .font(.system(size: 11))
                 .foregroundColor(Color.labelSecondary.opacity(0.6))
+                // 这条不在 ISection 里，得自己补上那份 14 才跟标题左对齐
+                .padding(.horizontal, 14)
+                .frame(maxWidth: .infinity, alignment: .leading)
         } else {
             // 六组共同属性，跟文字、图形、预览区那三个面板同一份
             LayerCommonSections(
@@ -1653,13 +1784,13 @@ struct CoverDesignerSheet: View {
         out.lockFocus()
         NSColor.black.setFill()
         NSRect(origin: .zero, size: size).fill()
-        // 按 fill 的方式铺满，跟预览里看到的一致
+        // 跟预览一样按 fit 摆：整张图完整进来、保持原比例
         if let base = processedBase() {
             let bs = base.size
             if bs.width > 0, bs.height > 0 {
-                // 先按 fill 铺满，再套上属性区那几个变换 —— 顺序要跟预览一致，
-                // 否则确认出来的图跟看到的不是一回事
-                let fit = max(size.width / bs.width, size.height / bs.height)
+                // **必须跟预览用同一个算法**（都是 min / fit）。
+                // 一边 fill 一边 fit 的话，确认出来的图跟弹窗里看到的不是一回事
+                let fit = min(size.width / bs.width, size.height / bs.height)
                 let w = bs.width * fit * draft.baseScale
                 let h = bs.height * fit * (draft.baseScaleY ?? draft.baseScale)
                 let ctx = NSGraphicsContext.current?.cgContext
@@ -1795,6 +1926,9 @@ private struct CoverFrameStrip: View {
 private struct CoverBaseTransformOverlay: View {
     @Binding var draft: ProjectCover
     let box: CGSize
+    /// 底图原始像素尺寸。框要贴着**图片**走，不是贴着封面框 ——
+    /// 竖图放进 16:9 的框里，两边是留白，框套在留白上就跟画面对不上了
+    let imageSize: CGSize
 
     @State private var startScale: Double = 1
     @State private var startScaleY: Double = 1
@@ -1802,11 +1936,13 @@ private struct CoverBaseTransformOverlay: View {
     @State private var startOffset: CGPoint? = nil
 
     var body: some View {
-        // 没裁之前的画面矩形：底图铺满封面框，再套上缩放和位移
-        // 高度得用 baseScaleY —— 属性区能把宽高分开调，
-        // 这儿还按 baseScale 算的话框就跟画面对不上了
-        let w = box.width * draft.baseScale
-        let h = box.height * (draft.baseScaleY ?? draft.baseScale)
+        // 没裁之前的画面矩形。**按 fit 算**，跟画面的摆法完全一致：
+        // 图先等比缩到能完整放进封面框，再套上用户调的缩放和位移。
+        // 高度得用 baseScaleY —— 属性区能把宽高分开调
+        let fit = (imageSize.width > 0 && imageSize.height > 0)
+            ? min(box.width / imageSize.width, box.height / imageSize.height) : 1
+        let w = imageSize.width * fit * draft.baseScale
+        let h = imageSize.height * fit * (draft.baseScaleY ?? draft.baseScale)
         let c = CGPoint(x: box.width / 2 + box.width * draft.baseOffsetX,
                         y: box.height / 2 + box.height * draft.baseOffsetY)
         ZStack {

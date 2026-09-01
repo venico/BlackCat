@@ -27,7 +27,8 @@ final class AIVideoService: ObservableObject {
     /// 只有 AI 面板和设置页两处菜单遍历它，别处都是按 `== .video` 这类精确匹配，
     /// 所以调顺序不影响逻辑
     enum ProviderCategory: String, CaseIterable {
-        case text = "文字生成"
+        // 这一类就是 Agent 用的模型：要支持工具调用，剪辑助手全靠它
+        case text = "Agent 模型"
         case image = "图片生成"
         case audio = "声音生成"
         case video = "视频生成"
@@ -498,6 +499,16 @@ final class AIVideoService: ObservableObject {
             var audioBookmark: Data?
             /// optional：旧会话记录没有这个字段，解码时为 nil
             var attachments: [Attachment]?
+            /// Agent 这一轮调过哪些工具。存下来，翻历史时才知道它当时改了什么
+            var agentSteps: [AgentStepRecord]?
+        }
+
+        /// 一次工具调用的留痕
+        struct AgentStepRecord: Identifiable, Codable {
+            var id = UUID()
+            var tool: String
+            var summary: String
+            var isError: Bool = false
         }
     }
 
@@ -953,6 +964,42 @@ final class AIVideoService: ObservableObject {
         history.insert(ConversationRecord(id: id, title: "新对话", createdAt: Date(),
                                           entries: [], canvas: nil), at: 0)
         currentConversationId = id
+        saveHistoryToDisk()
+    }
+
+    // MARK: - Agent 会话
+
+    /// 用户那条消息先落进会话，Agent 回答回来再补一条
+    @discardableResult
+    func appendUserEntry(_ text: String) -> UUID {
+        if currentConversationId == nil { newConversation() }
+        let msg = ChatMessage(role: .user, content: text)
+        messages.append(msg)
+        persist(msg, isUser: true, steps: nil)
+        return msg.id
+    }
+
+    /// Agent 的回答 + 它这一轮调过哪些工具
+    func appendAgentReply(_ text: String, steps: [ConversationRecord.AgentStepRecord]) {
+        let msg = ChatMessage(role: .assistant,
+                              content: text.isEmpty ? "（没有输出）" : text)
+        messages.append(msg)
+        persist(msg, isUser: false, steps: steps.isEmpty ? nil : steps)
+    }
+
+    private func persist(_ msg: ChatMessage, isUser: Bool,
+                         steps: [ConversationRecord.AgentStepRecord]?) {
+        guard let cid = currentConversationId,
+              let i = history.firstIndex(where: { $0.id == cid }) else { return }
+        var entry = ConversationRecord.Entry(id: msg.id, isUser: isUser,
+                                             text: msg.content, videoPath: nil)
+        entry.agentSteps = steps
+        history[i].entries.append(entry)
+        // 会话标题还是「新对话」时，拿用户第一句话当标题
+        if isUser, !history[i].titleIsCustom,
+           history[i].title == "新对话" || history[i].title.isEmpty {
+            history[i].title = String(msg.content.prefix(20))
+        }
         saveHistoryToDisk()
     }
 

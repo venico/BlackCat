@@ -60,6 +60,14 @@ extension ProjectState {
         shapeTracks[to].clips.append(clip)
     }
 
+    func moveEffectClipToTrack(id: UUID, from: Int, to: Int) {
+        guard effectTracks.indices.contains(from), effectTracks.indices.contains(to) else { return }
+        guard let idx = effectTracks[from].clips.firstIndex(where: { $0.id == id }) else { return }
+        pushUndoThrottled()
+        let clip = effectTracks[from].clips.remove(at: idx)
+        effectTracks[to].clips.append(clip)
+    }
+
     func moveAdjustClipToTrack(id: UUID, from: Int, to: Int) {
         guard adjustTracks.indices.contains(from), adjustTracks.indices.contains(to) else { return }
         guard let idx = adjustTracks[from].clips.firstIndex(where: { $0.id == id }) else { return }
@@ -286,8 +294,13 @@ extension ProjectState {
     }
 
     /// 为新字幕轨自动计算 bottomMargin，避免与已有轨道重叠
-    func newSubtitleStyle() -> SubtitleStyle {
-        SubtitleStyle()
+    /// 新字幕轨道的默认样式。给了文本就按语言定字号（纯英文小一档）
+    func newSubtitleStyle(for texts: [String] = []) -> SubtitleStyle {
+        var s = SubtitleStyle()
+        if !texts.isEmpty {
+            s.fontSize = SubtitleStyle.defaultFontSize(forSubtitles: texts)
+        }
+        return s
     }
 
     func updateTextTime(id: UUID, start: Double? = nil, end: Double? = nil) {
@@ -533,7 +546,7 @@ extension ProjectState {
                 }
             } else {
                 var newTrack = Track<SubtitleClip>(clips: clips, label: "字幕")
-                newTrack.subtitleStyle = newSubtitleStyle()
+                newTrack.subtitleStyle = newSubtitleStyle(for: clips.map(\.text))
                 subtitleTracks.append(newTrack)
                 overlayTrackOrder.insert(.subtitle(newTrack.id), at: 0)
             }
@@ -704,6 +717,7 @@ extension ProjectState {
     // MARK: - Mutation helpers
 
     func updateSubtitleText(id: UUID, text: String) {
+        defer { refreshOverlayComposite() }
         pushUndoThrottled()
         for i in subtitleTracks.indices {
             if let j = subtitleTracks[i].clips.firstIndex(where:{ $0.id == id }) {
@@ -736,7 +750,9 @@ extension ProjectState {
         pushUndoThrottled()
         for i in imageTracks.indices {
             if let j = imageTracks[i].clips.firstIndex(where:{ $0.id == id }) {
-                modify(&imageTracks[i].clips[j]); return
+                modify(&imageTracks[i].clips[j])
+                refreshOverlayComposite()
+                return
             }
         }
     }
@@ -793,7 +809,10 @@ extension ProjectState {
         selectedImageClipID = nil; selectedTextClipID = nil; selectedShapeClipID = nil
         selectedCompoundClipID = nil; selectedClipIDs.removeAll()
 
-        undoStack.append(snap)
+        // Agent 跑一轮期间不打快照，整轮共用开跑前那一个
+        if !suppressUndoPush {
+            undoStack.append(snap)
+        }
         if undoStack.count > 30 { undoStack.removeFirst() }
         redoStack.removeAll()
         undoCount = undoStack.count
@@ -840,7 +859,10 @@ extension ProjectState {
         selectedImageClipID = nil; selectedSubtitleClipID = nil; selectedShapeClipID = nil
         selectedCompoundClipID = nil; selectedClipIDs.removeAll()
 
-        undoStack.append(snap)
+        // Agent 跑一轮期间不打快照，整轮共用开跑前那一个
+        if !suppressUndoPush {
+            undoStack.append(snap)
+        }
         if undoStack.count > 30 { undoStack.removeFirst() }
         redoStack.removeAll()
         undoCount = undoStack.count
@@ -854,6 +876,7 @@ extension ProjectState {
             if let ci = textTracks[ti].clips.firstIndex(where: { $0.id == id }) {
                 mutate(&textTracks[ti].clips[ci])
                 isSaved = false
+                refreshOverlayComposite()
                 return
             }
         }
@@ -866,7 +889,10 @@ extension ProjectState {
             if let ci = textTracks[ti].clips.firstIndex(where: { $0.id == id }) {
                 textTracks[ti].clips.remove(at: ci)
                 if selectedTextClipID == id { selectedTextClipID = nil }
-                undoStack.append(snap)
+                // Agent 跑一轮期间不打快照，整轮共用开跑前那一个
+                if !suppressUndoPush {
+                    undoStack.append(snap)
+                }
                 if undoStack.count > 30 { undoStack.removeFirst() }
                 redoStack.removeAll()
                 undoCount = undoStack.count; redoCount = 0
@@ -943,7 +969,10 @@ extension ProjectState {
         selectedImageClipID = nil; selectedSubtitleClipID = nil; selectedTextClipID = nil
         selectedClipIDs.removeAll()
 
-        undoStack.append(snap)
+        // Agent 跑一轮期间不打快照，整轮共用开跑前那一个
+        if !suppressUndoPush {
+            undoStack.append(snap)
+        }
         if undoStack.count > 30 { undoStack.removeFirst() }
         redoStack.removeAll()
         undoCount = undoStack.count
@@ -957,6 +986,7 @@ extension ProjectState {
             if let ci = shapeTracks[ti].clips.firstIndex(where: { $0.id == id }) {
                 mutate(&shapeTracks[ti].clips[ci])
                 isSaved = false
+                refreshOverlayComposite()
                 return
             }
         }
@@ -969,7 +999,10 @@ extension ProjectState {
             if let ci = shapeTracks[ti].clips.firstIndex(where: { $0.id == id }) {
                 shapeTracks[ti].clips.remove(at: ci)
                 if selectedShapeClipID == id { selectedShapeClipID = nil }
-                undoStack.append(snap)
+                // Agent 跑一轮期间不打快照，整轮共用开跑前那一个
+                if !suppressUndoPush {
+                    undoStack.append(snap)
+                }
                 if undoStack.count > 30 { undoStack.removeFirst() }
                 redoStack.removeAll()
                 undoCount = undoStack.count; redoCount = 0
@@ -1475,7 +1508,7 @@ extension ProjectState {
     /// 选中的是效果类片段（滤镜/调节）。
     /// 这两类既没有音轨也没有画面内容，翻译、语音识别、去背景那些工具对它们都没意义
     var isEffectClipSelected: Bool {
-        selectedFilterClipID != nil || selectedAdjustClipID != nil
+        selectedFilterClipID != nil || selectedAdjustClipID != nil || selectedEffectClipID != nil
     }
 
     /// 清掉所有片段的选中态。
@@ -1491,7 +1524,69 @@ extension ProjectState {
         selectedShapeClipID = nil
         selectedFilterClipID = nil
         selectedAdjustClipID = nil
+        selectedEffectClipID = nil
         selectedCompoundClipID = nil
+    }
+
+    // MARK: - 特效
+
+    @discardableResult
+    func addEffect(kind: EffectKind, at time: Double? = nil) -> UUID {
+        pushUndo()
+        let start = max(0, time ?? currentTime)
+        let clip = EffectClip(kind: kind, startTime: start,
+                              endTime: start + Self.defaultFilterDuration)
+
+        func free(_ track: Track<EffectClip>) -> Bool {
+            !track.clips.contains { $0.startTime < clip.endTime && $0.endTime > clip.startTime }
+        }
+        if let i = effectTracks.firstIndex(where: free) {
+            effectTracks[i].clips.append(clip)
+        } else {
+            effectTracks.append(Track(clips: [clip], label: "特效"))
+            syncOverlayOrder()
+        }
+        selectedEffectClipID = clip.id
+        selectedClipIDs = [clip.id]
+        isSaved = false
+        rebuildTimelinePreview()
+        return clip.id
+    }
+
+    /// 改一段特效。
+    ///
+    /// `live` = 正在拖手柄/滑块：**不重建预览**，直接把新参数喂给合成器再逼一帧重绘。
+    /// 整份重建会把播放器按在重置上，拖中心点时画面一顿一顿地闪
+    func updateEffectClip(id: UUID, live: Bool = false, _ mutate: (inout EffectClip) -> Void) {
+        for ti in effectTracks.indices {
+            if let ci = effectTracks[ti].clips.firstIndex(where: { $0.id == id }) {
+                mutate(&effectTracks[ti].clips[ci])
+                isSaved = false
+                if live {
+                    ColorCompositor.setEffectTracks(effectTracks)
+                    clock.refreshSeekRequest &+= 1
+                } else {
+                    rebuildTimelinePreviewDebounced()
+                }
+                return
+            }
+        }
+    }
+
+    func deleteEffectClip(id: UUID) {
+        pushUndo()
+        for ti in effectTracks.indices {
+            effectTracks[ti].clips.removeAll { $0.id == id }
+        }
+        if selectedEffectClipID == id { selectedEffectClipID = nil }
+        selectedClipIDs.remove(id)
+        isSaved = false
+        rebuildTimelinePreviewDebounced()
+    }
+
+    var selectedEffectClip: EffectClip? {
+        guard let id = selectedEffectClipID else { return nil }
+        return effectTracks.flatMap(\.clips).first { $0.id == id }
     }
 
     // MARK: - 调节
@@ -1555,6 +1650,14 @@ extension ProjectState {
 extension ProjectState {
     /// 某一时刻正在生效的滤镜（按轨道顺序，下层在前）
     /// 某一时刻正在生效的调节（按轨道顺序，下层在前）
+    /// 某一时刻正在生效的特效（按轨道顺序，下层在前）
+    func activeEffectClips(at time: Double) -> [EffectClip] {
+        effectTracks
+            .filter(\.isVisible)
+            .flatMap { $0.clips }
+            .filter { $0.startTime <= time && $0.endTime > time }
+    }
+
     func activeAdjustClips(at time: Double) -> [AdjustClip] {
         adjustTracks
             .filter(\.isVisible)

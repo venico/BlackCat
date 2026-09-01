@@ -20,19 +20,58 @@ final class ProjectState: ObservableObject {
     // Tracks
     // 六种类型各留一条空轨。空项目就能看到完整的轨道结构，
     // 第一个素材直接落在对应的空轨上，不用先凭空多出一条轨道来
-    @Published var videoTracks: [Track<VideoClip>]    = [Track(label: "视频")]
-    @Published var audioTracks: [Track<AudioClip>]    = [Track(label: "音频")]
-    @Published var imageTracks: [Track<ImageClip>]       = [Track(label: "图片")]
-    @Published var subtitleTracks: [Track<SubtitleClip>] = [ProjectState.makeEmptySubtitleTrack()]
-    @Published var textTracks: [Track<TextClip>] = [Track(label: "文字")]
-    @Published var textTemplates: [TextTemplate] = []  // 文字样式模板
-    @Published var shapeTracks: [Track<ShapeClip>] = [Track(label: "图形")]  // 图形图层
+    /// 时间线标签页。**一个标签页 = 一整套轨道**，互不影响；
+    /// 素材库是全项目共享的，删素材会影响所有标签页里引用它的片段
+    @Published var tabs: [TimelineTab] = [TimelineTab(name: "时间线 1")]
+    @Published var activeTab: Int = 0
+
+    /// 下面这些都是当前标签页的轨道。
+    /// 保留成同名属性，几千处调用方一行都不用改
+    var videoTracks: [Track<VideoClip>] {
+        get { tab.videoTracks } set { withTab { $0.videoTracks = newValue } }
+    }
+    var audioTracks: [Track<AudioClip>] {
+        get { tab.audioTracks } set { withTab { $0.audioTracks = newValue } }
+    }
+    var imageTracks: [Track<ImageClip>] {
+        get { tab.imageTracks } set { withTab { $0.imageTracks = newValue } }
+    }
+    var subtitleTracks: [Track<SubtitleClip>] {
+        get { tab.subtitleTracks } set { withTab { $0.subtitleTracks = newValue } }
+    }
+    var textTracks: [Track<TextClip>] {
+        get { tab.textTracks } set { withTab { $0.textTracks = newValue } }
+    }
+    var shapeTracks: [Track<ShapeClip>] {
+        get { tab.shapeTracks } set { withTab { $0.shapeTracks = newValue } }
+    }
     /// 滤镜轨道。多条 = 叠加，从下往上依次套
-    @Published var filterTracks: [Track<FilterClip>] = []
+    var filterTracks: [Track<FilterClip>] {
+        get { tab.filterTracks } set { withTab { $0.filterTracks = newValue } }
+    }
+    var adjustTracks: [Track<AdjustClip>] {
+        get { tab.adjustTracks } set { withTab { $0.adjustTracks = newValue } }
+    }
+    var effectTracks: [Track<EffectClip>] {
+        get { tab.effectTracks } set { withTab { $0.effectTracks = newValue } }
+    }
+    var compoundTracks: [Track<CompoundClip>] {
+        get { tab.compoundTracks } set { withTab { $0.compoundTracks = newValue } }
+    }
+
+    /// 当前标签页。activeTab 万一越界就退回第一个，绝不崩
+    var tab: TimelineTab {
+        tabs.indices.contains(activeTab) ? tabs[activeTab] : (tabs.first ?? TimelineTab())
+    }
+    private func withTab(_ mutate: (inout TimelineTab) -> Void) {
+        guard tabs.indices.contains(activeTab) else { return }
+        mutate(&tabs[activeTab])
+    }
+
+    @Published var textTemplates: [TextTemplate] = []  // 文字样式模板
     @Published var selectedFilterClipID: UUID? = nil
-    @Published var adjustTracks: [Track<AdjustClip>] = []
     @Published var selectedAdjustClipID: UUID? = nil
-    @Published var compoundTracks: [Track<CompoundClip>] = []
+    @Published var selectedEffectClipID: UUID? = nil
     @Published var selectedMarkerID: UUID? = nil
 
     // 复合片段编辑栈
@@ -58,12 +97,14 @@ final class ProjectState: ObservableObject {
         case shape(UUID)
         case filter(UUID)
         case adjust(UUID)
+        case effect(UUID)
         case compound(UUID)
 
         var trackID: UUID {
             switch self {
             case .image(let id), .subtitle(let id), .text(let id), .shape(let id),
-                 .filter(let id), .adjust(let id), .compound(let id): return id
+                 .filter(let id), .adjust(let id), .effect(let id),
+                 .compound(let id): return id
             }
         }
     }
@@ -89,6 +130,7 @@ final class ProjectState: ObservableObject {
         shapeTracks: [Track<ShapeClip>] = [],
         filterTracks: [Track<FilterClip>] = [],
         adjustTracks: [Track<AdjustClip>] = [],
+        effectTracks: [Track<EffectClip>] = [],
         compoundTracks: [Track<CompoundClip>] = []
     ) -> [OverlayTrackRef] {
         // 没登记的一律补进来，压在最底下。不只是复合轨道——任何一条轨道只要
@@ -114,11 +156,43 @@ final class ProjectState: ObservableObject {
         for t in adjustTracks where t.isVisible && !listed.contains(t.id) {
             unlisted.append(.adjust(t.id))
         }
+        for t in effectTracks where t.isVisible && !listed.contains(t.id) {
+            unlisted.append(.effect(t.id))
+        }
         for t in compoundTracks where t.isVisible && !listed.contains(t.id) {
             unlisted.append(.compound(t.id))
         }
         // overlayTrackOrder 是从顶到底存的（index 0 = 最上面），反过来即从底到顶
         return unlisted + overlayTrackOrder.reversed()
+    }
+
+    /// 叠加层在某一时刻的内容指纹。
+    ///
+    /// 光栅化的结果靠它判断要不要重画 —— 图层挪了、文字改了、字幕换了一条，
+    /// 指纹就变。只盯参数不盯内容的话，改完画面还停在旧的那张图上
+    func overlayContentKey(at t: Double) -> String {
+        var out = ""
+        for track in imageTracks where track.isVisible {
+            for c in track.clips where c.startTime <= t && c.endTime > t {
+                out += "i\(c.id)\(c.offsetX)\(c.offsetY)\(c.scaleX)\(c.scaleY)\(c.rotation)\(c.opacity ?? 1)\(c.cornerRadius ?? 0)"
+            }
+        }
+        for track in textTracks where track.isVisible {
+            for c in track.clips where c.startTime <= t && c.endTime > t {
+                out += "t\(c.id)\(c.text)\(c.posX)\(c.posY)\(c.fontSize)\(c.rotation)\(c.opacity)"
+            }
+        }
+        for track in shapeTracks where track.isVisible {
+            for c in track.clips where c.startTime <= t && c.endTime > t {
+                out += "s\(c.id)\(c.posX)\(c.posY)\(c.scaleX)\(c.scaleY)\(c.rotation)\(c.opacity)"
+            }
+        }
+        for track in subtitleTracks where track.isVisible {
+            for c in track.clips where c.startTime <= t && c.endTime > t {
+                out += "b\(c.id)\(c.text)"
+            }
+        }
+        return out
     }
 
     /// 顶层的 overlay 图层清单，从底到顶
@@ -128,7 +202,7 @@ final class ProjectState: ObservableObject {
             imageTracks: imageTracks, subtitleTracks: subtitleTracks,
             textTracks: textTracks, shapeTracks: shapeTracks,
             filterTracks: filterTracks, adjustTracks: adjustTracks,
-            compoundTracks: compoundTracks)
+            effectTracks: effectTracks, compoundTracks: compoundTracks)
     }
 
     enum CompoundTrackKind { case overlay, video, audio }
@@ -161,8 +235,13 @@ final class ProjectState: ObservableObject {
     /// Shift 在重叠处是在「循环加选」还是「循环减选」。
     /// 纯交互状态，不参与渲染，所以不用 @Published
     var shiftCycleRemoving = false
+    /// Agent 跑一轮期间为 true：期间所有 pushUndo 都跳过，
+    /// 整轮只在开跑前打一个快照（见 AgentRunner）
+    var suppressUndoPush = false
 
-    @Published var overlayTrackOrder: [OverlayTrackRef] = []
+    var overlayTrackOrder: [OverlayTrackRef] {
+        get { tab.overlayTrackOrder } set { withTab { $0.overlayTrackOrder = newValue } }
+    }
 
     // Codable：这两个要跟着项目文件存盘，否则复合片段重新打开后位置会跑掉
     enum VideoSectionRef: Equatable, Hashable, Codable {
@@ -175,8 +254,12 @@ final class ProjectState: ObservableObject {
         case compound(UUID)
         var trackID: UUID { switch self { case .audio(let id), .compound(let id): return id } }
     }
-    @Published var videoSectionOrder: [VideoSectionRef] = []
-    @Published var audioSectionOrder: [AudioSectionRef] = []
+    var videoSectionOrder: [VideoSectionRef] {
+        get { tab.videoSectionOrder } set { withTab { $0.videoSectionOrder = newValue } }
+    }
+    var audioSectionOrder: [AudioSectionRef] {
+        get { tab.audioSectionOrder } set { withTab { $0.audioSectionOrder = newValue } }
+    }
 
     func syncVideoSectionOrder() {
         var validIDs = Set<UUID>()
@@ -213,6 +296,7 @@ final class ProjectState: ObservableObject {
         for t in shapeTracks { currentIDs.insert(t.id) }
         for t in filterTracks { currentIDs.insert(t.id) }
         for t in adjustTracks { currentIDs.insert(t.id) }
+        for t in effectTracks { currentIDs.insert(t.id) }
         for t in compoundTracks where compoundTrackKind(t) == .overlay { currentIDs.insert(t.id) }
         for ref in overlayTrackOrder {
             let rid: UUID
@@ -223,6 +307,7 @@ final class ProjectState: ObservableObject {
             case .shape(let id): rid = id
             case .filter(let id): rid = id
             case .adjust(let id): rid = id
+            case .effect(let id): rid = id
             case .compound(let id): rid = id
             }
             if currentIDs.contains(rid) { newOrder.append(ref); currentIDs.remove(rid) }
@@ -233,6 +318,7 @@ final class ProjectState: ObservableObject {
         for t in textTracks where currentIDs.contains(t.id) { newRefs.append(.text(t.id)); currentIDs.remove(t.id) }
         for t in filterTracks where currentIDs.contains(t.id) { newRefs.append(.filter(t.id)); currentIDs.remove(t.id) }
         for t in adjustTracks where currentIDs.contains(t.id) { newRefs.append(.adjust(t.id)); currentIDs.remove(t.id) }
+        for t in effectTracks where currentIDs.contains(t.id) { newRefs.append(.effect(t.id)); currentIDs.remove(t.id) }
         for t in shapeTracks where currentIDs.contains(t.id) { newRefs.append(.shape(t.id)); currentIDs.remove(t.id) }
         for t in compoundTracks where currentIDs.contains(t.id) { newRefs.append(.compound(t.id)); currentIDs.remove(t.id) }
         overlayTrackOrder = newRefs + newOrder
@@ -957,7 +1043,18 @@ final class ProjectState: ObservableObject {
     @Published var effectCategory: String = "transition"
     /// 素材库用缩略图还是列表看。侧边栏和画布素材库**共用这一份**，
     /// 一边切了另一边跟着变（跟排序设置一个待遇）
-    @Published var mediaGridMode: Bool = true
+    /// 缩略图 / 列表，**每个分类各记各的**。
+    /// 原先是一个全局开关：在图片里切成列表，回到视频也跟着变成列表
+    @Published var mediaGridModeByKey: [String: Bool] = [:]
+
+    /// 侧边栏素材库当前分类用哪种视图
+    var mediaGridMode: Bool {
+        get { gridMode(for: libraryCategory) }
+        set { setGridMode(newValue, for: libraryCategory) }
+    }
+
+    func gridMode(for key: String) -> Bool { mediaGridModeByKey[key] ?? true }
+    func setGridMode(_ on: Bool, for key: String) { mediaGridModeByKey[key] = on }
 
     /// 项目封面的设计稿。属性区那个入口点开就是编辑它，
     /// 确认后渲染成 PNG 给欢迎页用（见 `ProjectCover`）
@@ -999,6 +1096,9 @@ final class ProjectState: ObservableObject {
         case subtitle(SubtitleClip, trackIndex: Int)
         case text(TextClip, trackIndex: Int)
         case shape(ShapeClip, trackIndex: Int)
+        case filter(FilterClip, trackIndex: Int)
+        case effect(EffectClip, trackIndex: Int)
+        case adjust(AdjustClip, trackIndex: Int)
         case compound(CompoundClip, trackIndex: Int)
     }
     var clipboard: [ClipboardItem] = []

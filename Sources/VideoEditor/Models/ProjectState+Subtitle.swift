@@ -317,7 +317,7 @@ extension ProjectState {
                 await MainActor.run {
                     self.pushUndo()
                     var track = Track<SubtitleClip>(label: useAI ? "识别字幕·已校对" : "识别字幕")
-                    track.subtitleStyle = self.newSubtitleStyle()
+                    track.subtitleStyle = self.newSubtitleStyle(for: outSegs.map(\.text))
                     for s in outSegs {
                         let st = capOffset + s.start / capSpeed
                         let en = capOffset + s.end   / capSpeed

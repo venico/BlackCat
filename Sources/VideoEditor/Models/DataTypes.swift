@@ -58,7 +58,9 @@ struct MediaAsset: Identifiable, Equatable, Codable {
 // MARK: - Subtitle Style
 
 struct SubtitleStyle: Equatable, Codable {
-    var fontName: String  = "PingFang SC"
+    // 思源黑体简体。**用族名不用 PostScript 名**：粗体是靠选同族的 Bold 成员实现的，
+    // 写死 SourceHanSansSC-Regular 的话字重就切不动了
+    var fontName: String  = "Source Han Sans SC"
     var fontSize: CGFloat = 48
     var bold: Bool        = false
     var italic: Bool      = false
@@ -69,7 +71,21 @@ struct SubtitleStyle: Equatable, Codable {
     var widthPercent: Double  = 95
     var alignment: String     = "center" // "left" / "center" / "right"
     var lineSpacing: Double   = 6      // px between bilingual lines
-    var mergeLineBreaks: Bool = false   // 合并换行：去掉字幕中的手动换行，按宽度自动重排
+    var mergeLineBreaks: Bool = true
+
+    /// 纯英文字幕的默认字号。英文字形比汉字扁而宽，中文那档 48 落到英文上会顶满整行。
+    /// **只要出现一个汉字就按中文算** —— 中英混排的双语字幕仍旧走 48
+    static func defaultFontSize(forSubtitles texts: [String]) -> CGFloat {
+        let hasCJK = texts.contains { text in
+            text.unicodeScalars.contains { u in
+                (0x4E00...0x9FFF).contains(u.value)    // CJK 基本区
+                || (0x3400...0x4DBF).contains(u.value) // 扩展 A
+                || (0x3040...0x30FF).contains(u.value) // 假名
+                || (0xAC00...0xD7AF).contains(u.value) // 谚文
+            }
+        }
+        return hasCJK ? 48 : 32
+    }    // 合并换行：去掉字幕中的手动换行，按宽度自动重排
 
     /// 字幕层的排版尺寸（文字尺寸 + 内边距），**预览和导出共用这一份**。
     ///
@@ -1103,6 +1119,11 @@ struct ProjectDocument: Codable {
     var shapeTracks: [Track<ShapeClip>]?   // 图形图层（向后兼容：旧 .bcj 无此字段）
     var filterTracks: [Track<FilterClip>]? // 滤镜轨道（同上，可选是为了兼容旧文件）
     var adjustTracks: [Track<AdjustClip>]? // 调节轨道（同上）
+    var effectTracks: [Track<EffectClip>]? // 特效轨道（同上）
+    /// 时间线标签页。**新文件存这个**，上面那些散字段只为读旧文件保留 ——
+    /// 旧 .bcj 里没有 tabs，打开时把散字段收成一个标签页
+    var tabs: [TimelineTab]?
+    var activeTab: Int?
     var mediaAssets: [MediaAsset]
     var exportSettings: ExportSettings
     var previewResolution: String
@@ -1282,6 +1303,7 @@ struct ProjectSnapshot {
     /// 滤镜轨道。可选是为了不动那些逐字段构造快照的老代码
     var filterTracks: [Track<FilterClip>] = []
     var adjustTracks: [Track<AdjustClip>] = []
+    var effectTracks: [Track<EffectClip>] = []
     var compoundTracks: [Track<CompoundClip>]
     var overlayTrackOrder: [ProjectState.OverlayTrackRef]
     var videoSectionOrder: [ProjectState.VideoSectionRef] = []

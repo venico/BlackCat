@@ -31,9 +31,27 @@ struct PlayerView: View {
                                            geo.size.height / max(rs.height, 1))
                         let fitW = rs.width * fitScale
                         let fitH = rs.height * fitScale
-                        Color.black
-                            .frame(width: fitW, height: fitH)
-                            .position(x: geo.size.width / 2, y: geo.size.height / 2)
+                        // 安全边框：画面实际会落在这个框里。
+                        // 不填色，只画一圈虚线 —— 填黑的话空项目跟「加载中」分不出来
+                        ZStack {
+                            RoundedRectangle(cornerRadius: 8)
+                                // 点状：线帽设圆的、实线段长度给 0，画出来就是一串圆点
+                                .strokeBorder(style: StrokeStyle(lineWidth: 2.5, lineCap: .round,
+                                                                 dash: [0.01, 7]))
+                                .foregroundColor(Color.labelSecondary.opacity(0.4))
+                            if project.playerItem == nil {
+                                VStack(spacing: min(fitW, fitH) * 0.045) {
+                                    Image(nsImage: SidebarSVGIcon.load("video",
+                                                                       size: min(fitW, fitH) * 0.22))
+                                        .renderingMode(.template)
+                                    Text("安全边框")
+                                        .font(.system(size: min(fitW, fitH) * 0.075, weight: .semibold))
+                                }
+                                .foregroundColor(Color.labelSecondary.opacity(0.22))
+                            }
+                        }
+                        .frame(width: fitW, height: fitH)
+                        .position(x: geo.size.width / 2, y: geo.size.height / 2)
                     }
                     .allowsHitTesting(false)
                     AVPlayerNSView(
@@ -61,6 +79,21 @@ struct PlayerView: View {
                             ShapeTransformOverlay()
                             PenDrawingOverlay()
                             PenEditOverlay()
+                            // 特效的中心点。选中一段带中心点的特效才出现
+                            if let fx = project.selectedEffectClip, fx.kind.usesCenter {
+                                EffectCenterHandle(clip: fx,
+                                                   canvas: CGSize(width: fitW, height: fitH),
+                                                   onMove: { x, y in
+                                    project.updateEffectClip(id: fx.id, live: true) {
+                                        $0.centerX = x; $0.centerY = y
+                                    }
+                                }, onEnd: {
+                                    project.pushUndoThrottled()
+                                    project.rebuildTimelinePreview()
+                                })
+                                .frame(width: fitW, height: fitH)
+                                .coordinateSpace(name: EffectCenterHandle.space)
+                            }
                         }
                         .frame(width: fitW, height: fitH)
                         .position(x: geo.size.width / 2, y: geo.size.height / 2)
@@ -195,6 +228,10 @@ private struct OverlayStack: View {
     @EnvironmentObject private var clock: PlaybackClock
     @State private var editText: String = ""
     @State private var dragStart: [UUID: CGPoint] = [:]
+    /// 叠加层实际画多大。**特效的尺寸参数要按它换算，不能按渲染分辨率** ——
+    /// CALayer.filters 作用在这个显示尺寸的图层上，拿 1920 算出来的半径
+    /// 套到 800 宽的画布上，糊的程度会差一倍多
+    @State private var canvasSize: CGSize = .zero
 
     var body: some View {
         // 图层清单跟导出共用（含未登记复合轨道的兜底，见 overlayLayersBottomUp）。
@@ -210,13 +247,16 @@ private struct OverlayStack: View {
                 }
                 .zIndex(-1)
 
-            // 没有滤镜时按老样子平铺 —— 嵌套那条路每层都套 AnyView，
-            // 会丢掉 SwiftUI 的视图身份，白白拖累拖拽手感
-            if layersBottomUp.contains(where: {
-                if case .filter = $0 { return true }
-                if case .adjust = $0 { return true }
-                return false
-            }) {
+            // 有效果轨道时，画面**整帧**由合成器出（叠加层也在里面），
+            // 这层只留透明的命中区接鼠标 —— 再画一遍内容就会出现
+            // 「合成器扭一套、SwiftUI 扭另一套」两份对不上的画面
+            if hasEffectLayer(layersBottomUp) {
+                ForEach(Array(layersBottomUp.enumerated()), id: \.element.trackID) { i, ref in
+                    layerView(ref)
+                        .opacity(0)          // 内容归合成器画，这里只要命中区
+                        .zIndex(Double(i))
+                }
+            } else if false {
                 // 有滤镜：**从底往上一层层套**。滤镜只作用于排在它下面的图层，
                 // 所以走到滤镜那层时，把「已经堆好的部分」整个套一层效果再往上叠
                 overlayChain(layersBottomUp)
@@ -226,6 +266,11 @@ private struct OverlayStack: View {
                 }
             }
         }
+        .background(GeometryReader { g in
+            Color.clear
+                .onAppear { canvasSize = g.size }
+                .onChange(of: g.size) { _, v in canvasSize = v }
+        })
     }
 
     @ViewBuilder
@@ -263,6 +308,16 @@ private struct OverlayStack: View {
         }
     }
 
+    /// 有没有效果类轨道。有的话整帧交给合成器出
+    private func hasEffectLayer(_ layers: [ProjectState.OverlayTrackRef]) -> Bool {
+        layers.contains {
+            switch $0 {
+            case .filter, .adjust, .effect: return true
+            default: return false
+            }
+        }
+    }
+
     /// 从底到顶把图层叠起来。遇到滤镜就把下面那坨整个套一层
     private func overlayChain(_ layers: [ProjectState.OverlayTrackRef]) -> AnyView {
         layers.reduce(AnyView(Color.clear)) { acc, ref in
@@ -276,6 +331,21 @@ private struct OverlayStack: View {
                 let fs = clips.flatMap(\.adjust.ciFilters)
                 guard !fs.isEmpty else { return acc }
                 return AnyView(CILayerEffect(filters: fs) { acc })
+            }
+            if case .effect(let id) = ref {
+                let clips = project.effectTracks.first { $0.id == id }
+                    .map { t in
+                        t.isVisible
+                        ? t.clips.filter { $0.startTime <= clock.currentTime && $0.endTime > clock.currentTime }
+                        : []
+                    } ?? []
+                guard !clips.isEmpty else { return acc }
+                let disp = canvasSize == .zero ? project.previewRenderSize : canvasSize
+                return AnyView(acc.modifier(OverlayEffectFilter(
+                    clips: clips, displaySize: disp,
+                    renderSize: project.previewRenderSize,
+                    contentKey: project.overlayContentKey(at: clock.currentTime),
+                    isPlaying: clock.isPlaying)))
             }
             if case .filter(let id) = ref {
                 let clips = project.filterTracks.first { $0.id == id }
@@ -301,7 +371,8 @@ private struct OverlayStack: View {
         case .text(let id):     textTrackView(trackID: id)
         case .shape(let id):    shapeTrackView(trackID: id)
         case .compound(let id): compoundOverlayView(trackID: id)
-        case .filter, .adjust:  EmptyView()   // 滤镜/调节在 overlayChain 里单独处理
+        case .filter, .adjust, .effect:
+            EmptyView()   // 滤镜/调节/特效在 overlayChain 里单独处理
         }
     }
 
@@ -598,8 +669,8 @@ private struct OverlayStack: View {
             if isFirstSubtitle {
                 compoundSubtitles(compound: compound, it: it, geo: geo)
             }
-        case .filter, .adjust:
-            EmptyView()   // 复合片段内部没有滤镜/调节轨道
+        case .filter, .adjust, .effect:
+            EmptyView()   // 复合片段内部没有滤镜/调节/特效轨道
         case .compound(let id):
             nestedCompoundOverlay(compound: compound, trackID: id, it: it, geo: geo)
         }
@@ -3130,15 +3201,31 @@ struct PenDrawingOverlay: View {
 
 // MARK: - Pen Edit Overlay（钢笔路径编辑模式）
 
-private struct PenEditOverlay: View {
+/// 钢笔图形的锚点编辑层。
+///
+/// 两个可选参数跟 `ShapeTransformOverlay` 一样：改谁（`clipOverride`）、
+/// 改动写给谁（`onUpdate`）。封面设计弹窗里的图形存在自己的 draft 里，
+/// 不在 `project.shapeTracks` 上，靠这两个参数接进来
+struct PenEditOverlay: View {
+    var clipOverride: ShapeClip? = nil
+    var onUpdate: ((UUID, @escaping (inout ShapeClip) -> Void) -> Void)? = nil
+    /// 退出编辑态。不给就走 project.penEditingClipID
+    var onExit: (() -> Void)? = nil
+
     @EnvironmentObject private var project: ProjectState
     @Environment(\.windowID) private var windowID
     @State private var didPushUndo = false
+    /// 按下那一刻的锚点位置。**拖动全程锁住不刷新** ——
+    /// 每帧都拿「当前最新的点」再加上完整位移的话，位移会被一遍遍累加上去，
+    /// 表现就是控制点甩飞或者干脆不跟手
+    @State private var dragOrigin: PenPoint?
 
     var body: some View {
         GeometryReader { geo in
-            if let editID = project.penEditingClipID,
-               let clip = project.shapeTracks.flatMap({ $0.clips }).first(where: { $0.id == editID }),
+            if let clip = clipOverride
+                    ?? project.penEditingClipID.flatMap({ id in
+                        project.shapeTracks.flatMap { $0.clips }.first { $0.id == id }
+                    }),
                let pts = clip.penPoints, pts.count >= 2 {
                 let vs = geo.size
                 let scale = vs.width / max(project.previewRenderSize.width, 1)
@@ -3149,7 +3236,9 @@ private struct PenEditOverlay: View {
 
                 ZStack {
                     Color.black.opacity(0.01).contentShape(Rectangle())
-                        .onTapGesture { project.penEditingClipID = nil }
+                        .onTapGesture {
+                            if let exit = onExit { exit() } else { project.penEditingClipID = nil }
+                        }
 
                     ForEach(Array(pts.enumerated()), id: \.element.id) { i, pt in
                         let px = cx - fw / 2 + pt.x * fw
@@ -3167,16 +3256,16 @@ private struct PenEditOverlay: View {
 
                             handleCircle(color: .orange)
                                 .position(x: hOutX, y: hOutY)
-                                .gesture(handleDrag(clipID: editID, pointIndex: i, isOut: true, fw: fw, fh: fh, pt: pt))
+                                .gesture(handleDrag(clipID: clip.id, pointIndex: i, isOut: true, fw: fw, fh: fh, pt: pt))
 
                             handleCircle(color: .orange)
                                 .position(x: hInX, y: hInY)
-                                .gesture(handleDrag(clipID: editID, pointIndex: i, isOut: false, fw: fw, fh: fh, pt: pt))
+                                .gesture(handleDrag(clipID: clip.id, pointIndex: i, isOut: false, fw: fw, fh: fh, pt: pt))
                         }
 
                         anchorSquare()
                             .position(x: px, y: py)
-                            .gesture(anchorDrag(clipID: editID, pointIndex: i, fw: fw, fh: fh, pt: pt))
+                            .gesture(anchorDrag(clipID: clip.id, pointIndex: i, fw: fw, fh: fh, pt: pt))
                     }
                 }
                 .onAppear { installEscMonitor() }
@@ -3185,11 +3274,12 @@ private struct PenEditOverlay: View {
         }
     }
 
+    /// 锚点。跟控制柄一样是圆的，只是大一圈、描边用主题色
     private func anchorSquare() -> some View {
-        Rectangle().fill(Color.white).frame(width: 9, height: 9)
-            .overlay(Rectangle().stroke(Color.accent, lineWidth: 1.5))
+        Circle().fill(Color.white).frame(width: 9, height: 9)
+            .overlay(Circle().stroke(Color.accent, lineWidth: 1.5))
             .shadow(color: .black.opacity(0.3), radius: 2, y: 1)
-            .frame(width: 24, height: 24).contentShape(Rectangle())
+            .frame(width: 24, height: 24).contentShape(Circle())
     }
 
     private func handleCircle(color: Color) -> some View {
@@ -3199,45 +3289,56 @@ private struct PenEditOverlay: View {
     }
 
     private func pushUndoOnce() {
+        // 外面给了写回口子（封面弹窗）时，撤销由那边自己管
+        guard onUpdate == nil else { return }
         if !didPushUndo { project.pushUndo(); didPushUndo = true }
+    }
+
+    /// 改一条钢笔图形。给了 onUpdate 就交给它，否则走项目的图形轨道
+    private func writeBack(_ id: UUID, _ apply: @escaping (inout ShapeClip) -> Void) {
+        if let up = onUpdate { up(id, apply) } else { project.updateShapeClip(id: id, apply) }
     }
 
     private func anchorDrag(clipID: UUID, pointIndex i: Int, fw: CGFloat, fh: CGFloat, pt: PenPoint) -> some Gesture {
         DragGesture(minimumDistance: 1)
             .onChanged { v in
                 pushUndoOnce()
+                if dragOrigin == nil { dragOrigin = pt }
+                let origin = dragOrigin ?? pt
                 let dx = v.translation.width / fw
                 let dy = v.translation.height / fh
-                project.updateShapeClip(id: clipID) { c in
+                writeBack(clipID) { c in
                     guard var pts = c.penPoints, i < pts.count else { return }
-                    pts[i].x = pt.x + dx; pts[i].y = pt.y + dy
+                    pts[i].x = origin.x + dx; pts[i].y = origin.y + dy
                     c.penPoints = pts
                 }
             }
-            .onEnded { _ in didPushUndo = false }
+            .onEnded { _ in didPushUndo = false; dragOrigin = nil }
     }
 
     private func handleDrag(clipID: UUID, pointIndex i: Int, isOut: Bool, fw: CGFloat, fh: CGFloat, pt: PenPoint) -> some Gesture {
         DragGesture(minimumDistance: 1)
             .onChanged { v in
                 pushUndoOnce()
+                if dragOrigin == nil { dragOrigin = pt }
+                let origin = dragOrigin ?? pt
                 let dx = v.translation.width / fw
                 let dy = v.translation.height / fh
-                project.updateShapeClip(id: clipID) { c in
+                writeBack(clipID) { c in
                     guard var pts = c.penPoints, i < pts.count else { return }
                     if isOut {
-                        pts[i].ctrlOutDX = pt.ctrlOutDX + dx
-                        pts[i].ctrlOutDY = pt.ctrlOutDY + dy
+                        pts[i].ctrlOutDX = origin.ctrlOutDX + dx
+                        pts[i].ctrlOutDY = origin.ctrlOutDY + dy
                         if pts[i].smooth { pts[i].ctrlInDX = -(pts[i].ctrlOutDX); pts[i].ctrlInDY = -(pts[i].ctrlOutDY) }
                     } else {
-                        pts[i].ctrlInDX = pt.ctrlInDX + dx
-                        pts[i].ctrlInDY = pt.ctrlInDY + dy
+                        pts[i].ctrlInDX = origin.ctrlInDX + dx
+                        pts[i].ctrlInDY = origin.ctrlInDY + dy
                         if pts[i].smooth { pts[i].ctrlOutDX = -(pts[i].ctrlInDX); pts[i].ctrlOutDY = -(pts[i].ctrlInDY) }
                     }
                     c.penPoints = pts
                 }
             }
-            .onEnded { _ in didPushUndo = false }
+            .onEnded { _ in didPushUndo = false; dragOrigin = nil }
     }
 
     @State private var escMonitor: Any? = nil
@@ -3449,5 +3550,139 @@ struct CIAdjustEffect: ViewModifier {
         } else {
             CILayerEffect(filters: fs) { content }
         }
+    }
+}
+
+
+/// 给叠加层套特效。跟调节那条一样走 CALayer.filters，
+/// 用的是同一份 EffectEngine 的参数换算，所以跟视频画面、导出三边一致
+/// 给叠加层套特效。
+///
+/// **先把这一层内容光栅化到渲染分辨率，在那个尺度上套特效，再缩回显示尺寸** ——
+/// 视频帧走的就是这条路（合成器在 1920 上算完，预览再整体缩小显示）。
+/// 直接拿 CALayer.filters 在显示尺寸上算的话，同样的相对半径，
+/// 「1920 上扭曲完缩到 900」和「直接在 900 上扭曲」出来的锐利度差一截，
+/// 用户照着预览调好的强度，导出就不是那个味道了。
+///
+/// 代价是每次内容变化都要重新光栅化，所以结果按内容指纹缓存住
+struct OverlayEffectFilter: ViewModifier {
+    let clips: [EffectClip]
+    /// 预览里这一层实际画多大
+    let displaySize: CGSize
+    /// 导出用的渲染分辨率。特效在这个尺度上算，才跟视频帧和导出对得齐
+    let renderSize: CGSize
+    /// 叠加层内容的指纹，变了就重画
+    let contentKey: String
+    /// 播放中。光栅化一次要几十毫秒，逐帧做会直接卡死，
+    /// 播放时退回 CALayer.filters 那条近似的路，停下来再走精确的
+    let isPlaying: Bool
+
+    func body(content: Content) -> some View {
+        let live = clips.filter { $0.intensity > 0.001 }
+        if live.isEmpty || displaySize.width < 1 || renderSize.width < 1 {
+            content
+        } else if isPlaying {
+            // 播放中走近似：直接在显示尺寸上挂滤镜，快但跟视频帧的锐利度对不齐
+            ZStack {
+                content.opacity(0)
+                CILayerEffect(filters: live.flatMap {
+                    EffectEngine.ciFilters(for: $0, renderSize: displaySize)
+                }) { content }
+                    .allowsHitTesting(false)
+            }
+        } else {
+            RasterizedEffect(clips: live, displaySize: displaySize,
+                             renderSize: renderSize, contentKey: contentKey,
+                             fallback: { AnyView(content) }) { content }
+        }
+    }
+}
+
+/// 把一段 SwiftUI 内容按渲染分辨率光栅化，套上特效，再按显示尺寸画出来
+private struct RasterizedEffect<Content: View>: View {
+    let clips: [EffectClip]
+    let displaySize: CGSize
+    let renderSize: CGSize
+    let contentKey: String
+    /// 还没光栅化出结果时拿它顶着。**不能什么都不画** ——
+    /// 第一帧、或者光栅化失败时，那一层会整个消失
+    let fallback: () -> AnyView
+    @ViewBuilder let content: () -> Content
+
+    @State private var rendered: NSImage?
+
+    /// 内容和参数都没变就不用重新光栅化
+    private var key: String {
+        clips.map { "\($0.id)\($0.kind.rawValue)\($0.intensity)\($0.amount)\($0.angle)\($0.centerX)\($0.centerY)" }
+            .joined() + "|\(Int(displaySize.width))x\(Int(displaySize.height))|" + contentKey
+    }
+
+    var body: some View {
+        ZStack {
+            // 底层始终画着原内容：一来接鼠标，二来光栅化没出结果时顶着
+            fallback().opacity(rendered == nil ? 1 : 0)
+            if let img = rendered {
+                Image(nsImage: img)
+                    .resizable()
+                    .frame(width: displaySize.width, height: displaySize.height)
+                    .allowsHitTesting(false)
+            }
+        }
+        .frame(width: displaySize.width, height: displaySize.height)
+        .onAppear { rasterize() }
+        .onChange(of: key) { _, _ in rasterize() }
+    }
+
+    @MainActor
+    private func rasterize() {
+        // 光栅化按渲染分辨率来：内容按显示尺寸布局，scale 补足到渲染分辨率
+        let scale = max(renderSize.width / max(displaySize.width, 1), 1)
+        let r = ImageRenderer(content: content()
+            .frame(width: displaySize.width, height: displaySize.height))
+        r.scale = scale
+        guard let ns = r.nsImage,
+              let tiff = ns.tiffRepresentation,
+              let ci = CIImage(data: tiff) else { return }
+
+        var out = ci
+        for clip in clips {
+            out = EffectEngine.apply(clip, to: out, renderSize: ci.extent.size)
+        }
+        let ctx = CIContext(options: [.useSoftwareRenderer: false])
+        guard let cg = ctx.createCGImage(out, from: ci.extent) else { return }
+        rendered = NSImage(cgImage: cg, size: displaySize)
+    }
+}
+
+/// 特效的中心点。选中一段带中心点的特效时出现，可以直接拖
+struct EffectCenterHandle: View {
+    let clip: EffectClip
+    let canvas: CGSize
+    let onMove: (Double, Double) -> Void
+    var onEnd: () -> Void = {}
+
+    /// 画布的坐标空间名。手势读**这个空间里的绝对位置**，不用起点加位移 ——
+    /// 拖动中视图会因为数据变化不断重建，累加那套很容易错位或者干脆不跟手
+    static let space = "effectCenterCanvas"
+
+    var body: some View {
+        ZStack {
+            Circle().stroke(Color.white, lineWidth: 1.5).frame(width: 18, height: 18)
+            Circle().stroke(Color.black.opacity(0.4), lineWidth: 3).frame(width: 21, height: 21)
+            Circle().fill(Color.white).frame(width: 5, height: 5)
+        }
+        .contentShape(Circle().inset(by: -8))
+        .claimsDragFromWindow()
+        .onHover { $0 ? NSCursor.openHand.set() : NSCursor.arrow.set() }
+        .gesture(
+            DragGesture(minimumDistance: 0, coordinateSpace: .named(Self.space))
+                .onChanged { v in
+                    guard canvas.width > 0, canvas.height > 0 else { return }
+                    onMove(Double(min(max(v.location.x / canvas.width, 0), 1)),
+                           Double(min(max(v.location.y / canvas.height, 0), 1)))
+                }
+                .onEnded { _ in onEnd() }
+        )
+        .position(x: canvas.width * clip.centerX, y: canvas.height * clip.centerY)
     }
 }

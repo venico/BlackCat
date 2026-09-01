@@ -188,6 +188,8 @@ struct ContentView: View {
 
                         // Timeline card
                         VStack(spacing: 0) {
+                            TimelineTabBar()
+                                .fixedSize(horizontal: false, vertical: true)
                             TimelineToolbar()
                                 .fixedSize(horizontal: false, vertical: true)
                             TimelineView()

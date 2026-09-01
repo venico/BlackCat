@@ -8,6 +8,10 @@ extension ProjectState {
     // MARK: - Undo / Redo
 
     func pushUndo() {
+        // Agent 跑一轮期间不再打快照：整轮只在开跑前打一个，
+        // ⌘Z 一次回到它动手之前。工具内部各自 pushUndo 的话，
+        // 一轮会被切成好几步，撤一次只退回中间某个状态
+        guard !suppressUndoPush else { return }
         undoStack.append(currentSnapshot())
         if undoStack.count > 30 { undoStack.removeFirst() }
         redoStack.removeAll()
@@ -29,9 +33,13 @@ extension ProjectState {
     }
 
     func pushUndoSavingAssets() {
+        guard !suppressUndoPush else { return }   // 同 pushUndo，Agent 跑一轮期间不打快照
         var snap = currentSnapshot()
         snap.mediaAssets = mediaAssets
-        undoStack.append(snap)
+        // Agent 跑一轮期间不打快照，整轮共用开跑前那一个
+        if !suppressUndoPush {
+            undoStack.append(snap)
+        }
         if undoStack.count > 30 { undoStack.removeFirst() }
         redoStack.removeAll()
         undoCount = undoStack.count
@@ -107,6 +115,7 @@ extension ProjectState {
                         shapeTracks: shapeTracks,
                         filterTracks: filterTracks,
                         adjustTracks: adjustTracks,
+                        effectTracks: effectTracks,
                         compoundTracks: compoundTracks,
                         overlayTrackOrder: overlayTrackOrder,
                         videoSectionOrder: videoSectionOrder,
@@ -120,6 +129,7 @@ extension ProjectState {
     func applySnapshot(_ s: ProjectSnapshot) {
         filterTracks   = s.filterTracks
         adjustTracks   = s.adjustTracks
+        effectTracks   = s.effectTracks
         videoTracks    = s.videoTracks
         audioTracks    = s.audioTracks
         imageTracks    = s.imageTracks
@@ -278,7 +288,10 @@ extension ProjectState {
         }
 
         if changed {
-            undoStack.append(snap)
+            // Agent 跑一轮期间不打快照，整轮共用开跑前那一个
+            if !suppressUndoPush {
+                undoStack.append(snap)
+            }
             if undoStack.count > 30 { undoStack.removeFirst() }
             redoStack.removeAll()
             undoCount = undoStack.count
@@ -362,7 +375,10 @@ extension ProjectState {
         }
 
         if changed {
-            undoStack.append(snap)
+            // Agent 跑一轮期间不打快照，整轮共用开跑前那一个
+            if !suppressUndoPush {
+                undoStack.append(snap)
+            }
             if undoStack.count > 30 { undoStack.removeFirst() }
             redoStack.removeAll()
             undoCount = undoStack.count; redoCount = 0
@@ -449,7 +465,10 @@ extension ProjectState {
         }
 
         if changed {
-            undoStack.append(snap)
+            // Agent 跑一轮期间不打快照，整轮共用开跑前那一个
+            if !suppressUndoPush {
+                undoStack.append(snap)
+            }
             if undoStack.count > 30 { undoStack.removeFirst() }
             redoStack.removeAll()
             undoCount = undoStack.count; redoCount = 0
@@ -573,6 +592,7 @@ extension ProjectState {
                 case .shape: affected = shapeTracks.first(where: { $0.id == tid })?.clips.contains { ids.contains($0.id) } ?? false
                 case .filter: affected = filterTracks.first(where: { $0.id == tid })?.clips.contains { ids.contains($0.id) } ?? false
                 case .adjust: affected = adjustTracks.first(where: { $0.id == tid })?.clips.contains { ids.contains($0.id) } ?? false
+                case .effect: affected = effectTracks.first(where: { $0.id == tid })?.clips.contains { ids.contains($0.id) } ?? false
                 case .compound: affected = compoundTracks.first(where: { $0.id == tid })?.clips.contains { ids.contains($0.id) } ?? false
                 }
                 if affected { anchorOverlayIdx = oi; break }
@@ -732,7 +752,10 @@ extension ProjectState {
         syncOverlayOrder()
         syncVideoSectionOrder()
         syncAudioSectionOrder()
-        undoStack.append(snap)
+        // Agent 跑一轮期间不打快照，整轮共用开跑前那一个
+        if !suppressUndoPush {
+            undoStack.append(snap)
+        }
         if undoStack.count > 30 { undoStack.removeFirst() }
         redoStack.removeAll()
         undoCount = undoStack.count; redoCount = 0
@@ -989,7 +1012,10 @@ extension ProjectState {
                                                    : "内容已并入现有轨道",
                          autoCountdown: true)
 
-        undoStack.append(snap)
+        // Agent 跑一轮期间不打快照，整轮共用开跑前那一个
+        if !suppressUndoPush {
+            undoStack.append(snap)
+        }
         if undoStack.count > 30 { undoStack.removeFirst() }
         redoStack.removeAll()
         undoCount = undoStack.count; redoCount = 0
@@ -1014,6 +1040,7 @@ extension ProjectState {
         if let id = selectedShapeClipID    { ids.insert(id) }
         if let id = selectedFilterClipID   { ids.insert(id) }
         if let id = selectedAdjustClipID   { ids.insert(id) }
+        if let id = selectedEffectClipID   { ids.insert(id) }
         if let id = selectedCompoundClipID { ids.insert(id) }
         guard !ids.isEmpty else { return }
 
@@ -1057,6 +1084,11 @@ extension ProjectState {
             adjustTracks[i].clips.removeAll { ids.contains($0.id) }
             if adjustTracks[i].clips.count != before { changed = true }
         }
+        for i in effectTracks.indices {
+            let before = effectTracks[i].clips.count
+            effectTracks[i].clips.removeAll { ids.contains($0.id) }
+            if effectTracks[i].clips.count != before { changed = true }
+        }
         for i in compoundTracks.indices {
             let before = compoundTracks[i].clips.count
             compoundTracks[i].clips.removeAll { ids.contains($0.id) }
@@ -1074,7 +1106,10 @@ extension ProjectState {
         selectedClipIDs.removeAll()
 
         if changed {
-            undoStack.append(snap)
+            // Agent 跑一轮期间不打快照，整轮共用开跑前那一个
+            if !suppressUndoPush {
+                undoStack.append(snap)
+            }
             if undoStack.count > 30 { undoStack.removeFirst() }
             redoStack.removeAll()
             undoCount = undoStack.count
@@ -1106,6 +1141,9 @@ extension ProjectState {
         if let id = selectedSubtitleClipID { allIDs.insert(id) }
         if let id = selectedTextClipID     { allIDs.insert(id) }
         if let id = selectedShapeClipID    { allIDs.insert(id) }
+        if let id = selectedFilterClipID   { allIDs.insert(id) }
+        if let id = selectedAdjustClipID   { allIDs.insert(id) }
+        if let id = selectedEffectClipID   { allIDs.insert(id) }
         if let id = selectedCompoundClipID { allIDs.insert(id) }
 
         for id in allIDs {
@@ -1139,6 +1177,21 @@ extension ProjectState {
                     items.append(.shape(clip, trackIndex: ti)); srcIDs.insert(id)
                 }
             }
+            for (ti, track) in filterTracks.enumerated() {
+                if let clip = track.clips.first(where: { $0.id == id }) {
+                    items.append(.filter(clip, trackIndex: ti)); srcIDs.insert(id)
+                }
+            }
+            for (ti, track) in adjustTracks.enumerated() {
+                if let clip = track.clips.first(where: { $0.id == id }) {
+                    items.append(.adjust(clip, trackIndex: ti)); srcIDs.insert(id)
+                }
+            }
+            for (ti, track) in effectTracks.enumerated() {
+                if let clip = track.clips.first(where: { $0.id == id }) {
+                    items.append(.effect(clip, trackIndex: ti)); srcIDs.insert(id)
+                }
+            }
             for (ti, track) in compoundTracks.enumerated() {
                 if let clip = track.clips.first(where: { $0.id == id }) {
                     items.append(.compound(clip, trackIndex: ti)); srcIDs.insert(id)
@@ -1150,6 +1203,37 @@ extension ProjectState {
         clipboard = items
         clipboardIsCut = isCut
         clipboardSourceIDs = isCut ? srcIDs : []
+    }
+
+    /// 把一段效果片段（滤镜/调节）放进轨道：原轨道这段时间被占了就新开一条，
+    /// 新轨道要压在原轨道正上方 —— 效果类只作用于排在它下面的图层，
+    /// 顺序摆错了粘出来的东西作用范围就跟原来不是一回事
+    private func placeEffectClip<C: Identifiable & Equatable & Codable>(
+        _ clip: C, preferredTrack: Int,
+        tracks: inout [Track<C>], label: String,
+        ref: (UUID) -> OverlayTrackRef,
+        start: (C) -> Double, end: (C) -> Double
+    ) {
+        let idx = tracks.indices.contains(preferredTrack) ? preferredTrack : 0
+        guard tracks.indices.contains(idx) else {
+            var t = Track<C>(label: label)
+            t.clips.append(clip)
+            tracks.append(t)
+            syncOverlayOrder()
+            return
+        }
+        let overlaps = tracks[idx].clips.contains {
+            start($0) < end(clip) - 0.001 && end($0) > start(clip) + 0.001
+        }
+        if overlaps {
+            let anchorID = tracks[idx].id
+            var t = Track<C>(label: label)
+            t.clips.append(clip)
+            tracks.append(t)
+            insertOverlayRefAbove(ref(t.id), above: anchorID)
+        } else {
+            tracks[idx].clips.append(clip)
+        }
     }
 
     /// 粘贴剪贴板内容到当前播放头位置
@@ -1167,6 +1251,9 @@ extension ProjectState {
             for i in subtitleTracks.indices { subtitleTracks[i].clips.removeAll { srcIDs.contains($0.id) } }
             for i in textTracks.indices     { textTracks[i].clips.removeAll     { srcIDs.contains($0.id) } }
             for i in shapeTracks.indices    { shapeTracks[i].clips.removeAll    { srcIDs.contains($0.id) } }
+            for i in filterTracks.indices   { filterTracks[i].clips.removeAll   { srcIDs.contains($0.id) } }
+            for i in adjustTracks.indices   { adjustTracks[i].clips.removeAll   { srcIDs.contains($0.id) } }
+            for i in effectTracks.indices   { effectTracks[i].clips.removeAll   { srcIDs.contains($0.id) } }
             for i in compoundTracks.indices { compoundTracks[i].clips.removeAll { srcIDs.contains($0.id) } }
             clipboardIsCut = false
             clipboardSourceIDs = []
@@ -1180,6 +1267,9 @@ extension ProjectState {
             case .subtitle(let c, _): return c.startTime
             case .text(let c, _): return c.startTime
             case .shape(let c, _): return c.startTime
+            case .filter(let c, _): return c.startTime
+            case .adjust(let c, _): return c.startTime
+            case .effect(let c, _): return c.startTime
             case .compound(let c, _): return c.startTime
             }
         }
@@ -1364,6 +1454,44 @@ extension ProjectState {
                     selectedClipIDs.insert(newClip.id)
                 }
 
+            case .filter(let clip, let trackIdx):
+                var newClip = FilterClip(kind: clip.kind,
+                                         startTime: t + offset,
+                                         endTime: t + offset + clip.duration)
+                newClip.intensity = clip.intensity
+                newClip.lutPath = clip.lutPath
+                placeEffectClip(newClip, preferredTrack: trackIdx,
+                                tracks: &filterTracks, label: "滤镜",
+                                ref: { .filter($0) },
+                                start: { $0.startTime }, end: { $0.endTime })
+                selectedClipIDs.insert(newClip.id)
+
+            case .effect(let clip, let trackIdx):
+                var newClip = EffectClip(kind: clip.kind,
+                                         startTime: t + offset,
+                                         endTime: t + offset + clip.duration)
+                newClip.intensity = clip.intensity
+                newClip.amount = clip.amount
+                newClip.angle = clip.angle
+                newClip.centerX = clip.centerX
+                newClip.centerY = clip.centerY
+                placeEffectClip(newClip, preferredTrack: trackIdx,
+                                tracks: &effectTracks, label: "特效",
+                                ref: { .effect($0) },
+                                start: { $0.startTime }, end: { $0.endTime })
+                selectedClipIDs.insert(newClip.id)
+
+            case .adjust(let clip, let trackIdx):
+                var newClip = AdjustClip(startTime: t + offset,
+                                         endTime: t + offset + clip.duration)
+                newClip.adjust = clip.adjust
+                newClip.customName = clip.customName
+                placeEffectClip(newClip, preferredTrack: trackIdx,
+                                tracks: &adjustTracks, label: "调节",
+                                ref: { .adjust($0) },
+                                start: { $0.startTime }, end: { $0.endTime })
+                selectedClipIDs.insert(newClip.id)
+
             case .compound(let clip, let trackIdx):
                 var newClip = clip
                 newClip.id = UUID()
@@ -1400,7 +1528,10 @@ extension ProjectState {
         }
 
         syncOverlayOrder()
-        undoStack.append(snap)
+        // Agent 跑一轮期间不打快照，整轮共用开跑前那一个
+        if !suppressUndoPush {
+            undoStack.append(snap)
+        }
         if undoStack.count > 30 { undoStack.removeFirst() }
         redoStack.removeAll()
         undoCount = undoStack.count
@@ -1452,7 +1583,10 @@ extension ProjectState {
             }
         }
         if changed {
-            undoStack.append(snap)
+            // Agent 跑一轮期间不打快照，整轮共用开跑前那一个
+            if !suppressUndoPush {
+                undoStack.append(snap)
+            }
             if undoStack.count > 30 { undoStack.removeFirst() }
             redoStack.removeAll()
             undoCount = undoStack.count
@@ -1574,7 +1708,10 @@ extension ProjectState {
         videoTracks[trackIdx].clips.remove(at: clipIdx)
         videoTracks[trackIdx].clips.insert(contentsOf: splits, at: clipIdx)
 
-        undoStack.append(snap)
+        // Agent 跑一轮期间不打快照，整轮共用开跑前那一个
+        if !suppressUndoPush {
+            undoStack.append(snap)
+        }
         if undoStack.count > 30 { undoStack.removeFirst() }
         redoStack.removeAll()
         undoCount = undoStack.count
@@ -1726,7 +1863,10 @@ extension ProjectState {
         newTrack.clips = keeps
         videoTracks.append(newTrack)
 
-        undoStack.append(snap)
+        // Agent 跑一轮期间不打快照，整轮共用开跑前那一个
+        if !suppressUndoPush {
+            undoStack.append(snap)
+        }
         if undoStack.count > 30 { undoStack.removeFirst() }
         redoStack.removeAll()
         undoCount = undoStack.count

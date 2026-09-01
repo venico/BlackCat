@@ -28,72 +28,98 @@ struct SettingsView: View {
     @State private var separatedBytes: Int64 = 0
     @State private var cleanHint: String? = nil
     private let tabs = ["通用", "视频", "图片", "音频", "字幕", "AI 设置"]
+    /// 每个标签配的图标，全是现成的那套 SVG，不另画
+    private let tabIcons = ["settings", "video", "image", "audio", "subtitle", "ai"]
     /// 「AI 生成」在 tabs 里的位置。别处要跳过来，写死下标容易随改动失效
     static let aiTabIndex = 5
 
     var body: some View {
-        VStack(spacing: 0) {
-            HStack {
-                Text("设置")
-                    .font(.system(size: 15, weight: .semibold))
-                    .foregroundColor(Color.labelSecondary)
-                Spacer()
-                Button { dismiss() } label: {
-                    Image(systemName: "xmark")
-                        .font(.system(size: 12, weight: .medium))
+        // 左边一列标签、右边设置项。**竖着排才装得下越来越多的分类** ——
+        // 原来横着一排胶囊，加到第七八个就挤成一团了
+        HStack(spacing: 0) {
+            sidebar
+            // 跟主界面预览区/属性区之间那条一致：1pt 宽、白 10%
+            Rectangle()
+                .fill(Color.white.opacity(0.10))
+                .frame(width: 1)
+            VStack(spacing: 0) {
+                HStack {
+                    Image(nsImage: SidebarSVGIcon.load(tabIcons[min(selectedTab, tabIcons.count - 1)], size: 15))
+                        .renderingMode(.template)
                         .foregroundColor(Color.labelSecondary)
-                        .frame(width: 26, height: 26)
-                        .background(Color.white.opacity(0.08))
-                        .clipShape(Circle())
-                }
-                .buttonStyle(.plain)
-            }
-            .padding(.horizontal, 24)
-            .padding(.top, 24)
-            .padding(.bottom, 4)
-
-            // 标签栏
-            HStack(spacing: 0) {
-                ForEach(0..<tabs.count, id: \.self) { i in
-                    Button { selectedTab = i } label: {
-                        Text(tabs[i])
+                    Text(tabs[min(selectedTab, tabs.count - 1)])
+                        .font(.system(size: 15, weight: .semibold))
+                        .foregroundColor(Color.labelPrimary)
+                    Spacer()
+                    Button { dismiss() } label: {
+                        Image(systemName: "xmark")
                             .font(.system(size: 12, weight: .medium))
-                            .foregroundColor(selectedTab == i ? .white : Color.labelSecondary)
-                            .frame(maxWidth: .infinity)
-                            .frame(height: 26)
-                            .background(selectedTab == i ? Color.white.opacity(0.15) : Color.clear)
-                            .clipShape(Capsule())
-                            .contentShape(Capsule())
+                            .foregroundColor(Color.labelSecondary)
+                            .frame(width: 26, height: 26)
+                            .background(Color.white.opacity(0.08))
+                            .clipShape(Circle())
                     }
                     .buttonStyle(.plain)
                 }
-            }
-            .background(Color.white.opacity(0.06))
-            .clipShape(Capsule())
-            .padding(.horizontal, 24)
-            .padding(.top, 4)
-            .padding(.bottom, 8)
-
-            ScrollView {
-                VStack(alignment: .leading, spacing: 12) {
-                    switch selectedTab {
-                    case 0: saveTab
-                    case 1: sceneDetectTab
-                    case 2: imageTab
-                    case 3: audioTab
-                    case 4: subtitleTab
-                    case 5: aiVideoTab
-                    default: EmptyView()
-                    }
-                }
                 .padding(.horizontal, 24)
-                .padding(.vertical, 16)
+                .padding(.top, 20)
+                .padding(.bottom, 8)
+
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 12) {
+                        switch selectedTab {
+                        case 0: saveTab
+                        case 1: sceneDetectTab
+                        case 2: imageTab
+                        case 3: audioTab
+                        case 4: subtitleTab
+                        case 5: aiVideoTab
+                        default: EmptyView()
+                        }
+                    }
+                    .padding(.horizontal, 24)
+                    .padding(.bottom, 20)
+                }
             }
         }
-        .frame(width: 540, height: 520)
+        .frame(width: 720, height: 540)
         .background(Color.black.opacity(0.30))
         .floatingPanelMaterial()
         .onAppear { refreshModelStates(); refreshSceneDetectState(); refreshDemucsState(); refreshSeparated(); refreshBiRefNetStates(); refreshClarityModelStates(); refreshClarityProStates() }
+    }
+
+    private var sidebar: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text("设置")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundColor(Color.labelSecondary)
+                .padding(.horizontal, 14)
+                .padding(.top, 22).padding(.bottom, 10)
+
+            ForEach(0..<tabs.count, id: \.self) { i in
+                Button { selectedTab = i } label: {
+                    HStack(spacing: 7) {
+                        Image(nsImage: SidebarSVGIcon.load(tabIcons[i], size: 13))
+                            .renderingMode(.template)
+                            .foregroundColor(selectedTab == i ? Color.labelPrimary : Color.labelSecondary)
+                            .frame(width: 15)
+                        Text(tabs[i])
+                            .font(.system(size: 12, weight: selectedTab == i ? .medium : .regular))
+                            .foregroundColor(selectedTab == i ? Color.labelPrimary : Color.labelSecondary)
+                    }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 10)
+                        .frame(height: 28)
+                        .background(RoundedRectangle(cornerRadius: 6)
+                            .fill(selectedTab == i ? Color.white.opacity(0.12) : Color.clear))
+                        .contentShape(RoundedRectangle(cornerRadius: 6))
+                }
+                .buttonStyle(.plain)
+                .padding(.horizontal, 8)
+            }
+            Spacer()
+        }
+        .frame(width: 168)
     }
 
     /// 标签页内的一级标题，用来分块

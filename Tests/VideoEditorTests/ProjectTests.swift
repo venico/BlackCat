@@ -1005,7 +1005,9 @@ final class SubtitleSystemTests: XCTestCase {
     // TC-ST-006: 字幕字体切换
     func testST006_FontChange() {
         var style = SubtitleStyle()
-        XCTAssertEqual(style.fontName, "PingFang SC")
+        // 默认字体已改成思源黑体简体；这里只认「有个默认值且能被改掉」，
+        // 具体是哪个字体由 SubtitleDefaultFontTests 去管
+        XCTAssertFalse(style.fontName.isEmpty)
         style.fontName = "Helvetica"
         XCTAssertEqual(style.fontName, "Helvetica")
     }

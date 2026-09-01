@@ -289,6 +289,113 @@ final class ColorCompositor: NSObject, AVVideoCompositing {
         return liveFilterTracks
     }
 
+    /// 叠加层（图片/字幕/文字/图形/复合）。
+    ///
+    /// **画进帧里再做特效**，跟导出走同一份 OverlayRenderer ——
+    /// 原先预览是让 SwiftUI 单独画这些图层、各自套一遍特效，
+    /// 漩涡这种改几何的就会出现「图片扭一套、视频扭另一套」，两边对不上
+    struct OverlayInput {
+        var order: [ProjectState.OverlayTrackRef] = []
+        var imageTracks: [Track<ImageClip>] = []
+        var textTracks: [Track<TextClip>] = []
+        var shapeTracks: [Track<ShapeClip>] = []
+        var compoundTracks: [Track<CompoundClip>] = []
+        var subtitleInfo: OverlayRenderer.SubtitleRenderInfo? = nil
+        var imageCICache: [URL: CIImage] = [:]
+        var fontScale: CGFloat = 1
+    }
+    private static var liveOverlay = OverlayInput()
+
+    static func setOverlayInput(_ input: OverlayInput) {
+        lock.lock(); defer { lock.unlock() }
+        liveOverlay = input
+    }
+
+    static func getOverlayInput() -> OverlayInput {
+        lock.lock(); defer { lock.unlock() }
+        return liveOverlay
+    }
+
+    /// 把叠加层画到帧上。顺序跟导出一致：从底到顶
+    static func drawOverlays(_ image: CIImage, at t: Double, renderSize: CGSize) -> CIImage {
+        let input = getOverlayInput()
+        guard !input.order.isEmpty else { return image }
+        var out = image
+        var subtitleDone = false
+        for ref in input.order {
+            switch ref {
+            case .image(let tid):
+                guard let track = input.imageTracks.first(where: { $0.id == tid }), track.isVisible,
+                      let clip = track.clips.first(where: { $0.startTime <= t && $0.endTime > t }),
+                      let layer = OverlayRenderer.renderImageOverlay(
+                        clip: clip, renderSize: renderSize, ciCache: input.imageCICache)
+                else { continue }
+                out = layer.composited(over: out)
+            case .subtitle:
+                guard !subtitleDone, let info = input.subtitleInfo,
+                      let layer = OverlayRenderer.renderSubtitleOverlay(atTime: t, info: info)
+                else { continue }
+                subtitleDone = true
+                out = layer.composited(over: out)
+            case .text(let tid):
+                guard let track = input.textTracks.first(where: { $0.id == tid }), track.isVisible,
+                      let layer = OverlayRenderer.renderTextOverlay(
+                        atTime: t, clips: track.clips,
+                        fontScale: input.fontScale, renderSize: renderSize)
+                else { continue }
+                out = layer.composited(over: out)
+            case .shape(let tid):
+                guard let track = input.shapeTracks.first(where: { $0.id == tid }), track.isVisible,
+                      let layer = OverlayRenderer.renderShapeOverlay(
+                        atTime: t, clips: track.clips,
+                        scale: input.fontScale, renderSize: renderSize)
+                else { continue }
+                out = layer.composited(over: out)
+            case .compound(let tid):
+                guard let info = input.subtitleInfo else { continue }
+                out = OverlayRenderer.composeCompoundOverlays(
+                    trackID: tid, tracks: input.compoundTracks, atTime: t,
+                    onto: out, renderSize: renderSize,
+                    imageCICache: input.imageCICache, subtitleInfo: info)
+            case .filter(let tid):
+                // 滤镜只作用于排在它下面的图层，走到这一层就把已经画好的套一遍
+                guard let track = liveFilterTracks.first(where: { $0.id == tid }), track.isVisible
+                else { continue }
+                for clip in track.clips where clip.startTime <= t && clip.endTime > t {
+                    out = FilterEngine.apply(clip, to: out)
+                        .cropped(to: CGRect(origin: .zero, size: renderSize))
+                }
+            case .adjust(let tid):
+                guard let track = liveAdjustTracks.first(where: { $0.id == tid }), track.isVisible
+                else { continue }
+                for clip in track.clips where clip.startTime <= t && clip.endTime > t {
+                    out = ColorAdjust.apply(out, clip.adjust)
+                        .cropped(to: CGRect(origin: .zero, size: renderSize))
+                }
+            case .effect(let tid):
+                guard let track = liveEffectTracks.first(where: { $0.id == tid }), track.isVisible
+                else { continue }
+                for clip in track.clips where clip.startTime <= t && clip.endTime > t {
+                    out = EffectEngine.apply(clip, to: out, renderSize: renderSize)
+                        .cropped(to: CGRect(origin: .zero, size: renderSize))
+                }
+            }
+        }
+        return out
+    }
+
+    private static var liveEffectTracks: [Track<EffectClip>] = []
+
+    static func setEffectTracks(_ tracks: [Track<EffectClip>]) {
+        lock.lock(); defer { lock.unlock() }
+        liveEffectTracks = tracks
+    }
+
+    static func getEffectTracks() -> [Track<EffectClip>] {
+        lock.lock(); defer { lock.unlock() }
+        return liveEffectTracks
+    }
+
     static func setAdjustTracks(_ tracks: [Track<AdjustClip>]) {
         lock.lock(); defer { lock.unlock() }
         liveAdjustTracks = tracks
@@ -384,13 +491,9 @@ final class ColorCompositor: NSObject, AVVideoCompositing {
                 ci = ci.cropped(to: CGRect(x: 0, y: 0, width: outW, height: outH))
                 let box = CGRect(x: 0, y: 0, width: outW, height: outH)
                 let t = req.compositionTime.seconds
-                let tracks = Self.getFilterTracks()
-                if !tracks.isEmpty {
-                    ci = FilterEngine.apply(ci, tracks: tracks, at: t).cropped(to: box)
-                }
-                if !Self.getAdjustTracks().isEmpty {
-                    ci = Self.applyAdjustTracks(ci, at: t).cropped(to: box)
-                }
+                // 叠加层和三类效果轨道都在这一步：按图层顺序从底往上画，
+                // 走到效果那一层就把已经画好的整帧套一遍 —— 跟导出同一个套路
+                ci = Self.drawOverlays(ci, at: t, renderSize: box.size).cropped(to: box)
                 Self.sharedCtx.render(ci, to: outBuf,
                                       bounds: CGRect(x: 0, y: 0, width: outW, height: outH),
                                       colorSpace: CGColorSpaceCreateDeviceRGB())
@@ -544,13 +647,8 @@ final class ColorCompositor: NSObject, AVVideoCompositing {
 
         // 8. 滤镜：全部画面合成完之后再套，所以这段时间内谁都跑不掉。
         //    取静态存储而不是 data，跟上面那条透传路径同一个来源
-        let filters = Self.getFilterTracks()
-        if !filters.isEmpty {
-            result = FilterEngine.apply(result, tracks: filters, at: t).cropped(to: bounds)
-        }
-        if !Self.getAdjustTracks().isEmpty {
-            result = Self.applyAdjustTracks(result, at: t).cropped(to: bounds)
-        }
+        // 8. 叠加层 + 三类效果轨道，按图层顺序一次走完（见 drawOverlays）
+        result = Self.drawOverlays(result, at: t, renderSize: bounds.size).cropped(to: bounds)
 
         Self.sharedCtx.render(result, to: outBuf,
                               bounds: bounds,

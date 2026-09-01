@@ -125,6 +125,19 @@ extension ProjectState {
         compoundTracks = doc.compoundTracks ?? []
         videoSectionOrder = doc.videoSectionOrder ?? []
         audioSectionOrder = doc.audioSectionOrder ?? []
+        effectTracks = doc.effectTracks ?? []
+
+        // 新文件带整组标签页，直接用；老文件没有这一层，
+        // 上面刚读进来的那套轨道就是它唯一的时间线，收成一个标签页
+        if let saved = doc.tabs, !saved.isEmpty {
+            tabs = saved
+            activeTab = min(max(doc.activeTab ?? 0, 0), saved.count - 1)
+            // 全关着的话至少把当前这个打开，否则轨道区空着还找不回来
+            if !tabs.contains(where: { $0.isTabOpen }) { tabs[activeTab].isTabOpen = true }
+        } else if tabs.count == 1 {
+            tabs[0].name = "时间线 1"
+        }
+
         exportSettings = doc.exportSettings
         previewResolution = doc.previewResolution
         previewAspectRatio = doc.previewAspectRatio ?? "原始"
@@ -221,6 +234,11 @@ extension ProjectState {
             shapeTracks: shapeTracks.isEmpty ? nil : shapeTracks,
             filterTracks: filterTracks.isEmpty ? nil : filterTracks,
             adjustTracks: adjustTracks.isEmpty ? nil : adjustTracks,
+            effectTracks: effectTracks.isEmpty ? nil : effectTracks,
+            // 新文件真正读的是 tabs；上面那些散字段照旧写着，
+            // 老版本 app 打开这个文件时还能读出第一个标签页的内容
+            tabs: tabs,
+            activeTab: activeTab,
             // 素材库已全局化（v5.1.0），项目文件不再存素材清单。
             // 字段留着写空数组、不改成 optional —— 老版本 app 那边它是必需字段，
             // 省掉这个键会让旧版本直接解析失败、项目打不开

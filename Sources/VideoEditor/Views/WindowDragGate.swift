@@ -66,6 +66,7 @@ enum FileDropRouter {
         case asset(UUID)
         case shape(ShapeType)
         case filter(FilterKind)
+        case effect(EffectKind)
         case adjust
     }
 
@@ -116,6 +117,8 @@ enum FileDropRouter {
     /// 滤镜卡片拖出去的载荷，同理带前缀区分
     static let filterPrefix = "filter:"
     static func pasteboardString(for kind: FilterKind) -> String { filterPrefix + kind.rawValue }
+    static let effectPrefix = "effect:"
+    static func pasteboardString(for kind: EffectKind) -> String { effectPrefix + kind.rawValue }
     /// 调节只有一种，载荷是个固定串
     static let adjustPasteboardString = "adjust:default"
 
@@ -197,6 +200,10 @@ final class GatedHostingView<Content: View>: NSHostingView<Content> {
                let k = FilterKind(rawValue: String(s.dropFirst(FileDropRouter.filterPrefix.count))) {
                 return .filter(k)
             }
+            if s.hasPrefix(FileDropRouter.effectPrefix),
+               let k = EffectKind(rawValue: String(s.dropFirst(FileDropRouter.effectPrefix.count))) {
+                return .effect(k)
+            }
         }
         // Finder 拖进来的文件。只认 file:// —— 别把应用内那些串当成 URL
         if let urls = pb.readObjects(forClasses: [NSURL.self],
@@ -252,6 +259,7 @@ final class GatedHostingView<Content: View>: NSHostingView<Content> {
         case .asset(let id):   what = "素材=\(id.uuidString.prefix(8))"
         case .shape(let t):    what = "图形=\(t.rawValue)"
         case .filter(let k):   what = "滤镜=\(k.rawValue)"
+        case .effect(let k):   what = "特效=\(k.rawValue)"
         case .adjust:          what = "调节"
         }
         DiagLog.log("[拖入] 落点=\(pt) \(what) 接收=\(accepted)")

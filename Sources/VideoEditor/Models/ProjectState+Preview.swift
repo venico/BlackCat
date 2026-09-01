@@ -9,8 +9,58 @@ extension ProjectState {
 
     /// Debounced rebuild — coalesces rapid changes (e.g. dragging sliders)
     /// into a single rebuild after a short delay, preventing flicker.
+    /// 把叠加层的当前状态推给合成器，并逼一帧重绘。
+    ///
+    /// 叠加层现在是**合成器画的**，合成器只认这份静态数据 ——
+    /// 改了位置、缩放、显隐之后不推过去的话，画面会一直停在旧的那一帧，
+    /// 表现就是「加了效果轨道之后，图层怎么调都没反应」。
+    /// 整份 composition 重建照旧走防抖，这里只更新数据，很轻
+    func refreshOverlayComposite() {
+        guard !isShutDown, overlayDrawnByCompositor else { return }
+        // 三类效果轨道的参数也一起推。只推图层不推它们的话，
+        // 拖滤镜强度、改特效参数时合成器手上还是旧的那份
+        ColorCompositor.setFilterTracks(filterTracks)
+        ColorCompositor.setAdjustTracks(adjustTracks)
+        ColorCompositor.setEffectTracks(effectTracks)
+        ColorCompositor.setOverlayInput(makeOverlayInput())
+        clock.refreshSeekRequest &+= 1
+    }
+
+    /// 叠加层是不是交给合成器画的。有效果轨道时才是 ——
+    /// 没有的话 SwiftUI 自己重绘就够了，不用每次改动都去惊动播放器
+    var overlayDrawnByCompositor: Bool {
+        !filterTracks.isEmpty || !adjustTracks.isEmpty || !effectTracks.isEmpty
+    }
+
+    func makeOverlayInput() -> ColorCompositor.OverlayInput {
+        ColorCompositor.OverlayInput(
+            order: Self.overlayLayersBottomUp(
+                overlayTrackOrder: overlayTrackOrder,
+                imageTracks: imageTracks, subtitleTracks: subtitleTracks,
+                textTracks: textTracks, shapeTracks: shapeTracks,
+                filterTracks: filterTracks, adjustTracks: adjustTracks,
+                effectTracks: effectTracks, compoundTracks: compoundTracks),
+            imageTracks: imageTracks,
+            textTracks: textTracks,
+            shapeTracks: shapeTracks,
+            compoundTracks: compoundTracks,
+            subtitleInfo: OverlayRenderer.SubtitleRenderInfo(
+                tracks: subtitleTracks.compactMap { t in
+                    guard t.isVisible && !t.clips.isEmpty else { return nil }
+                    return (t, t.subtitleStyle ?? SubtitleStyle())
+                },
+                fontScale: 1,
+                bottomMargin: subtitleBottomMargin,
+                lineSpacing: CGFloat(subtitleLineSpacing),
+                renderSize: previewRenderSize),
+            imageCICache: [:],
+            fontScale: 1)
+    }
+
     func rebuildTimelinePreviewDebounced() {
         guard !isShutDown else { return }
+        // 数据先推过去，画面立刻跟上；重建这种重活才等防抖
+        refreshOverlayComposite()
         rebuildDebounceTimer?.invalidate()
         rebuildDebounceTimer = Timer.scheduledTimer(withTimeInterval: 0.15, repeats: false) { [weak self] _ in
             self?.rebuildTimelinePreview()
@@ -32,6 +82,10 @@ extension ProjectState {
         // 跟上面几条一样先快照。异步任务里直接读 self 的话，
         // 隐藏/显示这种一改就要立刻见效的开关容易慢一拍
         let fTracks = filterTracks
+        let fxTracks = effectTracks
+        let overlayOrder = overlayTrackOrder
+        let subBottomMargin = subtitleBottomMargin
+        let subLineSpacing = subtitleLineSpacing
         let adjTracks = adjustTracks
         let vSectionOrder = videoSectionOrder
         let restoreTime = seekTo ?? currentTime
@@ -63,6 +117,11 @@ extension ProjectState {
             .map { "\($0.id)\($0.kind.rawValue)\($0.startTime)\($0.endTime)\($0.intensity)\($0.lutPath ?? "")" }
             .joined())
         hasher.combine(fTracks.map { "\($0.isVisible)" }.joined())
+        // 特效也要进指纹，漏了的话新加一段特效会被当成「没变化」直接跳过重建
+        hasher.combine(fxTracks.flatMap(\.clips)
+            .map { "\($0.id)\($0.kind.rawValue)\($0.startTime)\($0.endTime)\($0.intensity)\($0.amount)\($0.angle)\($0.centerX)\($0.centerY)" }
+            .joined())
+        hasher.combine(fxTracks.map { "\($0.isVisible)" }.joined())
         // 调节也得进指纹，漏了的话新加/改参数会被当成「没变化」直接跳过重建
         hasher.combine(adjTracks.flatMap(\.clips).map {
             "\($0.id)\($0.startTime)\($0.endTime)\($0.adjust)"
@@ -546,6 +605,7 @@ extension ProjectState {
             // 没有视频轨时也要清掉静态存的滤镜，不然上一个项目的还留着
             if allVideoTracks.isEmpty {
                 ColorCompositor.setFilterTracks([]); ColorCompositor.setAdjustTracks([])
+                ColorCompositor.setEffectTracks([])
             }
             if !allVideoTracks.isEmpty && composition.duration.seconds > 0.01 {
                 let vc = AVMutableVideoComposition()
@@ -584,6 +644,10 @@ extension ProjectState {
                 // 滤镜单独存一份静态的：合成器有条「透传」快路径拿不到指令数据
                 ColorCompositor.setFilterTracks(fTracks)
                 ColorCompositor.setAdjustTracks(adjTracks)
+                ColorCompositor.setEffectTracks(fxTracks)
+                // 叠加层也交给合成器画。**这样特效才是作用在合成后的整帧上**，
+                // 跟导出完全一致；预览再单独画一遍的话，几何类特效两边对不上
+                ColorCompositor.setOverlayInput(makeOverlayInput())
                 var colorInstructions: [AVVideoCompositionInstruction] = []
                 for i in 0..<(sortedCM.count - 1) {
                     let segStartCM = sortedCM[i]

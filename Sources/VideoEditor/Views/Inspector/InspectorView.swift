@@ -37,6 +37,8 @@ struct InspectorView: View {
                         )
                     } else if let clip = project.selectedAdjustClip {
                         AdjustInspector(clip: clip).id(clip.id)
+                    } else if let clip = project.selectedEffectClip {
+                        EffectInspector(clip: clip).id(clip.id)
                     } else if let clip = project.selectedFilterClip {
                         FilterInspector(clip: clip).id(clip.id)
                     } else if let transID = project.selectedTransitionClipID {
@@ -128,6 +130,7 @@ struct InspectorView: View {
     private var tag: String {
         if project.selectedClipIDs.count > 1 { return "已选 \(project.selectedClipIDs.count) 个" }
         if project.selectedAdjustClipID != nil { return "调节" }
+        if project.selectedEffectClipID != nil { return "特效" }
         if project.selectedFilterClipID != nil { return "滤镜" }
         if project.selectedTransitionClipID != nil { return "转场" }
         if project.selectedTextClipID       != nil { return "文字" }
@@ -145,6 +148,7 @@ struct InspectorView: View {
         // 除了文字和图形有各自的删除，其余（含多选）都走时间轴那个统一入口
         if project.selectedClipIDs.count > 1 { return { project.deleteSelected() } }
         if let id = project.selectedAdjustClipID { return { project.deleteAdjustClip(id: id) } }
+        if let id = project.selectedEffectClipID { return { project.deleteEffectClip(id: id) } }
         if let id = project.selectedFilterClipID { return { project.deleteFilterClip(id: id) } }
         if let id = project.selectedTextClipID { return { project.deleteTextClip(id: id) } }
         if let id = project.selectedShapeClipID { return { project.deleteShapeClip(id: id) } }
@@ -3287,5 +3291,119 @@ struct FilterInspector: View {
         guard !syncing else { return }
         project.pushUndoThrottled()
         project.updateFilterClip(id: clip.id, mutate)
+    }
+}
+
+
+// MARK: - 特效属性
+
+struct EffectInspector: View {
+    let clip: EffectClip
+    @EnvironmentObject private var project: ProjectState
+
+    @State private var intensity: Double = 100
+    @State private var amount: Double = 30
+    @State private var angle: Double = 0
+    @State private var centerX: Double = 50
+    @State private var centerY: Double = 50
+    @State private var startTime: Double = 0
+    @State private var duration: Double = 3
+    @State private var syncing = false
+
+    /// 主参数在界面上叫什么。同样是「尺寸」，不同特效的说法不一样
+    private var amountLabel: String {
+        switch clip.kind {
+        case .pixellate, .crystallize, .pointillize: return "颗粒"
+        case .cmykHalftone, .dotScreen, .lineScreen,
+             .circularScreen, .hatchedScreen:        return "网点"
+        case .twirl, .vortex, .bump, .pinch, .hole,
+             .circleSplash, .lightTunnel:            return "范围"
+        case .edges:                                 return "强弱"
+        case .noiseReduction:                        return "力度"
+        default:                                     return "半径"
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            ISection(title: "特效") {
+                IFieldRow(label: "名称") {
+                    Text(clip.name)
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundColor(Color.labelPrimary)
+                }
+                ISlider(label: "强度", value: $intensity, range: 0...100, unit: "%")
+                    .onChange(of: intensity) { _ in write { $0.intensity = intensity / 100 } }
+                if clip.kind.amountScale != nil || clip.kind == .edges || clip.kind == .noiseReduction {
+                    ISlider(label: amountLabel, value: $amount, range: 0...100, unit: "%")
+                        .onChange(of: amount) { _ in write { $0.amount = amount / 100 } }
+                }
+                if clip.kind.usesAngle {
+                    ISlider(label: "角度", value: $angle,
+                            range: clip.kind.angleRange, unit: "°", decimals: 0)
+                        .onChange(of: angle) { _ in write { $0.angle = angle } }
+                }
+            }
+
+            if clip.kind.usesCenter {
+                ISection(title: "中心点") {
+                    ISlider(label: "水平", value: $centerX, range: 0...100, unit: "%")
+                        .onChange(of: centerX) { _ in write { $0.centerX = centerX / 100 } }
+                    ISlider(label: "垂直", value: $centerY, range: 0...100, unit: "%")
+                        .onChange(of: centerY) { _ in write { $0.centerY = centerY / 100 } }
+                    Text("也可以直接在预览区拖那个圆点")
+                        .font(.system(size: 9))
+                        .foregroundColor(Color.labelSecondary.opacity(0.6))
+                }
+            }
+
+            ISection(title: "时间") {
+                let span = max(project.contentEndTime, 1)
+                ISlider(label: "开始", value: $startTime, range: 0...span, unit: "秒", decimals: 2)
+                    .onChange(of: startTime) { _ in
+                        write { $0.startTime = startTime; $0.endTime = startTime + duration }
+                    }
+                ISlider(label: "持续", value: $duration, range: 0.1...span, unit: "秒", decimals: 2)
+                    .onChange(of: duration) { _ in
+                        write { $0.endTime = $0.startTime + max(0.1, duration) }
+                    }
+            }
+        }
+        .onAppear { sync() }
+        .onChange(of: clip.id) { _ in sync() }
+        .onChange(of: clip.centerX) { v in if !syncing { centerX = v * 100 } }
+        .onChange(of: clip.centerY) { v in if !syncing { centerY = v * 100 } }
+        // 在时间轴上拖片段两端改的是 clip，属性区这两个数得跟着回来。
+        // **回填时必须挡住写回**：不挡的话回填会触发滑块自己的 onChange，
+        // 那边又拿旧的 duration 去算 endTime —— 拖左边右边跟着抖就是这么来的
+        .onChange(of: clip.startTime) { v in syncBack() }
+        .onChange(of: clip.endTime)   { _ in syncBack() }
+    }
+
+    /// 从 clip 把时间回填到滑块，期间不许写回
+    private func syncBack() {
+        guard !syncing else { return }
+        syncing = true
+        startTime = clip.startTime
+        duration = clip.duration
+        DispatchQueue.main.async { syncing = false }
+    }
+
+    private func sync() {
+        syncing = true
+        intensity = clip.intensity * 100
+        amount = clip.amount * 100
+        angle = clip.angle
+        centerX = clip.centerX * 100
+        centerY = clip.centerY * 100
+        startTime = clip.startTime
+        duration = clip.duration
+        syncing = false
+    }
+
+    private func write(_ mutate: @escaping (inout EffectClip) -> Void) {
+        guard !syncing else { return }
+        project.pushUndoThrottled()
+        project.updateEffectClip(id: clip.id, mutate)
     }
 }

@@ -66,3 +66,38 @@ final class InspectorLayoutTests: XCTestCase {
                                  "速度那一组要 \(need)pt，比属性区下限 \(InspectorLayout.minWidth)pt 还宽")
     }
 }
+
+/// 字幕默认字号：纯英文小一档，含中文（含双语）保持大档
+final class SubtitleDefaultSizeTests: XCTestCase {
+    func testPureEnglishGetsSmallerSize() {
+        XCTAssertEqual(SubtitleStyle.defaultFontSize(
+            forSubtitles: ["Hello there", "How are you?"]), 32)
+    }
+    func testChineseKeepsLargeSize() {
+        XCTAssertEqual(SubtitleStyle.defaultFontSize(forSubtitles: ["你好", "今天天气不错"]), 48)
+    }
+    func testBilingualCountsAsChinese() {
+        XCTAssertEqual(SubtitleStyle.defaultFontSize(
+            forSubtitles: ["Hello there", "你好"]), 48, "中英都有的按中文走")
+        XCTAssertEqual(SubtitleStyle.defaultFontSize(
+            forSubtitles: ["Hello there\n你好"]), 48, "同一条里中英各一行也算")
+    }
+    func testMergeLineBreaksDefaultsOn() {
+        XCTAssertTrue(SubtitleStyle().mergeLineBreaks, "合并换行默认该是开的")
+    }
+}
+
+/// 字幕默认字体得是这台机器上真装了的 —— 名字写错不会报错，
+/// 只会静默回退到系统字体，表现成「改了没效果」
+final class SubtitleDefaultFontTests: XCTestCase {
+    func testDefaultFontIsInstalled() {
+        let name = SubtitleStyle().fontName
+        XCTAssertNotNil(NSFont(name: name, size: 24), "系统里没有「\(name)」这个字体")
+    }
+    func testDefaultFontSupportsBold() {
+        let name = SubtitleStyle().fontName
+        guard let f = NSFont(name: name, size: 24) else { return XCTFail("字体缺失") }
+        let bold = NSFontManager.shared.convert(f, toHaveTrait: .boldFontMask)
+        XCTAssertNotEqual(bold.fontName, f.fontName, "「\(name)」切不到粗体，字幕加粗会没反应")
+    }
+}

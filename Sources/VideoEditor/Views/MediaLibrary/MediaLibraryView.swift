@@ -153,8 +153,7 @@ struct MediaLibraryView: View {
                     case "effTransition": TransitionPanel()
                     case "effFilter": FilterPanel()
                     case "effAdjust": AdjustPanel()
-                    // 特效还没做，先占个位
-                    default: effectPlaceholder
+                    default: EffectPanel()
                     }
                 } else if filteredAssets.isEmpty {
                     emptyState
@@ -472,6 +471,8 @@ private struct AssetRow: View {
                 normalAssetRow
             }
         }
+        // 内容不贴着底色边缘 —— 音频和字幕没有封面打头，标题会直接顶到边上
+        .padding(.leading, 4)
         .background(
             RoundedRectangle(cornerRadius: 8)
                 .fill(hovered ? Color.white.opacity(0.08) : Color.clear)
@@ -595,6 +596,54 @@ private struct AssetRow: View {
 
     // MARK: Normal asset row — audio / subtitle
 
+    /// 字幕和音频的格式标签：文字就是扩展名本身，每种格式一个颜色。
+    /// 视频和图片有封面可认，不挂标签
+    private var formatTag: (text: String, color: Color)? {
+        guard asset.type == .subtitle || asset.type == .audio else { return nil }
+        let ext = asset.url.pathExtension.uppercased()
+        guard !ext.isEmpty else { return nil }
+        let color: Color
+        switch ext {
+        // 字幕
+        case "SRT":  color = Color(hex: "#7B6FC4")
+        case "ASS", "SSA": color = Color(hex: "#C4708F")
+        case "VTT":  color = Color(hex: "#5B8FF9")
+        case "LRC":  color = Color(hex: "#3F8F6B")
+        case "TXT":  color = Color(hex: "#8A8F9A")
+        // 音频
+        case "MP3":  color = Color(hex: "#5DB85D")
+        case "WAV":  color = Color(hex: "#3DBFBA")
+        case "M4A", "AAC": color = Color(hex: "#E8A54B")
+        case "FLAC": color = Color(hex: "#9B6FD4")
+        case "AIFF", "AIF": color = Color(hex: "#D4668E")
+        case "OGG", "OPUS": color = Color(hex: "#FF9F43")
+        default:     color = Color(hex: "#8A8F9A")
+        }
+        return (ext, color)
+    }
+
+    /// 名字，前面内联一个格式标签
+    private var titleWithTag: Text {
+        guard let tag = formatTag,
+              let img = FormatTagImage.image(text: tag.text, color: tag.color)
+        else { return Text(breakableName) }
+        return Text(Image(nsImage: img)).baselineOffset(-1) + Text(" " + breakableName)
+    }
+
+    /// 给长文件名塞软换行点（下划线、连字符、点后面各加一个零宽空格）。
+    ///
+    /// `Think_Different_Crazy_Ones` 这种整串没有空格的名字算**一个不可断的词**，
+    /// 第一行剩下的宽度放不下它就整体挪到第二行，把标签孤零零留在上面一行。
+    /// 零宽空格本身不显示、也不进文件名，只是给排版一个可以断开的位置
+    private var breakableName: String {
+        var out = ""
+        for ch in asset.name {
+            out.append(ch)
+            if ch == "_" || ch == "-" || ch == "." { out.append("\u{200B}") }
+        }
+        return out
+    }
+
     private var normalAssetRow: some View {
         // spacing 0：名字长到撑满时 Spacer 压到 0，行内不再有任何死间距，
         // 名字能一直排到按钮跟前（按钮自己的 padding 就是视觉间隔）
@@ -635,7 +684,9 @@ private struct AssetRow: View {
                 if isRenaming {
                     nameEditor(fontSize: 12)
                 } else {
-                    Text(asset.name)
+                    // 格式标签**内联进文字里**（渲染成图片当字符用），不是并排的两个视图。
+                    // 并排的话名字换到第二行会缩在标签右边；内联之后第二行顶到标签左边缘
+                    titleWithTag
                         .font(.system(size: 12))
                         .foregroundColor(asset.fileExists ? Color.labelPrimary : Color.labelSecondary)
                         .lineLimit(2)
@@ -2345,6 +2396,9 @@ enum SidebarSVGIcon {
         "transition": """
         <svg width="24px" height="24px" viewBox="0 0 24 24" version="1.1" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink"><title>特效</title><g id="特效" stroke="none" fill="none" fill-rule="evenodd"><path d="M11.0519818,1.25648246 C11.4023452,1.45184709 11.5371808,1.88907053 11.806852,2.7635174 L13.2782079,7.53459598 C13.4544579,8.10611137 13.5425829,8.39186907 13.6756793,8.60812195 C13.7936364,8.79977678 13.9430943,8.97014883 14.1177559,9.11205999 C14.3148346,9.27218483 14.5866826,9.39677258 15.1303787,9.6459481 L17.8652067,10.8993177 C18.6094708,11.2404133 18.9816029,11.4109612 19.1386603,11.7308311 C19.2751484,12.0088087 19.2751484,12.3343371 19.1386603,12.6123147 C18.9816029,12.9321846 18.6094708,13.1027324 17.8652067,13.4438281 L15.1303787,14.6971977 C14.5866826,14.9463732 14.3148346,15.0709609 14.1177559,15.2310858 C13.9430943,15.3729969 13.7936364,15.543369 13.6756793,15.7350238 C13.5425829,15.9512767 13.4544579,16.2370344 13.2782079,16.8085498 L11.806852,21.5796283 C11.5371808,22.4540752 11.4023452,22.8912987 11.0519818,23.0866633 C10.7492495,23.2554686 10.3806928,23.2554686 10.0779605,23.0866633 C9.72759714,22.8912987 9.59276153,22.4540752 9.32309031,21.5796283 L7.85173439,16.8085498 C7.67548439,16.2370344 7.5873594,15.9512767 7.45426299,15.7350238 C7.33630587,15.543369 7.18684802,15.3729969 7.01218641,15.2310858 C6.81510776,15.0709609 6.5432597,14.9463732 5.99956358,14.6971977 L3.26473558,13.4438281 C2.52047147,13.1027324 2.14833942,12.9321846 1.99128204,12.6123147 C1.85479394,12.3343371 1.85479394,12.0088087 1.99128204,11.7308311 C2.14833942,11.4109612 2.52047147,11.2404133 3.26473558,10.8993177 L5.99956358,9.6459481 C6.5432597,9.39677258 6.81510776,9.27218483 7.01218641,9.11205999 C7.18684802,8.97014883 7.33630587,8.79977678 7.45426299,8.60812195 C7.5873594,8.39186907 7.67548439,8.10611137 7.85173439,7.53459598 L9.32309031,2.7635174 C9.59276153,1.88907053 9.72759714,1.45184709 10.0779605,1.25648246 C10.3806928,1.08767714 10.7492495,1.08767714 11.0519818,1.25648246 Z M18.2435053,2.1889014 C18.418687,2.28658372 18.4861048,2.50519544 18.6209404,2.94241887 L18.8866425,3.80399532 C18.930705,3.94687417 18.9527363,4.01831359 18.9860104,4.07237681 C19.0154997,4.12029052 19.0528641,4.16288353 19.0965295,4.19836132 C19.1457992,4.23839253 19.2137612,4.26953947 19.3496852,4.33183335 L19.7939625,4.53544528 C20.1660945,4.70599311 20.3521606,4.79126703 20.4306893,4.95120198 C20.4989333,5.09019078 20.4989333,5.25295497 20.4306893,5.39194377 C20.3521606,5.55187872 20.1660945,5.63715264 19.7939625,5.80770047 L19.3496852,6.0113124 C19.2137612,6.07360628 19.1457992,6.10475322 19.0965295,6.14478443 C19.0528641,6.18026222 19.0154997,6.22285523 18.9860104,6.27076894 C18.9527363,6.32483216 18.930705,6.39627158 18.8866425,6.53915043 L18.6209404,7.40072688 C18.4861048,7.83795032 18.418687,8.05656203 18.2435053,8.15424435 C18.0921392,8.23864701 17.9078608,8.23864701 17.7564947,8.15424435 C17.581313,8.05656203 17.5138952,7.83795032 17.3790596,7.40072688 L17.1133575,6.53915043 C17.069295,6.39627158 17.0472637,6.32483216 17.0139896,6.27076894 C16.9845003,6.22285523 16.9471359,6.18026222 16.9034705,6.14478443 C16.8542008,6.10475322 16.7862388,6.07360628 16.6503148,6.0113124 L16.2060375,5.80770047 C15.8339055,5.63715264 15.6478394,5.55187872 15.5693107,5.39194377 C15.5010667,5.25295497 15.5010667,5.09019078 15.5693107,4.95120198 C15.6478394,4.79126703 15.8339055,4.70599311 16.2060375,4.53544528 L16.6503148,4.33183335 C16.7862388,4.26953947 16.8542008,4.23839253 16.9034705,4.19836132 C16.9471359,4.16288353 16.9845003,4.12029052 17.0139896,4.07237681 C17.0472637,4.01831359 17.069295,3.94687417 17.1133575,3.80399532 L17.3790596,2.94241887 C17.5138952,2.50519544 17.581313,2.28658372 17.7564947,2.1889014 C17.9078608,2.10449874 18.0921392,2.10449874 18.2435053,2.1889014 Z" id="形状结合" fill="#FFFFFF"></path></g></svg>
         """,
+        "effect": """
+        <svg width="24px" height="24px" viewBox="0 0 24 24" version="1.1" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink"><title>特效</title><g id="特效" stroke="none" fill="none" fill-rule="evenodd"><path d="M11.0519818,1.25648246 C11.4023452,1.45184709 11.5371808,1.88907053 11.806852,2.7635174 L13.2782079,7.53459598 C13.4544579,8.10611137 13.5425829,8.39186907 13.6756793,8.60812195 C13.7936364,8.79977678 13.9430943,8.97014883 14.1177559,9.11205999 C14.3148346,9.27218483 14.5866826,9.39677258 15.1303787,9.6459481 L17.8652067,10.8993177 C18.6094708,11.2404133 18.9816029,11.4109612 19.1386603,11.7308311 C19.2751484,12.0088087 19.2751484,12.3343371 19.1386603,12.6123147 C18.9816029,12.9321846 18.6094708,13.1027324 17.8652067,13.4438281 L15.1303787,14.6971977 C14.5866826,14.9463732 14.3148346,15.0709609 14.1177559,15.2310858 C13.9430943,15.3729969 13.7936364,15.543369 13.6756793,15.7350238 C13.5425829,15.9512767 13.4544579,16.2370344 13.2782079,16.8085498 L11.806852,21.5796283 C11.5371808,22.4540752 11.4023452,22.8912987 11.0519818,23.0866633 C10.7492495,23.2554686 10.3806928,23.2554686 10.0779605,23.0866633 C9.72759714,22.8912987 9.59276153,22.4540752 9.32309031,21.5796283 L7.85173439,16.8085498 C7.67548439,16.2370344 7.5873594,15.9512767 7.45426299,15.7350238 C7.33630587,15.543369 7.18684802,15.3729969 7.01218641,15.2310858 C6.81510776,15.0709609 6.5432597,14.9463732 5.99956358,14.6971977 L3.26473558,13.4438281 C2.52047147,13.1027324 2.14833942,12.9321846 1.99128204,12.6123147 C1.85479394,12.3343371 1.85479394,12.0088087 1.99128204,11.7308311 C2.14833942,11.4109612 2.52047147,11.2404133 3.26473558,10.8993177 L5.99956358,9.6459481 C6.5432597,9.39677258 6.81510776,9.27218483 7.01218641,9.11205999 C7.18684802,8.97014883 7.33630587,8.79977678 7.45426299,8.60812195 C7.5873594,8.39186907 7.67548439,8.10611137 7.85173439,7.53459598 L9.32309031,2.7635174 C9.59276153,1.88907053 9.72759714,1.45184709 10.0779605,1.25648246 C10.3806928,1.08767714 10.7492495,1.08767714 11.0519818,1.25648246 Z M18.2435053,2.1889014 C18.418687,2.28658372 18.4861048,2.50519544 18.6209404,2.94241887 L18.8866425,3.80399532 C18.930705,3.94687417 18.9527363,4.01831359 18.9860104,4.07237681 C19.0154997,4.12029052 19.0528641,4.16288353 19.0965295,4.19836132 C19.1457992,4.23839253 19.2137612,4.26953947 19.3496852,4.33183335 L19.7939625,4.53544528 C20.1660945,4.70599311 20.3521606,4.79126703 20.4306893,4.95120198 C20.4989333,5.09019078 20.4989333,5.25295497 20.4306893,5.39194377 C20.3521606,5.55187872 20.1660945,5.63715264 19.7939625,5.80770047 L19.3496852,6.0113124 C19.2137612,6.07360628 19.1457992,6.10475322 19.0965295,6.14478443 C19.0528641,6.18026222 19.0154997,6.22285523 18.9860104,6.27076894 C18.9527363,6.32483216 18.930705,6.39627158 18.8866425,6.53915043 L18.6209404,7.40072688 C18.4861048,7.83795032 18.418687,8.05656203 18.2435053,8.15424435 C18.0921392,8.23864701 17.9078608,8.23864701 17.7564947,8.15424435 C17.581313,8.05656203 17.5138952,7.83795032 17.3790596,7.40072688 L17.1133575,6.53915043 C17.069295,6.39627158 17.0472637,6.32483216 17.0139896,6.27076894 C16.9845003,6.22285523 16.9471359,6.18026222 16.9034705,6.14478443 C16.8542008,6.10475322 16.7862388,6.07360628 16.6503148,6.0113124 L16.2060375,5.80770047 C15.8339055,5.63715264 15.6478394,5.55187872 15.5693107,5.39194377 C15.5010667,5.25295497 15.5010667,5.09019078 15.5693107,4.95120198 C15.6478394,4.79126703 15.8339055,4.70599311 16.2060375,4.53544528 L16.6503148,4.33183335 C16.7862388,4.26953947 16.8542008,4.23839253 16.9034705,4.19836132 C16.9471359,4.16288353 16.9845003,4.12029052 17.0139896,4.07237681 C17.0472637,4.01831359 17.069295,3.94687417 17.1133575,3.80399532 L17.3790596,2.94241887 C17.5138952,2.50519544 17.581313,2.28658372 17.7564947,2.1889014 C17.9078608,2.10449874 18.0921392,2.10449874 18.2435053,2.1889014 Z" id="形状结合" fill="#FFFFFF"></path></g></svg>
+        """,
         "text": """
         <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path fill-rule="evenodd" d="M19.3619715,3.32698043 C19.9264578,3.61460055 20.3853994,4.07354222 20.6730196,4.6380285 C21,5.27976372 21,6.11984248 21,7.8 L21,16.2 C21,17.8801575 21,18.7202363 20.6730196,19.3619715 C20.3853994,19.9264578 19.9264578,20.3853994 19.3619715,20.6730196 C18.7202363,21 17.8801575,21 16.2,21 L7.8,21 C6.11984248,21 5.27976372,21 4.6380285,20.6730196 C4.07354222,20.3853994 3.61460055,19.9264578 3.32698043,19.3619715 C3,18.7202363 3,17.8801575 3,16.2 L3,7.8 C3,6.11984248 3,5.27976372 3.32698043,4.6380285 C3.61460055,4.07354222 4.07354222,3.61460055 4.6380285,3.32698043 C5.27976372,3 6.11984248,3 7.8,3 L16.2,3 C17.8801575,3 18.7202363,3 19.3619715,3.32698043 Z M15,8 L9,8 C8.44771525,8 8,8.44771525 8,9 C8,9.55228475 8.44771525,10 9,10 L11,10 L11,16 C11,16.5522847 11.4477153,17 12,17 C12.5522847,17 13,16.5522847 13,16 L13,10 L15,10 C15.5522847,10 16,9.55228475 16,9 C16,8.44771525 15.5522847,8 15,8 Z" fill="black"/></svg>
         """,
@@ -2670,6 +2724,120 @@ enum FilterThumbnails {
         var clip = FilterClip(kind: kind, startTime: 0, endTime: 1)
         clip.intensity = 1
         let out = FilterEngine.apply(clip, to: ci)
+        guard let cg = ctx.createCGImage(out, from: ci.extent) else { return base }
+        let img = NSImage(cgImage: cg, size: ci.extent.size)
+        cache[kind] = img
+        return img
+    }
+}
+
+
+/// 格式标签渲染成图片，好让它当成一个字符内联进标题里。
+/// 直接用视图并排的话，标题换行后第二行会缩在标签右边，跟第一行对不齐
+@MainActor
+enum FormatTagImage {
+    private static var cache: [String: NSImage] = [:]
+
+    static func image(text: String, color: Color) -> NSImage? {
+        let key = "\(text)|\(color)"
+        if let hit = cache[key] { return hit }
+        let label = Text(text)
+            .font(.system(size: 9, weight: .semibold))
+            .foregroundColor(color)
+            .padding(.horizontal, 4).padding(.vertical, 1)
+            .background(RoundedRectangle(cornerRadius: 3).fill(color.opacity(0.18)))
+        let r = ImageRenderer(content: label)
+        r.scale = 2
+        guard let img = r.nsImage else { return nil }
+        cache[key] = img
+        return img
+    }
+}
+
+
+// MARK: - Effect Panel（效果 → 特效）
+
+/// 特效列表。跟滤镜那页一样，卡片封面是**素材帧套上各自特效**的实拍效果
+struct EffectPanel: View {
+    @EnvironmentObject private var project: ProjectState
+
+    /// 按类别分组显示 —— 26 个平铺下来找不着东西
+    private static let groups: [(String, [EffectKind])] = [
+        ("模糊", [.gaussianBlur, .motionBlur, .zoomBlur, .bokeh]),
+        ("风格化", [.pixellate, .crystallize, .pointillize, .bloom, .gloom]),
+        ("线条", [.edges, .edgeWork, .lineOverlay]),
+        ("半调网点", [.cmykHalftone, .dotScreen, .lineScreen, .circularScreen, .hatchedScreen]),
+        ("扭曲", [.twirl, .vortex, .bump, .pinch, .hole, .circleSplash, .lightTunnel]),
+        ("锐化降噪", [.unsharpMask, .noiseReduction]),
+    ]
+
+    var body: some View {
+        ScrollView(showsIndicators: false) {
+            VStack(alignment: .leading, spacing: 10) {
+                ForEach(Self.groups, id: \.0) { group in
+                    Text(group.0)
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundColor(Color.labelSecondary)
+                        .padding(.leading, 3)
+                    LazyVGrid(columns: [GridItem(.flexible(), spacing: 6),
+                                        GridItem(.flexible(), spacing: 6)], spacing: 6) {
+                        ForEach(group.1, id: \.self) { kind in
+                            EffectCard(kind: kind) { project.addEffect(kind: kind) }
+                        }
+                    }
+                }
+            }
+            .padding(.leading, 3).padding(.trailing, 10)
+            .padding(.bottom, 8)
+        }
+    }
+}
+
+private struct EffectCard: View {
+    let kind: EffectKind
+    let onAdd: () -> Void
+    @State private var hover = false
+
+    var body: some View {
+        VStack(spacing: 4) {
+            Image(nsImage: EffectThumbnails.image(for: kind))
+                .resizable()
+                .aspectRatio(contentMode: .fill)
+                .aspectRatio(16.0 / 9.0, contentMode: .fit)
+                .clipShape(RoundedRectangle(cornerRadius: 4))
+                .overlay(alignment: .bottomTrailing) {
+                    if hover { VideoMiniBtnView(icon: "plus.circle", action: onAdd).padding(2) }
+                }
+
+            Text(kind.label)
+                .font(.system(size: 9))
+                .foregroundColor(Color.labelSecondary)
+                .lineLimit(1)
+        }
+        .padding(6)
+        .background(hover ? Color.white.opacity(0.08) : Color.clear)
+        .cornerRadius(6)
+        .contentShape(Rectangle())
+        // 拖拽必须排在双击之前，写反了拖的起始事件会被点击手势抢走
+        .onDrag { NSItemProvider(object: FileDropRouter.pasteboardString(for: kind) as NSString) }
+        .onHover { hover = $0 }
+        .gesture(TapGesture(count: 2).onEnded { onAdd() })
+        .help("双击添加\(kind.label)，或拖到时间轴")
+    }
+}
+
+enum EffectThumbnails {
+    private static var cache: [EffectKind: NSImage] = [:]
+    private static let ctx = CIContext(options: [.useSoftwareRenderer: false])
+
+    static func image(for kind: EffectKind) -> NSImage {
+        if let hit = cache[kind] { return hit }
+        let base = TransitionPreviewFrames.before
+        guard let tiff = base.tiffRepresentation, let ci = CIImage(data: tiff) else { return base }
+
+        var clip = EffectClip(kind: kind, startTime: 0, endTime: 1)
+        clip.intensity = 1
+        let out = EffectEngine.apply(clip, to: ci, renderSize: ci.extent.size)
         guard let cg = ctx.createCGImage(out, from: ci.extent) else { return base }
         let img = NSImage(cgImage: cg, size: ci.extent.size)
         cache[kind] = img

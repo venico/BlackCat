@@ -95,10 +95,10 @@ struct CanvasAssetBrowser: View {
         }
     }
 
-    /// 用列表还是缩略图。**跟侧边栏素材库共用同一个开关**（`project.mediaGridMode`），
+    /// 用列表还是缩略图。按自己的标签页记，跟侧边栏素材库分开 ——
     /// 一边切了另一边跟着变，跟排序设置一个待遇。
     /// 音频没有画面，摆成网格全是一样的图标 —— 那一栏固定用列表
-    private var showsAsList: Bool { tab == .audio || !project.mediaGridMode }
+    private var showsAsList: Bool { tab == .audio || !project.gridMode(for: "canvas.\(tab.rawValue)") }
 
     /// 音频那栏没缩略图可看，不给切换按钮
     private var canSwitchViewMode: Bool { tab != .audio }
@@ -350,8 +350,9 @@ struct CanvasAssetBrowser: View {
             searchField
             // 缩略图 / 列表切换，跟侧边栏那个同一个开关
             if canSwitchViewMode {
-            Button { project.mediaGridMode.toggle() } label: {
-                Image(nsImage: SidebarSVGIcon.load(project.mediaGridMode ? "gridView" : "listView",
+            Button { project.setGridMode(!project.gridMode(for: "canvas.\(tab.rawValue)"),
+                                        for: "canvas.\(tab.rawValue)") } label: {
+                Image(nsImage: SidebarSVGIcon.load(project.gridMode(for: "canvas.\(tab.rawValue)") ? "gridView" : "listView",
                                                    size: 13))
                     .renderingMode(.template)
                     .resizable()
@@ -363,7 +364,7 @@ struct CanvasAssetBrowser: View {
                     .contentShape(RoundedRectangle(cornerRadius: 8))
             }
             .buttonStyle(.plain)
-            .help(project.mediaGridMode ? "缩略图（点击切列表）" : "列表（点击切缩略图）")
+            .help(project.gridMode(for: "canvas.\(tab.rawValue)") ? "缩略图（点击切列表）" : "列表（点击切缩略图）")
             }
 
             Button { showSortNSMenu(project: project) } label: {

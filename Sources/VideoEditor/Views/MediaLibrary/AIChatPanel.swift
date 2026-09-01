@@ -7,6 +7,9 @@ struct AIChatPanel: View {
     @StateObject private var service = AIVideoService.shared
     @ObservedObject private var settings = AppSettings.shared
     @State private var inputText = ""
+    /// Agent 那条链：执行器、模式、这一轮的对话上下文
+    @StateObject private var agent = AgentRunner()
+    @State private var agentHistory: [AgentMessage] = []
     /// 进面板默认就是历史列表 —— 用户过来多半是要找之前那条，
     /// 而不是从空白开始
     @State private var showHistory = true
@@ -145,8 +148,7 @@ struct AIChatPanel: View {
         // **高度按图标那 24pt 定死**：历史列表页不画右侧图标，
         // 不撑着的话这一行会矮一截，两页之间标题就上下跳
         .frame(height: 24)
-        .padding(.leading, 3)
-        .padding(.trailing, 10)
+        .padding(.leading, 3).padding(.trailing, 10)
         // 顶部留白跟素材库那栏对齐（那边也是 8）——
         // 两栏切换时标题行不该上下跳
         .padding(.top, 8)
@@ -355,7 +357,8 @@ struct AIChatPanel: View {
                         .id(msg.id)
                     }
                 }
-                .padding(.horizontal, 10)
+                // 左边缘跟标题「AI 创作」对齐（标题是 leading 3）
+                .padding(.leading, 3).padding(.trailing, 10)
                 .padding(.vertical, 10)
             }
             .onChange(of: service.messages.count) { _ in scrollToLast(proxy) }
@@ -420,6 +423,22 @@ struct AIChatPanel: View {
 
     private var inputArea: some View {
         VStack(spacing: 0) {
+            // 危险操作的确认长在会话里，就在输入框上方，不弹系统窗
+            if let c = agent.pendingConfirm {
+                AgentConfirmBar(toolName: c.toolName, detail: c.detail, onAnswer: c.onAnswer)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.leading, 3).padding(.trailing, 10)
+                    .padding(.bottom, 6)
+            }
+            if !agent.steps.isEmpty || agent.isRunning {
+                AgentStepsView(steps: agent.steps.map {
+                    .init(tool: $0.toolName, summary: $0.summary, isError: $0.isError)
+                }, isRunning: agent.isRunning)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.leading, 3).padding(.trailing, 10)
+                    .padding(.bottom, 6)
+            }
+
             VStack(spacing: 0) {
                 HStack(alignment: .top) {
                     if service.selectedProvider.maxReferenceImages > 0 {
@@ -457,6 +476,23 @@ struct AIChatPanel: View {
                 }
                 .padding(.leading, 3).padding(.trailing, 10)
                 .padding(.top, 8)
+
+                if agent.isRunning {
+                    HStack {
+                        Spacer()
+                        Button { agent.cancel(project: project) } label: {
+                            Text("停止")
+                                .font(.system(size: 10, weight: .medium))
+                                .foregroundColor(Color.labelSecondary)
+                                .padding(.leading, 3).padding(.trailing, 10).frame(height: 20)
+                                .background(RoundedRectangle(cornerRadius: 5)
+                                    .fill(Color.white.opacity(0.08)))
+                        }
+                        .buttonStyle(.plain)
+                    }
+                    .padding(.leading, 3).padding(.trailing, 10)
+                    .padding(.bottom, 4)
+                }
 
                 ChatInputTextView(
                     text: $inputText,
@@ -514,6 +550,28 @@ struct AIChatPanel: View {
                         }
                     }
 
+                    // Agent 只在文字模型下才有意义 —— 图片/视频/音频那几个
+                    // 供应商压根不支持工具调用，摆个模式切换出来只会让人以为能用
+                    if service.selectedProvider.category == .text {
+                        capsuleMenu(label: settings.agentMode.rawValue) {
+                            ForEach(AgentMode.allCases, id: \.self) { m in
+                                Button("\(m.rawValue)模式") { settings.agentMode = m }
+                            }
+                        }
+                        .help(settings.agentMode.help)
+                    }
+
+                    // 推理强度
+                    if !service.selectedProvider.reasoningLevels.isEmpty {
+                        capsuleMenu(label: currentReasoningLabel) {
+                            ForEach(service.selectedProvider.reasoningLevels, id: \.value) { lv in
+                                Button(lv.label) {
+                                    settings.setProviderReasoning(lv.value, for: service.selectedProvider.rawValue)
+                                }
+                            }
+                        }
+                    }
+
                     if service.selectedProvider.supportsWebSearch {
                         Button {
                             service.webSearchEnabled.toggle()
@@ -536,17 +594,6 @@ struct AIChatPanel: View {
                         .buttonStyle(.plain)
                     }
 
-                    // 推理强度：挨着联网放。只有一档清单的时候没必要再套一层级联菜单
-                    if !service.selectedProvider.reasoningLevels.isEmpty {
-                        capsuleMenu(label: currentReasoningLabel) {
-                            ForEach(service.selectedProvider.reasoningLevels, id: \.value) { lv in
-                                Button(lv.label) {
-                                    settings.setProviderReasoning(lv.value, for: service.selectedProvider.rawValue)
-                                }
-                            }
-                        }
-                    }
-
                     Spacer()
 
                     // 生成中也照常显示发送按钮 —— 多任务之后可以接着发下一条。
@@ -563,6 +610,7 @@ struct AIChatPanel: View {
                     }
                     .buttonStyle(.plain)
                     .disabled(!canSend)
+
                 }
                 .padding(.leading, 3).padding(.trailing, 10)
                 .padding(.bottom, 6)
@@ -620,8 +668,9 @@ struct AIChatPanel: View {
                 .foregroundColor(active ? Color.accent : Color.labelSecondary)
                 .padding(.leading, 3).padding(.trailing, 10)
                 .padding(.vertical, 3)
-                .background(active ? Color.accent.opacity(0.15) : Color.white.opacity(0.06))
-                .clipShape(Capsule())
+                // 下拉一律不带底 —— 旁边「联网」那种是开关，有开没开要靠底色区分；
+                // 下拉本身没有开关态，铺一层灰底只是噪点
+                .contentShape(Capsule())
         }
         .menuStyle(.borderlessButton)
         .tint(Color.labelSecondary)
@@ -1017,6 +1066,14 @@ struct AIChatPanel: View {
         let text = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
         inputText = ""
+
+        // 没挂参考素材的纯文字消息交给 Agent —— 它会自己判断是查项目、
+        // 改时间轴还是调生成。挂了参考图/视频的仍走原来那条生成链路：
+        // 那种意图很明确，绕一圈让模型再判断一次没有意义，还慢
+        if referenceContents.isEmpty && firstFrameImage == nil && lastFrameImage == nil {
+            runAgent(text)
+            return
+        }
         let refImageURLs = referenceContents.filter { $0.type == .image }.map(\.url)
         let refVideoURLs = referenceContents.filter { $0.type == .video }.map(\.url)
         let refAudioURLs = referenceContents.filter { $0.type == .audio }.map(\.url)
@@ -1028,6 +1085,18 @@ struct AIChatPanel: View {
         referenceContents.removeAll()
         firstFrameImage = nil
         lastFrameImage = nil
+    }
+
+    /// 交给 Agent 跑一轮
+    private func runAgent(_ text: String) {
+        // 会话里先落一条用户消息，回答回来再补 assistant 那条
+        service.appendUserEntry(text)
+        agent.run(prompt: text, history: &agentHistory,
+                  mode: settings.agentMode, project: project) { reply in
+            service.appendAgentReply(reply, steps: agent.steps.map {
+                .init(tool: $0.toolName, summary: $0.summary, isError: $0.isError)
+            })
+        }
     }
 
     private func insertMediaToTimeline(_ url: URL) {
