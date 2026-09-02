@@ -141,6 +141,25 @@ extension AgentToolbox {
                 risk: .dangerous),
 
             AgentToolSpec(
+                name: "remember",
+                description: """
+                把一件值得长期记住的事写进记忆。
+                用户说「以后都…」「我习惯…」「记住…」这类话时调它。
+                **只记会反复用到的偏好和设定**，别把一次性的指令记进去 —— \
+                记满一堆临时的东西，下次它们会互相打架。
+                """,
+                parameters: [
+                    "type": "object",
+                    "properties": [
+                        "text": ["type": "string", "description": "一句话，写清楚是什么习惯或设定"],
+                        "scope": ["type": "string", "enum": ["global", "project"],
+                                  "description": "global=这个人的长期习惯（字幕字号、导出偏好），跟着人走；project=这个片子的设定（主角名字、基调），只在本项目有效"]
+                    ] as [String: Any],
+                    "required": ["text", "scope"]
+                ],
+                risk: .mutating),
+
+            AgentToolSpec(
                 name: "seek",
                 description: "把播放头移到某一秒。要看某处画面之前先移过去，再 capture_frame。",
                 parameters: [
@@ -243,6 +262,16 @@ extension AgentToolbox {
         case "delete_clip":
             guard let key = args["clip_id"] as? String else { return .fail("缺 clip_id") }
             return deleteClip(p, idPrefix: key)
+
+        case "remember":
+            guard AppSettings.shared.agentMemoryEnabled else {
+                return .fail("用户把记忆功能关了，这次别记，也别再尝试。")
+            }
+            guard let text = args["text"] as? String, !text.isEmpty else { return .fail("缺 text") }
+            let isGlobal = (args["scope"] as? String ?? "global") == "global"
+            if isGlobal { AgentMemory.shared.addGlobal(text) }
+            else { AgentMemory.shared.addProject(text) }
+            return .ok("记住了（\(isGlobal ? "长期习惯" : "本项目")）：\(text)")
 
         case "seek":
             guard let t = args["time"] as? Double else { return .fail("缺 time") }

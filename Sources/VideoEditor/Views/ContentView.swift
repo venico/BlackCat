@@ -202,7 +202,6 @@ struct ContentView: View {
                         .simultaneousGesture(TapGesture().onEnded {
                             NSApp.keyWindow?.makeFirstResponder(nil)
                         })
-                        .padding(.bottom, 8)
                     }
                     .onAppear {
                         topHeight = geo.size.height * 0.60

@@ -470,6 +470,8 @@ final class ColorCompositor: NSObject, AVVideoCompositing {
     }
     func renderContextChanged(_ newRenderContext: AVVideoCompositionRenderContext) {}
 
+
+
     func startRequest(_ req: AVAsynchronousVideoCompositionRequest) {
         let instrRange = req.videoCompositionInstruction.timeRange
         guard let data = Self.getData(for: instrRange) else {

@@ -3046,33 +3046,10 @@ struct IPicker<T: Hashable>: View {
     }
 
     private func showMenu() {
-        let menu = NSMenu()
-        IPickerItemHandler.shared.actions.removeAll()
-        for (i, (_, label)) in options.enumerated() {
-            let item = NSMenuItem(title: label,
-                                  action: #selector(IPickerItemHandler.pick(_:)),
-                                  keyEquivalent: "")
-            item.target = IPickerItemHandler.shared
-            item.tag = i
-            IPickerItemHandler.shared.actions[i] = { selection = options[i].0 }
-            let title = NSMutableAttributedString(string: label, attributes: [
-                .font: NSFont.systemFont(ofSize: 13)
-            ])
-            if options[i].0 == selection {
-                title.append(NSAttributedString(string: "  ✓", attributes: [
-                    .font: NSFont.systemFont(ofSize: 12, weight: .semibold),
-                    .foregroundColor: NSColor.white
-                ]))
-            }
-            item.attributedTitle = title
-            menu.addItem(item)
-        }
-        let view = NSApp.keyWindow?.contentView ?? NSView()
-        if let event = NSApp.currentEvent {
-            NSMenu.popUpContextMenu(menu, with: event, for: view)
-        } else {
-            menu.popUp(positioning: nil, at: .zero, in: view)
-        }
+        // 自绘行：系统画的项高亮跟着系统强调色走（蓝底），跟这里的黄主色打架
+        NSMenu.picker(options.map { opt in
+            (label: opt.1, checked: opt.0 == selection, action: { selection = opt.0 })
+        }).popUpHere()
     }
 }
 

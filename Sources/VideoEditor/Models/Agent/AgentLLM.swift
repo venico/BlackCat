@@ -12,6 +12,8 @@ import Foundation
 struct AgentTurn {
     var text: String = ""
     var toolCalls: [AgentToolCall] = []
+    /// 这一次请求烧掉的 token（进+出）。拿不到就是 0
+    var tokens: Int = 0
     /// 模型说它讲完了（没有再要调工具）
     var isFinal: Bool { toolCalls.isEmpty }
 }
@@ -53,6 +55,24 @@ enum AgentLLM {
         return custom.isEmpty ? p.baseURL : custom
     }
 
+    /// 填了自定义接口地址就是走中转。服务端工具（Claude 的 web_search）
+    /// 多数中转站不透传，AIVideoService 那边实测会报
+    /// 「tools[0].web_search can not be null」，所以这种情况下别加
+    static func viaRelay() -> Bool {
+        !AppSettings.shared.providerBaseURL(for: currentProvider().sharedProviderKey)
+            .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    /// 自带联网的几家。跟 AIVideoService 里那份保持一致：
+    /// DeepSeek 的原生搜索只在 Anthropic 端点上且未文档化，
+    /// Kimi 的 $web_search 要自己写工具调用循环，都不算
+    static let nativeSearchProviders: Set<AppSettings.LLMProvider> = [.qwen, .glm, .grok, .claude]
+
+    /// 这一家现在能不能用原生联网。用不了就该挂外挂 web_search 工具
+    static func canUseNativeSearch() -> Bool {
+        nativeSearchProviders.contains(currentProvider()) && !viaRelay()
+    }
+
     /// 当前该用哪个模型名
     static func currentModel() -> String {
         let p = currentProvider()
@@ -64,7 +84,8 @@ enum AgentLLM {
     /// 发一轮。返回模型的文本和它要调的工具
     static func send(messages: [AgentMessage],
                      tools: [AgentToolSpec],
-                     systemPrompt: String) async throws -> AgentTurn {
+                     systemPrompt: String,
+                     webSearch: Bool = false) async throws -> AgentTurn {
         // **认聊天框上选的那家**，不是设置里的 llmProvider。
         // 两套配置共用同一份 Key 和模型名，但「当前选哪家」是各记各的 ——
         // 用户在聊天框选了 Claude，Agent 却按设置里的智谱去发请求，
@@ -77,14 +98,16 @@ enum AgentLLM {
                 "「\(provider.rawValue)」还没填 API Key。到设置 → AI 设置里给它配一个，或者在上面的下拉里换一家已经配好的。"])
         }
         return provider == .claude
-            ? try await sendClaude(messages, tools, systemPrompt, key)
-            : try await sendOpenAI(messages, tools, systemPrompt, key)
+            ? try await sendClaude(messages, tools, systemPrompt, key, webSearch && canUseNativeSearch())
+            : try await sendOpenAI(messages, tools, systemPrompt, key,
+                                   webSearch && canUseNativeSearch())
     }
 
     // MARK: - OpenAI 兼容
 
     private static func sendOpenAI(_ messages: [AgentMessage], _ tools: [AgentToolSpec],
-                                   _ system: String, _ key: String) async throws -> AgentTurn {
+                                   _ system: String, _ key: String,
+                                   _ webSearch: Bool) async throws -> AgentTurn {
         var msgs: [[String: Any]] = [["role": "system", "content": system]]
         for m in messages {
             switch m {
@@ -126,12 +149,29 @@ enum AgentLLM {
             "messages": msgs,
             "temperature": 0.3
         ]
-        if !tools.isEmpty {
-            body["tools"] = tools.map { t in
-                ["type": "function",
-                 "function": ["name": t.name, "description": t.description, "parameters": t.parameters]]
+        var toolList: [[String: Any]] = tools.map { t in
+            ["type": "function",
+             "function": ["name": t.name, "description": t.description, "parameters": t.parameters]]
+        }
+        // 原生联网。三家的声明方式各不相同，都是 AIVideoService 那边实测过的写法：
+        // 智谱要带一个 web_search 配置对象，xAI 只要个 type，千问走 body 上的开关
+        if webSearch {
+            switch currentProvider() {
+            case .glm:
+                toolList.append(["type": "web_search",
+                                 "web_search": ["enable": "True", "search_result": "True", "count": "5"]])
+            case .grok:
+                toolList.append(["type": "web_search"])
+            case .qwen:
+                body["enable_search"] = true
+                // 不加 forced_search，模型多半会「自己判断」然后不搜
+                body["search_options"] = ["forced_search": true, "enable_source": true]
+                // 千问 max 系列要在思考模式下才支持联网，光给 enable_search 不生效
+                body["enable_thinking"] = true
+            default: break
             }
         }
+        if !toolList.isEmpty { body["tools"] = toolList }
 
         let data = try await post(currentBaseURL(), key: key,
                                   headers: ["Authorization": "Bearer \(key)"], body: body)
@@ -142,6 +182,11 @@ enum AgentLLM {
                 "模型返回的格式看不懂：\(String(String(data: data, encoding: .utf8)?.prefix(200) ?? ""))"])
         }
         var turn = AgentTurn(text: msg["content"] as? String ?? "")
+        // 用量：OpenAI 兼容这边统一在 usage 里。部分中转站不回，拿不到就算 0
+        if let u = root["usage"] as? [String: Any] {
+            turn.tokens = (u["total_tokens"] as? Int)
+                ?? ((u["prompt_tokens"] as? Int ?? 0) + (u["completion_tokens"] as? Int ?? 0))
+        }
         for c in (msg["tool_calls"] as? [[String: Any]]) ?? [] {
             guard let id = c["id"] as? String,
                   let f = c["function"] as? [String: Any],
@@ -156,7 +201,8 @@ enum AgentLLM {
     // MARK: - Claude
 
     private static func sendClaude(_ messages: [AgentMessage], _ tools: [AgentToolSpec],
-                                   _ system: String, _ key: String) async throws -> AgentTurn {
+                                   _ system: String, _ key: String,
+                                   _ webSearch: Bool) async throws -> AgentTurn {
         var msgs: [[String: Any]] = []
         for m in messages {
             switch m {
@@ -195,11 +241,15 @@ enum AgentLLM {
             "system": system,
             "messages": msgs
         ]
-        if !tools.isEmpty {
-            body["tools"] = tools.map { t in
-                ["name": t.name, "description": t.description, "input_schema": t.parameters]
-            }
+        var toolList: [[String: Any]] = tools.map { t in
+            ["name": t.name, "description": t.description, "input_schema": t.parameters]
         }
+        // 联网是**服务端工具**：Anthropic 那边自己搜完把结果接回答案里，
+        // 不会走到我们这边的执行循环，所以下面解析时不用管它
+        if webSearch {
+            toolList.append(["type": "web_search_20260209", "name": "web_search"])
+        }
+        if !toolList.isEmpty { body["tools"] = toolList }
 
         let data = try await post(currentBaseURL(), key: key,
                                   headers: ["x-api-key": key,
@@ -210,6 +260,10 @@ enum AgentLLM {
                 "模型返回的格式看不懂：\(String(String(data: data, encoding: .utf8)?.prefix(200) ?? ""))"])
         }
         var turn = AgentTurn()
+        // Claude 这边进出分开报，加起来才是这一轮的总量
+        if let u = root["usage"] as? [String: Any] {
+            turn.tokens = (u["input_tokens"] as? Int ?? 0) + (u["output_tokens"] as? Int ?? 0)
+        }
         for block in content {
             switch block["type"] as? String {
             case "text": turn.text += (block["text"] as? String ?? "")

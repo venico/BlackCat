@@ -4795,7 +4795,6 @@ struct CompoundBreadcrumb: View {
             }
             .padding(.horizontal, 12)
             .frame(height: 24)
-            .background(Color(red: 0.15, green: 0.15, blue: 0.16))
         }
     }
 }
@@ -5984,86 +5983,57 @@ private struct AIToolsMenuBtn: View {
     }
 
     private func showMenu() {
-        let h = AIToolsMenuHandler.shared
-        h.project = project
-
+        let p = project
         let menu = NSMenu()
-        menu.autoenablesItems = false      // 自己控制置灰，别让系统按响应链猜
+        menu.minimumWidth = 200
 
-        func add(_ title: String, _ sel: Selector, enabled: Bool) {
-            let item = NSMenuItem(title: title, action: sel, keyEquivalent: "")
-            item.target = h
-            item.isEnabled = enabled
-            menu.addItem(item)
+        func add(_ title: String, enabled: Bool, _ act: @escaping () -> Void) {
+            menu.addItem(MenuRowView.item(title: title, width: 200,
+                                          enabled: enabled, action: act))
         }
 
-        add("语音识别字幕", #selector(AIToolsMenuHandler.transcribe(_:)), enabled: canTranscribe)
+        add("语音识别字幕", enabled: canTranscribe) { p.showTranscribeOptions = true }
 
         // 视频分析：二级菜单
-        let analyze = NSMenuItem(title: "视频智能剪辑", action: nil, keyEquivalent: "")
-        analyze.isEnabled = canAnalyze
         let sub = NSMenu()
-        sub.autoenablesItems = false
-        let auto = NSMenuItem(title: "智能分割", action: #selector(AIToolsMenuHandler.autoDetect(_:)), keyEquivalent: "")
-        auto.target = h
-        auto.isEnabled = canAnalyze && SceneDetector.isInstalled
-        sub.addItem(auto)
-        let llm = NSMenuItem(title: "AI 剪辑", action: #selector(AIToolsMenuHandler.llmAnalyze(_:)), keyEquivalent: "")
-        llm.target = h
-        llm.isEnabled = canAnalyze && !AppSettings.shared.llmAPIKey.isEmpty
-        sub.addItem(llm)
-        analyze.submenu = sub
-        menu.addItem(analyze)
+        sub.minimumWidth = 160
+        sub.addItem(MenuRowView.item(title: "智能分割", width: 160,
+                                     enabled: canAnalyze && SceneDetector.isInstalled) {
+            p.sceneDetectSelectedClip()
+        })
+        sub.addItem(MenuRowView.item(title: "AI 剪辑", width: 160,
+                                     enabled: canAnalyze && !AppSettings.shared.llmAPIKey.isEmpty) {
+            p.llmAnalyzeSelectedClip()
+        })
+        menu.addItem(MenuRowView.item(title: "视频智能剪辑", width: 200,
+                                      enabled: canAnalyze, submenu: sub))
 
         menu.addItem(.separator())
-        add("去除背景", #selector(AIToolsMenuHandler.removeBg(_:)),
-            enabled: project.canRemoveImageBackground)
-        add("分离音轨", #selector(AIToolsMenuHandler.separateAudio(_:)),
-            enabled: project.canRemoveBackgroundMusic)
-        add("转换成语音", #selector(AIToolsMenuHandler.toSpeech(_:)),
-            enabled: project.canConvertSubtitleToSpeech)
+        add("去除背景", enabled: p.canRemoveImageBackground) { p.removeBackgroundForSelection(mode: .subject) }
+        add("分离音轨", enabled: p.canRemoveBackgroundMusic) { p.removeBackgroundMusicForSelection() }
+        add("转换成语音", enabled: p.canConvertSubtitleToSpeech) { p.convertSelectedSubtitlesToSpeech() }
 
         // 清晰度提升：二级菜单
-        let clarity = NSMenuItem(title: "清晰度提升", action: nil, keyEquivalent: "")
-        clarity.isEnabled = project.canEnhanceClarity
         let csub = NSMenu()
-        csub.autoenablesItems = false
+        csub.minimumWidth = 160
         // 系统超分只有 4 倍这一档，选了它就不摆一个点下去会报错的 2 倍
         if AppSettings.shared.clarityEngine.supportsX2 {
-            let x2 = NSMenuItem(title: "提升 2 倍", action: #selector(AIToolsMenuHandler.clarityX2(_:)), keyEquivalent: "")
-            x2.target = h
-            x2.isEnabled = project.canEnhanceClarity
-            csub.addItem(x2)
+            csub.addItem(MenuRowView.item(title: "提升 2 倍", width: 160,
+                                          enabled: p.canEnhanceClarity) {
+                p.enhanceClaritySelection(scale: .x2)
+            })
         }
-        let x4 = NSMenuItem(title: "提升 4 倍", action: #selector(AIToolsMenuHandler.clarityX4(_:)), keyEquivalent: "")
-        x4.target = h
-        x4.isEnabled = project.canEnhanceClarity
-        csub.addItem(x4)
-        clarity.submenu = csub
-        menu.addItem(clarity)
+        csub.addItem(MenuRowView.item(title: "提升 4 倍", width: 160,
+                                      enabled: p.canEnhanceClarity) {
+            p.enhanceClaritySelection(scale: .x4)
+        })
+        menu.addItem(MenuRowView.item(title: "清晰度提升", width: 200,
+                                      enabled: p.canEnhanceClarity, submenu: csub))
 
-        if let event = NSApp.currentEvent {
-            NSMenu.popUpContextMenu(menu, with: event, for: NSApp.keyWindow?.contentView ?? NSView())
-        }
+        menu.popUpHere()
     }
 }
 
-private final class AIToolsMenuHandler: NSObject {
-    static let shared = AIToolsMenuHandler()
-    weak var project: ProjectState?
-
-    @objc func transcribe(_ s: NSMenuItem)    { project?.showTranscribeOptions = true }
-    @objc func autoDetect(_ s: NSMenuItem)    { project?.sceneDetectSelectedClip() }
-    @objc func llmAnalyze(_ s: NSMenuItem)    { project?.llmAnalyzeSelectedClip() }
-    @objc func separateAudio(_ s: NSMenuItem) { project?.removeBackgroundMusicForSelection() }
-    @objc func toSpeech(_ s: NSMenuItem)      { project?.convertSelectedSubtitlesToSpeech() }
-    @objc func clarityX2(_ s: NSMenuItem)     { project?.enhanceClaritySelection(scale: .x2) }
-    @objc func clarityX4(_ s: NSMenuItem)     { project?.enhanceClaritySelection(scale: .x4) }
-    /// 去背景：BiRefNet 一个模型全包，系统内置那套才需要在语义分割和色键之间选
-    @objc func removeBg(_ s: NSMenuItem) {
-        project?.removeBackgroundForSelection(mode: .subject)
-    }
-}
 
 
 // MARK: - 素材丢失（片段上的标记 + 重新关联）

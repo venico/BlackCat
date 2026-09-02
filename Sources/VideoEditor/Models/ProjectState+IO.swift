@@ -138,6 +138,10 @@ extension ProjectState {
             tabs[0].name = "时间线 1"
         }
 
+        // 项目层记忆跟着这个 .bcj 走：换个项目就换一份
+        let loadedMemory = doc.agentMemory ?? []
+        Task { @MainActor in AgentMemory.shared.project = loadedMemory }
+
         exportSettings = doc.exportSettings
         previewResolution = doc.previewResolution
         previewAspectRatio = doc.previewAspectRatio ?? "原始"
@@ -239,6 +243,7 @@ extension ProjectState {
             // 老版本 app 打开这个文件时还能读出第一个标签页的内容
             tabs: tabs,
             activeTab: activeTab,
+            agentMemory: AgentMemory.projectSnapshot.isEmpty ? nil : AgentMemory.projectSnapshot,
             // 素材库已全局化（v5.1.0），项目文件不再存素材清单。
             // 字段留着写空数组、不改成 optional —— 老版本 app 那边它是必需字段，
             // 省掉这个键会让旧版本直接解析失败、项目打不开

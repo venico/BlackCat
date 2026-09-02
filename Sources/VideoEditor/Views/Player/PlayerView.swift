@@ -31,14 +31,10 @@ struct PlayerView: View {
                                            geo.size.height / max(rs.height, 1))
                         let fitW = rs.width * fitScale
                         let fitH = rs.height * fitScale
-                        // 安全边框：画面实际会落在这个框里。
-                        // 不填色，只画一圈虚线 —— 填黑的话空项目跟「加载中」分不出来
+                        // 画布底：画面实际会落在这个框里
                         ZStack {
                             RoundedRectangle(cornerRadius: 8)
-                                // 点状：线帽设圆的、实线段长度给 0，画出来就是一串圆点
-                                .strokeBorder(style: StrokeStyle(lineWidth: 2.5, lineCap: .round,
-                                                                 dash: [0.01, 7]))
-                                .foregroundColor(Color.labelSecondary.opacity(0.4))
+                                .fill(Color.black)
                             if project.playerItem == nil {
                                 VStack(spacing: min(fitW, fitH) * 0.045) {
                                     Image(nsImage: SidebarSVGIcon.load("video",
@@ -183,6 +179,9 @@ private class VideoLayerView: NSView {
         wantsLayer = true
         layer?.addSublayer(playerLayer)
         playerLayer.videoGravity = .resizeAspect
+        // 圆角跟安全边框一致，画面铺满画布时四角才对得上
+        playerLayer.cornerRadius = 8
+        playerLayer.masksToBounds = true
     }
     required init?(coder: NSCoder) { fatalError() }
 

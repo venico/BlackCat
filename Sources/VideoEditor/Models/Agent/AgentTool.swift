@@ -42,11 +42,12 @@ enum AgentMode: String, CaseIterable, Codable {
     case auto = "自动"
     case full = "全权"
 
+    /// 三档对应 Claude Code 的 plan / auto / bypass
     var help: String {
         switch self {
         case .plan: return "只读项目、只给方案，不动任何东西"
-        case .auto: return "加片段、挂特效这类直接做；删除、导出、跑脚本会先问你"
-        case .full: return "所有操作都不再询问"
+        case .auto: return "改动直接做，删除、生成这类先问你一句"
+        case .full: return "全部不问，装环境、改配置也照做"
         }
     }
 

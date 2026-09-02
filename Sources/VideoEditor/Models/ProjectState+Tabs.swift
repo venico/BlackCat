@@ -39,6 +39,10 @@ extension ProjectState {
     /// 新建的标签页那三张表都是空的，不补的话轨道一条都不显示
     private func activateTab(_ i: Int) {
         guard tabs.indices.contains(i) else { return }
+        // 复合片段栈挂在 ProjectState 上，是全局一份、不跟着标签页走。
+        // 不先退出来的话，在标签 1 里进了复合片段，切到标签 2 那个栈还在，
+        // 面包屑就跟过去了。退出会把内容写回所在标签页，切走前先收干净
+        while isInsideCompound { exitCompound() }
         // 选中态是跟着轨道走的，切过去之后那些 id 在新标签页里根本不存在
         clearClipSelections()
         selectedClipIDs.removeAll()
@@ -63,6 +67,8 @@ extension ProjectState {
 
     func closeAllTabs() {
         pushUndo()
+        // 全关掉就没有「当前在哪条时间线里」了，复合片段的面包屑也得跟着收
+        while isInsideCompound { exitCompound() }
         for i in tabs.indices { tabs[i].isTabOpen = false }
         isSaved = false
     }
@@ -78,6 +84,9 @@ extension ProjectState {
     func deleteTab(id: UUID) {
         guard let i = tabs.firstIndex(where: { $0.id == id }) else { return }
         pushUndo()
+        // 数据都要丢了，栈直接清掉，别走 exitCompound —— 那条路会把复合片段的
+        // 内容写回轨道，写进删完新补的那条空时间线里
+        if i == activeTab { compositionStack.removeAll() }
         tabs.remove(at: i)
         if tabs.isEmpty { tabs = [TimelineTab(name: "时间线 1")] }
         activeTab = min(max(activeTab, 0), tabs.count - 1)

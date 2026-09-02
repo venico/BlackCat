@@ -648,6 +648,8 @@ final class AIVideoService: ObservableObject {
     enum TaskSource: Equatable {
         case chat
         case canvas
+        /// Agent 派下来的。这类不往会话里插气泡，进度走后台任务面板
+        case agent
     }
 
     /// 一个在跑的生成任务
@@ -2799,6 +2801,12 @@ final class AIVideoService: ObservableObject {
     }
 
     // MARK: - 联网搜索
+
+    /// 给 Agent 调的入口。它自己决定搜什么词、搜几次，
+    /// 不像老链路那样只在发请求前闷头搜一次
+    func agentWebSearch(_ query: String) async throws -> String {
+        try await webSearchQuery(query)
+    }
 
     private func webSearchQuery(_ query: String) async throws -> String {
         switch settings.searchEngine {

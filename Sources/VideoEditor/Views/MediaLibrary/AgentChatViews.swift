@@ -38,17 +38,56 @@ struct AgentModePicker: View {
 struct AgentStepsView: View {
     let steps: [AIVideoService.ConversationRecord.AgentStepRecord]
     let isRunning: Bool
+    /// 这一轮跑了多久
+    var elapsed: TimeInterval = 0
+    /// 累计 token。中转站不回 usage 时是 0，这段就不显示
+    var tokens: Int = 0
+    /// 此刻在干什么。跑完是空的
+    var phase: String = ""
     @State private var expanded = false
 
+    /// 「12s」/「1m24s」
+    private var timeText: String {
+        let sec = Int(elapsed.rounded())
+        return sec < 60 ? "\(sec)s" : "\(sec / 60)m\(sec % 60)s"
+    }
+
+    /// 「832 tokens」/「5.6k tokens」
+    private var tokenText: String {
+        tokens < 1000 ? "\(tokens) tokens"
+            : String(format: "%.1fk tokens", Double(tokens) / 1000)
+    }
+
+    /// 时间和用量，有哪个显示哪个
+    private var meta: String {
+        var parts: [String] = []
+        if elapsed >= 1 { parts.append(timeText) }
+        if tokens > 0 { parts.append(tokenText) }
+        return parts.isEmpty ? "" : " · " + parts.joined(separator: " · ")
+    }
+
+    private var headline: String {
+        if isRunning {
+            // 正在跑的时候，「在干什么」比「跑了几步」有用
+            let what = phase.isEmpty ? "正在执行" : phase
+            return steps.isEmpty ? what : "\(what)（\(steps.count) 步）"
+        }
+        return "执行了 \(steps.count) 步"
+    }
+
     var body: some View {
-        if !steps.isEmpty {
+        // 刚发出去还没调工具时 steps 是空的，但用户已经在等了，
+        // 这时候更需要看到「正在思考 · 3s」
+        if !steps.isEmpty || isRunning {
             VStack(alignment: .leading, spacing: 3) {
                 Button { expanded.toggle() } label: {
                     HStack(spacing: 4) {
                         Image(systemName: expanded ? "chevron.down" : "chevron.right")
                             .font(.system(size: 8, weight: .semibold))
-                        Text(isRunning ? "正在执行…（\(steps.count) 步）" : "执行了 \(steps.count) 步")
+                            .opacity(steps.isEmpty ? 0 : 1)
+                        Text(headline + meta)
                             .font(.system(size: 10))
+                            .monospacedDigit()
                         if steps.contains(where: \.isError) {
                             Text("有失败")
                                 .font(.system(size: 9))
@@ -59,8 +98,15 @@ struct AgentStepsView: View {
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
+                .disabled(steps.isEmpty)
 
                 if expanded {
+                    // 十几步的时候整块能把输入框顶出屏幕，给个上限、超了自己滚。
+                    // 用 maxHeight 不用 height：ScrollView 的理想高度就是内容高度，
+                    // maxHeight 只封顶。先前拿 GeometryReader 量内容再钉 height，
+                    // 首帧量到 0、高度被钳成 1pt，展开等于没展开
+                    ScrollView(showsIndicators: true) {
+                    VStack(alignment: .leading, spacing: 3) {
                     ForEach(steps) { s in
                         HStack(alignment: .top, spacing: 5) {
                             Circle()
@@ -73,6 +119,9 @@ struct AgentStepsView: View {
                                 .fixedSize(horizontal: false, vertical: true)
                         }
                     }
+                    }
+                    }
+                    .frame(maxHeight: 600)
                     .padding(.leading, 2)
                 }
             }
@@ -95,14 +144,34 @@ struct AgentConfirmBar: View {
                 Image(nsImage: SidebarSVGIcon.load("toastWarn", size: 13))
                     .renderingMode(.template)
                     .foregroundColor(Color(hex: "#FF9230"))
-                Text("这一步会改动不好回头的东西")
+                Text(toolName == "run_command" ? "要在你的电脑上跑一条命令" : "这一步会改动不好回头的东西")
                     .font(.system(size: 11, weight: .medium))
                     .foregroundColor(Color.labelPrimary)
             }
-            Text(detail)
-                .font(.system(size: 10))
-                .foregroundColor(Color.labelSecondary)
-                .fixedSize(horizontal: false, vertical: true)
+            if toolName == "run_command" {
+                // 命令原文是这里最要紧的东西：等宽 + 单独的底色，
+                // 免得跟上面那句说明混成一片，看漏了才点确认
+                let parts = detail.components(separatedBy: "\n\n")
+                if parts.count > 1, !parts[0].isEmpty {
+                    Text(parts[0])
+                        .font(.system(size: 10))
+                        .foregroundColor(Color.labelSecondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Text(parts.last ?? detail)
+                    .font(.system(size: 10.5, design: .monospaced))
+                    .foregroundColor(Color.labelPrimary)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.horizontal, 7).padding(.vertical, 5)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(RoundedRectangle(cornerRadius: 5).fill(Color.black.opacity(0.28)))
+            } else {
+                Text(detail)
+                    .font(.system(size: 10))
+                    .foregroundColor(Color.labelSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
             HStack(spacing: 6) {
                 Spacer()
                 Button("拒绝") { onAnswer(false) }

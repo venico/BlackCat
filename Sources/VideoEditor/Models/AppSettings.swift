@@ -46,6 +46,7 @@ final class AppSettings: ObservableObject {
         static let llmAPIKey = "settings.llm.apiKey"
         static let searchEngine = "settings.ai.searchEngine"
         static let agentMode = "settings.agent.mode"
+        static let agentMemoryEnabled = "settings.agent.memory.enabled"
         static let bingSearchKey = "settings.ai.bing.searchKey"
         static let googleSearchKey = "settings.ai.google.searchKey"
         static let googleSearchCX = "settings.ai.google.searchCX"
@@ -313,6 +314,14 @@ final class AppSettings: ObservableObject {
     var llmAPIKey: String {
         get { providerAPIKey(for: llmProvider.sharedProviderKey) }
         set { setProviderAPIKey(newValue, for: llmProvider.sharedProviderKey) }
+    }
+
+    /// 让不让 Agent 用记忆。**它会悄悄影响每一次回答**，
+    /// 所以得能一键关掉 —— 记错一条又没有出口的话，会一直被误导
+    @Published var agentMemoryEnabled: Bool = {
+        UserDefaults.standard.object(forKey: K.agentMemoryEnabled) as? Bool ?? true
+    }() {
+        didSet { UserDefaults.standard.set(agentMemoryEnabled, forKey: K.agentMemoryEnabled) }
     }
 
     /// Agent 的运行模式。**默认自动** —— 计划模式什么都做不了，

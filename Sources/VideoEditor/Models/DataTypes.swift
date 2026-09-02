@@ -1124,6 +1124,8 @@ struct ProjectDocument: Codable {
     /// 旧 .bcj 里没有 tabs，打开时把散字段收成一个标签页
     var tabs: [TimelineTab]?
     var activeTab: Int?
+    /// 这个片子的设定（主角名字、基调之类）。跟着项目走，换个项目就不该再提
+    var agentMemory: [MemoryEntry]?
     var mediaAssets: [MediaAsset]
     var exportSettings: ExportSettings
     var previewResolution: String

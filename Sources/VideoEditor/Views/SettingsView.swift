@@ -3,6 +3,10 @@ import AppKit
 
 struct SettingsView: View {
     @ObservedObject private var settings = AppSettings.shared
+    @ObservedObject private var memory = AgentMemory.shared
+    @ObservedObject private var skills = AgentSkills.shared
+    @ObservedObject private var mcp = AgentMCP.shared
+    @State private var skillImportError: String?
     @EnvironmentObject var project: ProjectState
     @State private var modelStates: [WhisperTranscriber.ModelSize: ModelState] = [:]
     /// 打开时定位到哪个标签。外部通过 .showSettings 通知的 object 传下标
@@ -27,9 +31,14 @@ struct SettingsView: View {
     @State private var separatedFiles: [URL] = []
     @State private var separatedBytes: Int64 = 0
     @State private var cleanHint: String? = nil
-    private let tabs = ["通用", "视频", "图片", "音频", "字幕", "AI 设置"]
+    // 左边分成两组，「设置」和「智能体」都是**分组标题**，不是可点的条目
+    private let tabs = ["通用", "视频", "图片", "音频", "字幕", "模型"]
+    private let agentTabs = ["通用", "Skills", "MCP"]
+    private let agentIcons = ["agent", "elementLibrary", "relink"]
+    /// 智能体那组在 selectedTab 里的起始下标
+    private var agentTabBase: Int { tabs.count }
     /// 每个标签配的图标，全是现成的那套 SVG，不另画
-    private let tabIcons = ["settings", "video", "image", "audio", "subtitle", "ai"]
+    private let tabIcons = ["settings", "video", "image", "audio", "subtitle", "aiTools"]
     /// 「AI 生成」在 tabs 里的位置。别处要跳过来，写死下标容易随改动失效
     static let aiTabIndex = 5
 
@@ -44,13 +53,20 @@ struct SettingsView: View {
                 .frame(width: 1)
             VStack(spacing: 0) {
                 HStack {
-                    Image(nsImage: SidebarSVGIcon.load(tabIcons[min(selectedTab, tabIcons.count - 1)], size: 15))
-                        .renderingMode(.template)
-                        .foregroundColor(Color.labelSecondary)
-                    Text(tabs[min(selectedTab, tabs.count - 1)])
+                    Text(selectedTab >= agentTabBase
+                         ? agentTabs[min(selectedTab - agentTabBase, agentTabs.count - 1)]
+                         : tabs[min(selectedTab, tabs.count - 1)])
                         .font(.system(size: 15, weight: .semibold))
                         .foregroundColor(Color.labelPrimary)
                     Spacer()
+                    // Skills / MCP 有内容时，添加入口摆在关闭左边
+                    if selectedTab == agentTabBase + 1, !skills.skills.isEmpty {
+                        smallActionButton("添加") { importSkill() }
+                            .padding(.trailing, 24)
+                    } else if selectedTab == agentTabBase + 2, !mcp.servers.isEmpty {
+                        smallActionButton("添加") { mcp.add() }
+                            .padding(.trailing, 24)
+                    }
                     Button { dismiss() } label: {
                         Image(systemName: "xmark")
                             .font(.system(size: 12, weight: .medium))
@@ -74,6 +90,9 @@ struct SettingsView: View {
                         case 3: audioTab
                         case 4: subtitleTab
                         case 5: aiVideoTab
+                        case 6: agentGeneralTab
+                        case 7: skillsTab
+                        case 8: mcpTab
                         default: EmptyView()
                         }
                     }
@@ -88,38 +107,63 @@ struct SettingsView: View {
         .onAppear { refreshModelStates(); refreshSceneDetectState(); refreshDemucsState(); refreshSeparated(); refreshBiRefNetStates(); refreshClarityModelStates(); refreshClarityProStates() }
     }
 
+    /// 标签图标。有几个只长在时间轴那套注册表里，两边都找一下
+    private func settingsTabIcon(_ name: String, size: CGFloat) -> NSImage {
+        // 两套注册表各管一半，先查侧边栏那套，没有的退到时间轴那套
+        if SidebarSVGIcon.svgs[name] != nil { return SidebarSVGIcon.load(name, size: size) }
+        return TimelineSVGIcon.load(name, size: size)
+    }
+
     private var sidebar: some View {
         VStack(alignment: .leading, spacing: 2) {
-            Text("设置")
-                .font(.system(size: 13, weight: .semibold))
-                .foregroundColor(Color.labelSecondary)
-                .padding(.horizontal, 14)
-                .padding(.top, 22).padding(.bottom, 10)
-
+            groupTitle("设置").padding(.top, 22)
             ForEach(0..<tabs.count, id: \.self) { i in
-                Button { selectedTab = i } label: {
-                    HStack(spacing: 7) {
-                        Image(nsImage: SidebarSVGIcon.load(tabIcons[i], size: 13))
-                            .renderingMode(.template)
-                            .foregroundColor(selectedTab == i ? Color.labelPrimary : Color.labelSecondary)
-                            .frame(width: 15)
-                        Text(tabs[i])
-                            .font(.system(size: 12, weight: selectedTab == i ? .medium : .regular))
-                            .foregroundColor(selectedTab == i ? Color.labelPrimary : Color.labelSecondary)
-                    }
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(.horizontal, 10)
-                        .frame(height: 28)
-                        .background(RoundedRectangle(cornerRadius: 6)
-                            .fill(selectedTab == i ? Color.white.opacity(0.12) : Color.clear))
-                        .contentShape(RoundedRectangle(cornerRadius: 6))
+                navRow(title: tabs[i], icon: tabIcons[i],
+                       selected: selectedTab == i) { selectedTab = i }
+            }
+
+            groupTitle("智能体").padding(.top, 14)
+            ForEach(0..<agentTabs.count, id: \.self) { j in
+                navRow(title: agentTabs[j], icon: agentIcons[j],
+                       selected: selectedTab == agentTabBase + j) {
+                    selectedTab = agentTabBase + j
                 }
-                .buttonStyle(.plain)
-                .padding(.horizontal, 8)
             }
             Spacer()
         }
         .frame(width: 168)
+    }
+
+    /// 分组标题。跟条目不是一回事 —— 它不可点，只用来分块
+    private func groupTitle(_ text: String) -> some View {
+        Text(text)
+            .font(.system(size: 11, weight: .medium))
+            .foregroundColor(Color.labelSecondary)
+            .padding(.horizontal, 14)
+            .padding(.bottom, 6)
+    }
+
+    private func navRow(title: String, icon: String,
+                        selected: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack(spacing: 7) {
+                Image(nsImage: settingsTabIcon(icon, size: 13))
+                    .renderingMode(.template)
+                    .foregroundColor(selected ? Color.labelPrimary : Color.labelSecondary)
+                    .frame(width: 15)
+                Text(title)
+                    .font(.system(size: 12, weight: selected ? .medium : .regular))
+                    .foregroundColor(selected ? Color.labelPrimary : Color.labelSecondary)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 10)
+            .frame(height: 28)
+            .background(RoundedRectangle(cornerRadius: 6)
+                .fill(selected ? Color.white.opacity(0.12) : Color.clear))
+            .contentShape(RoundedRectangle(cornerRadius: 6))
+        }
+        .buttonStyle(.plain)
+        .padding(.horizontal, 8)
     }
 
     /// 标签页内的一级标题，用来分块
@@ -166,7 +210,7 @@ struct SettingsView: View {
                 }
                 Text(detail)
                     .font(.system(size: 10))
-                    .foregroundColor(Color.labelSecondary)
+                    .foregroundColor(Color.labelSecondary.opacity(0.6))
             }
 
             Spacer()
@@ -509,7 +553,7 @@ struct SettingsView: View {
                         .foregroundColor(Color.labelPrimary)
                     Text(stem.hint)
                         .font(.system(size: 10))
-                        .foregroundColor(Color.labelSecondary)
+                        .foregroundColor(Color.labelSecondary.opacity(0.6))
                         .lineLimit(1)
                 }
                 Spacer()
@@ -583,7 +627,7 @@ struct SettingsView: View {
                             .foregroundColor(Color.labelPrimary)
                         Text("生成后把超长的压到字幕长度，变速不变调")
                             .font(.system(size: 10))
-                            .foregroundColor(Color.labelSecondary)
+                            .foregroundColor(Color.labelSecondary.opacity(0.6))
                     }
                     Spacer()
                 }
@@ -640,7 +684,7 @@ struct SettingsView: View {
                 if settings.translateProvider == .google {
                     Text("免费，无需配置")
                         .font(.system(size: 10))
-                        .foregroundColor(Color.labelSecondary)
+                        .foregroundColor(Color.labelSecondary.opacity(0.6))
                 }
 
                 if settings.translateProvider == .apple {
@@ -651,7 +695,7 @@ struct SettingsView: View {
                     if #available(macOS 26, *) {
                         Text("使用系统内置翻译，无需 API Key（需先在系统设置中下载语言包）")
                             .font(.system(size: 10))
-                            .foregroundColor(Color.labelSecondary)
+                            .foregroundColor(Color.labelSecondary.opacity(0.6))
                     } else {
                         Text("Apple 翻译需要 macOS 26 或更高版本")
                             .font(.system(size: 10))
@@ -710,7 +754,7 @@ struct SettingsView: View {
 
             Text(settings.clarityEngine.hint)
                 .font(.system(size: 10))
-                .foregroundColor(Color.labelSecondary.opacity(0.7))
+                .foregroundColor(Color.labelSecondary.opacity(0.6))
                 .fixedSize(horizontal: false, vertical: true)
 
             if settings.clarityEngine.isCloud {
@@ -877,6 +921,277 @@ struct SettingsView: View {
     }
 
     // MARK: - AI 生成
+
+    // MARK: - Agent
+
+    // MARK: - Skills
+
+    @ViewBuilder
+    private var skillsTab: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            if skills.skills.isEmpty {
+                // 一个都没有的时候不摆说明和列表，直接给缺省页
+                emptyState(
+                    icon: "elementLibrary",
+                    text: "还没有 Skill。一个 Skill 是一个文件夹，里面放一份 SKILL.md 说明它该怎么做事，可以带脚本和素材。",
+                    primary: ("导入", { importSkill() }),
+                    secondary: ("打开 Skills 文件夹",
+                                { NSWorkspace.shared.open(AgentSkills.rootURL) }))
+            } else {
+                Text("一个 Skill 是一个文件夹，里面一份 SKILL.md 说明该怎么做事。")
+                    .font(.system(size: 10))
+                    .foregroundColor(Color.labelSecondary.opacity(0.6))
+                if let err = skillImportError {
+                    Text(err)
+                        .font(.system(size: 10))
+                        .foregroundColor(Color(hex: "#FF9230"))
+                }
+                ForEach(skills.skills) { sk in
+                    skillCard(sk)
+                }
+            }
+        }
+        .onAppear { skills.reload() }
+    }
+
+    /// 空状态：一个图标 + 一行说明 + 两个按钮，居中摆
+    private func emptyState(icon: String, text: String,
+                            primary: (String, () -> Void),
+                            secondary: (String, () -> Void)) -> some View {
+        VStack(spacing: 10) {
+            Image(nsImage: settingsTabIcon(icon, size: 34))
+                .renderingMode(.template)
+                .foregroundColor(Color.labelSecondary.opacity(0.28))
+            Text(text)
+                .font(.system(size: 10))
+                .foregroundColor(Color.labelSecondary.opacity(0.6))
+                .multilineTextAlignment(.center)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: 300)
+            HStack(spacing: 8) {
+                smallActionButton(primary.0, action: primary.1)
+                Button(action: secondary.1) {
+                    Text(secondary.0)
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundColor(Color.labelSecondary)
+                        .padding(.horizontal, 10).frame(height: 24)
+                        .background(Color.white.opacity(0.08))
+                        .cornerRadius(4)
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.top, 40)
+    }
+
+    private func smallActionButton(_ title: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Text(title)
+                .font(.system(size: 10, weight: .medium))
+                .foregroundColor(Color.accent)
+                .padding(.horizontal, 10).frame(height: 24)
+                .background(Color.accent.opacity(0.15))
+                .cornerRadius(4)
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func skillCard(_ sk: AgentSkill) -> some View {
+        HStack(spacing: 10) {
+            VStack(alignment: .leading, spacing: 1) {
+                HStack(spacing: 4) {
+                    Text(sk.name)
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundColor(Color.labelPrimary)
+                    if sk.hasScripts {
+                        // 带脚本要标出来：装别人的 Skill 等于跑别人的代码
+                        InfoBadge(text: "这个 Skill 带可执行脚本，运行前会先让你确认命令内容")
+                    }
+                }
+                Text(skillSubtitle(sk))
+                    .font(.system(size: 10))
+                    .foregroundColor(Color.labelSecondary.opacity(0.6))
+                    .lineLimit(1)
+            }
+
+            Spacer()
+
+            Button { NSWorkspace.shared.open(sk.folderURL) } label: {
+                Image(nsImage: SidebarSVGIcon.load("folder"))
+                    .renderingMode(.template)
+                    .resizable().aspectRatio(contentMode: .fit)
+                    .frame(width: 14, height: 14)
+                    .foregroundColor(Color.labelSecondary)
+                    .frame(width: 24, height: 24)
+            }
+            .buttonStyle(.plain)
+            .help("在访达中显示")
+
+            Toggle("", isOn: Binding(get: { sk.isEnabled },
+                                     set: { skills.setEnabled($0, for: sk) }))
+                .toggleStyle(.switch).controlSize(.mini).labelsHidden()
+
+            // 跟组件卡片同一个控件：静止显示「已安装」，悬停变「卸载」并转红
+            InstalledBadge(label: "已安装", onUninstall: { skills.delete(sk) })
+        }
+        .padding(.horizontal, 12).padding(.vertical, 10)
+        .background(RoundedRectangle(cornerRadius: 8).fill(Color.white.opacity(0.05)))
+    }
+
+    /// 副标题里塞作者、更新时间和描述 —— 一行说清这是谁的、多新、干什么
+    private func skillSubtitle(_ sk: AgentSkill) -> String {
+        var parts: [String] = [sk.author]
+        if sk.updatedAt > .distantPast {
+            let f = DateFormatter()
+            f.dateFormat = "yy/M/d"
+            parts.append("更新于 " + f.string(from: sk.updatedAt))
+        }
+        if !sk.description.isEmpty { parts.append(sk.description) }
+        return parts.joined(separator: " · ")
+    }
+
+    private func importSkill() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.message = "选一个含 SKILL.md 的文件夹"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        skillImportError = skills.install(from: url)
+    }
+
+    // MARK: - MCP
+
+    @ViewBuilder
+    private var mcpTab: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            if mcp.servers.isEmpty {
+                emptyState(
+                    icon: "relink",
+                    text: "还没有 MCP 服务。接进来之后，Agent 就能用外部工具 —— 本地进程填可执行命令，远程填完整 URL。",
+                    primary: ("添加", { mcp.add() }),
+                    secondary: ("什么是 MCP", {
+                        if let u = URL(string: "https://modelcontextprotocol.io") {
+                            NSWorkspace.shared.open(u)
+                        }
+                    }))
+            } else {
+                Text("接外部工具。本地进程填可执行命令，远程填完整 URL。")
+                    .font(.system(size: 10))
+                    .foregroundColor(Color.labelSecondary.opacity(0.6))
+                ForEach($mcp.servers) { $srv in
+                    VStack(spacing: 8) {
+                        HStack(spacing: 10) {
+                            VStack(alignment: .leading, spacing: 1) {
+                                TextField("名字", text: $srv.name)
+                                    .textFieldStyle(.plain)
+                                    .font(.system(size: 12, weight: .semibold))
+                                    .foregroundColor(Color.labelPrimary)
+                                Text(srv.transport.rawValue
+                                     + (srv.command.isEmpty ? " · 还没填地址" : " · " + srv.command))
+                                    .font(.system(size: 10))
+                                    .foregroundColor(Color.labelSecondary.opacity(0.6))
+                                    .lineLimit(1)
+                            }
+                            Spacer()
+                            Toggle("", isOn: $srv.isEnabled)
+                                .toggleStyle(.switch).controlSize(.mini).labelsHidden()
+                            InstalledBadge(label: "已添加", onUninstall: { mcp.remove(srv.id) })
+                        }
+
+                        Picker("", selection: $srv.transport) {
+                            ForEach(MCPServerConfig.Transport.allCases, id: \.self) {
+                                Text($0.rawValue).tag($0)
+                            }
+                        }
+                        .pickerStyle(.segmented).labelsHidden().controlSize(.small)
+
+                        TextField(srv.transport == .stdio ? "npx -y some-mcp"
+                                                          : "https://example.com/mcp",
+                                  text: $srv.command)
+                            .textFieldStyle(.roundedBorder)
+                            .font(.system(size: 11))
+                    }
+                    .padding(.horizontal, 12).padding(.vertical, 10)
+                    .background(RoundedRectangle(cornerRadius: 8).fill(Color.white.opacity(0.05)))
+                }
+            }
+        }
+    }
+
+    private var agentGeneralTab: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            VStack(alignment: .leading, spacing: 8) {
+                sectionTitle("记忆")
+                HStack {
+                    Text("记住你的习惯")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundColor(Color.labelSecondary)
+                    Spacer()
+                    Toggle("", isOn: Binding(get: { settings.agentMemoryEnabled },
+                                             set: { settings.agentMemoryEnabled = $0 }))
+                        .toggleStyle(.switch)
+                        .controlSize(.small)
+                        .labelsHidden()
+                }
+                Text("关掉之后它不再读也不再写记忆，下面这些条目会留着但不生效。")
+                    .font(.system(size: 10))
+                    .foregroundColor(Color.labelSecondary.opacity(0.6))
+
+                memoryList(title: "长期习惯（所有项目通用）",
+                           entries: memory.global, isGlobal: true)
+                memoryList(title: "本项目的设定",
+                           entries: memory.project, isGlobal: false)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func memoryList(title: String, entries: [MemoryEntry], isGlobal: Bool) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack {
+                Text(title)
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundColor(Color.labelSecondary)
+                Spacer()
+                if !entries.isEmpty {
+                    Button("全部清除") { memory.clear(isGlobal: isGlobal) }
+                        .buttonStyle(.plain)
+                        .font(.system(size: 10))
+                        .foregroundColor(Color.labelSecondary.opacity(0.6))
+                }
+            }
+            if entries.isEmpty {
+                Text(isGlobal ? "还没记下什么。你说「以后字幕都用 XX」这类话时它会自己记。"
+                              : "这个项目还没有专属设定。")
+                    .font(.system(size: 10))
+                    .foregroundColor(Color.labelSecondary.opacity(0.6))
+            } else {
+                ForEach(entries) { e in
+                    HStack(spacing: 6) {
+                        // 直接可编辑：记错了要能改，不能只有删掉重来一条路
+                        TextField("", text: Binding(
+                            get: { e.text },
+                            set: { memory.update(id: e.id, text: $0, isGlobal: isGlobal) }))
+                            .textFieldStyle(.plain)
+                            .font(.system(size: 11))
+                            .foregroundColor(Color.labelPrimary)
+                        Button { memory.remove(id: e.id, isGlobal: isGlobal) } label: {
+                            Image(systemName: "xmark")
+                                .font(.system(size: 8, weight: .semibold))
+                                .foregroundColor(Color.labelSecondary)
+                                .frame(width: 16, height: 16)
+                                .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                    }
+                    .padding(.horizontal, 8).padding(.vertical, 5)
+                    .background(RoundedRectangle(cornerRadius: 5).fill(Color.white.opacity(0.05)))
+                }
+            }
+        }
+    }
 
     private var aiVideoTab: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -1533,50 +1848,24 @@ private struct AIProviderPicker: View {
 
     private func showMenu() {
         let menu = NSMenu()
-        menu.minimumWidth = 220
-        IPickerItemHandler.shared.actions.removeAll()
-        var tag = 0
+        menu.minimumWidth = 200
         for cat in AIVideoService.ProviderCategory.allCases {
             let header = NSMenuItem(title: cat.rawValue, action: nil, keyEquivalent: "")
             header.isEnabled = false
-            let attrs: [NSAttributedString.Key: Any] = [
+            header.attributedTitle = NSAttributedString(string: cat.rawValue, attributes: [
                 .font: NSFont.systemFont(ofSize: 11, weight: .medium),
                 .foregroundColor: NSColor.secondaryLabelColor
-            ]
-            header.attributedTitle = NSAttributedString(string: cat.rawValue, attributes: attrs)
+            ])
             menu.addItem(header)
-
             for provider in AIVideoService.Provider.providers(for: cat) {
-                let item = NSMenuItem(title: provider.displayName,
-                                      action: #selector(IPickerItemHandler.pick(_:)),
-                                      keyEquivalent: "")
-                item.target = IPickerItemHandler.shared
-                item.tag = tag
-                item.indentationLevel = 1
-                let sel = selection
-                IPickerItemHandler.shared.actions[tag] = { [self] in selection = provider.rawValue }
-                let title = NSMutableAttributedString(string: provider.displayName, attributes: [
-                    .font: NSFont.systemFont(ofSize: 13)
-                ])
-                if provider.rawValue == sel {
-                    title.append(NSAttributedString(string: "  ✓", attributes: [
-                        .font: NSFont.systemFont(ofSize: 12, weight: .semibold),
-                        .foregroundColor: NSColor.white
-                    ]))
-                }
-                item.attributedTitle = title
-                menu.addItem(item)
-                tag += 1
+                menu.addItem(MenuRowView.item(title: provider.displayName,
+                                              checked: provider.rawValue == selection,
+                                              width: 200, indent: true) { selection = provider.rawValue })
             }
             menu.addItem(.separator())
         }
         if menu.items.last?.isSeparatorItem == true { menu.removeItem(at: menu.numberOfItems - 1) }
-        let view = NSApp.keyWindow?.contentView ?? NSView()
-        if let event = NSApp.currentEvent {
-            NSMenu.popUpContextMenu(menu, with: event, for: view)
-        } else {
-            menu.popUp(positioning: nil, at: .zero, in: view)
-        }
+        menu.popUpHere()
     }
 }
 
@@ -1607,34 +1896,9 @@ private struct TTSProviderPicker: View {
     }
 
     private func showMenu() {
-        let menu = NSMenu()
-        menu.minimumWidth = 180
-        IPickerItemHandler.shared.actions.removeAll()
-        for (tag, p) in AppSettings.ttsProviders.enumerated() {
-            let item = NSMenuItem(title: p.displayName,
-                                  action: #selector(IPickerItemHandler.pick(_:)),
-                                  keyEquivalent: "")
-            item.target = IPickerItemHandler.shared
-            item.tag = tag
-            IPickerItemHandler.shared.actions[tag] = { [self] in selection = p }
-            let title = NSMutableAttributedString(string: p.displayName, attributes: [
-                .font: NSFont.systemFont(ofSize: 13)
-            ])
-            if p == selection {
-                title.append(NSAttributedString(string: "  ✓", attributes: [
-                    .font: NSFont.systemFont(ofSize: 12, weight: .semibold),
-                    .foregroundColor: NSColor.white
-                ]))
-            }
-            item.attributedTitle = title
-            menu.addItem(item)
-        }
-        guard let view = NSApp.keyWindow?.contentView else { return }
-        if let event = NSApp.currentEvent {
-            NSMenu.popUpContextMenu(menu, with: event, for: view)
-        } else {
-            menu.popUp(positioning: nil, at: .zero, in: view)
-        }
+        NSMenu.picker(AppSettings.ttsProviders.map { p in
+            (label: p.displayName, checked: p == selection, action: { selection = p })
+        }).popUpHere()
     }
 }
 
@@ -1665,34 +1929,9 @@ private struct BGEnginePicker: View {
     }
 
     private func showMenu() {
-        let menu = NSMenu()
-        menu.minimumWidth = 180
-        IPickerItemHandler.shared.actions.removeAll()
-        for (tag, eng) in BackgroundRemover.Engine.allCases.enumerated() {
-            let item = NSMenuItem(title: eng.label,
-                                  action: #selector(IPickerItemHandler.pick(_:)),
-                                  keyEquivalent: "")
-            item.target = IPickerItemHandler.shared
-            item.tag = tag
-            IPickerItemHandler.shared.actions[tag] = { [self] in selection = eng }
-            let title = NSMutableAttributedString(string: eng.label, attributes: [
-                .font: NSFont.systemFont(ofSize: 13)
-            ])
-            if eng == selection {
-                title.append(NSAttributedString(string: "  ✓", attributes: [
-                    .font: NSFont.systemFont(ofSize: 12, weight: .semibold),
-                    .foregroundColor: NSColor.white
-                ]))
-            }
-            item.attributedTitle = title
-            menu.addItem(item)
-        }
-        guard let view = NSApp.keyWindow?.contentView else { return }
-        if let event = NSApp.currentEvent {
-            NSMenu.popUpContextMenu(menu, with: event, for: view)
-        } else {
-            menu.popUp(positioning: nil, at: .zero, in: view)
-        }
+        NSMenu.picker(BackgroundRemover.Engine.allCases.map { eng in
+            (label: eng.label, checked: eng == selection, action: { selection = eng })
+        }).popUpHere()
     }
 }
 
@@ -1723,55 +1962,9 @@ private struct ClarityEnginePicker: View {
     }
 
     private func showMenu() {
-        let menu = NSMenu()
-        menu.minimumWidth = 180
-        IPickerItemHandler.shared.actions.removeAll()
-        var lastGroup: AppSettings.ClarityEngine.Group? = nil
-        for (tag, eng) in AppSettings.ClarityEngine.allCases.enumerated() {
-            // 本地一组、云端一组，中间画条分隔线——两类的代价完全不同
-            // （一个是等 CPU，一个是花钱），不该混在一起让人一眼扫过去
-            if let last = lastGroup, last != eng.group {
-                menu.addItem(.separator())
-            }
-            lastGroup = eng.group
-
-            // 这台机器跑不了系统超分就置灰，别让用户选一个用不了的
-            var usable = true
-            if eng == .system {
-                if #available(macOS 26.0, *) { usable = AppleSuperResolution.isSupported }
-                else { usable = false }
-            }
-            let item = NSMenuItem(title: eng.label,
-                                  action: #selector(IPickerItemHandler.pick(_:)),
-                                  keyEquivalent: "")
-            item.target = IPickerItemHandler.shared
-            item.tag = tag
-            IPickerItemHandler.shared.actions[tag] = { [self] in selection = eng }
-            let title = NSMutableAttributedString(string: eng.label, attributes: [
-                .font: NSFont.systemFont(ofSize: 13)
-            ])
-            if eng == selection {
-                title.append(NSAttributedString(string: "  ✓", attributes: [
-                    .font: NSFont.systemFont(ofSize: 12, weight: .semibold),
-                    .foregroundColor: NSColor.white
-                ]))
-            }
-            item.isEnabled = usable
-            if !usable {
-                title.append(NSAttributedString(string: "（需 macOS 26+）", attributes: [
-                    .font: NSFont.systemFont(ofSize: 11),
-                    .foregroundColor: NSColor.secondaryLabelColor
-                ]))
-            }
-            item.attributedTitle = title
-            menu.addItem(item)
-        }
-        guard let view = NSApp.keyWindow?.contentView else { return }
-        if let event = NSApp.currentEvent {
-            NSMenu.popUpContextMenu(menu, with: event, for: view)
-        } else {
-            menu.popUp(positioning: nil, at: .zero, in: view)
-        }
+        NSMenu.picker(AppSettings.ClarityEngine.allCases.map { eng in
+            (label: eng.label, checked: eng == selection, action: { selection = eng })
+        }).popUpHere()
     }
 }
 
@@ -1802,35 +1995,9 @@ private struct SearchEnginePicker: View {
     }
 
     private func showMenu() {
-        let menu = NSMenu()
-        menu.minimumWidth = 180
-        IPickerItemHandler.shared.actions.removeAll()
-        for (tag, eng) in AppSettings.SearchEngine.allCases.enumerated() {
-            let item = NSMenuItem(title: eng.rawValue,
-                                  action: #selector(IPickerItemHandler.pick(_:)),
-                                  keyEquivalent: "")
-            item.target = IPickerItemHandler.shared
-            item.tag = tag
-            IPickerItemHandler.shared.actions[tag] = { [self] in selection = eng }
-            let title = NSMutableAttributedString(string: eng.rawValue, attributes: [
-                .font: NSFont.systemFont(ofSize: 13)
-            ])
-            if eng == selection {
-                title.append(NSAttributedString(string: "  ✓", attributes: [
-                    .font: NSFont.systemFont(ofSize: 12, weight: .semibold),
-                    .foregroundColor: NSColor.white
-                ]))
-            }
-            item.attributedTitle = title
-            menu.addItem(item)
-        }
-
-        guard let view = NSApp.keyWindow?.contentView else { return }
-        if let event = NSApp.currentEvent {
-            NSMenu.popUpContextMenu(menu, with: event, for: view)
-        } else {
-            menu.popUp(positioning: nil, at: .zero, in: view)
-        }
+        NSMenu.picker(AppSettings.SearchEngine.allCases.map { eng in
+            (label: eng.rawValue, checked: eng == selection, action: { selection = eng })
+        }).popUpHere()
     }
 }
 
@@ -1839,12 +2006,14 @@ private struct SearchEnginePicker: View {
 /// 独立成 View 是因为要有自己的 hover 状态——写在 componentCard 里的话
 /// 几张卡片会共用同一个 @State，悬停一张其余全跟着变。
 private struct InstalledBadge: View {
+    /// 静止时显示什么。模型那边是「已下载」，Skill 是「已安装」
+    var label: String = "已下载"
     let onUninstall: () -> Void
     @State private var hovering = false
 
     var body: some View {
         Button(action: onUninstall) {
-            Text(hovering ? "卸载" : "已下载")
+            Text(hovering ? "卸载" : label)
                 .font(.system(size: 10, weight: .medium))
                 .foregroundColor(hovering ? .red.opacity(0.9) : .green.opacity(0.8))
                 .padding(.horizontal, 8)
