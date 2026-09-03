@@ -13,6 +13,13 @@ import SwiftUI
 @MainActor
 final class AgentRunner: ObservableObject {
 
+    /// 气泡里要显示实时步骤，会话列表里每一条都得能观察到它，做成单例最省事
+    static let shared = AgentRunner()
+
+    /// 这一轮的步骤挂在哪条回复上。气泡靠它认领「我是正在跑的那条」
+    @Published var runningMessageID: UUID?
+
+
     /// 一轮里发生过什么，给界面显示
     struct Step: Identifiable {
         let id = UUID()
@@ -60,6 +67,7 @@ final class AgentRunner: ObservableObject {
 
     /// 跑一轮。`history` 会被就地追加，方便上层保存会话
     func run(prompt: String,
+             images: [Data] = [],
              history: inout [AgentMessage],
              mode: AgentMode,
              project: ProjectState,
@@ -70,7 +78,7 @@ final class AgentRunner: ObservableObject {
         steps = []
         streamingText = ""
 
-        history.append(.user(prompt))
+        history.append(.user(prompt, images: images))
         var msgs = history
 
         // 整轮一个撤销点：开跑前打一次，期间工具内部的 pushUndo 全部跳过
@@ -88,7 +96,7 @@ final class AgentRunner: ObservableObject {
                   // 这家有原生联网就用原生（搜索在服务端跑，模型自己决定搜什么词）；
                   // 没有、或者走了中转站发不过去，才挂这个外挂工具兜底
                   + (webSearch && !AgentLLM.canUseNativeSearch() ? AgentToolbox.searchTools : [])
-        let system = Self.systemPrompt(mode: mode)
+        let system = Self.systemPrompt(mode: mode, inCanvas: project.showCanvas)
                    + AgentMemory.shared.promptSection
                    + AgentSkills.shared.promptSection
 
@@ -121,7 +129,7 @@ final class AgentRunner: ObservableObject {
 
                     for call in turn.toolCalls {
                         if Task.isCancelled { break }
-                        self.phase = "正在跑 \(call.name)"
+                        self.phase = AgentPhaseText.phase(for: call.name)
                         let result = await self.execute(call, mode: mode, project: project)
                         self.steps.append(Step(toolName: call.name,
                                                summary: String(result.text.prefix(120)),
@@ -131,8 +139,10 @@ final class AgentRunner: ObservableObject {
                     }
                 }
             } catch {
-                finalText = "出错了：\(error.localizedDescription)"
-                self.steps.append(Step(toolName: "模型", summary: finalText, isError: true))
+                // 用户自己按的停止，不该报成错
+                let cancelled = error.isUserCancellation
+                finalText = cancelled ? "已取消" : "出错了：\(error.localizedDescription)"
+                self.steps.append(Step(toolName: "模型", summary: finalText, isError: !cancelled))
             }
             if !finalText.isEmpty { msgs.append(.assistant(text: finalText, calls: [])) }
             project.suppressUndoPush = false
@@ -204,7 +214,7 @@ final class AgentRunner: ObservableObject {
 
     // MARK: - 系统提示词
 
-    static func systemPrompt(mode: AgentMode) -> String {
+    static func systemPrompt(mode: AgentMode, inCanvas: Bool = false) -> String {
         var s = """
         你是黑猫剪辑里的剪辑助手，直接操作用户当前打开的项目。
 
@@ -219,9 +229,25 @@ final class AgentRunner: ObservableObject {
         · Skill 说明书里给的命令，用 run_command 照着跑，别自己改写、也别自己发明命令。
           命令失败先看输出里的报错，按说明书里的重试链处理，连试三次还不行就停下来告诉用户。
 
-        说话风格：中文，简短，别用「好的」「我将为您」这类开场白。
+        说话风格：中文，简短，别用「好的」「我将为您」这类开场白。**不要用 emoji**，
+        该标状态就用文字（成功 / 失败 / 已完成），面板里 emoji 跟界面图标混在一起很乱。
 
         """
+
+        if inCanvas {
+            s += """
+
+            **用户现在打开的是 AI 画布，不是时间轴。**
+            画布是一块自由排布的创作台，上面摆着一张张卡片（图片/视频/音频/文字），
+            卡片之间连线表示「上游是下游的参考素材」。
+            · 你生成的图片/视频会**自动落到画布上**成为一张新卡片，不会进时间轴。
+              别跟用户说「放到时间轴上」「等好了叫我放进时间轴」——他现在不在那儿。
+            · 时间轴那套工具（加片段、分割、加字幕这些）在画布上一般用不着，
+              用户明确说要放进时间轴时才用。
+
+            """
+        }
+
         switch mode {
         case .plan:
             s += """
@@ -244,4 +270,45 @@ final class AgentRunner: ObservableObject {
         }
         return s
     }
+}
+
+/// 是不是用户主动取消。
+///
+/// 两种都要认：Swift 并发取消抛的是 `CancellationError`，
+/// URLSession 那边取消报的是 `URLError.cancelled`。
+/// 只认一种的话，另一种会以「未能完成操作。(Swift.CancellationError 错误1。)」
+/// 这样一句系统文案露到界面上
+extension Error {
+    var isUserCancellation: Bool {
+        if self is CancellationError { return true }
+        let ns = self as NSError
+        return ns.domain == NSURLErrorDomain && ns.code == NSURLErrorCancelled
+    }
+}
+
+/// 折叠着的步骤栏标题上报哪一步。
+///
+/// 只报改动项目、要等的那些。查询类（读工程、列素材、列轨道）一秒能过好几个，
+/// 标题跟着闪反而看不清，也没什么可看的 —— 一律落到「正在执行」
+enum AgentPhaseText {
+    private static let table: [String: String] = [
+        "generate_video":        "正在生成视频",
+        "generate_image":        "正在生成图片",
+        "generate_audio":        "正在生成音频",
+        "web_search":            "正在联网搜索",
+        "run_command":           "正在执行命令",
+        "run_skill_script":      "正在跑 Skill",
+        "add_asset_to_timeline": "正在放进时间轴",
+        "add_subtitle":          "正在加字幕",
+        "add_text":              "正在加标题文字",
+        "add_filter":            "正在加滤镜",
+        "add_effect":            "正在加特效",
+        "add_adjust":            "正在加调节",
+        "capture_frame":         "正在截取画面",
+        "split_at":              "正在分割片段",
+        "move_clip":             "正在移动片段",
+        "delete_clip":           "正在删除片段",
+    ]
+
+    static func phase(for tool: String) -> String { table[tool] ?? "正在执行" }
 }

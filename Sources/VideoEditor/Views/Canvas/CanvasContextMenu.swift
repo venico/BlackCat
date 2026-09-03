@@ -12,6 +12,8 @@ struct CanvasContextPanel: View {
     let targets: Set<UUID>
     /// 右键的是组的底就带上组 id
     var groupID: UUID?
+    /// 右键点在哪（内容坐标）。粘贴出来的卡片落在这儿
+    var pastePoint: CGPoint?
     /// 右键的那张卡片素材丢了，就多一项「重新关联文件…」。
     /// nil = 没丢或者选了多张，不显示
     var relinkTarget: UUID?
@@ -36,8 +38,10 @@ struct CanvasContextPanel: View {
             }
 
             row(SidebarSVGIcon.load("copy", size: 13), "复制") { canvas.copy(ids: targets) }
+            // 画布里没复制过卡片时看系统剪贴板 —— 截图、访达里复制的文件、
+            // 一段文字，都能直接落成卡片
             row(SidebarSVGIcon.load("paste", size: 13), "粘贴",
-                enabled: !canvas.clipboard.isEmpty) { canvas.paste() }
+                enabled: canvas.canPaste) { canvas.pasteHere(at: pastePoint) }
             row(SidebarSVGIcon.load("copy", size: 13), "创建副本") { canvas.duplicate(ids: targets) }
             Divider().opacity(0.12).padding(.vertical, 4)
             row(TimelineSVGIcon.load("delete", size: 13), "删除") { canvas.delete(ids: targets) }

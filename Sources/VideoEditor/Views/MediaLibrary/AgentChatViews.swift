@@ -45,6 +45,8 @@ struct AgentStepsView: View {
     /// 此刻在干什么。跑完是空的
     var phase: String = ""
     @State private var expanded = false
+    /// 跑着的时候那个呼吸圆点
+    @State private var pulsing = false
 
     /// 「12s」/「1m24s」
     private var timeText: String {
@@ -80,11 +82,21 @@ struct AgentStepsView: View {
         // 这时候更需要看到「正在思考 · 3s」
         if !steps.isEmpty || isRunning {
             VStack(alignment: .leading, spacing: 3) {
-                Button { expanded.toggle() } label: {
+                // 没步骤可展开时点了不动，但**不能用 `.disabled`** ——
+                // 那会把整个 label 压暗，「正在思考 · 1s」就糊得看不清，
+                // 跟跑完之后的「执行了 N 步」明显两个颜色
+                Button { if !steps.isEmpty { expanded.toggle() } } label: {
                     HStack(spacing: 4) {
-                        Image(systemName: expanded ? "chevron.down" : "chevron.right")
-                            .font(.system(size: 8, weight: .semibold))
-                            .opacity(steps.isEmpty ? 0 : 1)
+                        if isRunning {
+                            Circle()
+                                .fill(Color.accent)
+                                .frame(width: 6, height: 6)
+                                .opacity(pulsing ? 1 : 0.25)
+                                .animation(.easeInOut(duration: 0.8).repeatForever(autoreverses: true),
+                                           value: pulsing)
+                                .onAppear { pulsing = true }
+                                .onDisappear { pulsing = false }
+                        }
                         Text(headline + meta)
                             .font(.system(size: 10))
                             .monospacedDigit()
@@ -93,12 +105,17 @@ struct AgentStepsView: View {
                                 .font(.system(size: 9))
                                 .foregroundColor(Color(hex: "#FF9230"))
                         }
+                        // 展开箭头摆在末尾。没步骤可展开时整个不占位
+                        if !steps.isEmpty {
+                            Image(systemName: expanded ? "chevron.down" : "chevron.right")
+                                .font(.system(size: 8, weight: .semibold))
+                                .padding(.leading, 1)
+                        }
                     }
                     .foregroundColor(Color.labelSecondary)
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
-                .disabled(steps.isEmpty)
 
                 if expanded {
                     // 十几步的时候整块能把输入框顶出屏幕，给个上限、超了自己滚。
@@ -106,7 +123,7 @@ struct AgentStepsView: View {
                     // maxHeight 只封顶。先前拿 GeometryReader 量内容再钉 height，
                     // 首帧量到 0、高度被钳成 1pt，展开等于没展开
                     ScrollView(showsIndicators: true) {
-                    VStack(alignment: .leading, spacing: 3) {
+                    VStack(alignment: .leading, spacing: 6) {
                     ForEach(steps) { s in
                         HStack(alignment: .top, spacing: 5) {
                             Circle()
@@ -115,6 +132,8 @@ struct AgentStepsView: View {
                                 .padding(.top, 5)
                             Text("\(s.tool) · \(s.summary)")
                                 .font(.system(size: 10))
+                                // 一条步骤常常自己就折成三四行，行内也得松一点
+                                .lineSpacing(2.5)
                                 .foregroundColor(Color.labelSecondary.opacity(0.85))
                                 .fixedSize(horizontal: false, vertical: true)
                         }
@@ -125,7 +144,7 @@ struct AgentStepsView: View {
                     .padding(.leading, 2)
                 }
             }
-            .padding(.vertical, 4).padding(.horizontal, 8)
+            .padding(.vertical, 8).padding(.horizontal, 12)
             .background(RoundedRectangle(cornerRadius: 6).fill(Color.white.opacity(0.04)))
         }
     }
@@ -193,4 +212,32 @@ struct AgentConfirmBar: View {
         .overlay(RoundedRectangle(cornerRadius: 8)
             .stroke(Color(hex: "#FF9230").opacity(0.30), lineWidth: 1))
     }
+}
+
+/// 悬停提示。
+///
+/// SwiftUI 的 `.help()` 在自绘 Button 上时灵时不灵，索性自己画一个：
+/// 一个透明的 NSView，靠 AppKit 的 toolTip 机制出气泡。
+struct ChatTooltip: NSViewRepresentable {
+    let text: String
+
+    func makeNSView(context: Context) -> NSView {
+        let v = PassthroughTipView()
+        v.toolTip = text
+        return v
+    }
+
+    func updateNSView(_ v: NSView, context: Context) {
+        v.toolTip = text
+    }
+}
+
+/// 这层只为出气泡，不该抢鼠标。
+///
+/// 它盖在按钮上（`.overlay`），而 AppKit 的命中测试认 NSView 不认 SwiftUI ——
+/// 事件停在这儿，下面的 Button 既点不动、`.onHover` 也不触发。
+/// 气泡照弹是因为 toolTip 走的是 NSToolTipManager 的 tracking rect，
+/// 那条路不经 hitTest，所以看着「像是能用」，最容易误判。
+private final class PassthroughTipView: NSView {
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
 }

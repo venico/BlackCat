@@ -1192,6 +1192,8 @@ final class ProjectState: ObservableObject {
     /// AI 画布是否展开。每个窗口一份 —— 开关是界面状态，
     /// 画布**内容**是全局的（跟会话走，B5 接）
     @Published var showCanvas = false
+    /// 聊天区点开的图片/视频，全屏查看用。nil 表示没在看
+    @Published var mediaPreview: MediaPreviewItem?
     /// 画布的视图状态（缩放/平移/撤销栈）
     let canvas = CanvasState()
     @Published var showSettings = false

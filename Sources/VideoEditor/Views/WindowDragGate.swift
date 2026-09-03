@@ -72,7 +72,13 @@ enum FileDropRouter {
 
     /// 接收区。素材区收文件，时间轴收素材 id —— 两边收的载荷类型不同，
     /// 所以匹配时既要看落点在不在区里，也要看这个区收不收这种载荷
-    enum Kind: Hashable { case mediaLibrary, timeline }
+    enum Kind: Hashable { case mediaLibrary, timeline, aiChat, canvasChat, canvas }
+
+    /// 匹配顺序。**必须固定**：AI 面板和素材库是同一块地方的两个标签页，
+    /// 矩形几乎重合，而素材库那块登记后不会撤（切标签页只是不显示）。
+    /// 原来靠 `Dictionary.values.first` 撞运气，谁先匹配全看哈希顺序
+    // 画布铺满整块地方，聊天卡片浮在它上面 —— 卡片必须排在画布前面
+    private static let matchOrder: [Kind] = [.canvasChat, .aiChat, .canvas, .mediaLibrary, .timeline]
 
     private struct Zone {
         /// SwiftUI `.global` 坐标系（原点左上）里的接收区
@@ -122,28 +128,34 @@ enum FileDropRouter {
     /// 调节只有一种，载荷是个固定串
     static let adjustPasteboardString = "adjust:default"
 
-    private static func zone(at point: CGPoint, for payload: Payload,
-                             in id: WindowID) -> Zone? {
-        zones[id]?.values.first { $0.rect.contains(point) && $0.accepts(payload) }
+    private static func hit(at point: CGPoint, for payload: Payload,
+                            in id: WindowID) -> (kind: Kind, zone: Zone)? {
+        guard let all = zones[id] else { return nil }
+        for k in matchOrder {
+            if let z = all[k], z.rect.contains(point), z.accepts(payload) { return (k, z) }
+        }
+        return nil
     }
 
     static func canAccept(_ point: CGPoint, payload: Payload, in id: WindowID) -> Bool {
-        zone(at: point, for: payload, in: id) != nil
+        hit(at: point, for: payload, in: id) != nil
     }
 
-    /// 只点亮命中的那个区，其余区一律熄灭 —— 否则拖过时间轴时素材区还亮着
+    /// 只点亮命中的那个区，其余区一律熄灭 —— 否则拖过时间轴时素材区还亮着。
+    /// 按 kind 比，不按 rect 比：AI 面板和素材库的矩形是重合的，
+    /// 比矩形会把两个都点亮
     static func setTargeted(_ targeted: Bool, at point: CGPoint,
                             payload: Payload, in id: WindowID) {
         guard let all = zones[id] else { return }
-        let hit = targeted ? zone(at: point, for: payload, in: id) : nil
-        for z in all.values {
-            z.onTargetChange(hit != nil && z.rect == hit!.rect)
+        let hitKind = targeted ? hit(at: point, for: payload, in: id)?.kind : nil
+        for (k, z) in all {
+            z.onTargetChange(k == hitKind)
         }
     }
 
     @discardableResult
     static func deliver(_ payload: Payload, at point: CGPoint, in id: WindowID) -> Bool {
-        guard let z = zone(at: point, for: payload, in: id) else { return false }
+        guard let z = hit(at: point, for: payload, in: id)?.zone else { return false }
         // 落点转成区内本地坐标：时间轴要用 x 算时间码
         z.onDrop(payload, CGPoint(x: point.x - z.rect.minX, y: point.y - z.rect.minY))
         return true

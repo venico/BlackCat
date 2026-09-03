@@ -6,15 +6,28 @@
 // 要么干脆看不见，用户只能干等着猜好没好。
 
 import SwiftUI
+import AppKit
 
 struct AgentTaskEntry: View {
     @ObservedObject private var tasks = AgentBackgroundTasks.shared
     @State private var expanded = false
     @State private var hover = false
+    /// 卡片和标签各自占的地方。**不能量外面那个 VStack** ——
+    /// 它的宽度被 260 的卡片撑满了，标签右边那截空白也算在里头，
+    /// 点上去不收起
+    @State private var cardRect: CGRect = .zero
+    @State private var labelRect: CGRect = .zero
+    /// 点外面收起用的鼠标监听。展开时装，收起时拆
+    @State private var clickMonitor: Any?
 
     var body: some View {
         // 一个任务都没有就不占位置
+        Group {
         if !tasks.items.isEmpty {
+            VStack(alignment: .leading, spacing: 5) {
+            // 展开的卡片长在标签上方 —— 往下长会把输入框顶出去，
+            // 往上长挤的是可以滚的会话区
+            if expanded { taskCard.trackFrame { cardRect = $0 } }
             Button { expanded.toggle() } label: {
                 HStack(spacing: 4) {
                     if tasks.runningCount > 0 {
@@ -42,11 +55,56 @@ struct AgentTaskEntry: View {
             }
             .buttonStyle(.plain)
             .onHover { hover = $0 }
-            // 向上展开：面板往上长，不去挤输入框
-            .popover(isPresented: $expanded, arrowEdge: .top) {
-                taskList
+            .trackFrame { labelRect = $0 }
             }
+            .onChange(of: expanded) { _, open in
+                open ? startWatchingOutsideClick() : stopWatchingOutsideClick()
+            }
+            .onDisappear { stopWatchingOutsideClick() }
         }
+        }
+        // 任务清空后入口整个消失，但 expanded 是 @State，会一直留着 ——
+        // 下次有新任务入口重新冒出来就是展开的，看着像它自己弹开了
+        .onChange(of: tasks.items.isEmpty) { _, empty in
+            if empty { expanded = false }
+        }
+    }
+
+    /// 点面板外面就收起。
+    ///
+    /// 用 NSEvent 监听而不是铺一层透明的「点击遮罩」—— 卡片是就地展开在
+    /// 输入区上方的，铺遮罩得挂到整个窗口那层去，还会把底下的会话挡住点不动
+    private func startWatchingOutsideClick() {
+        stopWatchingOutsideClick()
+        clickMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { ev in
+            // 坐标换算照 GatedHostingView 那套：窗口坐标 → 内容视图坐标，
+            // 不是 flipped 的再翻一次，才跟 SwiftUI 的 .global 对得上
+            guard let content = ev.window?.contentView else { return ev }
+            let inContent = content.convert(ev.locationInWindow, from: nil)
+            let pt = content.isFlipped
+                ? inContent
+                : CGPoint(x: inContent.x, y: content.bounds.height - inContent.y)
+            // 卡片里的取消 / 清除已完成，以及标签自己，都不算点外面
+            // （标签留给 Button 自己 toggle，不然点一下一开一关等于没反应）
+            if !cardRect.contains(pt) && !labelRect.contains(pt) { expanded = false }
+            return ev
+        }
+    }
+
+    private func stopWatchingOutsideClick() {
+        if let m = clickMonitor { NSEvent.removeMonitor(m) }
+        clickMonitor = nil
+    }
+
+    /// 就地展开的卡片。原来用 .popover，那是系统气泡、带箭头，
+    /// 跟面板里其它东西不是一套
+    private var taskCard: some View {
+        taskList
+            .background(VisualEffectBackground(material: .menu, blending: .withinWindow))
+            .clipShape(RoundedRectangle(cornerRadius: 10))
+            .overlay(RoundedRectangle(cornerRadius: 10)
+                .stroke(Color.systemSeparator, lineWidth: 0.5))
+            .shadow(color: .black.opacity(0.30), radius: 10, y: 3)
     }
 
     private var taskList: some View {
@@ -128,5 +186,16 @@ struct AgentTaskEntry: View {
         case .failed(let m):
             return String(m.prefix(40))
         }
+    }
+}
+
+private extension View {
+    /// 把自己在窗口里的位置报出来
+    func trackFrame(_ report: @escaping (CGRect) -> Void) -> some View {
+        background(GeometryReader { g in
+            Color.clear
+                .onAppear { report(g.frame(in: .global)) }
+                .onChange(of: g.frame(in: .global)) { _, r in report(r) }
+        })
     }
 }

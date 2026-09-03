@@ -42,6 +42,21 @@ final class AIVideoService: ObservableObject {
     /// 那是 AI 面板顶部全局选的，可能是任何类型。画布「重试」按钮最初就是
     /// 直接拿 selectedProvider，结果文字卡片重试时全局正好切到了图片模型，
     /// 报错「Image2 不支持文字生成」
+    /// 这家的 API Key 到底存在哪。
+    ///
+    /// 大多数按 `providerKey.<rawValue>` 存，但火山方舟那两家（Seedance /
+    /// Seedream）在设置界面里共用一个 `seedanceApiKey` —— 照 rawValue 去查
+    /// Seedream 永远是空，会误报「还没配 Key」
+    static func apiKey(for provider: Provider, settings: AppSettings = .shared) -> String {
+        switch provider {
+        case .seedance, .seedance15, .seedream:
+            return settings.seedanceApiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        default:
+            return settings.providerAPIKey(for: provider.rawValue)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+    }
+
     static func provider(for category: ProviderCategory, settings: AppSettings = .shared) -> Provider {
         let saved = settings.canvasProvider(for: category.rawValue)
         if let p = Provider(rawValue: saved), p.category == category, !p.isHidden {
@@ -103,13 +118,14 @@ final class AIVideoService: ObservableObject {
                 return [("GPT-5.6-Sol", "gpt-5.6-sol"), ("GPT-5.6-Terra", "gpt-5.6-terra"),
                         ("GPT-5.6-Luna", "gpt-5.6-luna"), ("GPT-5.5", "gpt-5.5")]
             case .deepseek_ai:
-                return [("deepseek-v4-flash", "deepseek-v4-flash"),
-                        ("deepseek-v4-pro", "deepseek-v4-pro")]
+                return [("Deepseek-V4-Flash", "deepseek-v4-flash"),
+                        ("Deepseek-V4-Pro", "deepseek-v4-pro")]
             case .qwen:
                 return [("Qwen3.8-Max", "qwen3.8-max"), ("Qwen3.7-Max", "qwen3.7-max"),
                         ("Qwen3.7-Plus", "qwen3.7-plus"), ("Qwen3.7-Flash", "qwen3.7-flash")]
             case .glm:
-                return [("GLM-5.3", "glm-5.3"), ("GLM-5.2", "glm-5.2")]
+                return [("GLM-5.3", "glm-5.3"), ("GLM-5.3-Flash", "glm-5.3-flash"),
+                        ("GLM-5.2", "glm-5.2")]
             case .kling:
                 // model_name 的官方写法只核实到 kling-v3；turbo/omni 两个是按
                 // kling-v2.5-turbo 那套命名规律推的，对不上就在设置里改
@@ -121,7 +137,7 @@ final class AIVideoService: ObservableObject {
             case .minimaxTTS:
                 return [("speech-2.8-hd", "speech-2.8-hd"), ("speech-2.8-turbo", "speech-2.8-turbo")]
             case .grok:
-                return [("grok-4.6", "grok-4.6")]
+                return [("Grok-4.6", "grok-4.6")]
             case .grokImage:
                 return [("grok-imagine-image-2.0", "grok-imagine-image-2.0"),
                         ("grok-imagine-image-quality", "grok-imagine-image-quality"),
@@ -130,7 +146,7 @@ final class AIVideoService: ObservableObject {
                 return [("grok-imagine-video-1.5", "grok-imagine-video-1.5"),
                         ("grok-imagine-video", "grok-imagine-video")]
             case .kimi:
-                return [("kimi-k3", "kimi-k3")]
+                return [("Kimi-K3", "kimi-k3")]
             case .nanobanana2:
                 // 同 Seedance：id 只是「用哪一栏接入点」的标记，
                 // 真正发出去的模型名在设置里填
@@ -367,6 +383,10 @@ final class AIVideoService: ObservableObject {
         var imageBookmark: Data?
         var audioBookmark: Data?
         var attachments: [Attachment] = []
+        /// Agent 那一轮的执行步骤/耗时/用量，翻历史和重启后靠它显示
+        var agentSteps: [ConversationRecord.AgentStepRecord]?
+        var agentElapsed: Double?
+        var agentTokens: Int?
         var status: TaskStatus
         let timestamp: Date
 
@@ -501,6 +521,12 @@ final class AIVideoService: ObservableObject {
             var attachments: [Attachment]?
             /// Agent 这一轮调过哪些工具。存下来，翻历史时才知道它当时改了什么
             var agentSteps: [AgentStepRecord]?
+            /// 这一轮跑了多久、烧了多少 token。旧记录没有，解码为 nil
+            var agentElapsed: Double?
+            var agentTokens: Int?
+            /// 失败/取消的原因。存下来重开才认得出这是失败态 ——
+            /// 不存的话读回来一律当普通回复，图标和颜色都没了
+            var failedError: String?
         }
 
         /// 一次工具调用的留痕
@@ -685,6 +711,9 @@ final class AIVideoService: ObservableObject {
     @Published var webSearchEnabled = false
     @Published var history: [ConversationRecord] = []
     @Published var currentConversationId: UUID? = nil
+    /// 当前是停在历史列表还是某条会话里。**不能放面板的 @State** ——
+    /// 切到素材库再切回来，面板整个重建，状态一重置就弹回列表了
+    @Published var showChatHistory = true
 
     private let settings = AppSettings.shared
 
@@ -907,12 +936,15 @@ final class AIVideoService: ObservableObject {
                     audioPath = url.path; audioBookmark = createBookmark(for: url)
                 default: break
                 }
+                var failedError: String? = nil
+                if case .failed(let e) = status { failedError = e }
                 var entry = ConversationRecord.Entry(id: msgId, isUser: false, text: content, videoPath: videoPath)
                 entry.imagePath = imagePath
                 entry.audioPath = audioPath
                 entry.videoBookmark = videoBookmark
                 entry.imageBookmark = imageBookmark
                 entry.audioBookmark = audioBookmark
+                entry.failedError = failedError
                 if let eIdx = history[histIdx].entries.firstIndex(where: { $0.id == msgId }) {
                     history[histIdx].entries[eIdx] = entry
                 } else {
@@ -934,11 +966,15 @@ final class AIVideoService: ObservableObject {
     /// 新建一张画布，返回它的会话 id
     @discardableResult
     func newCanvasConversation() -> UUID {
+        // 手上那条先存了再走，顺手把消息清空 —— 只改 id 不清 messages 的话，
+        // 新画布的聊天区里会挂着上一条会话的记录（画布里那张卡片直接就看得见）
+        saveCurrentConversation()
         let id = UUID()
         history.insert(ConversationRecord(id: id, title: "未命名画布", createdAt: Date(),
                                           entries: [], canvas: .init()), at: 0)
         // 画布跟聊天一样算「当前会话」，否则历史列表的高亮会一直停在上次那条对话上
         currentConversationId = id
+        messages.removeAll()
         saveHistoryToDisk()
         return id
     }
@@ -982,11 +1018,64 @@ final class AIVideoService: ObservableObject {
     }
 
     /// Agent 的回答 + 它这一轮调过哪些工具
-    func appendAgentReply(_ text: String, steps: [ConversationRecord.AgentStepRecord]) {
-        let msg = ChatMessage(role: .assistant,
-                              content: text.isEmpty ? "（没有输出）" : text)
+    /// 生成完了往会话里插一张卡片。
+    ///
+    /// **不占位**：提交时就插一条「正在生成…」跟左上角那个后台任务标签
+    /// 说的是同一件事，两处一起转没意义。做完了再出现卡片就行
+    func appendAgentMedia(url: URL, category: ProviderCategory) {
+        if currentConversationId == nil { newConversation() }
+        var msg: ChatMessage
+        switch category {
+        case .image:
+            msg = ChatMessage(role: .assistant, content: "图片生成完成",
+                              imageURL: url, status: .completedImage(url: url))
+            msg.imageBookmark = createBookmark(for: url)
+        case .audio:
+            msg = ChatMessage(role: .assistant, content: "音频生成完成",
+                              audioURL: url, status: .completedAudio(url: url))
+            msg.audioBookmark = createBookmark(for: url)
+        default:
+            msg = ChatMessage(role: .assistant, content: "视频生成完成",
+                              videoURL: url, status: .completed(url: url))
+            msg.videoBookmark = createBookmark(for: url)
+        }
         messages.append(msg)
-        persist(msg, isUser: false, steps: steps.isEmpty ? nil : steps)
+        let conv = currentConversationId ?? UUID()
+        applyGenerationResult(convId: conv, msgId: msg.id, content: msg.content,
+                              mediaURL: url, status: msg.status)
+    }
+
+    /// 生成失败或被取消，往会话里留一条。
+    ///
+    /// 进行中那条占位是去掉了（跟左上角后台任务标签重复），但**结束态得有** ——
+    /// 不然点了取消，聊天里什么都没发生，看着像没取消掉
+    func appendAgentFailure(_ text: String) {
+        if currentConversationId == nil { newConversation() }
+        let msg = ChatMessage(role: .assistant, content: text,
+                              status: .failed(error: text))
+        messages.append(msg)
+        persist(msg, isUser: false, steps: nil)
+    }
+
+    /// Agent 开跑就先占一条空回复：步骤要实时长在这条气泡里，
+    /// 等跑完再 append 的话，整个过程用户看不到东西
+    func beginAgentReply() -> UUID {
+        if currentConversationId == nil { newConversation() }
+        let msg = ChatMessage(role: .assistant, content: "")
+        messages.append(msg)
+        return msg.id
+    }
+
+    /// 跑完了，把正文和这一轮的步骤填进那条占位回复，同时落盘
+    func finishAgentReply(id: UUID, text: String,
+                          steps: [ConversationRecord.AgentStepRecord],
+                          elapsed: TimeInterval = 0, tokens: Int = 0) {
+        guard let i = messages.firstIndex(where: { $0.id == id }) else { return }
+        messages[i].content = text.isEmpty ? "（没有输出）" : text
+        messages[i].agentSteps = steps.isEmpty ? nil : steps
+        messages[i].agentElapsed = elapsed > 0 ? elapsed : nil
+        messages[i].agentTokens = tokens > 0 ? tokens : nil
+        persist(messages[i], isUser: false, steps: steps.isEmpty ? nil : steps)
     }
 
     private func persist(_ msg: ChatMessage, isUser: Bool,
@@ -996,6 +1085,9 @@ final class AIVideoService: ObservableObject {
         var entry = ConversationRecord.Entry(id: msg.id, isUser: isUser,
                                              text: msg.content, videoPath: nil)
         entry.agentSteps = steps
+        entry.agentElapsed = msg.agentElapsed
+        entry.agentTokens = msg.agentTokens
+        if case .failed(let e) = msg.status { entry.failedError = e }
         history[i].entries.append(entry)
         // 会话标题还是「新对话」时，拿用户第一句话当标题
         if isUser, !history[i].titleIsCustom,
@@ -1028,7 +1120,12 @@ final class AIVideoService: ObservableObject {
                     msg.audioBookmark = entry.audioBookmark
                     return msg
                 } else {
-                    return ChatMessage(role: .assistant, content: entry.text)
+                    var msg = ChatMessage(role: .assistant, content: entry.text,
+                                          status: entry.failedError.map { .failed(error: $0) } ?? .idle)
+                    msg.agentSteps = entry.agentSteps
+                    msg.agentElapsed = entry.agentElapsed
+                    msg.agentTokens = entry.agentTokens
+                    return msg
                 }
             }
         }
@@ -1107,7 +1204,10 @@ final class AIVideoService: ObservableObject {
 
         if let cid = currentConversationId, let idx = history.firstIndex(where: { $0.id == cid }) {
             history[idx].entries = entries
-            history[idx].title = title
+            // 用户自己起过名就别按内容改回去。这个方法每次切会话都会跑一遍，
+            // 原来无条件覆盖 —— 重命名完随便点进另一条，名字就被冲回
+            // 「第一条消息的前 30 字」。saveCanvas 和 persist 都有这道，唯独这儿漏了
+            if !history[idx].titleIsCustom { history[idx].title = title }
         } else {
             let conv = ConversationRecord(id: UUID(), title: title, createdAt: Date(), entries: entries)
             history.insert(conv, at: 0)

@@ -41,10 +41,10 @@ struct ContentView: View {
     @State private var topHeight: CGFloat = 420
     @State private var isDraggingH = false
     @State private var sidebarVisible = true
-    @State private var sidebarWidth: CGFloat = 260
+    @State private var sidebarWidth: CGFloat = 320
     @State private var inspectorWidth: CGFloat = InspectorLayout.defaultWidth
     // Drag origin tracking (prevents cumulative translation bug)
-    @State private var dragOriginSidebar: CGFloat = 260
+    @State private var dragOriginSidebar: CGFloat = 320
     @State private var isDraggingSidebar = false
     @State private var dragOriginInspector: CGFloat = 280
     @State private var isDraggingInspector = false
@@ -103,7 +103,7 @@ struct ContentView: View {
                             .onChanged { v in
                                 if !isDraggingSidebar { dragOriginSidebar = sidebarWidth }
                                 isDraggingSidebar = true
-                                sidebarWidth = min(max(dragOriginSidebar + v.translation.width, 160), 400)
+                                sidebarWidth = min(max(dragOriginSidebar + v.translation.width, 160), 800)
                             }
                             .onEnded { _ in
                                 isDraggingSidebar = false
@@ -366,6 +366,13 @@ struct ContentView: View {
             if project.showCanvas {
                 CanvasOverlay(canvas: project.canvas)
                     .environmentObject(project)
+            }
+        }
+        // 图片/视频全屏查看。**必须排在画布后面** ——
+        // 画布里那张聊天卡片点出来的预览也得盖在画布上面
+        .overlay {
+            if let item = project.mediaPreview {
+                MediaPreviewOverlay(item: item) { project.mediaPreview = nil }
             }
         }
 
@@ -655,6 +662,8 @@ struct ContentView: View {
             if project.showNewProjectSheet { return event }
             // 画布是最上层，esc 先关它。不光靠 CanvasOverlay 的 onExitCommand ——
             // 那个依赖 SwiftUI 焦点落在画布上，焦点跑到别处就不灵了
+            // 预览层盖在画布之上，esc 也该先关它
+            if project.mediaPreview != nil { project.mediaPreview = nil; return nil }
             if project.showCanvas { project.showCanvas = false; return nil }
             if project.showExportSheet { project.showExportSheet = false; return nil }
             if project.showSettings { closeSettings(); return nil }

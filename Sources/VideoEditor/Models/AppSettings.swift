@@ -236,7 +236,8 @@ final class AppSettings: ObservableObject {
         }
 
         /// 官方端点。实际请求走 `AppSettings.shared.effectiveLLMBaseURL`，
-        /// 设置里填了自定义地址时以那个为准
+        /// 设置里填了自定义地址时以那个为准。
+        /// 模型名别直接读上面那个 `defaultModel`，走 `resolvedModel(saved:)`
         var baseURL: String {
             switch self {
             case .openai: return "https://api.openai.com/v1/chat/completions"
@@ -247,6 +248,24 @@ final class AppSettings: ObservableObject {
             case .grok: return "https://api.x.ai/v1/chat/completions"
             case .kimi: return "https://api.moonshot.cn/v1/chat/completions"
             }
+        }
+
+        /// 存下来的那个值最终该发哪个模型名。
+        ///
+        /// 两件事在这儿一起处理，两件都出过事：
+        ///
+        /// 1. **存的可能是显示名**。早期版本把 label 直接写进了
+        ///    `settings.ai.model.*`（"GPT-5.6-Sol"、"Opus5"），原样发出去
+        ///    中转站只回一句 `Model "GPT-5.6-Sol" is not supported`。
+        /// 2. **没存过时不能用 `defaultModel`**。界面下拉没选过时显示的是
+        ///    `subModels` 第一项，那份清单跟这里的 `defaultModel` 早分家了 ——
+        ///    界面写着 GLM-5.3、请求发的却是 glm-4-flash，报 404 还对不上号。
+        ///    七家里只有 Grok / Kimi 碰巧两边一致
+        func resolvedModel(saved raw: String) -> String {
+            let saved = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            let list = AIVideoService.Provider(rawValue: sharedProviderKey)?.subModels ?? []
+            if saved.isEmpty { return list.first?.id ?? defaultModel }
+            return list.first { $0.label == saved }?.id ?? saved
         }
 
         /// 对应 AI 生成面板里的供应商 key。两套配置共用同一份
@@ -285,10 +304,7 @@ final class AppSettings: ObservableObject {
     }
 
     /// 实际请求用的模型名
-    var effectiveLLMModel: String {
-        let custom = llmModel.trimmingCharacters(in: .whitespacesAndNewlines)
-        return custom.isEmpty ? llmProvider.defaultModel : custom
-    }
+    var effectiveLLMModel: String { llmProvider.resolvedModel(saved: llmModel) }
 
     /// 同上，跟 AI 生成面板共享
     var llmBaseURL: String {

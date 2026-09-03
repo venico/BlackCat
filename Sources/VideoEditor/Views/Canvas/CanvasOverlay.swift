@@ -85,6 +85,7 @@ struct CanvasOverlay: View {
                     withAnimation(.easeIn(duration: 0.2)) { slideY = outer.size.height }
                     // 动画播完再真正摘掉；遮罩在上面那层，这时已经跟着 showCanvas 一起没了
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                        FileDropRouter.unregister(windowID, kind: .canvas)
                         project.showCanvas = false
                         closing = false
                         slideY = 0
@@ -145,6 +146,13 @@ struct CanvasOverlay: View {
     private func canvasBody(containerSize: CGSize) -> some View {
         ZStack {
             CanvasSurface(canvas: canvas, containerSize: containerSize)
+                // 从访达拖文件进来落成卡片。跟素材库一样得走 FileDropRouter ——
+                // SwiftUI 的 .onDrop 在这个 app 里收不到（见 FileDropRouter 注释）
+                .background(GeometryReader { g in
+                    Color.clear
+                        .onAppear { registerCanvasDropZone(g.frame(in: .global)) }
+                        .onChange(of: g.frame(in: .global)) { _, r in registerCanvasDropZone(r) }
+                })
 
             // 左上角关闭，右上角撤销/重做/缩放
             VStack {
@@ -157,6 +165,21 @@ struct CanvasOverlay: View {
             }
             .padding(12)
         }
+        // Agent 会话卡片。位置由它自己按吸附结果算，这儿只给它整块画布
+        .overlay(alignment: .topLeading) {
+            CanvasChatCard(containerSize: containerSize)
+        }
+    }
+
+    private func registerCanvasDropZone(_ rect: CGRect) {
+        FileDropRouter.register(windowID, kind: .canvas, rect: rect,
+                                accepts: { if case .files = $0 { return true } else { return false } },
+                                onDrop: { payload, local in
+                                    guard case .files(let urls) = payload else { return }
+                                    // local 是画布容器里的坐标，换算成内容坐标才知道落哪张卡片
+                                    canvas.dropFiles(urls, at: canvas.contentPoint(fromViewPoint: local))
+                                },
+                                onTargetChange: { _ in })
     }
 
     private var closeButton: some View {
@@ -475,6 +498,11 @@ private struct CanvasSurface: View {
     /// 往回收会让菜单跟它的 + 按钮错开，反而看不出是从哪儿弹出来的。
     /// 允许超出画布
     private var menuOffset: CGPoint { menuLocation }
+
+    /// 输入框自己的宽度（`CanvasPromptBar` 里写死 720），钳位置要用
+    static let promptBarWidth: CGFloat = 720
+    /// 给输入框留的最小高度，贴到画布底边时按这个钳住
+    static let promptBarMinRoom: CGFloat = 150
 
     /// 画布内容坐标 → 视图坐标。
     /// 内容层的原点在容器左上角（`.position()` 的坐标系），
@@ -956,38 +984,31 @@ private struct CanvasSurface: View {
             canvas.rightClickAt = nil          // 消费掉，下次右键才能再触发
             openContextMenu(at: point)
         }
-        .overlay {
-            if ctxLocation != nil {
-                Color.clear
-                    .contentShape(Rectangle())
-                    .onTapGesture { ctxLocation = nil }
-            }
-        }
-        .overlay(alignment: .topLeading) {
-            if let at = ctxLocation {
-                CanvasContextPanel(canvas: canvas, targets: ctxTargets,
-                                   groupID: ctxGroupID,
-                                   relinkTarget: missingMediaTarget,
-                                   onRelink: { id in
-                                       guard let n = canvas.node(id) else { return }
-                                       canvasRelinkNode(n, canvas: canvas, project: project)
-                                   }) { ctxLocation = nil }
-                .background(RoundedRectangle(cornerRadius: 10).fill(Color(red: 0.16, green: 0.16, blue: 0.17)))
-                .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(Color.white.opacity(0.12)))
-                .shadow(color: .black.opacity(0.5), radius: 16, y: 6)
-                .offset(x: at.x, y: at.y)
-            }
-        }
         // 点空白关菜单
         .onChange(of: canvas.selectedNodeID) { _, _ in showAddMenu = false }
-        // 选中媒体节点时，底部升起输入框
-        .overlay(alignment: .bottom) {
+        // 选中卡片时贴在它下方 20pt 出输入框。
+        //
+        // **挂在内容层外面**：里头有 scaleEffect，放进去输入框会跟着画布一起
+        // 缩放，缩小时字都看不清。所以位置自己按 viewPoint 换算，
+        // 尺寸保持不变
+        .overlay(alignment: .topLeading) {
             // 文本节点也要出输入框（用文字模型生成正文），别再按类型挡了
             if let sel = canvas.selectedNodeID, let n = canvas.node(sel) {
+                let anchor = viewPoint(from: CGPoint(
+                    x: n.position.x + n.renderSize.width / 2,
+                    // 底边跟节点视图的定位口径保持一致（见 contentLayer 里那段注释）
+                    y: n.position.y + n.renderSize.height
+                       - CanvasNodeView.labelHeight / 2
+                       + (n.kind == .text ? CanvasNodeView.edgeStraddle / 2 : 0)))
                 CanvasPromptBar(canvas: canvas, node: n)
                     .environmentObject(project)
-                    .padding(.bottom, 24)
-                    .transition(.move(edge: .bottom).combined(with: .opacity))
+                    .fixedSize()
+                    // 卡片贴边时输入框会被画布的圆角裁掉，钳回可视区里
+                    .offset(x: min(max(12, anchor.x - Self.promptBarWidth / 2),
+                                   max(12, containerSize.width - Self.promptBarWidth - 12)),
+                            y: min(anchor.y + 20,
+                                   max(12, containerSize.height - Self.promptBarMinRoom)))
+                    .transition(.opacity)
                     // 动画只归输入框自己。挂在整层上的话，新建卡片会设选中，
                     // 卡片跟着一起做位移动画 —— 那就是「加卡片时有多余动画」的来源
                     .animation(.easeOut(duration: 0.2), value: canvas.selectedNodeID)
@@ -1038,6 +1059,32 @@ private struct CanvasSurface: View {
             }
         }
         .animation(.easeOut(duration: 0.2), value: showAssetPicker)
+        // 右键菜单排在**所有** overlay 最后：越靠后越上层。
+        // 排在提示词栏前面的话，跟着卡片走的那条栏会把菜单下半截盖住
+        .overlay {
+            if ctxLocation != nil {
+                Color.clear
+                    .contentShape(Rectangle())
+                    .onTapGesture { ctxLocation = nil }
+            }
+        }
+        .overlay(alignment: .topLeading) {
+            if let at = ctxLocation {
+                CanvasContextPanel(canvas: canvas, targets: ctxTargets,
+                                   groupID: ctxGroupID,
+                                   pastePoint: contentPoint(from: at),
+                                   relinkTarget: missingMediaTarget,
+                                   onRelink: { id in
+                                       guard let n = canvas.node(id) else { return }
+                                       canvasRelinkNode(n, canvas: canvas, project: project)
+                                   }) { ctxLocation = nil }
+                .background(RoundedRectangle(cornerRadius: 10).fill(Color(red: 0.16, green: 0.16, blue: 0.17)))
+                .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(Color.white.opacity(0.12)))
+                .shadow(color: .black.opacity(0.5), radius: 16, y: 6)
+                .offset(x: at.x, y: at.y)
+            }
+        }
+
         // 节点上的「上传」「素材」：填进那个节点，不新建
         .onReceive(NotificationCenter.default.publisher(for: .canvasNodeUpload)) { note in
             guard let id = note.object as? UUID, let n = canvas.node(id) else { return }
@@ -1233,6 +1280,10 @@ struct CanvasKeyMonitor: ViewModifier {
             // ⌘C / ⌘V。正在输入文字时不拦 —— 那时候归输入框自己复制粘贴
             if event.type == .keyDown, !editing,
                event.modifierFlags.contains(.command) {
+                // 光标在某个能编辑的文本框里（聊天卡片的输入框就是）：
+                // 复制粘贴是它的事，别把剪贴板里的东西落成画布卡片。
+                // 只认 isEditable —— 会话里那片只读的回复区不算
+                if let tv = w.firstResponder as? NSTextView, tv.isEditable { return event }
                 switch event.charactersIgnoringModifiers?.lowercased() {
                 case "c":
                     let ids = canvas.selectedGroupID.map { canvas.nodeIDs(inGroup: $0) }
@@ -1241,9 +1292,9 @@ struct CanvasKeyMonitor: ViewModifier {
                     canvas.copy(ids: ids)
                     return nil
                 case "v":
-                    guard !canvas.clipboard.isEmpty else { break }
-                    canvas.paste()
-                    return nil
+                    // 画布自己复制过卡片就粘卡片；没有的话看系统剪贴板 ——
+                    // 截图、访达里复制的文件、一段文字，都能直接落成卡片
+                    return canvas.pasteHere() ? nil : event
                 default: break
                 }
             }
@@ -1310,6 +1361,16 @@ struct CanvasKeyMonitor: ViewModifier {
             // ⌘+滚轮是缩放画布，那个优先级更高，不让
             if !event.modifierFlags.contains(.command), canvas.hoveredTextNodeID != nil {
                 return event
+            }
+
+            // 鼠标停在右下角那张聊天卡片上：滚轮归会话自己滚。
+            // 坐标换算照 GatedHostingView 那套，跟卡片报上来的 .global 对齐
+            if let content = w.contentView {
+                let inContent = content.convert(event.locationInWindow, from: nil)
+                let pt = content.isFlipped
+                    ? inContent
+                    : CGPoint(x: inContent.x, y: content.bounds.height - inContent.y)
+                if canvas.chatCardRect.contains(pt) { return event }
             }
 
             // 鼠标停在素材库/元素库面板上：滚轮滚那个列表，别平移画布。

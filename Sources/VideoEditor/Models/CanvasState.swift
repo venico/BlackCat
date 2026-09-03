@@ -162,6 +162,12 @@ final class CanvasState: ObservableObject {
 
     /// 这张画布对应的会话 id。一张画布 = AI 历史里的一条记录
     @Published var conversationID: UUID?
+
+    /// 右下角那张聊天卡片占的地方（SwiftUI `.global` 坐标）。
+    /// 滚轮监听靠它放行 —— 鼠标在卡片上时滚的是会话，不是整个画布。
+    /// **不用 @Published**：拖动调卡片尺寸时每帧都在变，发布出去等于每帧重绘画布。
+    /// 也不用 onHover 判断，那个在快速移动时会漏掉 exit，漏一次画布就再也滚不动
+    var chatCardRect: CGRect = .zero
     /// 画布标题，历史列表里显示
     @Published var title: String = "未命名画布"
 
@@ -972,6 +978,143 @@ final class CanvasState: ObservableObject {
             if let text { $0.text = text }
         }
         return new.id
+    }
+
+    /// Agent 在画布里生成出来的东西，落成一张新卡片。
+    ///
+    /// 画布里的 agent 干的是画布的活，产物就该出现在画布上；
+    /// 只塞进素材库的话用户还得自己去拖回来。素材库那份照旧也进（统一走
+    /// 全局素材库，改名/删除才联动）
+    @discardableResult
+    func dropGeneratedMedia(url: URL, kind: CanvasNode.Kind, at point: CGPoint? = nil) -> UUID {
+        let pos = freeSpot(near: point ?? viewportCenterInContent())
+        // 用「原始」比例：卡片随后按素材真实尺寸摆正（`applyOriginalRatio`）。
+        // 走默认的 1:1 会把 16:9 的视频塞进方卡片里
+        let new = addNode(kind: kind, at: pos, ratio: CanvasNode.originalRatio)
+        updateNode(id: new.id) { $0.mediaPath = url.path }
+        project?.importFile(url)
+        if let asset = project?.mediaAssets.first(where: { $0.url == url }) {
+            updateNode(id: new.id) { $0.assetID = asset.id }
+        }
+        return new.id
+    }
+
+    /// 视口中心对应的内容坐标。换算跟 CanvasOverlay.contentPoint 一致
+    func viewportCenterInContent() -> CGPoint {
+        let c = CGPoint(x: containerSize.width / 2, y: containerSize.height / 2)
+        return contentPoint(fromViewPoint: c)
+    }
+
+    /// 画布容器里的点 → 内容坐标
+    func contentPoint(fromViewPoint p: CGPoint) -> CGPoint {
+        let c = CGPoint(x: containerSize.width / 2, y: containerSize.height / 2)
+        return CGPoint(x: (p.x - offset.width - c.x) / zoom + c.x,
+                       y: (p.y - offset.height - c.y) / zoom + c.y)
+    }
+
+    /// 目标位置上已经压着卡片就往右下错开，别正好摞上去
+    private func freeSpot(near point: CGPoint) -> CGPoint {
+        var pos = point
+        var guardCount = 0
+        while nodes.contains(where: { hypot($0.position.x - pos.x, $0.position.y - pos.y) < 40 }),
+              guardCount < 40 {
+            pos = CGPoint(x: pos.x + 40, y: pos.y + 40)
+            guardCount += 1
+        }
+        return pos
+    }
+
+    /// 能读成文字卡片的后缀。二进制不收 —— 一屏乱码没有意义
+    static let textFileExts: Set<String> = [
+        "txt", "md", "markdown", "json", "csv", "tsv", "log", "yml", "yaml", "xml",
+        "html", "css", "js", "ts", "swift", "py", "rb", "go", "rs", "java", "kt",
+        "c", "h", "cpp", "sh", "toml", "ini", "conf", "srt", "vtt"
+    ]
+
+    /// 拖进来 / 粘贴进来的文件，按后缀落成对应的卡片。
+    /// 媒体一律同时进全局素材库（`dropGeneratedMedia` 里做），
+    /// 之后改名删除才跟卡片联动
+    @discardableResult
+    func dropFiles(_ urls: [URL], at point: CGPoint? = nil) -> Int {
+        var pos = point ?? viewportCenterInContent()
+        var landed = 0
+        for url in urls {
+            let ext = url.pathExtension.lowercased()
+            let kind: CanvasNode.Kind
+            if AIVideoService.imageExts.contains(ext) { kind = .image }
+            else if AIVideoService.videoExts.contains(ext) { kind = .video }
+            else if AIVideoService.audioExts.contains(ext) { kind = .audio }
+            else if Self.textFileExts.contains(ext) { kind = .text }
+            else { continue }
+
+            if kind == .text {
+                guard let body = try? String(contentsOf: url, encoding: .utf8) else { continue }
+                let n = addNode(kind: .text, at: freeSpot(near: pos))
+                updateNode(id: n.id) { $0.text = body }
+            } else {
+                dropGeneratedMedia(url: url, kind: kind, at: pos)
+            }
+            landed += 1
+            pos = CGPoint(x: pos.x + 40, y: pos.y + 40)
+        }
+        return landed
+    }
+
+    /// 系统剪贴板里有没有能落成卡片的东西
+    var systemPasteboardHasContent: Bool {
+        let pb = NSPasteboard.general
+        if pb.canReadObject(forClasses: [NSURL.self],
+                            options: [.urlReadingFileURLsOnly: true]) { return true }
+        if pb.canReadObject(forClasses: [NSImage.self], options: nil) { return true }
+        return !(pb.string(forType: .string) ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    /// 画布自己复制过卡片就粘卡片，否则看系统剪贴板
+    var canPaste: Bool { !clipboard.isEmpty || systemPasteboardHasContent }
+
+    @discardableResult
+    func pasteHere(at point: CGPoint? = nil) -> Bool {
+        if !clipboard.isEmpty { paste(); return true }
+        return pasteFromPasteboard(at: point)
+    }
+
+    /// 系统剪贴板里的东西落成卡片：文件、图片位图、纯文字都收
+    @discardableResult
+    func pasteFromPasteboard(at point: CGPoint? = nil) -> Bool {
+        let pb = NSPasteboard.general
+        // ① 先看文件 —— 从访达复制过来的是 fileURL
+        if let urls = pb.readObjects(forClasses: [NSURL.self],
+                                     options: [.urlReadingFileURLsOnly: true]) as? [URL],
+           !urls.isEmpty {
+            return dropFiles(urls, at: point) > 0
+        }
+        // ② 截图这类是内存里的位图，得先落成文件才能进素材库
+        if let img = NSImage(pasteboard: pb), let url = saveToPasted(img) {
+            dropGeneratedMedia(url: url, kind: .image, at: point)
+            return true
+        }
+        // ③ 纯文字 → 文本卡片
+        if let text = pb.string(forType: .string),
+           !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            let n = addNode(kind: .text, at: freeSpot(near: point ?? viewportCenterInContent()))
+            updateNode(id: n.id) { $0.text = text }
+            return true
+        }
+        return false
+    }
+
+    /// 把粘贴板里的位图存成 PNG。跟历史记录放一块，别塞进系统临时目录 ——
+    /// 那儿会被清掉，素材库里就成了失效链接
+    private func saveToPasted(_ image: NSImage) -> URL? {
+        guard let tiff = image.tiffRepresentation,
+              let rep = NSBitmapImageRep(data: tiff),
+              let png = rep.representation(using: .png, properties: [:]) else { return nil }
+        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("BlackCat/pasted", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let url = dir.appendingPathComponent("粘贴_\(Int(Date().timeIntervalSince1970)).png")
+        do { try png.write(to: url) } catch { return nil }
+        return url
     }
 
     /// 上游完成后，把等着它的下游拉起来

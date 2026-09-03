@@ -3,24 +3,33 @@ import AVFoundation
 import UniformTypeIdentifiers
 
 struct AIChatPanel: View {
+    /// 画布右侧那张悬浮卡片。跟侧栏那份**是同一套东西** ——
+    /// service / AgentRunner 都是单例，会话、历史、正在跑的任务全共享，
+    /// 差别只有：画布里不再给「新建画布」入口，拖入区也各登记各的
+    var inCanvas = false
+
+    @Environment(\.windowID) private var windowID
     @EnvironmentObject private var project: ProjectState
     @StateObject private var service = AIVideoService.shared
     @ObservedObject private var settings = AppSettings.shared
     @State private var inputText = ""
+    /// 程序自己改输入框内容的次数（选命令、发送后清空这些）。
+    /// 只有它变了才把文本回写进 NSTextView —— Agent 跑起来时每秒都在刷新，
+    /// 重绘拿到的 text 可能比用户刚敲进去的那个字慢一拍，无条件回写就是「打不上字」
+    @State private var inputRevision = 0
     /// 光标前正在打的 `/xxx`（不带斜杠）；nil = 没在打命令
     @State private var slashQuery: String?
     @State private var slashIndex = 0
     /// 打命令时的光标位置（按字符数）。插入时得知道换哪一段，不能拿末尾去猜
     @State private var slashCaret = 0
     /// Agent 那条链：执行器、模式、这一轮的对话上下文
-    @StateObject private var agent = AgentRunner()
+    @ObservedObject private var agent = AgentRunner.shared
     @State private var agentHistory: [AgentMessage] = []
     /// agentHistory 是这一次运行期间的内存状态。记下它对应哪个会话，
     /// 换了会话（或重启后压根没有）就得从落盘的聊天记录重建
     @State private var historyConvID: UUID?
     /// 进面板默认就是历史列表 —— 用户过来多半是要找之前那条，
     /// 而不是从空白开始
-    @State private var showHistory = true
     @State private var swapHovering = false
     /// 鼠标停在哪一条历史上。方法产出的行没法各自持 @State，只能记 id
     @State private var hoverHistoryID: UUID?
@@ -54,7 +63,7 @@ struct AIChatPanel: View {
 
     /// 时长按供应商/子模型给 —— 各家上限差很多，列出人家不收的档位等于挖坑
     private var durations: [String] {
-        switch service.selectedProvider {
+        switch uiProvider {
         case .seedance:
             // 2.5 单次能出到 30s，2.0 上限 15s
             return currentSubModel == "2.5"
@@ -75,7 +84,7 @@ struct AIChatPanel: View {
 
     /// 分辨率按供应商给 —— 列出人家不认的档位，选了也是白选（会被静默换掉）
     private var resolutions: [String] {
-        switch service.selectedProvider {
+        switch uiProvider {
         case .minimax: return ["768P", "2K"]        // H3 只有这两档
         case .seedance:
             // 2.5 目前只开放到 720P，1080P/4K 还没上
@@ -93,19 +102,49 @@ struct AIChatPanel: View {
     var body: some View {
         VStack(spacing: 0) {
             header
-            canvasEntry
+            if !inCanvas { canvasEntry }
             // 历史会话展开时**替换**整个会话区。
             // 用 ZStack 盖一层的话得给它一个不透明底色才挡得住下面的消息，
             // 那块底色跟面板不搭；直接替换就没这问题
-            if showHistory {
+            // 画布那张卡片只做聊天，历史列表留在侧栏那份里
+            if service.showChatHistory && !inCanvas {
                 historyOverlay
             } else {
-                messageList
-                inputArea
+                // 收附件的范围就是会话 + 输入区这一块，不含上面的标题栏和
+                // 新建画布 / 新建会话那排 —— 拖到那两个按钮上不该算。
+                //
+                // **不能用 SwiftUI 的 `.onDrop`**，也不能往里插 NSView —— 这个 app 的
+                // 拖放全被最外层的 GatedHostingView 截走（hitTest 到不了内层，
+                // 原委见 FileDropRouter 的注释）。登记一块接收区，宿主按落点分发过来
+                VStack(spacing: 0) {
+                    messageList
+                    inputArea
+                }
+                .background(GeometryReader { g in
+                    Color.clear
+                        .onAppear { registerChatDropZone(g.frame(in: .global)) }
+                        // 侧栏能拖宽、窗口能缩放，位置得跟着更新
+                        .onChange(of: g.frame(in: .global)) { _, r in registerChatDropZone(r) }
+                })
+                .overlay {
+                    if isDropTargeted {
+                        // 跟素材区拖入一个样式：整块染色，不加描边和文字
+                        RoundedRectangle(cornerRadius: 10)
+                            .fill(Color.accent.opacity(0.06))
+                            .allowsHitTesting(false)
+                    }
+                }
+                // 翻去历史列表时这块就不在了，登记得跟着撤
+                .onDisappear { FileDropRouter.unregister(windowID, kind: dropZoneKind) }
             }
         }
+        // 切去素材库标签页后这块就不在了，登记必须撤掉 ——
+        // 留着的话它排在素材区前面，拖文件进素材库会被这儿吃掉
+        .onDisappear { FileDropRouter.unregister(windowID, kind: dropZoneKind) }
+        .onChange(of: namedModel) { _ in pruneInputsForProvider() }
         .onChange(of: service.selectedProvider) { _ in
             pruneInputsForProvider()
+            ensureAgentProvider()
         }
         // 试听播放器是单例，view 销毁不会带走它 —— 切会话和关面板都得手动停，否则声音继续响
         .onChange(of: service.currentConversationId) { _ in
@@ -116,7 +155,7 @@ struct AIChatPanel: View {
 
     /// 切换模型后，裁掉新模型不支持的参考内容，避免带着旧模型的数据发出去被静默丢弃
     private func pruneInputsForProvider() {
-        let provider = service.selectedProvider
+        let provider = uiProvider
         if !provider.supportsLastFrame { lastFrameImage = nil }
         if !provider.supportsFirstFrame { firstFrameImage = nil }
 
@@ -139,24 +178,28 @@ struct AIChatPanel: View {
 
     private var header: some View {
         HStack {
-            Text("AI 创作")
+            Text(inCanvas ? conversationTitle : "AI 创作")
                 .font(.system(size: 11, weight: .semibold))
                 .foregroundColor(Color.labelSecondary)
-                .textCase(.uppercase)
+                // 会话名可能是英文，别给它全大写
+                .textCase(inCanvas ? nil : .uppercase)
+                .lineLimit(1)
+                .truncationMode(.tail)
             Spacer()
             // 进面板默认就停在历史列表上，这时候再放个「历史会话」图标是多余的；
-            // 进了某条会话（showHistory = false）才需要它退回列表。
+            // 进了某条会话（service.showChatHistory = false）才需要它退回列表。
             // 新建那两个入口挪到下面的卡片上了，这儿不再重复
-            if !showHistory {
+            if !service.showChatHistory && !inCanvas {
                 HoverIconButton(icon: "clock", svgName: "chatHistory", tip: "历史会话") {
-                    withAnimation(.easeInOut(duration: 0.18)) { showHistory = true }
+                    withAnimation(.easeInOut(duration: 0.18)) { service.showChatHistory = true }
                 }
             }
         }
         // **高度按图标那 24pt 定死**：历史列表页不画右侧图标，
         // 不撑着的话这一行会矮一截，两页之间标题就上下跳
         .frame(height: 24)
-        .padding(.leading, 3).padding(.trailing, 10)
+        // 画布卡片右上角那颗最小化按钮压在这一行上，标题得让开
+        .padding(.leading, leadPad).padding(.trailing, inCanvas ? 32 : 10)
         // 顶部留白跟素材库那栏对齐（那边也是 8）——
         // 两栏切换时标题行不该上下跳
         .padding(.top, 8)
@@ -168,17 +211,20 @@ struct AIChatPanel: View {
     /// 两个新建入口，并排放在会话区最上面
     private var canvasEntry: some View {
         HStack(spacing: 8) {
-            EntryCard(svgName: "freeCanvas", title: "新建画布") {
-                let id = service.newCanvasConversation()
-                project.canvas.reset(conversationID: id)
-                project.showCanvas = true
+            // 已经在画布里了，再给个「新建画布」没意义
+            if !inCanvas {
+                EntryCard(svgName: "freeCanvas", title: "新建画布") {
+                    let id = service.newCanvasConversation()
+                    project.canvas.reset(conversationID: id)
+                    project.showCanvas = true
+                }
             }
             EntryCard(svgName: "newChat", title: "新建会话") {
                 service.newConversation()
-                showHistory = false   // 建完直接进新会话，不留在列表里
+                service.showChatHistory = false   // 建完直接进新会话，不留在列表里
             }
         }
-        .padding(.leading, 3).padding(.trailing, 10)
+        .padding(.leading, leadPad).padding(.trailing, 10)
         .padding(.bottom, 6)
     }
 
@@ -201,7 +247,7 @@ struct AIChatPanel: View {
                             historyRow(conv)
                         }
                     }
-                    .padding(.leading, 3).padding(.trailing, 10)
+                    .padding(.leading, leadPad).padding(.trailing, 10)
                     .padding(.vertical, 6)
                 }
                 // 点列表空白处：正在重命名就提交。失焦本身也会提交（见 TextField
@@ -236,11 +282,13 @@ struct AIChatPanel: View {
                 if let snap = conv.canvas {
                     project.canvas.restore(from: snap, conversationID: conv.id, title: conv.title)
                 }
-                service.currentConversationId = conv.id
+                // 走 loadConversation 而不是直接赋 id —— 裸赋值只换了「当前是哪条」，
+                // messages 还留着上一条会话的内容，画布里那张卡片会把它照原样显示出来
+                service.loadConversation(conv.id)
                 project.showCanvas = true
             } else {
                 service.loadConversation(conv.id)
-                showHistory = false
+                service.showChatHistory = false
             }
         } label: {
             HStack(spacing: 6) {
@@ -341,6 +389,41 @@ struct AIChatPanel: View {
 
     // MARK: - 消息列表
 
+    /// 输入框里用 `/` 点名的生成模型。
+    ///
+    /// 供应商下拉只剩 Agent 模型之后，参考图区、时长比例这些控件不能再跟着
+    /// selectedProvider 走 —— 改成跟着命令：打了 /seedance 就按视频那套显示
+    private var namedModel: AIVideoService.Provider? { namedModel(in: inputText) }
+
+    /// 从一段文本里认出 `/` 点名的生成模型。
+    /// **发送时必须传 text**：sendMessage 会先把输入框清空再调 runAgent，
+    /// 那时候再读 inputText 只会读到空串，界面上选的参数就带不过去了
+    private func namedModel(in text: String) -> AIVideoService.Provider? {
+        let names = SlashCommands.matchedRanges(in: text)
+            .map { (text as NSString).substring(with: $0).dropFirst() }
+            .map(String.init)
+        for n in names {
+            if let p = AIVideoService.Provider.allCases.first(where: {
+                !$0.isHidden && $0.category != .text && SlashCommands.slug($0.rawValue) == n
+            }) { return p }
+        }
+        return nil
+    }
+
+    /// 这一轮实际按哪家的规则摆控件
+    private var uiProvider: AIVideoService.Provider {
+        namedModel ?? service.selectedProvider
+    }
+
+    /// 下拉里只剩 Agent 模型了，旧配置可能还存着图片/视频模型 —— 那样发消息会
+    /// 走老的生成链路而不是 Agent，开面板时先纠正回来
+    private func ensureAgentProvider() {
+        guard service.selectedProvider.category != .text,
+              let first = AIVideoService.Provider.providers(for: .text).first else { return }
+        service.selectedProvider = first
+        settings.aiProvider = first.rawValue
+    }
+
     @ViewBuilder
     private var messageList: some View {
         // 空状态放在 ScrollView **外面**：PositionedAtOneThird 靠 GeometryReader 读高度，
@@ -361,6 +444,15 @@ struct AIChatPanel: View {
         }
     }
 
+    /// 会话是不是已经拉到底。没贴底说明用户正翻旧消息，
+    /// 这时候 Agent 那边刷新不该把人拽回去
+    @State private var atBottom = true
+    /// 会话区可视高度，判断贴底要用
+    @State private var viewportH: CGFloat = 0
+    /// 最后一次内容变高的时刻。内容长高时探针也会被顶出可视区，
+    /// 跟「用户自己往上翻」在探针那儿长得一模一样，只能靠时间窗分开
+    @State private var lastGrow = Date.distantPast
+
     private var scrollBody: some View {
         ScrollViewReader { proxy in
             ScrollView(showsIndicators: false) {
@@ -375,19 +467,65 @@ struct AIChatPanel: View {
                     }
                 }
                 // 左边缘跟标题「AI 创作」对齐（标题是 leading 3）
-                .padding(.leading, 3).padding(.trailing, 10)
+                .padding(.leading, leadPad).padding(.trailing, 10)
                 .padding(.vertical, 10)
+
+                // 贴底探针。跟在内容最后，它进了可视区就说明人在最底下。
+                // ScrollView 没有现成的偏移量可读，只能这么量
+                Color.clear.frame(height: 1)
+                    .background(GeometryReader { g in
+                        Color.clear.onChange(of: g.frame(in: .named("chatScroll")).minY) { y in
+                            // 高度还没量到就别判，viewportH 是 0 时算出来永远
+                            // 是「没贴底」，之后探针不动，自动滚就再也不触发了
+                            guard viewportH > 0 else { return }
+                            // 刚长高那一下不算用户上翻
+                            guard Date().timeIntervalSince(lastGrow) > 0.4 else { return }
+                            atBottom = y - viewportH < 40
+                        }
+                    })
             }
-            .onChange(of: service.messages.count) { _ in scrollToLast(proxy) }
+            .coordinateSpace(name: "chatScroll")
+            .background(GeometryReader { g in
+                Color.clear
+                    .onAppear { viewportH = g.size.height }
+                    .onChange(of: g.size.height) { viewportH = $0 }
+            })
+            // 切到素材库再切回来，面板是重建的 —— 不补这一下会停在顶部
+            .onAppear { scrollToLast(proxy, waitForLayout: true) }
+            .onChange(of: service.messages.count) { _ in
+                lastGrow = Date()
+                scrollToLast(proxy, waitForLayout: true)
+            }
             // 生成完成时消息条数**没变**：同一条 assistant 消息的 status 从 .generating
             // 变成 .completed 并挂上视频卡片。只看 count 就不会滚，用户得自己往下拖
             .onChange(of: service.messages.last?.status) { _ in
+                lastGrow = Date()
                 scrollToLast(proxy, waitForLayout: true)
+            }
+            // Agent 跑的时候最后那条一直在长高：步骤一条条往里加、跑完再把
+            // 正文写进去 —— 条数和 status 全程不变，只盯那两个就一路被顶在上面
+            // 回复正文冒出来那一下必须到底 —— 那正是用户要看的东西
+            .onChange(of: service.messages.last?.content) { _ in
+                lastGrow = Date()
+                scrollToLast(proxy, waitForLayout: true)
+            }
+            // 过程中的高频刷新才看贴底：人正翻旧消息时不该被拽回来
+            .onChange(of: agent.steps.count) { _ in
+                lastGrow = Date()
+                scrollToLast(proxy, onlyIfAtBottom: true)
+            }
+            .onChange(of: agent.phase) { _ in
+                lastGrow = Date()
+                scrollToLast(proxy, onlyIfAtBottom: true)
             }
         }
     }
 
-    private func scrollToLast(_ proxy: ScrollViewProxy, waitForLayout: Bool = false) {
+    /// `onlyIfAtBottom`：人正翻着旧消息就别动。
+    /// 自己发的新消息不受这条限制 —— 发完看不到自己那条会以为没发出去
+    private func scrollToLast(_ proxy: ScrollViewProxy, waitForLayout: Bool = false,
+                              onlyIfAtBottom: Bool = false) {
+        if onlyIfAtBottom && !atBottom { return }
         guard let last = service.messages.last else { return }
         withAnimation { proxy.scrollTo(last.id, anchor: .bottom) }
         // 视频卡片是状态变完成之后才挂上去的，挂上去气泡才变高 —— 这一下只能滚到
@@ -418,7 +556,7 @@ struct AIChatPanel: View {
 
     /// 生成类型 → 素材库同款图标
     private var emptyHintIcon: String {
-        switch service.selectedProvider.category {
+        switch uiProvider.category {
         case .video: return "video"
         case .image: return "image"
         case .audio: return "audio"
@@ -432,6 +570,24 @@ struct AIChatPanel: View {
     @State private var inputHeight: CGFloat = 50
     @State private var dragStartHeight: CGFloat? = nil
     @State private var isResizing = false
+    @State private var webHover = false
+    @State private var plusHover = false
+    /// Agent 对话的附件（图片给模型看，文本读成文字塞进提示词）
+    @State private var agentAttachments: [AgentAttachment] = []
+    /// 有文件正拖在聊天区上方
+    @State private var isDropTargeted = false
+    /// 侧栏那份和画布那份同时在，登记同一个名字会互相覆盖 ——
+    /// 画布的排在前面，它开着的时候就该它收
+    private var dropZoneKind: FileDropRouter.Kind { inCanvas ? .canvasChat : .aiChat }
+    /// 侧栏那份左边只留 3 是为了跟外面「AI 创作」那行标题对齐；
+    /// 画布上是一张独立卡片，左右得一样宽
+    private var leadPad: CGFloat { inCanvas ? 10 : 3 }
+    /// 卡片标题用会话名，跟侧栏历史列表里显示的是同一个
+    private var conversationTitle: String {
+        guard let id = service.currentConversationId,
+              let c = service.history.first(where: { $0.id == id }) else { return "新会话" }
+        return c.title
+    }
 
     /// 正文行距。目标是 1.4 倍行高（12pt 字 → 16.8pt 行高），
     /// 而 lineSpacing 加的是行间额外间距，默认单行已占约 14.3pt，所以补 2.5。
@@ -444,60 +600,33 @@ struct AIChatPanel: View {
             if let c = agent.pendingConfirm {
                 AgentConfirmBar(toolName: c.toolName, detail: c.detail, onAnswer: c.onAnswer)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.leading, 3).padding(.trailing, 10)
+                    .padding(.leading, leadPad).padding(.trailing, 10)
                     .padding(.bottom, 6)
             }
-            if !agent.steps.isEmpty || agent.isRunning {
-                AgentStepsView(steps: agent.steps.map {
-                    .init(tool: $0.toolName, summary: $0.summary, isError: $0.isError)
-                }, isRunning: agent.isRunning,
-                   elapsed: agent.elapsed, tokens: agent.totalTokens, phase: agent.phase)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.leading, 3).padding(.trailing, 10)
-                    .padding(.bottom, 6)
-            }
+
+            // 后台任务入口在输入区正上方，占正常的位置 —— 浮起来的话会压到
+            // 会话最后一条上。没有任务时它自己不显示
+            AgentTaskEntry()
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.leading, leadPad)
+                // 气泡自己带 8pt 的 top padding，这儿再给 6 就是双份，收到 2
+                .padding(.bottom, 2)
 
             VStack(spacing: 0) {
                 HStack(alignment: .top) {
-                    if service.selectedProvider.maxReferenceImages > 0 {
+                    if uiProvider.maxReferenceImages > 0 {
                         imagePreviewArea
                     }
-                    // 后台任务入口。生成类任务不占会话，进度集中在这儿看
-                    AgentTaskEntry()
-                    Spacer()
-                    // 子模型紧挨着供应商下拉左边：先选哪一家，再选它下面哪个型号，
-                    // 从左往右读正好是「Seedance2.0 → Seedance」这个层级。
-                    // 外层 HStack 是 .top 对齐（迁就参考图区），这两个下拉要单独居中对齐
-                    HStack(alignment: .center, spacing: 0) {
-                        if !service.selectedProvider.subModels.isEmpty {
-                            capsuleMenu(label: currentSubModelLabel) {
-                                service.selectedProvider.subModels.map { m in
-                                    MenuChoice(label: m.label,
-                                               checked: m.label == currentSubModelLabel) {
-                                        settings.setProviderModel(m.id, for: service.selectedProvider.rawValue)
-                                    }
-                                }
-                            }
+                    if !agentAttachments.isEmpty {
+                        AgentAttachmentBar(items: agentAttachments) { it in
+                            agentAttachments.removeAll { $0.id == it.id }
                         }
-                        Button { showProviderMenu() } label: {
-                            HStack(spacing: 3) {
-                                Text(service.selectedProvider.displayName)
-                                    .font(.system(size: 10))
-                                    .lineLimit(1)
-                                    .truncationMode(.tail)
-                                Image(systemName: "chevron.down")
-                                    .font(.system(size: 7, weight: .bold))
-                            }
-                            .foregroundColor(Color.labelSecondary)
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 3)
-                        }
-                        .buttonStyle(.plain)
                     }
+                    Spacer()
                 }
-                .padding(.horizontal, 8)
+                // 跟输入框左边缘对齐，上面也留一样的空
+                .padding(.leading, 8)
                 .padding(.top, 8)
-
 
                 ChatInputTextView(
                     text: $inputText,
@@ -519,38 +648,33 @@ struct AIChatPanel: View {
                         case .confirm: pickSlash(slashMatches[min(slashIndex, n - 1)])
                         case .cancel:  slashQuery = nil
                         }
-                    }
+                    },
+                    // 只打了命令、还没写正文时也要提示 —— 那正是用户
+                    // 等着看「这个模型能塞几张参考图」的时候
+                    placeholder: inputPlaceholder,
+                    showsPlaceholder: placeholderVisible,
+                    externalRevision: inputRevision
                 )
                     .frame(height: inputHeight)
                     .animation(nil, value: inputHeight)
                     .padding(.horizontal, 8)
                     .padding(.top, 2)
-                    .overlay(alignment: .topLeading) {
-                        if inputText.isEmpty {
-                            Text(inputPlaceholder)
-                                .font(.system(size: 12))
-                                .foregroundColor(Color.labelSecondary.opacity(0.4))
-                                // overlay 挂在 padding **之后**，坐标系是含边距的整块，
-                                // 所以这里得自己补回那 8pt，才跟真正输入的文字同一条线
-                                .padding(.leading, 8)
-                                .padding(.top, 4)
-                                .allowsHitTesting(false)
-                        }
-                    }
-                    .overlay(alignment: .topLeading) {
-                        if !slashMatches.isEmpty {
-                            SlashCommandPopup(commands: slashMatches,
-                                              selectedIndex: $slashIndex,
-                                              onPick: { pickSlash($0) })
-                                .fixedSize()
-                                // 把自己的底边当成对齐用的顶边，整块就浮到输入框上方去了
-                                .alignmentGuide(.top) { $0[.bottom] + 6 }
-                                .padding(.leading, 8)
-                        }
-                    }
 
-                HStack(spacing: 4) {
-                    if service.selectedProvider.category == .video {
+                HStack(spacing: 2) {
+                    // 子模型跟生成参数是一组：先定用哪家的哪个型号，再定时长比例。
+                    // 只在 `/` 点名了生成模型时出现 —— 没点名时 uiProvider 就是
+                    // Agent 模型，它的子模型属于框外那排，不该跑到这儿来
+                    if namedModel != nil, !uiProvider.subModels.isEmpty {
+                        capsuleMenu(label: currentSubModelLabel) {
+                            uiProvider.subModels.map { m in
+                                MenuChoice(label: m.label,
+                                           checked: m.label == currentSubModelLabel) {
+                                    settings.setProviderModel(m.id, for: uiProvider.rawValue)
+                                }
+                            }
+                        }
+                    }
+                    if uiProvider.category == .video {
                         capsuleMenu(label: imageMode == .reference ? refSlotLabel : imageMode.label) {
                             [MenuChoice(label: refSlotLabel, checked: imageMode == .reference) {
                                 firstFrameImage = nil; lastFrameImage = nil
@@ -582,7 +706,7 @@ struct AIChatPanel: View {
                                 }
                             }
                         }
-                    } else if service.selectedProvider.category == .image {
+                    } else if uiProvider.category == .image {
                         capsuleMenu(label: settings.aiImageRatio) {
                             ratios.map { r in
                                 MenuChoice(label: r, checked: r == settings.aiImageRatio) {
@@ -590,61 +714,6 @@ struct AIChatPanel: View {
                                 }
                             }
                         }
-                    }
-
-                    // Agent 只在文字模型下才有意义 —— 图片/视频/音频那几个
-                    // 供应商压根不支持工具调用，摆个模式切换出来只会让人以为能用
-                    if service.selectedProvider.category == .text {
-                        // 自己弹 NSMenu：SwiftUI 的 Menu 会把 label 里的换行压平，
-                        // 标题和那句解释挤成一行，读起来分不清哪句管哪个模式
-                        Button { showModeMenu() } label: {
-                            HStack(spacing: 3) {
-                                Text(settings.agentMode.rawValue)
-                                    .font(.system(size: 10))
-                                    .lineLimit(1)
-                                Image(systemName: "chevron.down")
-                                    .font(.system(size: 7, weight: .bold))
-                            }
-                            .foregroundColor(Color.labelSecondary)
-                            .padding(.leading, 3).padding(.trailing, 10)
-                            .padding(.vertical, 3)
-                            .contentShape(Rectangle())
-                        }
-                        .buttonStyle(.plain)
-                        .help(settings.agentMode.help)
-                    }
-
-                    // 推理强度
-                    if !service.selectedProvider.reasoningLevels.isEmpty {
-                        capsuleMenu(label: currentReasoningLabel) {
-                            service.selectedProvider.reasoningLevels.map { lv in
-                                MenuChoice(label: lv.label, checked: lv.label == currentReasoningLabel) {
-                                    settings.setProviderReasoning(lv.value, for: service.selectedProvider.rawValue)
-                                }
-                            }
-                        }
-                    }
-
-                    if service.selectedProvider.supportsWebSearch {
-                        Button {
-                            service.webSearchEnabled.toggle()
-                        } label: {
-                            HStack(spacing: 2) {
-                                Image(nsImage: SidebarSVGIcon.load("webSearch", size: 11))
-                                    .renderingMode(.template)
-                                    .resizable()
-                                    .aspectRatio(contentMode: .fit)
-                                    .frame(width: 11, height: 11)
-                                Text("联网")
-                                    .font(.system(size: 10))
-                            }
-                            .foregroundColor(service.webSearchEnabled ? Color.accent : Color.labelSecondary)
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 3)
-                            .background(service.webSearchEnabled ? Color.accent.opacity(0.15) : Color.white.opacity(0.06))
-                            .clipShape(Capsule())
-                        }
-                        .buttonStyle(.plain)
                     }
 
                     Spacer()
@@ -676,19 +745,23 @@ struct AIChatPanel: View {
                 .padding(.bottom, 6)
                 .clipped()
             }
-            .background(Color.white.opacity(0.06))
-            .clipShape(RoundedRectangle(cornerRadius: 10))
-            // 拖动热区：跨在输入框上边缘，上下各 8pt。
+            // 拖动热区：贴着输入区上边缘的内侧 12pt。
             //
             // 必须挂在这一层（气泡本体）而不是外层容器 —— 外层还有 8pt 的
             // top padding，挂那儿热区会落在气泡上方的空白里，跟看到的边缘错开，
             // 表现就是"有时能拖有时拖不动"。
-            // 放在 clipShape 之后，超出边界的那一半才不会被裁掉
-            .overlay(alignment: .top) {
+            // **整条留在边界内**：越过父视图边界的部分收不到鼠标（命中测试不出
+            // bounds），原来靠 offset 推出去一半，那一半是白给的。
+            //
+            // 用 `.background` 而不是 `.overlay`，位置也排在气泡底色**之前** ——
+            // 这样它夹在底色和内容之间：顶上那排缩略图和删除角标先接到鼠标，
+            // 只有真正的空白处才落到热区。搁在 overlay 里是最上层，
+            // 鼠标一挨到角标就变成上下拖动的箭头，那一层的 DragGesture
+            // 还会把点击一并吃掉
+            .background(alignment: .top) {
                 Color.clear
-                    .frame(height: 16)
+                    .frame(height: 12)
                     .contentShape(Rectangle())
-                    .offset(y: -8)
                     .onHover { hovering in
                         // 拖动中鼠标会甩出热区，这时不能把光标改回箭头，否则一路闪
                         if hovering || isResizing { NSCursor.resizeUpDown.set() }
@@ -713,8 +786,120 @@ struct AIChatPanel: View {
                             }
                     )
             }
-            .padding(.leading, 3).padding(.trailing, 10)
+            .background(Color.white.opacity(0.06))
+            .clipShape(RoundedRectangle(cornerRadius: 10))
+            // `/` 候选浮在输入区上方。**必须挂在 clipShape 之后** ——
+            // 挂里面的话向上溢出的部分全被那个圆角裁掉，只剩贴着边的最后一项
+            .overlay(alignment: .topLeading) {
+                if !slashMatches.isEmpty {
+                    SlashCommandPopup(commands: slashMatches,
+                                      selectedIndex: $slashIndex,
+                                      onPick: { pickSlash($0) })
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .offset(y: -(SlashCommandPopup.height(for: slashMatches.count) + 6))
+                }
+            }
+            .padding(.leading, leadPad).padding(.trailing, 10)
             .padding(.top, 8)
+
+            // Agent 自己的那套（模式、附件、推理、联网、模型）在输入框**外面**。
+            // 原来用 overlay + offset 顶出去，越过父视图边界的部分收不到鼠标 ——
+            // 气泡还在（toolTip 走 AppKit 那条路），但点不动、hover 也没反馈
+HStack(spacing: 2) {
+            // Agent 只在文字模型下才有意义 —— 图片/视频/音频那几个
+            // 供应商压根不支持工具调用，摆个模式切换出来只会让人以为能用
+            if service.selectedProvider.category == .text {
+                // 自己弹 NSMenu：SwiftUI 的 Menu 会把 label 里的换行压平，
+                // 标题和那句解释挤成一行，读起来分不清哪句管哪个模式
+                Button { showModeMenu() } label: {
+                    HStack(spacing: 3) {
+                        Text(settings.agentMode.rawValue)
+                            .font(.system(size: 10))
+                            .lineLimit(1)
+                        Image(systemName: "chevron.down")
+                            .font(.system(size: 7, weight: .bold))
+                    }
+                    .foregroundColor(Color.labelSecondary)
+                    .padding(.leading, leadPad).padding(.trailing, 10)
+                    .padding(.vertical, 3)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help(settings.agentMode.help)
+            }
+
+            // 推理强度
+            // 附件入口。图片直接给模型看，文本文件读成文字塞进提示词
+            Button { pickAgentAttachments() } label: {
+                Image(systemName: "plus")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundColor(Color.labelSecondary)
+                    .padding(4)
+                    .background(RoundedRectangle(cornerRadius: 5)
+                        .fill(Color.white.opacity(plusHover ? 0.10 : 0)))
+                    .contentShape(RoundedRectangle(cornerRadius: 5))
+            }
+            .buttonStyle(.plain)
+            .onHover { plusHover = $0 }
+            .overlay { ChatTooltip(text: "添加图片或文件") }
+
+            Spacer()
+
+            if service.selectedProvider.supportsWebSearch {
+                Button {
+                    service.webSearchEnabled.toggle()
+                } label: {
+                    Image(nsImage: SidebarSVGIcon.load("webSearch", size: 13))
+                        .renderingMode(.template)
+                        .foregroundColor(service.webSearchEnabled
+                                         ? Color.accent : Color.labelSecondary)
+                        .padding(4)
+                        .background(RoundedRectangle(cornerRadius: 5)
+                            .fill(Color.white.opacity(webHover ? 0.10 : 0)))
+                        .contentShape(RoundedRectangle(cornerRadius: 5))
+                }
+                .buttonStyle(.plain)
+                .onHover { webHover = $0 }
+                // .help 挂在 Button 上不弹，挂到 label 那层才认
+                .overlay { ChatTooltip(text: service.webSearchEnabled ? "联网：已开启" : "联网：已关闭") }
+            }
+
+            if !service.selectedProvider.reasoningLevels.isEmpty {
+                capsuleMenu(label: currentReasoningLabel) {
+                    service.selectedProvider.reasoningLevels.map { lv in
+                        MenuChoice(label: lv.label, checked: lv.label == currentReasoningLabel) {
+                            settings.setProviderReasoning(lv.value, for: service.selectedProvider.rawValue)
+                        }
+                    }
+                }
+            }
+                if !service.selectedProvider.subModels.isEmpty {
+                    capsuleMenu(label: agentSubModelLabel) {
+                        service.selectedProvider.subModels.map { m in
+                            MenuChoice(label: m.label, checked: m.label == agentSubModelLabel) {
+                                settings.setProviderModel(m.id, for: service.selectedProvider.rawValue)
+                            }
+                        }
+                    }
+                }
+                Button { showProviderMenu() } label: {
+                    HStack(spacing: 3) {
+                        Text(service.selectedProvider.displayName)
+                            .font(.system(size: 10))
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                        Image(systemName: "chevron.down")
+                            .font(.system(size: 7, weight: .bold))
+                    }
+                    .foregroundColor(Color.labelSecondary)
+                    .padding(.leading, leadPad)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+            }
+            .padding(.horizontal, 4)
+            .padding(.horizontal, 7)
+            .padding(.top, 5)
             .padding(.bottom, 8)
         }
     }
@@ -748,7 +933,7 @@ struct AIChatPanel: View {
                     .font(.system(size: 7, weight: .bold))
             }
             .foregroundColor(active ? Color.accent : Color.labelSecondary)
-            .padding(.leading, 3).padding(.trailing, 10)
+            .padding(.leading, 2).padding(.trailing, 5)
             .padding(.vertical, 3)
             .contentShape(Rectangle())
         }
@@ -760,14 +945,16 @@ struct AIChatPanel: View {
 
     private var imagePreviewArea: some View {
         HStack(spacing: 2) {
-            if imageMode == .reference || service.selectedProvider.category != .video {
+            if imageMode == .reference || uiProvider.category != .video {
                 refContentSlot
             } else {
                 frameSlot(image: firstFrameImage, label: "首帧") {
                     pickSingleImage { u, i in firstFrameImage = (u, i) }
                 }
-                // 只有支持尾帧的模型才显示尾帧槽，否则用户设了会被 API 静默丢弃
-                if service.selectedProvider.supportsLastFrame {
+                // 只有支持尾帧的模型才显示尾帧槽，否则用户设了会被 API 静默丢弃。
+                // 认 uiProvider —— 这一栏是给命令点名的那个生成模型用的，
+                // 拿 Agent 模型去问支不支持尾帧，答案永远是不支持
+                if uiProvider.supportsLastFrame {
                     swapFramesButton
                     frameSlot(image: lastFrameImage, label: "尾帧") {
                         pickSingleImage { u, i in lastFrameImage = (u, i) }
@@ -802,9 +989,11 @@ struct AIChatPanel: View {
         .onHover { swapHovering = $0 && enabled }
     }
 
-    /// 只收图片的模型显示「参考图」，能收视频/音频的才叫「参考内容」
+    /// 视频模型跟「首尾帧」二选一，那一档叫「智能参考」；
+    /// 其余只收图片的叫「参考图」，能收视频/音频的叫「参考内容」
     private var refSlotLabel: String {
-        let p = service.selectedProvider
+        let p = uiProvider
+        if p.category == .video { return "智能参考" }
         return (p.maxReferenceVideos == 0 && p.maxReferenceAudios == 0) ? "参考图" : "参考内容"
     }
 
@@ -855,7 +1044,8 @@ struct AIChatPanel: View {
                     .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.white.opacity(0.15), lineWidth: 0.5))
                     .overlay(alignment: .bottomTrailing) {
                         if item.type == .video {
-                            Image(systemName: "video.fill")
+                            Image(nsImage: SidebarSVGIcon.load("video", size: 9))
+                                .renderingMode(.template)
                                 .font(.system(size: 8))
                                 .foregroundColor(.white)
                                 .padding(2)
@@ -863,7 +1053,8 @@ struct AIChatPanel: View {
                                 .clipShape(RoundedRectangle(cornerRadius: 2))
                                 .padding(2)
                         } else if item.type == .audio {
-                            Image(systemName: "waveform")
+                            Image(nsImage: SidebarSVGIcon.load("audio", size: 9))
+                                .renderingMode(.template)
                                 .font(.system(size: 8))
                                 .foregroundColor(.white)
                                 .padding(2)
@@ -939,8 +1130,42 @@ struct AIChatPanel: View {
     private static let videoExts = AIVideoService.videoExts
     private static let audioExts = AIVideoService.audioExts
 
+    /// 选图片/文本文件当附件
+    private func pickAgentAttachments() {
+        let panel = NSOpenPanel()
+        panel.allowsMultipleSelection = true
+        panel.canChooseDirectories = false
+        panel.begin { resp in
+            guard resp == .OK else { return }
+            addAgentAttachments(panel.urls)
+        }
+    }
+
+    /// 把聊天区登记成文件接收区。只收 Finder 文件 ——
+    /// 素材库拖出来的那些载荷（素材 id / 图形 / 滤镜）归时间轴，不该落这儿
+    private func registerChatDropZone(_ rect: CGRect) {
+        FileDropRouter.register(windowID, kind: dropZoneKind, rect: rect,
+                                accepts: { if case .files = $0 { return true } else { return false } },
+                                onDrop: { payload, _ in
+                                    if case .files(let urls) = payload { addAgentAttachments(urls) }
+                                },
+                                onTargetChange: { isDropTargeted = $0 })
+    }
+
+    /// 收下这些文件。不认的类型直接跳过 —— 二进制读成乱码塞给模型只会添乱
+    private func addAgentAttachments(_ urls: [URL]) {
+        for u in urls {
+            guard AgentAttachmentIO.accepts(u),
+                  !agentAttachments.contains(where: { $0.url == u }),
+                  let a = AgentAttachmentIO.make(u) else { continue }
+            agentAttachments.append(a)
+        }
+    }
+
     private func pickRefContents() {
-        let provider = service.selectedProvider
+        // 认命令点名的那个模型 —— 拿 Agent 模型问「能塞几张参考图」，
+        // 答案是 0，remaining 直接为负，点了槽位没任何反应
+        let provider = uiProvider
         let maxImg = provider.maxReferenceImages
         let maxVid = provider.maxReferenceVideos
         let maxAud = provider.maxReferenceAudios
@@ -1028,25 +1253,44 @@ struct AIChatPanel: View {
 
     // MARK: - Actions
 
-    private var inputPlaceholder: String {
-        switch service.selectedProvider.category {
-        case .video: return "描述你想生成的视频…"
-        case .image: return "描述你想生成的图片…"
-        case .audio: return "描述你想生成的声音…"
-        case .text: return "输入你的问题…"
+    /// 去掉 `/命令` 之后还剩不剩东西。只剩命令时照样给提示
+    private var placeholderVisible: Bool {
+        var rest = inputText
+        for r in SlashCommands.matchedRanges(in: inputText).reversed() {
+            rest = (rest as NSString).replacingCharacters(in: r, with: "")
         }
+        return rest.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private var inputPlaceholder: String {
+        // 跟着命令走：打了 /seedance 就该提示写视频描述，而不是「输入你的问题」
+        let p = uiProvider
+        let head: String
+        switch p.category {
+        case .video: head = "描述你想生成的视频…"
+        case .image: head = "描述你想生成的图片…"
+        case .audio: head = "描述你想生成的声音…"
+        case .text:  return "请输入或 / 命令"
+        }
+        // 首尾帧模式下只认两张图，不用报那一串上限
+        if p.category == .video, imageMode == .frames {
+            return head + "（第一张是首帧，第二张是尾帧）"
+        }
+        guard p.maxReferenceTotal > 0 else { return head }
+        return head + "（图片 ≤\(p.maxReferenceImages)，视频 ≤\(p.maxReferenceVideos)，"
+             + "音频 ≤\(p.maxReferenceAudios)，总数 ≤\(p.maxReferenceTotal)）"
     }
 
     /// 当前选中的子模型（发给 API 的那个名字）；没选过就用清单第一项
     private var currentSubModel: String {
-        let saved = settings.providerModel(for: service.selectedProvider.rawValue)
+        let saved = settings.providerModel(for: uiProvider.rawValue)
             .trimmingCharacters(in: .whitespacesAndNewlines)
         if !saved.isEmpty {
             // 旧配置存的是显示名，换算成 id（勾选状态才对得上）
-            let list = service.selectedProvider.subModels
+            let list = uiProvider.subModels
             return list.first { $0.label == saved }?.id ?? saved
         }
-        return service.selectedProvider.subModels.first?.id ?? ""
+        return uiProvider.subModels.first?.id ?? ""
     }
 
     /// 界面上显示的子模型名。
@@ -1054,10 +1298,27 @@ struct AIChatPanel: View {
     /// 让旧配置也能对上，不至于显示成一串陌生的 id
     private var currentSubModelLabel: String {
         let v = currentSubModel
-        let list = service.selectedProvider.subModels
+        let list = uiProvider.subModels
         return list.first { $0.id == v }?.label
             ?? list.first { $0.label == v }?.label
             ?? v
+    }
+
+    /// Agent 模型自己的子模型（框外那排用）。跟生成模型那套分开记
+    private var agentSubModel: String {
+        let p = service.selectedProvider
+        let saved = settings.providerModel(for: p.rawValue)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if !saved.isEmpty {
+            return p.subModels.first { $0.label == saved }?.id ?? saved
+        }
+        return p.subModels.first?.id ?? ""
+    }
+
+    private var agentSubModelLabel: String {
+        let v = agentSubModel
+        let list = service.selectedProvider.subModels
+        return list.first { $0.id == v }?.label ?? list.first { $0.label == v }?.label ?? v
     }
 
     /// 当前推理强度取值；没选过就用该家默认（清单第一项）
@@ -1070,11 +1331,14 @@ struct AIChatPanel: View {
 
     private var currentReasoningLabel: String {
         let v = currentReasoningValue
-        return service.selectedProvider.reasoningLevels.first { $0.value == v }?.label ?? v
+        let full = service.selectedProvider.reasoningLevels.first { $0.value == v }?.label ?? v
+        // 档位写成「很高 xhigh」，菜单里两半都要（对得上各家文档），
+        // 但收起来时只显示中文那半，省得挤
+        return full.components(separatedBy: " ").first ?? full
     }
 
     private var emptyHintText: String {
-        switch service.selectedProvider.category {
+        switch uiProvider.category {
         case .video: return "描述你想生成的视频"
         case .image: return "描述你想生成的图片"
         case .audio: return "描述你想生成的声音"
@@ -1108,31 +1372,20 @@ struct AIChatPanel: View {
     }
 
     private func showProviderMenu() {
+        // 只列 Agent 模型。图片/音频/视频交给 Agent 自己挑 —— 说「用 image2 画一张」
+        // 或打 /image2 就行，不必先来这儿切一次
         let menu = NSMenu()
         menu.minimumWidth = 200
-        for cat in AIVideoService.ProviderCategory.allCases {
-            let header = NSMenuItem(title: cat.rawValue, action: nil, keyEquivalent: "")
-            header.isEnabled = false
-            header.attributedTitle = NSAttributedString(string: cat.rawValue, attributes: [
-                .font: NSFont.systemFont(ofSize: 11, weight: .medium),
-                .foregroundColor: NSColor.secondaryLabelColor
-            ])
-            menu.addItem(header)
-
-            for provider in AIVideoService.Provider.providers(for: cat) {
-                let svc = service
-                let sets = settings
-                menu.addItem(MenuRowView.item(title: provider.displayName,
-                                              checked: provider.rawValue == settings.aiProvider,
-                                              width: 200,
-                                              indent: true) {
-                    svc.selectedProvider = provider
-                    sets.aiProvider = provider.rawValue
-                })
-            }
-            menu.addItem(.separator())
+        for provider in AIVideoService.Provider.providers(for: .text) {
+            let svc = service
+            let sets = settings
+            menu.addItem(MenuRowView.item(title: provider.displayName,
+                                          checked: provider.rawValue == settings.aiProvider,
+                                          width: 200) {
+                svc.selectedProvider = provider
+                sets.aiProvider = provider.rawValue
+            })
         }
-        if menu.items.last?.isSeparatorItem == true { menu.removeItem(at: menu.numberOfItems - 1) }
         popUp(menu)
     }
 
@@ -1155,8 +1408,10 @@ struct AIChatPanel: View {
     private func pickSlash(_ cmd: SlashCommand) {
         if let tok = SlashCommands.activeToken(in: inputText, cursor: min(slashCaret, inputText.count)) {
             inputText.replaceSubrange(tok.range, with: "/" + cmd.name + " ")
+            inputRevision += 1
         } else {
             inputText += (inputText.isEmpty || inputText.hasSuffix(" ") ? "" : " ") + "/" + cmd.name + " "
+            inputRevision += 1
         }
         slashQuery = nil
         slashIndex = 0
@@ -1166,6 +1421,7 @@ struct AIChatPanel: View {
         let text = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
         inputText = ""
+        inputRevision += 1
         slashQuery = nil
 
         // 没挂参考素材的纯文字消息交给 Agent —— 它会自己判断是查项目、
@@ -1234,16 +1490,65 @@ struct AIChatPanel: View {
         let named = SlashCommands.matchedRanges(in: text)
             .map { (text as NSString).substring(with: $0).dropFirst() }
             .map(String.init)
-        if !named.isEmpty {
-            prompt += "\n\n[用户点名了 Skill：" + named.map { "「\($0)」" }.joined()
+        let namedSkills = named.filter { !SlashCommands.isModel($0) }
+        let namedModels = named.filter { SlashCommands.isModel($0) }
+        if !namedSkills.isEmpty {
+            prompt += "\n\n[用户点名了 Skill：" + namedSkills.map { "「\($0)」" }.joined()
                     + "。先用 read_skill 读它的完整说明，再照着里面写的做。]"
         }
-        agent.run(prompt: prompt, history: &agentHistory,
+        if !namedModels.isEmpty {
+            prompt += "\n\n[用户点名了模型：" + namedModels.map { "「\($0)」" }.joined()
+                    + "。调生成工具时把它填进 model 参数。]"
+        }
+        // 界面上那排下拉是用户明确选过的，不带上的话模型会自己填一套默认值 ——
+        // 选了 9:16 结果出 1:1 就是这么来的
+        if let m = namedModel(in: text) {
+            var picked: [String] = []
+            switch m.category {
+            case .video:
+                picked.append("比例 \(settings.aiRatio)")
+                picked.append("时长 \(currentDuration) 秒")
+                picked.append("分辨率 \(currentResolution)")
+            case .image:
+                picked.append("比例 \(settings.aiImageRatio)")
+            default: break
+            }
+            if !picked.isEmpty {
+                prompt += "\n\n[用户在界面上选好了：" + picked.joined(separator: "、")
+                        + "。调生成工具时按这些填，别自己另定。]"
+            }
+        }
+        // 先占一条空回复，步骤就长在这条气泡里，跑完再把正文填进去
+        let replyID = service.beginAgentReply()
+        agent.runningMessageID = replyID
+        // 附件：图片压成 JPEG 直接给模型看，文本读出来贴在提示词后面
+        var images: [Data] = []
+        var docs: [String] = []
+        for a in agentAttachments {
+            if let img = a.thumb {
+                if let d = AgentAttachmentIO.jpegData(img) { images.append(d) }
+            } else if let text = AgentAttachmentIO.readText(a.url) {
+                docs.append("<文件 name=\"\(a.name)\">\n\(text)\n</文件>")
+            }
+        }
+        if !docs.isEmpty {
+            prompt += "\n\n" + docs.joined(separator: "\n\n")
+        }
+        if !images.isEmpty {
+            prompt += "\n\n[用户带了 \(images.count) 张图，就在这条消息里。]"
+        }
+        agentAttachments.removeAll()
+
+        agent.run(prompt: prompt, images: images, history: &agentHistory,
                   mode: settings.agentMode, project: project,
                   webSearch: service.webSearchEnabled) { reply in
-            service.appendAgentReply(reply, steps: agent.steps.map {
-                .init(tool: $0.toolName, summary: $0.summary, isError: $0.isError)
-            })
+            service.finishAgentReply(id: replyID, text: reply,
+                                     steps: agent.steps.map {
+                                         .init(tool: $0.toolName, summary: $0.summary,
+                                               isError: $0.isError)
+                                     },
+                                     elapsed: agent.elapsed, tokens: agent.totalTokens)
+            agent.runningMessageID = nil
         }
     }
 
@@ -1277,11 +1582,19 @@ struct AIChatPanel: View {
 
 private struct MessageBubble: View {
     @EnvironmentObject var project: ProjectState
+    /// 正在跑的那条回复要实时长步骤，所以每条气泡都盯着 Agent
+    @ObservedObject private var agent = AgentRunner.shared
+    @Environment(\.chatListWidth) private var listWidth: CGFloat
+
+    /// 用户气泡里文字的可用宽度：列表左右 3+10、跟 Spacer 之间 8、
+    /// Spacer 至少 20、气泡自己 padding 10×2
+    private var userTextWidth: CGFloat { listWidth - 61 }
     /// 取消按钮要跟着任务的存亡显隐，得观察 service
     @ObservedObject private var service = AIVideoService.shared
     let message: AIVideoService.ChatMessage
     var onInsertToTimeline: (URL) -> Void
     var onRestoreAttachment: (AIVideoService.Attachment) -> Void = { _ in }
+    @State private var copied = false
 
     var body: some View {
         HStack(alignment: .top, spacing: 8) {
@@ -1302,7 +1615,8 @@ private struct MessageBubble: View {
             SelectableMarkdownView(
                 attributed: userAttributed(),
                 onAddSubtitle: { project.insertSubtitleAtPlayhead(text: $0) },
-                onAddTitle: { project.addTextAtPlayhead(text: $0) }
+                onAddTitle: { project.addTextAtPlayhead(text: $0) },
+                layoutWidth: userTextWidth
             )
                 .padding(.horizontal, 10)
                 .padding(.vertical, 7)
@@ -1316,6 +1630,21 @@ private struct MessageBubble: View {
     }
 
     /// 气泡底部的参考内容/首尾帧缩略图，点击回填输入区
+    /// 「把这个产物放过去」。图标按素材类型走，不跟着场景变 ——
+    /// 变的只有提示文字和落点：画布开着就加到画布上，否则插进对应的轨道
+    private func addButton(kind: CanvasNode.Kind, url: URL,
+                           icon: String, svg: String, tip: String) -> some View {
+        let inCanvas = project.showCanvas
+        return HoverIconButton(icon: icon, svgName: svg,
+                               tip: inCanvas ? "添加到画布" : tip) {
+            if inCanvas {
+                project.canvas.dropGeneratedMedia(url: url, kind: kind)
+            } else {
+                onInsertToTimeline(url)
+            }
+        }
+    }
+
     private var attachmentRow: some View {
         HStack(spacing: 4) {
             ForEach(message.attachments) { att in
@@ -1330,12 +1659,12 @@ private struct MessageBubble: View {
         let para = NSMutableParagraphStyle()
         para.lineSpacing = AIChatPanel.bodyLineSpacing
         let out = NSMutableAttributedString(string: message.content, attributes: [
-            .font: NSFont.systemFont(ofSize: 12),
-            .foregroundColor: NSColor.white.withAlphaComponent(0.7),
+            .font: NSFont.systemFont(ofSize: 13),
+            .foregroundColor: NSColor.white.withAlphaComponent(0.8),
             .paragraphStyle: para
         ])
         // `/命令` 画成标签，跟输入框里打的时候一个样
-        out.applyCommandChips()
+        out.applyCommandChips(fontSize: 11)
         return out
     }
 
@@ -1400,9 +1729,8 @@ private struct MessageBubble: View {
 
                         Spacer()
 
-                        HoverIconButton(icon: "film.stack", svgName: "addToVideoTrack", tip: "插入视频轨道") {
-                            onInsertToTimeline(message.resolvedVideoURL() ?? url)
-                        }
+                        addButton(kind: .video, url: message.resolvedVideoURL() ?? url,
+                                  icon: "film.stack", svg: "addToVideoTrack", tip: "插入视频轨道")
                         HoverIconButton(icon: "folder", svgName: "folder", tip: "在 Finder 中显示") {
                             NSWorkspace.shared.activateFileViewerSelecting([message.resolvedVideoURL() ?? url])
                         }
@@ -1428,9 +1756,8 @@ private struct MessageBubble: View {
 
                         Spacer()
 
-                        HoverIconButton(icon: "photo.on.rectangle", svgName: "addToImageTrack", tip: "插入图片轨道") {
-                            onInsertToTimeline(message.resolvedImageURL() ?? url)
-                        }
+                        addButton(kind: .image, url: message.resolvedImageURL() ?? url,
+                                  icon: "photo.on.rectangle", svg: "addToImageTrack", tip: "插入图片轨道")
                         HoverIconButton(icon: "folder", svgName: "folder", tip: "在 Finder 中显示") {
                             NSWorkspace.shared.activateFileViewerSelecting([message.resolvedImageURL() ?? url])
                         }
@@ -1456,9 +1783,8 @@ private struct MessageBubble: View {
 
                         Spacer()
 
-                        HoverIconButton(icon: "waveform", svgName: "addToAudioTrack", tip: "插入音频轨道") {
-                            onInsertToTimeline(message.resolvedAudioURL() ?? url)
-                        }
+                        addButton(kind: .audio, url: message.resolvedAudioURL() ?? url,
+                                  icon: "waveform", svg: "addToAudioTrack", tip: "插入音频轨道")
                         HoverIconButton(icon: "folder", svgName: "folder", tip: "在 Finder 中显示") {
                             NSWorkspace.shared.activateFileViewerSelecting([message.resolvedAudioURL() ?? url])
                         }
@@ -1467,9 +1793,9 @@ private struct MessageBubble: View {
 
             case .failed(let error):
                 HStack(spacing: 4) {
-                    Image(systemName: "exclamationmark.triangle.fill")
+                    Image(nsImage: SidebarSVGIcon.load("toastWarn", size: 12))
+                        .renderingMode(.template)
                         .foregroundColor(.orange)
-                        .font(.system(size: 12))
                     Text(error)
                         .font(.system(size: 11))
                         .foregroundColor(.orange)
@@ -1477,13 +1803,74 @@ private struct MessageBubble: View {
                 }
 
             case .idle:
-                MarkdownContentView(text: message.content)
+                agentStepsSection
+                if !message.content.isEmpty {
+                    MarkdownContentView(text: message.content)
+                }
+                bubbleFooter
             }
         }
-        .padding(10)
-        .background(Color.white.opacity(0.06))
-        .clipShape(RoundedRectangle(cornerRadius: 10))
+        .padding(.vertical, 4)
     }
+
+    /// 这一轮跑到哪了。正在跑的那条读实时状态，其余读落盘的那份
+    private var isLiveAgentReply: Bool {
+        agent.isRunning && agent.runningMessageID == message.id
+    }
+
+    @ViewBuilder
+    private var agentStepsSection: some View {
+        let steps: [AIVideoService.ConversationRecord.AgentStepRecord] = isLiveAgentReply
+            ? agent.steps.map { .init(tool: $0.toolName, summary: $0.summary, isError: $0.isError) }
+            : (message.agentSteps ?? [])
+        if !steps.isEmpty || isLiveAgentReply {
+            AgentStepsView(steps: steps,
+                           isRunning: isLiveAgentReply,
+                           elapsed: isLiveAgentReply ? agent.elapsed : (message.agentElapsed ?? 0),
+                           tokens: isLiveAgentReply ? agent.totalTokens : (message.agentTokens ?? 0),
+                           phase: isLiveAgentReply ? agent.phase : "")
+        }
+    }
+
+    /// 回复末尾那行：复制 + 时间。还在跑的时候不出现
+    @ViewBuilder
+    private var bubbleFooter: some View {
+        if !isLiveAgentReply, !message.content.isEmpty {
+            HStack(spacing: 6) {
+                Button {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(message.content, forType: .string)
+                    copied = true
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.4) { copied = false }
+                } label: {
+                    Group {
+                        if copied {
+                            Image(nsImage: SidebarSVGIcon.load("toastSuccess", size: 13))
+                                .renderingMode(.template)
+                        } else {
+                            Image(nsImage: SidebarSVGIcon.load("copy", size: 13))
+                                .renderingMode(.template)
+                        }
+                    }
+                    .foregroundColor(Color.labelSecondary.opacity(copied ? 0.9 : 0.55))
+                    .frame(width: 18, height: 18)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help(copied ? "已复制" : "复制这条回复")
+                Text(Self.clockFormatter.string(from: message.timestamp))
+                    .font(.system(size: 10).monospacedDigit())
+                    .foregroundColor(Color.labelSecondary.opacity(0.45))
+                Spacer(minLength: 0)
+            }
+        }
+    }
+
+    private static let clockFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "HH:mm"
+        return f
+    }()
 }
 
 // MARK: - 视频封面
@@ -1528,8 +1915,8 @@ private struct AttachmentThumb: View {
                         .fill(Color.white.opacity(0.08))
                         .frame(width: 32, height: 32)
                         .overlay {
-                            Image(systemName: missing ? "questionmark" : "photo")
-                                .font(.system(size: 10, weight: .light))
+                            Image(nsImage: SidebarSVGIcon.load("image", size: 11))
+                                .renderingMode(.template)
                                 .foregroundColor(Color.labelSecondary.opacity(0.5))
                         }
                 }
@@ -1589,6 +1976,7 @@ private struct AttachmentThumb: View {
 }
 
 private struct VideoThumbnailView: View {
+    @EnvironmentObject private var project: ProjectState
     let url: URL
     @State private var thumbnail: NSImage?
     @State private var duration: String = ""
@@ -1623,6 +2011,8 @@ private struct VideoThumbnailView: View {
             }
             .clipped()
             .clipShape(RoundedRectangle(cornerRadius: 8))
+            // 中间那颗播放按钮管行内播放，点画面其它地方是全屏看
+            .onTapGesture { project.mediaPreview = MediaPreviewItem(url: url, isVideo: true) }
             .overlay { if thumbnail != nil { InlinePlayButton(url: url) } }
 
             if !duration.isEmpty {
@@ -1674,6 +2064,7 @@ enum AIMediaThumbSize {
 }
 
 private struct ImageThumbnailView: View {
+    @EnvironmentObject private var project: ProjectState
     let url: URL
     @State private var image: NSImage?
 
@@ -1697,6 +2088,7 @@ private struct ImageThumbnailView: View {
         }
         .clipped()
         .clipShape(RoundedRectangle(cornerRadius: 8))
+        .onTapGesture { project.mediaPreview = MediaPreviewItem(url: url, isVideo: false) }
         .task {
             if let img = NSImage(contentsOf: url) {
                 await MainActor.run { image = img }
@@ -1950,8 +2342,9 @@ private struct MarkdownContentView: View {
     @Environment(\.chatListWidth) private var listWidth: CGFloat
 
     /// 从列表宽度到这段文字的可用宽度之间，被固定占掉的部分：
-    /// 列表左右 3 + 10、气泡跟 Spacer 之间 8、Spacer 至少 20、气泡自己 padding 10×2
-    private static let chrome: CGFloat = 3 + 10 + 8 + 20 + 20
+    /// 列表左右 3 + 10、气泡跟 Spacer 之间 8、Spacer 至少 20。
+    /// 回复气泡去掉底色时水平内边距也一并去了，这里不能再算那 20
+    private static let chrome: CGFloat = 3 + 10 + 8 + 20
 
     private var textWidth: CGFloat { listWidth - Self.chrome }
 
@@ -1980,20 +2373,31 @@ private struct MarkdownContentView: View {
         let para = NSMutableParagraphStyle()
         para.lineSpacing = AIChatPanel.bodyLineSpacing
 
+        // 代码块的段落左右各缩 8pt：底是照着行矩形画的，行矩形本来贴着容器
+        // 左右边缘，框再向外扩 4 就压到边界上，看着像被截掉一截。
+        // 缩 8 之后框落在 4…宽度-4，两边还各留 4pt
+        let codePara = NSMutableParagraphStyle()
+        codePara.lineSpacing = AIChatPanel.bodyLineSpacing
+        codePara.firstLineHeadIndent = 8
+        codePara.headIndent = 8
+        codePara.tailIndent = -8
+
         func append(_ str: String, size: CGFloat, weight: NSFont.Weight = .regular,
                     alpha: CGFloat = 0.7, mono: Bool = false, bg: Bool = false) {
             var attrs: [NSAttributedString.Key: Any] = [
                 .font: mono ? NSFont.monospacedSystemFont(ofSize: size, weight: weight)
                             : NSFont.systemFont(ofSize: size, weight: weight),
                 .foregroundColor: NSColor.white.withAlphaComponent(alpha),
-                .paragraphStyle: para
+                .paragraphStyle: bg ? codePara : para
             ]
-            if bg { attrs[.backgroundColor] = NSColor.white.withAlphaComponent(0.08) }
+            // 代码底交给 ChipLayoutManager 画 —— .backgroundColor 是方角、
+            // 贴着字、也没有内边距
+            if bg { attrs[.codeBlock] = true }
             out.append(NSAttributedString(string: str, attributes: attrs))
         }
 
         /// 行内 markdown（粗体/斜体/链接）交给系统解析，再补上字号和颜色
-        func appendInline(_ text: String, size: CGFloat = 12, alpha: CGFloat = 0.7) {
+        func appendInline(_ text: String, size: CGFloat = 13, alpha: CGFloat = 0.8) {
             guard let a = try? NSAttributedString(
                 markdown: text,
                 options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)
@@ -2004,13 +2408,15 @@ private struct MarkdownContentView: View {
             let m = NSMutableAttributedString(attributedString: a)
             let full = NSRange(location: 0, length: m.length)
             m.addAttribute(.paragraphStyle, value: para, range: full)
+            // 加粗/斜体是记在 .inlinePresentationIntent 上的，不是 .font 的
+            // bold trait —— 只改 font 没用，渲染时 TextKit 照着 intent 又加回去。
+            // 摘掉它，行内加粗才真的按正文走
+            m.removeAttribute(.inlinePresentationIntent, range: full)
             // 逐段铺色，跳过链接 —— 整段无脑上色会把链接的蓝色盖掉
             m.enumerateAttributes(in: full) { attrs, range, _ in
-                let isBold = (attrs[.font] as? NSFont)?.fontDescriptor
-                    .symbolicTraits.contains(.bold) ?? false
-                m.addAttribute(.font,
-                               value: NSFont.systemFont(ofSize: size, weight: isBold ? .semibold : .regular),
-                               range: range)
+                // 行内加粗不作数：模型爱拿它当小标题，满屏粗字反而更难读，
+                // 一律按正文渲染
+                m.addAttribute(.font, value: NSFont.systemFont(ofSize: size), range: range)
                 if attrs[.link] == nil {
                     m.addAttribute(.foregroundColor,
                                    value: NSColor.white.withAlphaComponent(alpha), range: range)
@@ -2020,17 +2426,17 @@ private struct MarkdownContentView: View {
         }
 
         for (i, block) in parseBlocks().enumerated() {
-            if i > 0 { append("\n\n", size: 12) }
+            if i > 0 { append("\n\n", size: 13) }
             switch block {
             case .heading(let level, let t):
-                appendInline(t, size: level == 1 ? 15 : level == 2 ? 13.5 : 12.5, alpha: 0.9)
+                appendInline(t, size: level == 1 ? 16 : level == 2 ? 14.5 : 13.5, alpha: 0.7)
             case .code(let code, _):
                 append(code, size: 11, mono: true, bg: true)
             case .bullet(let t):
-                append("•  ", size: 12, alpha: 0.5)
+                append("•  ", size: 13, alpha: 0.5)
                 appendInline(t)
             case .numbered(let n, let t):
-                append("\(n).  ", size: 12, alpha: 0.5)
+                append("\(n).  ", size: 13, alpha: 0.5)
                 appendInline(t)
             case .paragraph(let t):
                 appendInline(t)
@@ -2289,7 +2695,7 @@ struct SelectableMarkdownView: NSViewRepresentable {
         tv.isEditable = false
         tv.isSelectable = true
         tv.drawsBackground = false
-        // 纵向留 2：命令标签比行高略高一点，不留这 2pt 第一行的标签顶部会被切掉
+        // 纵向留 2：命令标签比行高略高，要往行外顶一点，不留这 2pt 第一行会被切掉
         tv.textContainerInset = NSSize(width: 0, height: 2)
         tv.textContainer?.lineFragmentPadding = 0
         tv.isAutomaticLinkDetectionEnabled = true
@@ -2472,6 +2878,11 @@ struct ChatInputTextView: NSViewRepresentable {
     /// 候选列表开着的时候，上下键/回车/Esc 归它管，不能走进文本框
     var slashOpen: Bool = false
     var onSlashKey: (SlashKey) -> Void = { _ in }
+    /// 空输入时的提示。交给文本框自己画，才跟命令标签一条基线
+    var placeholder: String = ""
+    var showsPlaceholder: Bool = false
+    /// 外部改动计数。只有它变了才回写文本，见 AIChatPanel.inputRevision
+    var externalRevision: Int = 0
 
     enum SlashKey { case up, down, confirm, cancel }
 
@@ -2486,7 +2897,7 @@ struct ChatInputTextView: NSViewRepresentable {
         tv.isEditable = true
         tv.isSelectable = true
         tv.drawsBackground = false
-        tv.font = .systemFont(ofSize: 12)
+        tv.font = .systemFont(ofSize: 13)
         tv.textColor = .labelColor
         // 横向留 0：外层已经有 8pt 了，这里再加一份会叠成 16
         tv.textContainerInset = NSSize(width: 0, height: 2)
@@ -2504,13 +2915,15 @@ struct ChatInputTextView: NSViewRepresentable {
         para.lineSpacing = AIChatPanel.bodyLineSpacing
         tv.defaultParagraphStyle = para
         tv.typingAttributes = [
-            .font: NSFont.systemFont(ofSize: 12),
+            .font: NSFont.systemFont(ofSize: 13),
             .foregroundColor: NSColor.labelColor,
             .paragraphStyle: para
         ]
 
         tv.onSlashKey = onSlashKey
         tv.slashOpen = slashOpen
+        tv.placeholder = placeholder
+        tv.showsPlaceholder = showsPlaceholder
 
         let scroll = NSScrollView()
         scroll.documentView = tv
@@ -2528,31 +2941,48 @@ struct ChatInputTextView: NSViewRepresentable {
         storage.beginEditing()
         storage.addAttribute(.foregroundColor, value: NSColor.labelColor, range: full)
         // 字重也要一并还原，不然删掉命令后那几个字还留着加粗
-        storage.addAttribute(.font, value: NSFont.systemFont(ofSize: 12), range: full)
+        storage.addAttribute(.font, value: NSFont.systemFont(ofSize: 13), range: full)
         storage.removeAttribute(.chipTag, range: full)
+        storage.removeAttribute(.chipSlash, range: full)
         storage.removeAttribute(.kern, range: full)
-        storage.applyCommandChips()
+        // 撑杆的下沉量也要清 —— 删到不成命令了，斜杠会重新显出来，
+        // 还带着 baselineOffset 就沉在基线下面，跟后面的字对不齐
+        storage.removeAttribute(.baselineOffset, range: full)
+        storage.applyCommandChips(fontSize: 11)
         storage.endEditing()
     }
 
     func updateNSView(_ scroll: NSScrollView, context: Context) {
         guard let tv = scroll.documentView as? ChatInputInner else { return }
-        if tv.string != text {
-            tv.string = text
-            // 外部塞进来的文本（选中候选项那一下）也要染色
-            Self.highlight(tv)
-            tv.setSelectedRange(NSRange(location: (text as NSString).length, length: 0))
+        // **只在程序自己改过内容时回写**。这里原来是「值不一样就回写」，
+        // 而 Agent 一跑，计时器每秒、每一步、每次 phase 变都会重绘一遍，
+        // 重绘时手里的 text 可能还是用户敲这个字之前的值 —— 回写等于把字吞掉
+        if context.coordinator.lastRevision != externalRevision {
+            context.coordinator.lastRevision = externalRevision
+            if tv.string != text {
+                tv.string = text
+                // 外部塞进来的文本（选中候选项那一下）也要染色
+                Self.highlight(tv)
+                tv.setSelectedRange(NSRange(location: (text as NSString).length, length: 0))
+            }
         }
         tv.onAddSubtitle = onAddSubtitle
         tv.onAddTitle = onAddTitle
         tv.onSubmit = onSubmit
         tv.onSlashKey = onSlashKey
         tv.slashOpen = slashOpen
+        tv.placeholder = placeholder
+        tv.showsPlaceholder = showsPlaceholder
+        // 标签宽度一变提示就得挪位置。NSTextView 只重绘脏行，
+        // 不强制一次的话上一处的提示会留在原地成重影
+        if tv.showsPlaceholder { tv.needsDisplay = true }
     }
 
     func makeCoordinator() -> Coordinator { Coordinator(text: $text, onSlashQuery: onSlashQuery) }
 
     final class Coordinator: NSObject, NSTextViewDelegate {
+        /// 上次回写时的外部改动计数
+        var lastRevision = 0
         let text: Binding<String>
         let onSlashQuery: (String?, Int) -> Void
         init(text: Binding<String>, onSlashQuery: @escaping (String?, Int) -> Void) {
@@ -2584,8 +3014,63 @@ private final class ChatInputInner: ChatTextView {
     var onSubmit: (() -> Void)?
     var onSlashKey: ((ChatInputTextView.SlashKey) -> Void)?
     var slashOpen = false
+    /// 空输入时的提示。自己画而不是拿 SwiftUI 的 Text 盖在上面 ——
+    /// 打了命令之后它得跟在标签后面、和标签一条基线，
+    /// 那个位置只有 layoutManager 知道，外面靠 padding 只能凑
+    var placeholder = "" { didSet { if placeholder != oldValue { needsDisplay = true } } }
+    var showsPlaceholder = false { didSet { if showsPlaceholder != oldValue { needsDisplay = true } } }
 
-    /// 回车发送，Shift+回车换行 —— 跟原来 TextEditor 上挂的 onKeyPress 行为一致。
+    /// 正文字号。提示文字和插入点都按它算，跟真正输入的字对齐
+    private static let bodyFont = NSFont.systemFont(ofSize: 13)
+
+    /// 插入点不跟着行高走。
+    ///
+    /// 命令标签靠一根放大的「撑杆」把行撑高（见 `applyCommandChips`），
+    /// 而插入点默认就是整行那么高 —— 打完命令光标会突然长一截。
+    /// 撑杆已经把行的几何中心对到文字视觉中心上了，这里按正文高度居中即可
+    override func drawInsertionPoint(in rect: NSRect, color: NSColor, turnedOn flag: Bool) {
+        let f = Self.bodyFont
+        let h = ceil(f.ascender - f.descender)
+        guard rect.height > h else {
+            super.drawInsertionPoint(in: rect, color: color, turnedOn: flag)
+            return
+        }
+        var r = rect
+        r.origin.y = rect.midY - h / 2
+        r.size.height = h
+        super.drawInsertionPoint(in: r, color: color, turnedOn: flag)
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        guard showsPlaceholder, !placeholder.isEmpty,
+              let lm = layoutManager, let tc = textContainer else { return }
+
+        let f = Self.bodyFont
+        let origin = textContainerOrigin
+        var x = origin.x
+        var baseline = origin.y + f.ascender
+
+        // 有内容时只可能是一枚命令标签（`placeholderVisible` 保证了这点），
+        // 提示就接在它后面。基线取**名字**那个字形的 —— 斜杠是撑杆，
+        // 带着下沉量，拿它对齐会矮一截
+        let len = (string as NSString).length
+        if len > 0 {
+            lm.ensureLayout(for: tc)
+            let ci = min(1, len - 1)
+            let gi = lm.glyphIndexForCharacter(at: ci)
+            let line = lm.lineFragmentRect(forGlyphAt: gi, effectiveRange: nil)
+            baseline = origin.y + line.minY + lm.location(forGlyphAt: gi).y
+            x = origin.x + lm.usedRect(for: tc).maxX
+        }
+
+        (placeholder as NSString).draw(
+            at: NSPoint(x: x, y: baseline - f.ascender),
+            withAttributes: [.font: f,
+                             .foregroundColor: NSColor.labelColor.withAlphaComponent(0.28)])
+    }
+
+    /// 回车发送，⌘+回车换行。
     /// 候选列表开着的时候这几个键归列表用：回车是「选中这条」，不是发送
     override func keyDown(with event: NSEvent) {
         if slashOpen {
@@ -2597,8 +3082,13 @@ private final class ChatInputInner: ChatTextView {
             default: break
             }
         }
-        if event.keyCode == 36 && !event.modifierFlags.contains(.shift) {
-            onSubmit?()
+        // 36 是主键盘回车，76 是小键盘那颗 —— 两个都得认
+        if event.keyCode == 36 || event.keyCode == 76 {
+            if event.modifierFlags.contains(.command) {
+                insertNewline(nil)
+            } else {
+                onSubmit?()
+            }
             return
         }
         super.keyDown(with: event)

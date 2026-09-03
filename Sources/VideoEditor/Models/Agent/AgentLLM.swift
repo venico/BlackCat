@@ -26,7 +26,7 @@ struct AgentToolCall: Identifiable {
 
 /// 对话历史里的一条。工具结果也算一条，得原样回给模型
 enum AgentMessage {
-    case user(String, imageData: Data? = nil)
+    case user(String, images: [Data] = [])
     case assistant(text: String, calls: [AgentToolCall])
     case toolResult(callID: String, name: String, text: String, imageData: Data?)
 }
@@ -73,12 +73,10 @@ enum AgentLLM {
         nativeSearchProviders.contains(currentProvider()) && !viaRelay()
     }
 
-    /// 当前该用哪个模型名
+    /// 当前该用哪个模型名。显示名换算和「没选过用哪个」都在 resolvedModel 里
     static func currentModel() -> String {
         let p = currentProvider()
-        let custom = AppSettings.shared.providerModel(for: p.sharedProviderKey)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        return custom.isEmpty ? p.defaultModel : custom
+        return p.resolvedModel(saved: AppSettings.shared.providerModel(for: p.sharedProviderKey))
     }
 
     /// 发一轮。返回模型的文本和它要调的工具
@@ -111,15 +109,16 @@ enum AgentLLM {
         var msgs: [[String: Any]] = [["role": "system", "content": system]]
         for m in messages {
             switch m {
-            case .user(let t, let img):
-                if let img {
-                    msgs.append(["role": "user", "content": [
-                        ["type": "text", "text": t],
-                        ["type": "image_url",
-                         "image_url": ["url": "data:image/jpeg;base64,\(img.base64EncodedString())"]]
-                    ]])
-                } else {
+            case .user(let t, let imgs):
+                if imgs.isEmpty {
                     msgs.append(["role": "user", "content": t])
+                } else {
+                    var parts: [[String: Any]] = [["type": "text", "text": t]]
+                    for img in imgs {
+                        parts.append(["type": "image_url",
+                                      "image_url": ["url": "data:image/jpeg;base64,\(img.base64EncodedString())"]])
+                    }
+                    msgs.append(["role": "user", "content": parts])
                 }
             case .assistant(let t, let calls):
                 var m: [String: Any] = ["role": "assistant", "content": t]
@@ -206,9 +205,10 @@ enum AgentLLM {
         var msgs: [[String: Any]] = []
         for m in messages {
             switch m {
-            case .user(let t, let img):
+            case .user(let t, let imgs):
                 var content: [[String: Any]] = [["type": "text", "text": t]]
-                if let img {
+                // 图片放在文字前面：Anthropic 建议先给图再提问，模型答得更准
+                for img in imgs.reversed() {
                     content.insert(["type": "image",
                                     "source": ["type": "base64", "media_type": "image/jpeg",
                                                "data": img.base64EncodedString()]], at: 0)

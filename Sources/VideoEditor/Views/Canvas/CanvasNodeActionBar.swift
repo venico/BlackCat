@@ -187,6 +187,10 @@ struct CanvasNodeActionBar: View {
     /// 旧的 assetID 必须换掉：不换的话缩略图还按旧 key 取缓存，显示的是翻转前那张
     private func replaceContent(url: URL, newSize: CGSize? = nil) {
         canvas.pushUndo()
+        // 正在播这张卡片的话先停掉。行内播放器按 node.id 认「在播谁」，
+        // 换了 mediaPath 它不知道 —— 还攥着旧文件的 AVPlayer 继续放，
+        // 非得等这一遍播完才轮到新的
+        if AIInlinePlayer.shared.isCurrent(node.id) { AIInlinePlayer.shared.stop() }
         project.importFile(url)
         let asset = project.mediaAssets.first { $0.url == url }
         canvas.updateNode(id: node.id) {
