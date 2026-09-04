@@ -78,10 +78,100 @@ enum AgentAttachmentIO {
 /// 输入框上方那排附件缩略图
 struct AgentAttachmentBar: View {
     let items: [AgentAttachment]
+    /// 能用多宽（由面板那层量好传进来）。**不自己量** ——
+    /// 量自己会被网格内容撑大，量到的又是撑大后的值，列数再也减不回去
+    let availableWidth: CGFloat
     let onRemove: (AgentAttachment) -> Void
+    let onClear: () -> Void
+    /// 默认叠成一摞，点开才平铺 —— 跟参考区一个交互，
+    /// 不然十几个附件占掉半个聊天框，删还得一个一个删
+    @State private var expanded = false
+
+    private static let cell: CGFloat = 40
+    private static let gap: CGFloat = 4
+    /// 最多铺三行，再多就在里头滚
+    private static let maxHeight: CGFloat = 3 * (cell + gap) - gap
 
     var body: some View {
-        HStack(spacing: 4) {
+        if expanded { grid } else { fan }
+    }
+
+    /// 收起态：叠成一摞，带个数和清空
+    private var fan: some View {
+        let top = Array(items.prefix(3))
+        return ZStack {
+            ForEach(Array(top.enumerated()), id: \.offset) { i, it in
+                thumbBody(it)
+                    .frame(width: Self.cell, height: Self.cell)
+                    .clipShape(RoundedRectangle(cornerRadius: 6))
+                    .overlay(RoundedRectangle(cornerRadius: 6)
+                        .stroke(Color.white.opacity(0.15), lineWidth: 0.5))
+                    .rotationEffect(.degrees(top.count == 1 ? 0
+                                             : Double(i - (top.count - 1)) * 8 + Double(top.count - 1) * 4))
+            }
+        }
+        .frame(width: Self.cell + CGFloat(max(0, top.count - 1)) * 8, height: Self.cell)
+        .overlay(alignment: .topLeading) {
+            if items.count > 1 {
+                Text("\(items.count)")
+                    .font(.system(size: 8, weight: .bold))
+                    .foregroundColor(.black)
+                    .frame(width: 14, height: 14)
+                    .background(Color.accent)
+                    .clipShape(Circle())
+                    .offset(x: -3, y: -3)
+            }
+        }
+        .overlay(alignment: .topTrailing) {
+            Button(action: onClear) {
+                Image(systemName: "xmark")
+                    .font(.system(size: 7, weight: .semibold))
+                    .foregroundColor(.white)
+                    .frame(width: 14, height: 14)
+                    .background(Circle().fill(Color.black.opacity(0.65)))
+            }
+            .buttonStyle(.plain)
+            .offset(x: 3, y: -3)
+        }
+        .onTapGesture {
+            withAnimation(.easeInOut(duration: 0.2)) { expanded = true }
+        }
+        .help("\(items.count) 个附件，点开看全部")
+    }
+
+    /// 展开态：按宽度换行铺开，最多三行，超了在里头滚
+    private var grid: some View {
+        let cols = max(1, Int((availableWidth + Self.gap) / (Self.cell + Self.gap)))
+        let rows = max(1, (items.count + cols - 1) / cols)
+        let height = min(CGFloat(rows) * (Self.cell + Self.gap) - Self.gap, Self.maxHeight)
+        return VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 0) {
+                Spacer()
+                Button {
+                    withAnimation(.easeInOut(duration: 0.2)) { expanded = false }
+                } label: {
+                    // 尖对尖的两个尖括号，转 45° —— 「收起来」那个意思。
+                    // SF Symbol 里没有现成的，自己拼：上面那个尖朝下、下面那个尖朝上
+                    VStack(spacing: -1) {
+                        Image(systemName: "chevron.down")
+                        Image(systemName: "chevron.up")
+                    }
+                    .font(.system(size: 6, weight: .semibold))
+                    .rotationEffect(.degrees(45))
+                    .foregroundColor(Color.labelSecondary.opacity(0.7))
+                    .frame(width: 16, height: 16)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .padding(.trailing, 8)
+                .help("收起")
+            }
+            .padding(.bottom, 2)
+
+            ScrollView(showsIndicators: false) {
+            LazyVGrid(columns: Array(repeating: GridItem(.fixed(Self.cell), spacing: Self.gap),
+                                     count: cols),
+                      alignment: .leading, spacing: Self.gap) {
             ForEach(items) { it in
                 ZStack(alignment: .topTrailing) {
                     Group {
@@ -121,6 +211,35 @@ struct AgentAttachmentBar: View {
                 }
                 .help(it.name)
             }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .frame(maxWidth: .infinity, alignment: .topLeading)
+        .frame(height: height)
+        // 同参考区：不裁的话拉窄侧栏时这一行会把容器撑大，
+        // 量到的宽度一直是撑大后的，列数减不回去
+        .clipped()
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    /// 缩略图本体：图片直接画，其它按后缀画个文档图标
+    @ViewBuilder
+    private func thumbBody(_ it: AgentAttachment) -> some View {
+        if let img = it.thumb {
+            Image(nsImage: img)
+                .resizable()
+                .aspectRatio(contentMode: .fill)
+        } else {
+            VStack(spacing: 2) {
+                Image(systemName: "doc.text")
+                    .font(.system(size: 13, weight: .light))
+                Text(it.url.pathExtension.uppercased())
+                    .font(.system(size: 7, weight: .medium))
+            }
+            .foregroundColor(Color.labelSecondary.opacity(0.7))
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(Color.white.opacity(0.06))
         }
     }
 }

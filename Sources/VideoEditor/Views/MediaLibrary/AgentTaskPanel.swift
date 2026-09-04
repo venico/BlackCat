@@ -10,6 +10,8 @@ import AppKit
 
 struct AgentTaskEntry: View {
     @ObservedObject private var tasks = AgentBackgroundTasks.shared
+    /// 会话一换，这份清单跟着换 —— 得观察它才会重算
+    @ObservedObject private var service = AIVideoService.shared
     @State private var expanded = false
     @State private var hover = false
     /// 卡片和标签各自占的地方。**不能量外面那个 VStack** ——
@@ -23,7 +25,7 @@ struct AgentTaskEntry: View {
     var body: some View {
         // 一个任务都没有就不占位置
         Group {
-        if !tasks.items.isEmpty {
+        if !tasks.currentItems.isEmpty {
             VStack(alignment: .leading, spacing: 5) {
             // 展开的卡片长在标签上方 —— 往下长会把输入框顶出去，
             // 往上长挤的是可以滚的会话区
@@ -65,7 +67,7 @@ struct AgentTaskEntry: View {
         }
         // 任务清空后入口整个消失，但 expanded 是 @State，会一直留着 ——
         // 下次有新任务入口重新冒出来就是展开的，看着像它自己弹开了
-        .onChange(of: tasks.items.isEmpty) { _, empty in
+        .onChange(of: tasks.currentItems.isEmpty) { _, empty in
             if empty { expanded = false }
         }
     }
@@ -114,7 +116,7 @@ struct AgentTaskEntry: View {
                     .font(.system(size: 11, weight: .semibold))
                     .foregroundColor(Color.labelPrimary)
                 Spacer()
-                if tasks.items.contains(where: { !$0.isRunning }) {
+                if tasks.currentItems.contains(where: { !$0.isRunning }) {
                     Button("清除已完成") { tasks.clearFinished() }
                         .buttonStyle(.plain)
                         .font(.system(size: 10))
@@ -125,7 +127,7 @@ struct AgentTaskEntry: View {
 
             ScrollView {
                 VStack(spacing: 4) {
-                    ForEach(tasks.items) { item in
+                    ForEach(tasks.currentItems) { item in
                         row(item)
                     }
                 }

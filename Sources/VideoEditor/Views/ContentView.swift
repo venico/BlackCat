@@ -368,6 +368,26 @@ struct ContentView: View {
                     .environmentObject(project)
             }
         }
+        // 画布是全屏盖上去的，主界面那层通知卡片被它整个压住了 ——
+        // 跟封面设计器、欢迎页一样，在画布之上再画一层
+        .overlay(alignment: .bottomTrailing) {
+            if project.showCanvas {
+                VStack(alignment: .trailing, spacing: 8) {
+                    ForEach(project.successToasts) { toast in
+                        SuccessToastBubble(toast: toast,
+                            onTap: { project.dismissSuccessToast(toast.id) },
+                            onDismiss: { project.dismissSuccessToast(toast.id) })
+                        .transition(.asymmetric(
+                            insertion: .move(edge: .trailing).combined(with: .opacity),
+                            removal: .opacity))
+                    }
+                }
+                .animation(.spring(response: 0.35, dampingFraction: 0.8),
+                           value: project.successToasts.count)
+                .padding(.trailing, 16)
+                .padding(.bottom, 16)
+            }
+        }
         // 图片/视频全屏查看。**必须排在画布后面** ——
         // 画布里那张聊天卡片点出来的预览也得盖在画布上面
         .overlay {

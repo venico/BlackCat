@@ -1160,7 +1160,8 @@ private struct SmallCardAction: View {
         }
         .buttonStyle(.plain)
         .onHover { hovering = $0 }
-        .help(help)
+        // 自绘按钮上 .help 时灵时不灵，走 ChatTooltip 那条（它自己不抢鼠标）
+        .overlay { ChatTooltip(text: help) }
     }
 }
 
@@ -1196,7 +1197,8 @@ private struct FloatingIconButton: View {
         }
         .buttonStyle(.plain)
         .onHover { hovering = $0 }
-        .help(help)
+        // 自绘按钮上 .help 时灵时不灵，走 ChatTooltip 那条（它自己不抢鼠标）
+        .overlay { ChatTooltip(text: help) }
     }
 }
 

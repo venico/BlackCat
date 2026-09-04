@@ -565,6 +565,21 @@ final class AIVideoService: ObservableObject {
     @Published var firstFrameImage: (url: URL, image: NSImage)? = nil
     @Published var lastFrameImage: (url: URL, image: NSImage)? = nil
     @Published var imageMode: ImageInputMode = .reference
+    /// 输入框里还没发出去的草稿，和挂在上面的附件。
+    ///
+    /// **必须放这儿，不能留在 AIChatPanel 的 @State 里** —— 面板是按标签页
+    /// 条件渲染的，切去素材库/效果再回来视图就重建了，@State 全丢。
+    /// 而「切过去从素材库拖个素材到参考区」正是常规操作
+    /// 这一轮发给 Agent 的参考内容快照。
+    ///
+    /// 界面上那份（`referenceContents`）发完就清空了，而生成工具是**异步**跑的，
+    /// 等它执行时早没了 —— 所以单独留一份给工具读
+    var agentRoundReferences: [RefContent] = []
+    var agentRoundFirstFrame: URL?
+    var agentRoundLastFrame: URL?
+
+    @Published var agentInputText: String = ""
+    @Published var agentAttachments: [AgentAttachment] = []
 
     static let imageExts: Set<String> = ["jpg","jpeg","png","gif","bmp","tiff","webp","heic"]
     static let videoExts: Set<String> = ["mp4","mov","m4v","avi","mkv","webm"]
@@ -579,7 +594,11 @@ final class AIVideoService: ObservableObject {
 
     /// 把素材加进当前模式对应的占位。UI 层不必显示，AI 面板重建后状态仍在。
     @discardableResult
-    func addToReference(url: URL) -> AddReferenceResult {
+    /// `provider` 传 nil 就是下拉选的那家；打了 `/` 命令时要把**命令点名的那家**
+    /// 传进来 —— 上限、首尾帧支不支持都得按它算，不然拿 Agent 模型去问
+    /// 「能塞几张参考图」，答案永远是 0
+    func addToReference(url: URL, provider: Provider? = nil) -> AddReferenceResult {
+        let p = provider ?? selectedProvider
         let ext = url.pathExtension.lowercased()
         let type: RefContentType
         if Self.imageExts.contains(ext) { type = .image }
@@ -587,40 +606,42 @@ final class AIVideoService: ObservableObject {
         else if Self.audioExts.contains(ext) { type = .audio }
         else { return .unsupportedType }
 
-        if selectedProvider.category == .video && imageMode == .frames {
-            return addAsFrame(url: url, type: type)
+        if p.category == .video && imageMode == .frames {
+            return addAsFrame(url: url, type: type, provider: p)
         }
-        return addAsReference(url: url, type: type)
+        return addAsReference(url: url, type: type, provider: p)
     }
 
     /// 首尾帧模式：先点的进首帧，后点的进尾帧，都满了从首帧重新开始
-    private func addAsFrame(url: URL, type: RefContentType) -> AddReferenceResult {
+    private func addAsFrame(url: URL, type: RefContentType,
+                            provider: Provider) -> AddReferenceResult {
         guard type == .image, let img = NSImage(contentsOf: url) else { return .unsupportedType }
         let thumb = img.aiThumbnail(maxSize: 200)
         if firstFrameImage == nil {
             firstFrameImage = (url, thumb)
-        } else if selectedProvider.supportsLastFrame && lastFrameImage == nil {
+        } else if provider.supportsLastFrame && lastFrameImage == nil {
             lastFrameImage = (url, thumb)
         } else {
-            firstFrameImage = (url, thumb)
-            if selectedProvider.supportsLastFrame { lastFrameImage = nil }
+            // 两个都满了：这一张不再顶掉已有的，交回上层当附件收
+            return .limitReached("首尾帧都占满了")
         }
         return .added
     }
 
-    private func addAsReference(url: URL, type: RefContentType) -> AddReferenceResult {
+    private func addAsReference(url: URL, type: RefContentType,
+                                provider: Provider) -> AddReferenceResult {
         guard !referenceContents.contains(where: { $0.url == url }) else { return .duplicate }
 
         let limit: Int
         let name: String
         switch type {
-        case .image: limit = selectedProvider.maxReferenceImages; name = "图片"
-        case .video: limit = selectedProvider.maxReferenceVideos; name = "视频"
-        case .audio: limit = selectedProvider.maxReferenceAudios; name = "音频"
+        case .image: limit = provider.maxReferenceImages; name = "图片"
+        case .video: limit = provider.maxReferenceVideos; name = "视频"
+        case .audio: limit = provider.maxReferenceAudios; name = "音频"
         }
         guard limit > 0 else { return .unsupportedType }
-        guard referenceContents.count < selectedProvider.maxReferenceTotal else {
-            return .limitReached("参考内容总数上限 \(selectedProvider.maxReferenceTotal) 个")
+        guard referenceContents.count < provider.maxReferenceTotal else {
+            return .limitReached("参考内容总数上限 \(provider.maxReferenceTotal) 个")
         }
         guard referenceContents.filter({ $0.type == type }).count < limit else {
             return .limitReached("\(name)上限 \(limit) 个")
@@ -727,7 +748,10 @@ final class AIVideoService: ObservableObject {
     /// 发起一次生成，返回任务 id（画布要用它做取消/重试和依赖调度）。
     /// `source` 默认 `.chat`，聊天面板的调用点一个字都不用改
     @discardableResult
-    func sendPrompt(_ prompt: String, duration: String = "5", aspectRatio: String = "16:9", resolution: String = "720P", imageRatio: String = "1:1", referenceImages: [URL] = [], referenceVideos: [URL] = [], referenceAudios: [URL] = [], firstFrame: URL? = nil, lastFrame: URL? = nil, source: TaskSource = .chat) -> UUID {
+    /// `provider` 传 nil 就是下拉里选的那家；打了 `/命令` 时必须把**命令点名的那家**
+    /// 传进来。不传的坑：用户打 `/gpt-image-2` 挂了参考图，请求却发给了下拉里的
+    /// 文字模型 —— 界面显示「正在生成回复」，模型回一句「请先上传参考图」
+    func sendPrompt(_ prompt: String, provider: Provider? = nil, duration: String = "5", aspectRatio: String = "16:9", resolution: String = "720P", imageRatio: String = "1:1", referenceImages: [URL] = [], referenceVideos: [URL] = [], referenceAudios: [URL] = [], firstFrame: URL? = nil, lastFrame: URL? = nil, source: TaskSource = .chat) -> UUID {
         var userMsg = ChatMessage(role: .user, content: prompt)
         var atts: [Attachment] = []
         atts += referenceImages.map { Attachment(url: $0, kind: .image, bookmark: createBookmark(for: $0)) }
@@ -738,7 +762,7 @@ final class AIVideoService: ObservableObject {
         userMsg.attachments = atts
         messages.append(userMsg)
 
-        let category = selectedProvider.category
+        let category = (provider ?? selectedProvider).category
         let progressText: String
         switch category {
         case .video: progressText = "正在生成视频…"
@@ -760,7 +784,7 @@ final class AIVideoService: ObservableObject {
         runningTasks[taskID] = RunningGeneration(id: taskID, convId: convId, msgId: msgId,
                                                  source: source, category: category, handle: nil)
 
-        let provider = selectedProvider
+        let provider = provider ?? selectedProvider
         let useSearch = webSearchEnabled && provider.supportsWebSearch
         let handle = Task { @MainActor in
             await Context.$taskID.withValue(taskID) {

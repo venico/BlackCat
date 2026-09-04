@@ -28,6 +28,8 @@ struct CanvasOverlay: View {
     /// 遮罩要等画布滑到位了才出现。先出现的话，画布还在半路上，
     /// 屏幕上就成了「顶上一条暗的、中间露着底层界面、画布在下面爬」
     @State private var maskVisible = false
+    /// 有文件正拖在画布上。素材区和聊天区都有这个反馈，画布不该缺
+    @State private var dropTargeted = false
     @State private var saveWork: DispatchWorkItem?
 
     private var effectiveGap: CGFloat { liveGap ?? canvas.topGap }
@@ -165,6 +167,13 @@ struct CanvasOverlay: View {
             }
             .padding(12)
         }
+        // 拖文件进来时的反馈。跟素材区一个样式：整块染色，不加描边和文字。
+        // 排在聊天卡片**前面** —— 这层染色不该盖住卡片
+        .overlay {
+            if dropTargeted {
+                Color.accent.opacity(0.06).allowsHitTesting(false)
+            }
+        }
         // Agent 会话卡片。位置由它自己按吸附结果算，这儿只给它整块画布
         .overlay(alignment: .topLeading) {
             CanvasChatCard(containerSize: containerSize)
@@ -179,7 +188,7 @@ struct CanvasOverlay: View {
                                     // local 是画布容器里的坐标，换算成内容坐标才知道落哪张卡片
                                     canvas.dropFiles(urls, at: canvas.contentPoint(fromViewPoint: local))
                                 },
-                                onTargetChange: { _ in })
+                                onTargetChange: { dropTargeted = $0 })
     }
 
     private var closeButton: some View {
@@ -1036,7 +1045,9 @@ private struct CanvasSurface: View {
                     .ignoresSafeArea()
                     .onTapGesture { showAssetPicker = false; fillTargetNode = nil }
                 CanvasAssetPicker(canvas: canvas,
-                                  limitTo: fillTargetNode.flatMap { canvas.node($0)?.kind }) { asset in
+                                  limitKinds: fillTargetNode.flatMap { canvas.node($0)?.kind }
+                                                             .map { Set([$0]) }) { picks in
+                    let asset = picks.first
                     showAssetPicker = false
                     guard let asset else { fillTargetNode = nil; return }
                     if let target = fillTargetNode {
@@ -1391,9 +1402,11 @@ struct CanvasKeyMonitor: ViewModifier {
                 let factor = 1 + delta * 0.08
                 canvas.setZoom(canvas.zoom * factor, anchor: anchor, containerSize: containerSize)
             } else {
-                // 系统给的滚动量是按「一屏内容」的尺度来的，用在画布上一格挪不了多远。
-                // 放大 2.5 倍，滚一下的位移跟手感对得上
-                let step: CGFloat = 10
+                // 两种设备的滚动量根本不是一个尺度，一个系数套不住：
+                // 触控板给的是**像素级**位移（hasPreciseScrollingDeltas），
+                // 1:1 用就跟手；鼠标滚轮给的是行数，一格挪不了多远，得放大。
+                // 原来一律乘 10，触控板上双指一滑画布就飞出去
+                let step: CGFloat = event.hasPreciseScrollingDeltas ? 1 : 10
                 canvas.offset = CGSize(width: canvas.offset.width + event.scrollingDeltaX * step,
                                        height: canvas.offset.height + event.scrollingDeltaY * step)
             }

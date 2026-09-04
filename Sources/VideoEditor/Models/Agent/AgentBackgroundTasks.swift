@@ -17,6 +17,9 @@ final class AgentBackgroundTasks: ObservableObject {
         let id: UUID
         var title: String
         var kind: AIVideoService.ProviderCategory
+        /// 派这个任务的是哪条会话。每张画布、每条对话各看各的 ——
+        /// 一份全局清单会让 A 画布看见 B 画布在跑什么
+        var conversationID: UUID?
         var startedAt = Date()
         var state: State = .running
         /// 产出的素材。成功了才有
@@ -35,10 +38,17 @@ final class AgentBackgroundTasks: ObservableObject {
     /// 完成之后要在会话里报一声的那些，报完清掉
     @Published var unreadFinished: [Item] = []
 
-    var runningCount: Int { items.filter(\.isRunning).count }
+    /// 当前这条会话派出去的任务
+    var currentItems: [Item] {
+        let cid = AIVideoService.shared.currentConversationId
+        return items.filter { $0.conversationID == cid }
+    }
+
+    var runningCount: Int { currentItems.filter(\.isRunning).count }
 
     func add(id: UUID, title: String, kind: AIVideoService.ProviderCategory) {
-        items.insert(Item(id: id, title: title, kind: kind), at: 0)
+        items.insert(Item(id: id, title: title, kind: kind,
+                          conversationID: AIVideoService.shared.currentConversationId), at: 0)
     }
 
     func finish(id: UUID, url: URL) {
@@ -59,8 +69,10 @@ final class AgentBackgroundTasks: ObservableObject {
         items.removeAll { $0.id == id }
     }
 
-    /// 清掉已经结束的，留着在跑的
+    /// 清掉**这条会话**已经结束的，留着在跑的。
+    /// 按钮长在当前会话的面板上，不该顺手把别的会话的记录也扫了
     func clearFinished() {
-        items.removeAll { !$0.isRunning }
+        let cid = AIVideoService.shared.currentConversationId
+        items.removeAll { !$0.isRunning && $0.conversationID == cid }
     }
 }

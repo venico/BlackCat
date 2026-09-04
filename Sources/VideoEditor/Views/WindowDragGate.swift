@@ -77,8 +77,12 @@ enum FileDropRouter {
     /// 匹配顺序。**必须固定**：AI 面板和素材库是同一块地方的两个标签页，
     /// 矩形几乎重合，而素材库那块登记后不会撤（切标签页只是不显示）。
     /// 原来靠 `Dictionary.values.first` 撞运气，谁先匹配全看哈希顺序
-    // 画布铺满整块地方，聊天卡片浮在它上面 —— 卡片必须排在画布前面
-    private static let matchOrder: [Kind] = [.canvasChat, .aiChat, .canvas, .mediaLibrary, .timeline]
+    // 顺序 = 谁在上面谁先收。
+    // 画布铺满整块地方、盖住底下的侧栏，所以 `.canvas` 必须排在 `.aiChat` 前面 ——
+    // 画布开着的时候侧栏那份聊天面板**视图还在**，登记也还在，
+    // 排前面的话拖到画布左半边会被底下的侧栏吃掉，变成 Agent 附件而不是落成卡片。
+    // 卡片浮在画布之上，所以 `.canvasChat` 又要排在 `.canvas` 前面
+    private static let matchOrder: [Kind] = [.canvasChat, .canvas, .aiChat, .mediaLibrary, .timeline]
 
     private struct Zone {
         /// SwiftUI `.global` 坐标系（原点左上）里的接收区
@@ -153,13 +157,16 @@ enum FileDropRouter {
         }
     }
 
+    /// 返回收下它的是哪个区，没人收就是 nil
     @discardableResult
-    static func deliver(_ payload: Payload, at point: CGPoint, in id: WindowID) -> Bool {
-        guard let z = hit(at: point, for: payload, in: id)?.zone else { return false }
+    static func deliver(_ payload: Payload, at point: CGPoint, in id: WindowID) -> Kind? {
+        guard let h = hit(at: point, for: payload, in: id) else { return nil }
         // 落点转成区内本地坐标：时间轴要用 x 算时间码
-        z.onDrop(payload, CGPoint(x: point.x - z.rect.minX, y: point.y - z.rect.minY))
-        return true
+        h.zone.onDrop(payload, CGPoint(x: point.x - h.zone.rect.minX,
+                                       y: point.y - h.zone.rect.minY))
+        return h.kind
     }
+
 }
 
 /// 主窗口的宿主视图。把 mouseDownCanMoveWindow 接到上面那个开关上，
@@ -262,7 +269,7 @@ final class GatedHostingView<Content: View>: NSHostingView<Content> {
         let load = payload(sender)
         clearTarget()
         guard let id = windowID, let load else { return false }
-        let accepted = FileDropRouter.deliver(load, at: pt, in: id)
+        let landed = FileDropRouter.deliver(load, at: pt, in: id)
         // 留一条：拖入这条链路排查过一整轮（SwiftUI onDrop / 内嵌 NSView 都收不到），
         // 万一以后又不灵，这一行能直接分清是「没触发」还是「落点没落进接收区」
         let what: String
@@ -274,8 +281,8 @@ final class GatedHostingView<Content: View>: NSHostingView<Content> {
         case .effect(let k):   what = "特效=\(k.rawValue)"
         case .adjust:          what = "调节"
         }
-        DiagLog.log("[拖入] 落点=\(pt) \(what) 接收=\(accepted)")
-        return accepted
+        DiagLog.log("[拖入] 落点=\(pt) \(what) 收下的区=\(landed.map(String.init(describing:)) ?? "没人收")")
+        return landed != nil
     }
 }
 

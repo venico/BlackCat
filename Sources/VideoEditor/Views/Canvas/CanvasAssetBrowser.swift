@@ -14,8 +14,13 @@ struct CanvasAssetBrowser: View {
     /// 滚轮要跟画布抢：悬在这个面板上时归列表滚，不平移画布
     @ObservedObject var canvas: CanvasState
 
-    /// 只让选这一类（给节点换素材时给）。nil = 随便选
-    var limitTo: CanvasNode.Kind?
+    /// 只让选这几类。nil = 随便选。
+    /// 给节点换素材时是一类；聊天区的参考内容按模型能收的类型给一组
+    var limitKinds: Set<CanvasNode.Kind>?
+    /// 已经选中的（多选时给）。nil = 单选，点一下就回调
+    var selection: Set<URL>?
+    /// 框选圈中了这些（多选时才会调）
+    var onMarquee: ([URL]) -> Void = { _ in }
     /// 每行几列由外壳定：弹窗宽、抽屉窄
     var cellWidth: CGFloat = 96
     var onPick: (URL, CanvasNode.Kind) -> Void
@@ -33,6 +38,36 @@ struct CanvasAssetBrowser: View {
     @State private var editName = ""
     /// 面板当前多宽 —— 一行放几个按它算（面板右边缘可以拖）
     @State private var panelWidth: CGFloat = 300
+    /// 框选：起止点 + 每个格子占的地方（都在 "assetGrid" 这个坐标系里）
+    @State private var marqueeStart: CGPoint?
+    @State private var marqueeEnd: CGPoint?
+    @State private var cellFrames: [URL: CGRect] = [:]
+
+    private var marqueeGesture: some Gesture {
+        DragGesture(minimumDistance: 6, coordinateSpace: .named("assetGrid"))
+            .onChanged { v in
+                if marqueeStart == nil { marqueeStart = v.startLocation }
+                marqueeEnd = v.location
+            }
+            .onEnded { _ in
+                if let r = marqueeRect {
+                    // 圈中的里头只收能选的类型，别的本来就是置灰的
+                    let hit = items.filter { item in
+                        guard limitKinds?.contains(item.kind) ?? true else { return false }
+                        return cellFrames[item.url].map { r.intersects($0) } ?? false
+                    }
+                    if !hit.isEmpty { onMarquee(hit.map(\.url)) }
+                }
+                marqueeStart = nil
+                marqueeEnd = nil
+            }
+    }
+
+    private var marqueeRect: CGRect? {
+        guard let a = marqueeStart, let b = marqueeEnd else { return nil }
+        return CGRect(x: min(a.x, b.x), y: min(a.y, b.y),
+                      width: abs(a.x - b.x), height: abs(a.y - b.y))
+    }
 
     enum Tab: String, CaseIterable {
         case all = "全部", video = "视频", audio = "音频", image = "图片"
@@ -68,7 +103,7 @@ struct CanvasAssetBrowser: View {
                         fileSize: asset.fileSize ?? 0,
                         date: asset.importDate ?? .distantPast)
         }
-        // 不按 limitTo 过滤 —— 不能选的素材照样列出来，只是格子置灰。
+        // 不按 limitKinds 过滤 —— 不能选的素材照样列出来，只是格子置灰。
         // 直接藏掉的话用户会以为素材库里没有那些东西
         if let want = tab.nodeKind { list = list.filter { $0.kind == want } }
         if !keyword.isEmpty {
@@ -143,7 +178,8 @@ struct CanvasAssetBrowser: View {
                         LazyVStack(spacing: 2) {
                             ForEach(items) { item in
                                 AssetRow(item: item,
-                                         enabled: limitTo == nil || item.kind == limitTo,
+                                         enabled: limitKinds?.contains(item.kind) ?? true,
+                                         selected: selection?.contains(item.url) ?? false,
                                          renaming: renamingURL == item.url,
                                          editName: $editName,
                                          onCommitRename: { commitRename(item) },
@@ -162,7 +198,8 @@ struct CanvasAssetBrowser: View {
                             ForEach(items) { item in
                                 AssetCell(item: item,
                                           // 限定了类型时，别的类型置灰不可选
-                                          enabled: limitTo == nil || item.kind == limitTo,
+                                          enabled: limitKinds?.contains(item.kind) ?? true,
+                                          selected: selection?.contains(item.url) ?? false,
                                           renaming: renamingURL == item.url,
                                           editName: $editName,
                                           onCommitRename: { commitRename(item) },
@@ -170,10 +207,39 @@ struct CanvasAssetBrowser: View {
                                           menu: { menu(for: item) }) {
                                     onPick(item.url, item.kind)
                                 }
+                                // 框选要算相交，得知道每个格子落在哪儿
+                                .background(GeometryReader { g in
+                                    Color.clear
+                                        .onAppear { cellFrames[item.url] = g.frame(in: .named("assetGrid")) }
+                                        .onChange(of: g.frame(in: .named("assetGrid"))) { _, r in
+                                            cellFrames[item.url] = r
+                                        }
+                                })
                             }
                         }
                         .padding(.horizontal, 20)
                         .padding(.vertical, 12)
+                        // 撑满 + contentShape，框选才拖得起来：
+                        // LazyVGrid 只有内容那么高，且没背景的容器空白处
+                        // 根本不参与命中测试 —— 在格子下方那片空地拖，什么都收不到
+                        .frame(maxWidth: .infinity, minHeight: 360, alignment: .top)
+                        .contentShape(Rectangle())
+                        .coordinateSpace(name: "assetGrid")
+                        // 框选。只在多选时给 —— 单选模式下拖一下就选一片没有意义。
+                        // 用 simultaneousGesture 跟格子自己的点击并存：
+                        // 移动不到 6pt 就还算点击，格子照常点得动
+                        .overlay {
+                            if let r = marqueeRect {
+                                Rectangle()
+                                    .fill(Color.accent.opacity(0.10))
+                                    .overlay(Rectangle().strokeBorder(Color.accent.opacity(0.85),
+                                                                      lineWidth: 1))
+                                    .frame(width: r.width, height: r.height)
+                                    .position(x: r.midX, y: r.midY)
+                                    .allowsHitTesting(false)
+                            }
+                        }
+                        .simultaneousGesture(selection == nil ? nil : marqueeGesture)
                     }
                 }
                 // 自绘竖向滚动条，贴右边内缘。系统那条已经关掉（showsIndicators: false）
@@ -208,8 +274,10 @@ struct CanvasAssetBrowser: View {
             }
         )
         .onAppear {
-            // 限定类型时默认落在那个标签上，省得用户还要自己找
-            if let limitTo, let t = Tab.allCases.first(where: { $0.nodeKind == limitTo }) {
+            // 只限一类时默认落在那个标签上，省得用户还要自己找；
+            // 限多类就留在「全部」，那儿才看得全
+            if let only = limitKinds, only.count == 1, let k = only.first,
+               let t = Tab.allCases.first(where: { $0.nodeKind == k }) {
                 tab = t
             }
         }
@@ -394,6 +462,8 @@ private struct AssetCell<Menu: View>: View {
     let item: CanvasAssetBrowser.Item
     /// 这个卡片放不了的类型：压暗 + 不可点，但仍然列出来
     var enabled: Bool = true
+    /// 多选时已经勾上的
+    var selected: Bool = false
     let renaming: Bool
     @Binding var editName: String
     let onCommitRename: () -> Void
@@ -432,6 +502,23 @@ private struct AssetCell<Menu: View>: View {
                     .aspectRatio(10.0 / 7.0, contentMode: .fit)
                     .frame(maxWidth: .infinity)
                     .clipShape(RoundedRectangle(cornerRadius: 8))
+                    // 多选勾上的：主色描边 + 左上角一个勾
+                    .overlay {
+                        if selected {
+                            RoundedRectangle(cornerRadius: 8)
+                                .strokeBorder(Color.accent, lineWidth: 2)
+                        }
+                    }
+                    .overlay(alignment: .topLeading) {
+                        if selected {
+                            Image(systemName: "checkmark")
+                                .font(.system(size: 9, weight: .bold))
+                                .foregroundColor(.black)
+                                .frame(width: 16, height: 16)
+                                .background(Circle().fill(Color.accent))
+                                .padding(4)
+                        }
+                    }
 
                     // 时长角标，跟侧边栏同一个样式。元素库项的时长是异步补的，
                     // 补上之前先不显示，别挂个 00:00 在那儿
@@ -538,21 +625,65 @@ private struct AssetCell<Menu: View>: View {
 
 // MARK: - 弹窗外壳
 
-/// 从素材库挑一个（弹窗版）。标题、边距、关闭按钮都按「设置」那套来
+/// 从素材库挑（弹窗版）。标题、边距、关闭按钮都按「设置」那套来。
+/// `multiSelect` 打开时点格子是勾选/取消，底下多一排取消+确定
 struct CanvasAssetPicker: View {
     @EnvironmentObject var project: ProjectState
     @ObservedObject var canvas: CanvasState
-    var limitTo: CanvasNode.Kind?
-    var onPick: (MediaAsset?) -> Void
+    var limitKinds: Set<CanvasNode.Kind>?
+    var multiSelect = false
+    /// 选完给出去。取消是空数组
+    var onPick: ([MediaAsset]) -> Void
+
+    /// 勾了哪些。**按点击顺序存**，参考图的先后是有意义的
+    @State private var picked: [URL] = []
+
+    /// 底部两颗按钮，样式照导出弹窗那套
+    private var footer: some View {
+        HStack(spacing: 10) {
+            Spacer()
+            Button { onPick([]) } label: {
+                Text("取消").font(.system(size: 13))
+                    .foregroundColor(Color.labelSecondary)
+                    .frame(width: 80, height: 36)
+                    .background(Color.white.opacity(0.08))
+                    .cornerRadius(8)
+            }
+            .buttonStyle(.plain)
+
+            Button {
+                // 按勾选顺序给出去
+                onPick(picked.compactMap { u in project.mediaAssets.first { $0.url == u } })
+            } label: {
+                Text(picked.isEmpty ? "确定" : "确定（\(picked.count)）")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundColor(.black)
+                    .frame(width: 120, height: 36)
+                    .background(Color.accent.opacity(picked.isEmpty ? 0.4 : 1))
+                    .cornerRadius(8)
+            }
+            .buttonStyle(.plain)
+            .disabled(picked.isEmpty)
+        }
+        .padding(.horizontal, 24)
+        .padding(.vertical, 16)
+    }
+
+    /// 标题跟着能选的类型走
+    private var title: String {
+        guard let ks = limitKinds, !ks.isEmpty else { return "从素材库选择" }
+        let names = CanvasNode.Kind.allCases.filter { ks.contains($0) }.map(\.label)
+        return "选择" + names.joined(separator: " / ") + "素材"
+    }
 
     var body: some View {
         VStack(spacing: 0) {
             HStack {
-                Text(limitTo == nil ? "从素材库选择" : "选择\(limitTo!.label)素材")
+                Text(title)
                     .font(.system(size: 15, weight: .semibold))
                     .foregroundColor(Color.labelSecondary)
                 Spacer()
-                Button { onPick(nil) } label: {
+                Button { onPick([]) } label: {
                     Image(systemName: "xmark")
                         .font(.system(size: 12, weight: .medium))
                         .foregroundColor(Color.labelSecondary)
@@ -566,12 +697,24 @@ struct CanvasAssetPicker: View {
             .padding(.top, 24)
             .padding(.bottom, 8)
 
-            CanvasAssetBrowser(canvas: canvas, limitTo: limitTo, cellWidth: 110) { url, _ in
-                onPick(project.mediaAssets.first { $0.url == url })
+            CanvasAssetBrowser(canvas: canvas, limitKinds: limitKinds,
+                               selection: multiSelect ? Set(picked) : nil,
+                               // 框选圈到的一并勾上，已经勾过的不重复
+                               onMarquee: { urls in
+                                   for u in urls where !picked.contains(u) { picked.append(u) }
+                               },
+                               cellWidth: 110) { url, _ in
+                guard multiSelect else {
+                    onPick([project.mediaAssets.first { $0.url == url }].compactMap { $0 })
+                    return
+                }
+                if let i = picked.firstIndex(of: url) { picked.remove(at: i) } else { picked.append(url) }
             }
             .environmentObject(project)
+
+            if multiSelect { footer }
         }
-        .frame(width: 560, height: 480)
+        .frame(width: 560, height: multiSelect ? 540 : 480)
         .floatingPanelMaterial()
     }
 }
@@ -582,6 +725,8 @@ private struct AssetRow<Menu: View>: View {
     @EnvironmentObject var project: ProjectState
     let item: CanvasAssetBrowser.Item
     var enabled: Bool = true
+    /// 多选时已经勾上的
+    var selected: Bool = false
     let renaming: Bool
     @Binding var editName: String
     let onCommitRename: () -> Void

@@ -124,13 +124,25 @@ extension AgentToolbox {
             // 先占一个盒子，提交完填进去，回调再从盒子里取。
             // 回调里现造一个新 id 的话，跟提交时登记的那条对不上，
             // 面板上那条会永远停在「进行中」
+            // 用户在输入框上边那排挂着的参考内容要带上 —— 原来一张都没往下传，
+            // 表现就是「我明明给了参考图，模型还让我上传」
+            let refs = svc.agentRoundReferences
+            let refImages = refs.filter { $0.type == .image }.map(\.url)
+            let refVideos = refs.filter { $0.type == .video }.map(\.url)
+            let refAudios = refs.filter { $0.type == .audio }.map(\.url)
+
             let box = TaskIDBox()
             let id = svc.generateForCanvas(
                 prompt: prompt,
                 provider: provider,
                 duration: args["duration"] as? String ?? "5",
                 aspectRatio: args["ratio"] as? String ?? "16:9",
-                imageRatio: args["ratio"] as? String ?? "1:1"
+                imageRatio: args["ratio"] as? String ?? "1:1",
+                referenceImages: refImages,
+                referenceVideos: refVideos,
+                referenceAudios: refAudios,
+                firstFrame: svc.agentRoundFirstFrame,
+                lastFrame: svc.agentRoundLastFrame
             ) { result in
                 Task { @MainActor in
                     guard let tid = box.id else { return }
@@ -172,7 +184,9 @@ extension AgentToolbox {
                 """)
 
         case "list_background_tasks":
-            let items = AgentBackgroundTasks.shared.items
+            // 只报这条会话自己派的 —— 画布之间互不相干，
+            // 报出别人的任务只会让模型拿去乱回答
+            let items = AgentBackgroundTasks.shared.currentItems
             guard !items.isEmpty else { return .ok("后台没有任务。") }
             var s = "后台任务：\n"
             for it in items {

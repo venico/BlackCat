@@ -12,7 +12,11 @@ struct AIChatPanel: View {
     @EnvironmentObject private var project: ProjectState
     @StateObject private var service = AIVideoService.shared
     @ObservedObject private var settings = AppSettings.shared
-    @State private var inputText = ""
+    /// 草稿和附件都存在 service 上，切标签页回来还在（见那边的说明）
+    private var inputText: String {
+        get { service.agentInputText }
+        nonmutating set { service.agentInputText = newValue }
+    }
     /// 程序自己改输入框内容的次数（选命令、发送后清空这些）。
     /// 只有它变了才把文本回写进 NSTextView —— Agent 跑起来时每秒都在刷新，
     /// 重绘拿到的 text 可能比用户刚敲进去的那个字慢一拍，无条件回写就是「打不上字」
@@ -141,7 +145,40 @@ struct AIChatPanel: View {
         // 切去素材库标签页后这块就不在了，登记必须撤掉 ——
         // 留着的话它排在素材区前面，拖文件进素材库会被这儿吃掉
         .onDisappear { FileDropRouter.unregister(windowID, kind: dropZoneKind) }
-        .onChange(of: namedModel) { _ in pruneInputsForProvider() }
+        // 从素材库挑参考内容 / 首尾帧。复用画布那套弹窗，能选的类型按模型给
+        .sheet(item: $libraryPick) { target in
+            // 参考内容能收好几个就让多选；首尾帧一次只认一张
+            CanvasAssetPicker(canvas: project.canvas,
+                              limitKinds: libraryPickKinds,
+                              multiSelect: target == .reference
+                                           && uiProvider.maxReferenceTotal > 1) { picks in
+                libraryPick = nil
+                guard let first = picks.first else { return }
+                switch target {
+                case .reference:
+                    // 跟拖入 / ＋ 走同一条：先进参考区，收不下的落附件，还带提示。
+                    // 原来直接调 addToReference 且不看返回值 —— 当时要是还没打
+                    // `/命令`（当前是文字模型、参考区收不了），图就被静默丢掉了
+                    addAgentAttachments(picks.map(\.url))
+                case .firstFrame:
+                    if let img = NSImage(contentsOf: first.url) { firstFrameImage = (first.url, img) }
+                case .lastFrame:
+                    if let img = NSImage(contentsOf: first.url) { lastFrameImage = (first.url, img) }
+                }
+            }
+            .environmentObject(project)
+        }
+        // 面板宽度：参考区/附件区的列数都按它算（见 panelWidth 的说明）
+        .background(GeometryReader { g in
+            Color.clear
+                .onAppear { panelWidth = g.size.width }
+                .onChange(of: g.size.width) { _, w in panelWidth = w }
+        })
+        .onChange(of: namedModel) { _ in
+            // 顺序要紧：先把附件里的图收进参考区，再按新模型裁掉多余的
+            promoteAttachmentsToReference()
+            pruneInputsForProvider()
+        }
         .onChange(of: service.selectedProvider) { _ in
             pruneInputsForProvider()
             ensureAgentProvider()
@@ -573,9 +610,51 @@ struct AIChatPanel: View {
     @State private var webHover = false
     @State private var plusHover = false
     /// Agent 对话的附件（图片给模型看，文本读成文字塞进提示词）
-    @State private var agentAttachments: [AgentAttachment] = []
+    private var agentAttachments: [AgentAttachment] {
+        get { service.agentAttachments }
+        nonmutating set { service.agentAttachments = newValue }
+    }
     /// 有文件正拖在聊天区上方
     @State private var isDropTargeted = false
+    /// 正从素材库挑东西，挑完放哪儿
+    @State private var libraryPick: LibraryPickTarget?
+    /// ＋ 弹出来那个菜单开在哪一页。nil = 没开
+    @State private var plusMenu: PlusMenuPage?
+    /// Skill 面板停在哪个标签页
+    @State private var skillTab: SkillTab = .builtin
+
+    enum PlusMenuPage { case root, skills }
+    enum SkillTab: String, CaseIterable { case builtin = "内置", custom = "自定义" }
+
+    /// 参考内容是不是摊开成平铺了
+    @State private var refExpanded = false
+    /// **整个面板**有多宽。参考区、附件区一行放几个都按它算。
+    ///
+    /// 不能量那两块自己：气泡的宽度是「子视图里最宽的那个」，网格一撑气泡就变宽，
+    /// 量到的又是撑大后的值 —— 正反馈，拉窄侧栏时列数永远减不回去。
+    /// 面板这一层的宽度由侧栏的 `frame(width:)` 钉死，不受内容影响
+    @State private var panelWidth: CGFloat = 0
+    /// 气泡内外的边距加起来，算可用宽度时扣掉
+    private static let refGridInset: CGFloat = 40
+    /// 摊开最多铺这么多张，再多就只能在里头滚 —— 也是给渲染兜个底
+    private static let maxExpandedRefs = 50
+    private static let expandedRefMaxHeight: CGFloat = 220
+
+    enum LibraryPickTarget: Identifiable {
+        case reference, firstFrame, lastFrame
+        var id: Int { hashValue }
+    }
+
+    /// 素材库弹窗里能选哪几类 —— 按当前模型收得下的来。
+    /// 首尾帧只认图片
+    private var libraryPickKinds: Set<CanvasNode.Kind> {
+        guard libraryPick == .reference else { return [.image] }
+        var s: Set<CanvasNode.Kind> = []
+        if uiProvider.maxReferenceImages > 0 { s.insert(.image) }
+        if uiProvider.maxReferenceVideos > 0 { s.insert(.video) }
+        if uiProvider.maxReferenceAudios > 0 { s.insert(.audio) }
+        return s
+    }
     /// 侧栏那份和画布那份同时在，登记同一个名字会互相覆盖 ——
     /// 画布的排在前面，它开着的时候就该它收
     private var dropZoneKind: FileDropRouter.Kind { inCanvas ? .canvasChat : .aiChat }
@@ -613,23 +692,29 @@ struct AIChatPanel: View {
                 .padding(.bottom, 2)
 
             VStack(spacing: 0) {
-                HStack(alignment: .top) {
+                // 上下排，不并排 —— 两块都要按自己那行的宽度换行，
+                // 并排时它们互相挤宽度，谁也算不准一行放几个
+                VStack(alignment: .leading, spacing: 6) {
                     if uiProvider.maxReferenceImages > 0 {
                         imagePreviewArea
                     }
                     if !agentAttachments.isEmpty {
-                        AgentAttachmentBar(items: agentAttachments) { it in
-                            agentAttachments.removeAll { $0.id == it.id }
-                        }
+                        AgentAttachmentBar(items: agentAttachments,
+                                           availableWidth: max(0, panelWidth - Self.refGridInset),
+                                           onRemove: { it in
+                                               agentAttachments.removeAll { $0.id == it.id }
+                                           },
+                                           onClear: { agentAttachments.removeAll() })
                     }
-                    Spacer()
                 }
+                .frame(maxWidth: .infinity, alignment: .leading)
                 // 跟输入框左边缘对齐，上面也留一样的空
                 .padding(.leading, 8)
                 .padding(.top, 8)
 
                 ChatInputTextView(
-                    text: $inputText,
+                    // 草稿存在 service 上，binding 直接取它的投影
+                    text: $service.agentInputText,
                     onAddSubtitle: { project.insertSubtitleAtPlayhead(text: $0) },
                     onAddTitle: { project.addTextAtPlayhead(text: $0) },
                     onSubmit: { sendMessage() },
@@ -653,7 +738,8 @@ struct AIChatPanel: View {
                     // 等着看「这个模型能塞几张参考图」的时候
                     placeholder: inputPlaceholder,
                     showsPlaceholder: placeholderVisible,
-                    externalRevision: inputRevision
+                    externalRevision: inputRevision,
+                    onDropFiles: { addAgentAttachments($0) }
                 )
                     .frame(height: inputHeight)
                     .animation(nil, value: inputHeight)
@@ -828,20 +914,30 @@ HStack(spacing: 2) {
                 .help(settings.agentMode.help)
             }
 
-            // 推理强度
-            // 附件入口。图片直接给模型看，文本文件读成文字塞进提示词
-            Button { pickAgentAttachments() } label: {
+            // 添加入口。点开是一张菜单：上传 / 素材库 / Skill / MCP
+            Button {
+                withAnimation(.easeOut(duration: 0.12)) {
+                    plusMenu = plusMenu == nil ? .root : nil
+                }
+            } label: {
                 Image(systemName: "plus")
                     .font(.system(size: 11, weight: .medium))
                     .foregroundColor(Color.labelSecondary)
                     .padding(4)
                     .background(RoundedRectangle(cornerRadius: 5)
-                        .fill(Color.white.opacity(plusHover ? 0.10 : 0)))
+                        .fill(Color.white.opacity(plusHover || plusMenu != nil ? 0.10 : 0)))
                     .contentShape(RoundedRectangle(cornerRadius: 5))
             }
             .buttonStyle(.plain)
             .onHover { plusHover = $0 }
-            .overlay { ChatTooltip(text: "添加图片或文件") }
+            .overlay { ChatTooltip(text: "添加内容") }
+            // 菜单往上弹 —— 这排按钮已经在最底下了
+            .overlay(alignment: .bottomLeading) {
+                if let page = plusMenu {
+                    plusMenuPanel(page)
+                        .offset(y: -(page == .root ? 140 : 344))
+                }
+            }
 
             Spacer()
 
@@ -997,32 +1093,132 @@ HStack(spacing: 2) {
         return (p.maxReferenceVideos == 0 && p.maxReferenceAudios == 0) ? "参考图" : "参考内容"
     }
 
+    @ViewBuilder
     private var refContentSlot: some View {
-        Group {
-            if referenceContents.isEmpty {
-                placeholderSlot(label: refSlotLabel, icon: "photo.badge.plus") { pickRefContents() }
-            } else {
-                ZStack {
-                    fanThumbnails
+        if refExpanded {
+            expandedRefGrid
+        } else {
+            // 还没装满就把空槽留在缩略图**后面**，接着加下一个；
+            // 满了（比如 10 张收齐）才收起来。间距照画布卡片那排来
+            HStack(spacing: 6) {
+                if !referenceContents.isEmpty { pickedFan }
+                if referenceContents.count < uiProvider.maxReferenceTotal {
+                    placeholderSlot(label: refSlotLabel, icon: "photo.badge.plus",
+                                    onUpload: { pickRefContents() },
+                                    onLibrary: { libraryPick = .reference })
                 }
-                .frame(width: refFanWidth, height: 48)
-                .overlay(alignment: .topLeading) {
-                    if referenceContents.count > 1 {
-                        Text("\(referenceContents.count)")
-                            .font(.system(size: 8, weight: .bold))
-                            .foregroundColor(.black)
-                            .frame(width: 14, height: 14)
-                            .background(Color.accent)
-                            .clipShape(Circle())
-                            .offset(x: -3, y: -3)
-                    }
-                }
-                .overlay(alignment: .topTrailing) {
-                    deleteBadge { referenceContents.removeAll() }
-                }
-                .onTapGesture { pickRefContents() }
             }
         }
+    }
+
+    /// 摊开的那一片。**长在原位**，把输入区自己撑高，不是浮一层卡片在上面。
+    /// 一行铺满就换行；超过上限高度才在里头滚
+    private var expandedRefGrid: some View {
+        let shown = Array(referenceContents.prefix(Self.maxExpandedRefs))
+        let canAdd = referenceContents.count < uiProvider.maxReferenceTotal
+        // 列数**自己按量到的宽度算**，不交给 .adaptive ——
+        // 那个配上 fixedSize 会拿到「无限宽」的提案，图一多就排成横着一长条，
+        // 直接顶出聊天框外面
+        let cols = max(1, Int((max(0, panelWidth - Self.refGridInset) + 6) / 54))
+        let rows = max(1, (shown.count + (canAdd ? 1 : 0) + cols - 1) / cols)
+        let height = min(CGFloat(rows) * 54 - 6, Self.expandedRefMaxHeight)
+        return VStack(alignment: .leading, spacing: 0) {
+            // 收起按钮单占一行，不压在图上
+            HStack(spacing: 0) {
+                Spacer()
+                Button {
+                    withAnimation(.easeInOut(duration: 0.2)) { refExpanded = false }
+                } label: {
+                    // 两个尖括号对着、转 45° —— 就是「收起来」那个意思
+                    // 尖对尖的两个尖括号，转 45° —— 「收起来」那个意思。
+                    // SF Symbol 里没有现成的，自己拼：上面那个尖朝下、下面那个尖朝上
+                    VStack(spacing: -1) {
+                        Image(systemName: "chevron.down")
+                        Image(systemName: "chevron.up")
+                    }
+                    .font(.system(size: 6, weight: .semibold))
+                    .rotationEffect(.degrees(45))
+                    .foregroundColor(Color.labelSecondary.opacity(0.7))
+                    .frame(width: 16, height: 16)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .overlay { ChatTooltip(text: "收起") }
+                .padding(.trailing, 8)
+            }
+            .padding(.bottom, 2)
+
+            ScrollView(showsIndicators: false) {
+                LazyVGrid(columns: Array(repeating: GridItem(.fixed(48), spacing: 6), count: cols),
+                          alignment: .leading, spacing: 6) {
+                    ForEach(shown) { refThumb($0) }
+                    // 加更多的入口跟在最后一张后面
+                    if canAdd {
+                        placeholderSlot(label: refSlotLabel, icon: "photo.badge.plus",
+                                        onUpload: { pickRefContents() },
+                                        onLibrary: { libraryPick = .reference })
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .frame(maxWidth: .infinity, alignment: .topLeading)
+            .frame(height: height)
+            // **必须裁**：列数是按上一次量到的宽度定死的，侧栏一拉窄，
+            // 那一整行会把容器撑大，探针跟着量到撑大后的宽度 —— 列数于是永远
+            // 减不回去（拉宽正常，就是因为拉宽时本来就更宽）
+            .clipped()
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .clipped()
+    }
+
+    /// 平铺里的一张：缩略图 + 单独删除
+    private func refThumb(_ item: RefContent) -> some View {
+        Image(nsImage: item.thumbnail)
+            .resizable()
+            .aspectRatio(contentMode: .fill)
+            .frame(width: 48, height: 48)
+            .clipShape(RoundedRectangle(cornerRadius: 6))
+            .overlay(RoundedRectangle(cornerRadius: 6)
+                .stroke(Color.white.opacity(0.15), lineWidth: 0.5))
+            .overlay(alignment: .topTrailing) {
+                Button {
+                    referenceContents.removeAll { $0.id == item.id }
+                    if referenceContents.isEmpty { refExpanded = false }
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 7, weight: .semibold))
+                        .foregroundColor(.white)
+                        .frame(width: 14, height: 14)
+                        .background(Circle().fill(Color.black.opacity(0.65)))
+                }
+                .buttonStyle(.plain)
+                .padding(2)
+            }
+    }
+
+    /// 已经选好的那几个，叠成一小摞
+    private var pickedFan: some View {
+        ZStack { fanThumbnails }
+            .frame(width: refFanWidth, height: 48)
+            .overlay(alignment: .topLeading) {
+                if referenceContents.count > 1 {
+                    Text("\(referenceContents.count)")
+                        .font(.system(size: 8, weight: .bold))
+                        .foregroundColor(.black)
+                        .frame(width: 14, height: 14)
+                        .background(Color.accent)
+                        .clipShape(Circle())
+                        .offset(x: -3, y: -3)
+                }
+            }
+            .overlay(alignment: .topTrailing) {
+                deleteBadge { referenceContents.removeAll() }
+            }
+            // 点一下摊开看全部；再点收起。加新的走后面那个空槽
+            .onTapGesture {
+                withAnimation(.easeInOut(duration: 0.2)) { refExpanded.toggle() }
+            }
     }
 
     private var refFanWidth: CGFloat {
@@ -1082,46 +1278,158 @@ HStack(spacing: 2) {
                             if label == "首帧" { firstFrameImage = nil } else { lastFrameImage = nil }
                         }
                     }
+                    // 标出这张是首帧还是尾帧，跟画布上那份一个样式
+                    // （CanvasPromptBar 的 refThumbImage badge）
+                    .overlay(alignment: .topLeading) {
+                        Text(label)
+                            .font(.system(size: 8, weight: .medium))
+                            .foregroundColor(.black)
+                            .padding(.horizontal, 4)
+                            .padding(.vertical, 1)
+                            .background(Capsule().fill(Color.accent))
+                            .padding(2)
+                            .allowsHitTesting(false)
+                    }
                     .onTapGesture(perform: onPick)
             } else {
-                placeholderSlot(label: label, icon: "photo", action: onPick)
+                placeholderSlot(label: label, onUpload: onPick,
+                                onLibrary: { libraryPick = label == "首帧" ? .firstFrame : .lastFrame })
             }
         }
     }
 
-    /// 统一的删除角标：白圈 + 深色叉，垫深色底保证压在浅色图片上时观感一致
+    /// 统一的删除角标。跟附件条上那颗、画布参考图上那颗是同一个样子：
+    /// 细叉 + 黑底圆。**整颗留在框内**（原来靠 offset 顶出去一半，
+    /// 越过父视图边界的那半收不到鼠标）
     private func deleteBadge(action: @escaping () -> Void) -> some View {
         Button(action: action) {
-            Image(systemName: "xmark.circle.fill")
-                .font(.system(size: 12))
-                .foregroundColor(.white.opacity(0.7))
-                .background {
-                    Circle()
-                        .fill(Color(red: 0.13, green: 0.13, blue: 0.14))
-                        .frame(width: 10, height: 10)
-                }
+            Image(systemName: "xmark")
+                .font(.system(size: 8, weight: .semibold))
+                .foregroundColor(.white)
+                .frame(width: 16, height: 16)
+                .background(Circle().fill(Color.black.opacity(0.7)))
         }
         .buttonStyle(.plain)
-        .offset(x: 2, y: -3)
+        .padding(2)
     }
 
-    private func placeholderSlot(label: String, icon: String = "photo", action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            RoundedRectangle(cornerRadius: 6)
-                .fill(Color.white.opacity(0.06))
-                .frame(width: 48, height: 48)
-                .overlay {
-                    VStack(spacing: 2) {
-                        Image(systemName: icon)
-                            .font(.system(size: 14, weight: .light))
-                            .foregroundColor(Color.labelSecondary.opacity(0.45))
-                        Text(label)
-                            .font(.system(size: 8))
-                            .foregroundColor(Color.labelSecondary.opacity(0.4))
-                    }
-                }
+    private func placeholderSlot(label: String, icon: String = "photo",
+                                 onUpload: @escaping () -> Void,
+                                 onLibrary: @escaping () -> Void) -> some View {
+        RefPlaceholderSlot(label: label, icon: icon, onUpload: onUpload, onLibrary: onLibrary)
+    }
+
+    // MARK: - ＋ 菜单
+
+    @ViewBuilder
+    private func plusMenuPanel(_ page: PlusMenuPage) -> some View {
+        Group {
+            switch page {
+            case .root:   plusRootMenu
+            case .skills: skillPanel
+            }
         }
-        .buttonStyle(.plain)
+        .background(VisualEffectBackground(material: .menu, blending: .withinWindow))
+        .clipShape(RoundedRectangle(cornerRadius: 11))
+        .overlay(RoundedRectangle(cornerRadius: 11).stroke(Color.systemSeparator, lineWidth: 0.5))
+        .shadow(color: .black.opacity(0.35), radius: 12, y: 4)
+    }
+
+    private var plusRootMenu: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            PlusMenuRow(svg: "importFile", title: "上传附件") {
+                plusMenu = nil
+                pickAgentAttachments()
+            }
+            PlusMenuRow(svg: "folder", title: "从素材库选择") {
+                plusMenu = nil
+                libraryPick = .reference
+            }
+            PlusMenuRow(svg: "aiTools", title: "Skill", hasSubmenu: true) {
+                withAnimation(.easeOut(duration: 0.12)) { plusMenu = .skills }
+            }
+            PlusMenuRow(svg: "relink", title: "MCP") {
+                plusMenu = nil
+                // 设置左边那列：前 6 个是「设置」组，智能体组从 6 起，MCP 是第 3 个
+                NotificationCenter.default.post(name: .showSettings, object: 8)
+            }
+        }
+        .padding(.vertical, 5)
+        .frame(width: 190)
+    }
+
+    /// 内置 = `/` 里那些生成模型；自定义 = Skills 目录里自己放的那些
+    private var skillCards: [SlashCommand] {
+        SlashCommands.all().filter {
+            skillTab == .builtin ? $0.kind == .builtin : $0.kind == .skill
+        }
+    }
+
+    private var skillPanel: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 6) {
+                Button {
+                    withAnimation(.easeOut(duration: 0.12)) { plusMenu = .root }
+                } label: {
+                    Image(systemName: "chevron.left")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundColor(Color.labelSecondary)
+                        .frame(width: 20, height: 20)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+
+                ForEach(SkillTab.allCases, id: \.self) { t in
+                    Button { skillTab = t } label: {
+                        Text(t.rawValue)
+                            .font(.system(size: 11, weight: skillTab == t ? .semibold : .regular))
+                            .foregroundColor(skillTab == t ? Color.labelPrimary : Color.labelSecondary)
+                            .padding(.horizontal, 10)
+                            .frame(height: 22)
+                            .background(RoundedRectangle(cornerRadius: 6)
+                                .fill(Color.white.opacity(skillTab == t ? 0.12 : 0)))
+                            .contentShape(RoundedRectangle(cornerRadius: 6))
+                    }
+                    .buttonStyle(.plain)
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 8)
+            .padding(.top, 8)
+            .padding(.bottom, 6)
+
+            Divider().opacity(0.12)
+
+            ScrollView(showsIndicators: false) {
+                if skillCards.isEmpty {
+                    Text(skillTab == .custom
+                         ? "还没装 Skill。放一个文件夹到\n设置 → 智能体 → Skills 里指的那个目录就行"
+                         : "没有可用的生成模型")
+                        .font(.system(size: 11))
+                        .foregroundColor(Color.labelSecondary.opacity(0.6))
+                        .multilineTextAlignment(.center)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 40)
+                } else {
+                    LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 8), count: 2),
+                              spacing: 8) {
+                        ForEach(skillCards) { cmd in
+                            SkillCard(command: cmd) { insertCommand(cmd.name) }
+                        }
+                    }
+                    .padding(10)
+                }
+            }
+            .frame(height: 250)
+        }
+        .frame(width: 320)
+    }
+
+    /// 把 `/名字 ` 插到输入框末尾，跟从候选列表里选是一回事
+    private func insertCommand(_ name: String) {
+        inputText += (inputText.isEmpty || inputText.hasSuffix(" ") ? "" : " ") + "/" + name + " "
+        inputRevision += 1
+        plusMenu = nil
     }
 
     // MARK: - 参考内容选择
@@ -1152,13 +1460,68 @@ HStack(spacing: 2) {
                                 onTargetChange: { isDropTargeted = $0 })
     }
 
-    /// 收下这些文件。不认的类型直接跳过 —— 二进制读成乱码塞给模型只会添乱
+    /// 收下这些文件。
+    ///
+    /// **参考内容和附件是同一个入口**：当前这条命令点名的模型能收参考素材时，
+    /// 拖进来的媒体先按它的上限当参考内容（首尾帧模式下按上传顺序进首帧、尾帧），
+    /// 装不下的、或者这家压根不收的，才落回附件。
+    ///
+    /// 落回附件的只认图片和能读成文字的 —— 视频音频塞给模型没意义。
+    /// 但**不能静默丢掉**：拖进来什么都不发生，用户只会以为功能坏了
+    /// 点名生成模型之后，把之前当附件收着的图挪进参考区。
+    ///
+    /// 加图那会儿当前还是文字模型（`maxReferenceTotal` 为 0），参考区收不了，
+    /// 只能先躺在附件里 —— 用户的顺序常常是「先拖图、再打 /命令」，
+    /// 不补这一下，图就一直是附件，生成时也带不上
+    private func promoteAttachmentsToReference() {
+        guard !agentAttachments.isEmpty else { return }
+        let p = uiProvider
+        guard p.maxReferenceTotal > 0
+                || (p.category == .video && imageMode == .frames && p.supportsFirstFrame) else { return }
+        var kept: [AgentAttachment] = []
+        for a in agentAttachments {
+            switch service.addToReference(url: a.url, provider: p) {
+            case .added, .duplicate: continue
+            case .limitReached, .unsupportedType: kept.append(a)
+            }
+        }
+        if kept.count != agentAttachments.count { agentAttachments = kept }
+    }
+
     private func addAgentAttachments(_ urls: [URL]) {
+        let p = uiProvider
+        let takesReference = p.maxReferenceTotal > 0
+            || (p.category == .video && imageMode == .frames && p.supportsFirstFrame)
+
+        var rejected: [URL] = []
+        var limitHit: String?
         for u in urls {
-            guard AgentAttachmentIO.accepts(u),
-                  !agentAttachments.contains(where: { $0.url == u }),
+            if takesReference {
+                switch service.addToReference(url: u, provider: p) {
+                case .added, .duplicate: continue
+                case .limitReached(let msg): limitHit = msg      // 满了，试试当附件收
+                case .unsupportedType: break                     // 这家不收这类，同上
+                }
+            }
+            guard AgentAttachmentIO.accepts(u) else { rejected.append(u); continue }
+            guard !agentAttachments.contains(where: { $0.url == u }),
                   let a = AgentAttachmentIO.make(u) else { continue }
             agentAttachments.append(a)
+        }
+
+        if !rejected.isEmpty {
+            let names = rejected.prefix(3).map(\.lastPathComponent).joined(separator: "、")
+            // icon 要传 **SF Symbol 名**，SuccessToastBubble 那张表会映射成自绘 SVG。
+            // 直接传 SVG key（toastFail）表里查不到，会拿去当 SF Symbol 画 —— 画出来是个空圆
+            project.showSuccessToast(
+                icon: "exclamationmark.triangle.fill", iconColor: Color(hex: "#FF9230"),
+                title: limitHit ?? "暂不支持此类素材",
+                subtitle: rejected.count > 3 ? "\(names) 等 \(rejected.count) 个" : names)
+        } else if let msg = limitHit {
+            // 没被拒但确实满了：说一声，不然用户不知道后面那几张去哪了
+            project.showSuccessToast(
+                icon: "exclamationmark.triangle.fill", iconColor: Color(hex: "#FF9230"),
+                title: msg, subtitle: "多出来的那几个当普通附件收下了")
         }
     }
 
@@ -1226,7 +1589,7 @@ HStack(spacing: 2) {
             project.showSuccessToast(icon: "exclamationmark.triangle", iconColor: .orange, title: "文件已不存在", subtitle: att.url.lastPathComponent.truncatedFileName())
             return
         }
-        switch service.addToReference(url: url) {
+        switch service.addToReference(url: url, provider: uiProvider) {
         case .added, .duplicate:
             break
         case .unsupportedType:
@@ -1424,24 +1787,12 @@ HStack(spacing: 2) {
         inputRevision += 1
         slashQuery = nil
 
-        // 没挂参考素材的纯文字消息交给 Agent —— 它会自己判断是查项目、
-        // 改时间轴还是调生成。挂了参考图/视频的仍走原来那条生成链路：
-        // 那种意图很明确，绕一圈让模型再判断一次没有意义，还慢
-        if referenceContents.isEmpty && firstFrameImage == nil && lastFrameImage == nil {
-            runAgent(text)
-            return
-        }
-        let refImageURLs = referenceContents.filter { $0.type == .image }.map(\.url)
-        let refVideoURLs = referenceContents.filter { $0.type == .video }.map(\.url)
-        let refAudioURLs = referenceContents.filter { $0.type == .audio }.map(\.url)
-        let firstURL = firstFrameImage?.url
-        let lastURL = lastFrameImage?.url
-        // 发的是校正过的值：换供应商后旧档位这家可能不收，
-        // 界面上已经退回到合法档，这里不能再把原始值发出去
-        service.sendPrompt(text, duration: currentDuration, aspectRatio: settings.aiRatio, resolution: currentResolution, imageRatio: settings.aiImageRatio, referenceImages: refImageURLs, referenceVideos: refVideoURLs, referenceAudios: refAudioURLs, firstFrame: firstURL, lastFrame: lastURL)
-        referenceContents.removeAll()
-        firstFrameImage = nil
-        lastFrameImage = nil
+        // **一律交给 Agent**。挂没挂参考素材都一样 —— 生成走它的
+        // generate_* 工具，界面上才有步骤条。
+        // 以前挂了参考图会绕开 Agent 直接调生成接口：那条路没有步骤条，
+        // 显示的是「正在生成回复」，而且模型按下拉里选的那家发，
+        // 跟 `/命令` 点名的对不上
+        runAgent(text)
     }
 
     /// 界面上挂着上一轮的对话，Agent 却说「没有上文」—— agentHistory 是
@@ -1538,6 +1889,24 @@ HStack(spacing: 2) {
             prompt += "\n\n[用户带了 \(images.count) 张图，就在这条消息里。]"
         }
         agentAttachments.removeAll()
+
+        // 挂着的参考素材：留一份快照给生成工具（它是异步跑的，等执行时
+        // 界面上那份早清空了），图片同时压一张给模型看 ——
+        // 不然它不知道「这个图」指的是什么
+        service.agentRoundReferences = referenceContents
+        service.agentRoundFirstFrame = firstFrameImage?.url
+        service.agentRoundLastFrame = lastFrameImage?.url
+        for r in referenceContents where r.type == .image {
+            if let d = AgentAttachmentIO.jpegData(r.thumbnail) { images.append(d) }
+        }
+        if let f = firstFrameImage?.image, let d = AgentAttachmentIO.jpegData(f) { images.append(d) }
+        if !referenceContents.isEmpty || firstFrameImage != nil {
+            prompt += "\n\n[用户挂了参考素材，调生成工具时会自动带上，不用再问他要。]"
+        }
+        referenceContents.removeAll()
+        firstFrameImage = nil
+        lastFrameImage = nil
+        refExpanded = false
 
         agent.run(prompt: prompt, images: images, history: &agentHistory,
                   mode: settings.agentMode, project: project,
@@ -2883,6 +3252,8 @@ struct ChatInputTextView: NSViewRepresentable {
     var showsPlaceholder: Bool = false
     /// 外部改动计数。只有它变了才回写文本，见 AIChatPanel.inputRevision
     var externalRevision: Int = 0
+    /// 拖文件进输入框
+    var onDropFiles: ([URL]) -> Void = { _ in }
 
     enum SlashKey { case up, down, confirm, cancel }
 
@@ -2922,8 +3293,12 @@ struct ChatInputTextView: NSViewRepresentable {
 
         tv.onSlashKey = onSlashKey
         tv.slashOpen = slashOpen
+        tv.onDropFiles = onDropFiles
         tv.placeholder = placeholder
         tv.showsPlaceholder = showsPlaceholder
+        // 草稿现在是带着走的（存在 service 上），切标签页回来这个视图会重建 ——
+        // 不在这儿补一次染色，已经成形的 /命令 会退回成一串纯文本
+        Self.highlight(tv)
 
         let scroll = NSScrollView()
         scroll.documentView = tv
@@ -2971,6 +3346,7 @@ struct ChatInputTextView: NSViewRepresentable {
         tv.onSubmit = onSubmit
         tv.onSlashKey = onSlashKey
         tv.slashOpen = slashOpen
+        tv.onDropFiles = onDropFiles
         tv.placeholder = placeholder
         tv.showsPlaceholder = showsPlaceholder
         // 标签宽度一变提示就得挪位置。NSTextView 只重绘脏行，
@@ -3014,6 +3390,42 @@ private final class ChatInputInner: ChatTextView {
     var onSubmit: (() -> Void)?
     var onSlashKey: ((ChatInputTextView.SlashKey) -> Void)?
     var slashOpen = false
+    /// 拖文件进输入框，交给外面收成附件
+    var onDropFiles: (([URL]) -> Void)?
+
+    // MARK: 拖文件进来
+    //
+    // **这一层必须自己接**：NSTextView 本身就注册了 fileURL，拖进来默认是
+    // 「把路径当文字插进去」，于是输入框里多出一串 file:///Users/...。
+    // SwiftUI 的 `.onDrop` 包在外面轮不到（那条路见 FileDropRouter 的注释），
+    // 但 NSTextView 是**真实 NSView**，AppKit 的拖放目标查找找得到它
+
+    private func droppedURLs(_ sender: NSDraggingInfo) -> [URL] {
+        sender.draggingPasteboard.readObjects(
+            forClasses: [NSURL.self],
+            options: [.urlReadingFileURLsOnly: true]) as? [URL] ?? []
+    }
+
+    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
+        droppedURLs(sender).isEmpty ? super.draggingEntered(sender) : .copy
+    }
+
+    override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation {
+        droppedURLs(sender).isEmpty ? super.draggingUpdated(sender) : .copy
+    }
+
+    override func prepareForDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        droppedURLs(sender).isEmpty ? super.prepareForDragOperation(sender) : true
+    }
+
+    override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        let urls = droppedURLs(sender)
+        guard !urls.isEmpty else { return super.performDragOperation(sender) }
+        // 收不收得下由外面判断 —— 不认的类型也要在那儿提示，
+        // 这里一律拦下，免得又变成往输入框里插路径
+        onDropFiles?(urls)
+        return true
+    }
     /// 空输入时的提示。自己画而不是拿 SwiftUI 的 Text 盖在上面 ——
     /// 打了命令之后它得跟在标签后面、和标签一条基线，
     /// 那个位置只有 layoutManager 知道，外面靠 padding 只能凑
@@ -3095,6 +3507,132 @@ private final class ChatInputInner: ChatTextView {
     }
 }
 
+
+/// 参考内容的空槽位。默认是图标 + 文字，**hover 才浮出两个入口** ——
+/// 跟画布空卡片上那两颗按钮一个交互。
+///
+/// 单独一个 struct 是为了各存各的 hover：方法产出的视图没法持 @State，
+/// 而共用一份状态时 onHover 在相邻槽位之间快速划过会漏掉 exit
+private struct RefPlaceholderSlot: View {
+    let label: String
+    let icon: String
+    let onUpload: () -> Void
+    let onLibrary: () -> Void
+    @State private var hovering = false
+
+    var body: some View {
+        RoundedRectangle(cornerRadius: 6)
+            .fill(Color.white.opacity(hovering ? 0.10 : 0.06))
+            .frame(width: 48, height: 48)
+            .overlay {
+                VStack(spacing: 2) {
+                    Image(systemName: icon)
+                        .font(.system(size: 14, weight: .light))
+                        .foregroundColor(Color.labelSecondary.opacity(0.45))
+                    Text(label)
+                        .font(.system(size: 8))
+                        .foregroundColor(Color.labelSecondary.opacity(0.4))
+                        .lineLimit(1)
+                }
+                .opacity(hovering ? 0 : 1)
+            }
+            .overlay {
+                if hovering {
+                    HStack(spacing: 5) {
+                        button(icon: "importFile", tip: "从本地上传", action: onUpload)
+                        button(icon: "folder", tip: "从素材库选择", action: onLibrary)
+                    }
+                }
+            }
+            .onHover { hovering = $0 }
+    }
+
+    private func button(icon: String, tip: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(nsImage: SidebarSVGIcon.load(icon, size: 11))
+                .renderingMode(.template)
+                .foregroundColor(.white)
+                .frame(width: 20, height: 20)
+                .background(Circle().fill(Color.black.opacity(0.55)))
+                .contentShape(Circle())
+        }
+        .buttonStyle(.plain)
+        // 自绘按钮上 .help 时灵时不灵，走 ChatTooltip
+        .overlay { ChatTooltip(text: tip) }
+    }
+}
+
+/// ＋ 菜单里的一行。单独一个 struct 是为了各存各的 hover
+private struct PlusMenuRow: View {
+    let svg: String
+    let title: String
+    var hasSubmenu = false
+    let action: () -> Void
+    @State private var hovering = false
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 8) {
+                Image(nsImage: SidebarSVGIcon.load(svg, size: 13))
+                    .renderingMode(.template)
+                    .foregroundColor(Color.labelSecondary)
+                    .frame(width: 16, height: 16)
+                Text(title)
+                    .font(.system(size: 12))
+                    .foregroundColor(Color.labelPrimary)
+                Spacer(minLength: 0)
+                if hasSubmenu {
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 8, weight: .semibold))
+                        .foregroundColor(Color.labelSecondary)
+                }
+            }
+            .padding(.horizontal, 10)
+            .frame(height: 30)
+            .background(RoundedRectangle(cornerRadius: 6)
+                .fill(Color.white.opacity(hovering ? 0.10 : 0))
+                .padding(.horizontal, 5))
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering = $0 }
+    }
+}
+
+/// Skill 面板里的一张卡片
+private struct SkillCard: View {
+    let command: SlashCommand
+    let action: () -> Void
+    @State private var hovering = false
+
+    var body: some View {
+        Button(action: action) {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(command.name)
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundColor(Color.labelPrimary)
+                    .lineLimit(1)
+                Text(command.detail.isEmpty ? "—" : command.detail)
+                    .font(.system(size: 10))
+                    .foregroundColor(Color.labelSecondary.opacity(0.7))
+                    .lineLimit(2)
+                    .multilineTextAlignment(.leading)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .padding(8)
+            .frame(height: 62, alignment: .top)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(RoundedRectangle(cornerRadius: 8)
+                .fill(Color.white.opacity(hovering ? 0.12 : 0.06)))
+            .overlay(RoundedRectangle(cornerRadius: 8)
+                .stroke(Color.white.opacity(0.08), lineWidth: 1))
+            .contentShape(RoundedRectangle(cornerRadius: 8))
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering = $0 }
+        .help(command.detail)
+    }
+}
 
 /// 新建入口的小卡片。两个并排放在会话区最上面，可点的东西一律给 hover 反馈
 private struct EntryCard: View {
