@@ -364,14 +364,21 @@ private struct OverlayStack: View {
 
     @ViewBuilder
     private func layerView(_ ref: ProjectState.OverlayTrackRef) -> some View {
-        switch ref {
-        case .image(let id):    imageTrackView(trackID: id)
-        case .subtitle(let id): subtitleTrackView(trackID: id)
-        case .text(let id):     textTrackView(trackID: id)
-        case .shape(let id):    shapeTrackView(trackID: id)
-        case .compound(let id): compoundOverlayView(trackID: id)
-        case .filter, .adjust, .effect:
-            EmptyView()   // 滤镜/调节/特效在 overlayChain 里单独处理
+        // 有滤镜/调节/特效轨道时，叠加层已经由合成器画进画面了
+        // （`overlayDrawnByCompositor`）—— 这儿再画一份就是两层字幕/文字叠在一起。
+        // 没有效果轨道时合成器不管叠加层，仍旧走下面这条
+        if project.overlayDrawnByCompositor {
+            EmptyView()
+        } else {
+            switch ref {
+            case .image(let id):    imageTrackView(trackID: id)
+            case .subtitle(let id): subtitleTrackView(trackID: id)
+            case .text(let id):     textTrackView(trackID: id)
+            case .shape(let id):    shapeTrackView(trackID: id)
+            case .compound(let id): compoundOverlayView(trackID: id)
+            case .filter, .adjust, .effect:
+                EmptyView()   // 滤镜/调节/特效在 overlayChain 里单独处理
+            }
         }
     }
 
@@ -969,7 +976,10 @@ private struct SubtitleLabel: View {
     let text: String; let style: SubtitleStyle; var scale: CGFloat = 1.0
     var body: some View {
         Text(text)
-            .font(.custom(style.fontName, size: style.fontSize * scale).weight(style.bold ? .bold : .regular))
+            // 用 resolvedFontName：字体没装时跟测量那边回退到同一个，
+            // 不然量出来的高度和画出来的高度对不上，多条字幕轨会叠在一起
+            .font(.custom(style.resolvedFontName, size: style.fontSize * scale)
+                    .weight(style.bold ? .bold : .regular))
             .transformEffect(italicSkew(style.italic, fontSize: style.fontSize * scale))
             .foregroundColor(style.textColor)
             .shadow(color: .black.opacity(0.8), radius: 1 * scale, x: 1 * scale, y: 1 * scale)

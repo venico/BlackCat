@@ -202,6 +202,18 @@ struct MediaLibraryView: View {
             }
             } // else (non-AI tabs)
         }
+        // 标签页一变就核一次登记：AI 那条排在素材区前面，漏撤会把素材区的拖入吃掉
+        .onAppear { syncAIDropZone() }
+        .onChange(of: project.mediaLibraryTab) { _, _ in syncAIDropZone() }
+    }
+
+    /// 切走 AI 标签页时撤掉聊天区的拖入登记。
+    ///
+    /// **不能只靠 AIChatPanel 的 onDisappear**：那条登记排在素材区**前面**
+    /// （聊天卡片浮在素材区上面，得优先），一旦漏撤，拖到素材区的文件会被
+    /// 聊天区收走当附件 —— 而那时聊天区不可见，看着就是「没高亮、导不进去」
+    private func syncAIDropZone() {
+        if !isAITab { FileDropRouter.unregister(windowID, kind: .aiChat) }
     }
 
     private func registerDropZone(_ rect: CGRect) {

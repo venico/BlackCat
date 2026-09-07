@@ -100,10 +100,24 @@ struct SubtitleStyle: Equatable, Codable {
     /// - Parameters:
     ///   - scale: 预览传 `预览区宽 / previewRenderSize.width`，导出传 `renderSize.width / previewRenderSize.width`
     ///   - renderWidth: 对应坐标系下的画面宽度
+    /// 这台机器上真正能用的字体名。
+    ///
+    /// 默认的「Source Han Sans SC」**不是 macOS 自带的**，换台机器很可能没装。
+    /// 缺字体时 SwiftUI 的 `.custom` 和 CoreText 的 `CTFontCreateWithName`
+    /// **各自回退到不同的字体**，于是量出来的高度对不上真正画出来的高度 ——
+    /// 多条字幕轨靠「累加下面各轨的高度」错开，一旦量错就叠在一起。
+    /// 测量和渲染都走这里，保证两边用的是同一个字体
+    var resolvedFontName: String {
+        NSFont(name: fontName, size: 12) != nil ? fontName : SubtitleStyle.fallbackFontName
+    }
+
+    /// 系统自带的中文字体，作兜底
+    static let fallbackFontName = "PingFang SC"
+
     func layerSize(text: String, scale: CGFloat, renderWidth: CGFloat) -> CGSize {
         let padH: CGFloat = 10 * scale, padV: CGFloat = 3 * scale
         let scaledSize = fontSize * scale
-        var ctFont = CTFontCreateWithName(fontName as CFString, scaledSize, nil)
+        var ctFont = CTFontCreateWithName(resolvedFontName as CFString, scaledSize, nil)
         if bold, let bf = CTFontCreateCopyWithSymbolicTraits(ctFont, scaledSize, nil,
                                                              .boldTrait, .boldTrait) {
             ctFont = bf

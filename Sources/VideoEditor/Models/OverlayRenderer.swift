@@ -279,7 +279,8 @@ enum OverlayRenderer {
         var layouts: [SubLayout] = []
         for item in activeItems {
             let scaledSize = item.style.fontSize * scale
-            var ctFont = CTFontCreateWithName(item.style.fontName as CFString, scaledSize, nil)
+            // 跟预览用同一个兜底，导出才不会跟预览错位
+            var ctFont = CTFontCreateWithName(item.style.resolvedFontName as CFString, scaledSize, nil)
             if item.style.bold,
                let bf = CTFontCreateCopyWithSymbolicTraits(ctFont, scaledSize, nil, .boldTrait, .boldTrait) { ctFont = bf }
             if item.style.italic {
