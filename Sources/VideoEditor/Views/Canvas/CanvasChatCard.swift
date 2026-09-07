@@ -99,16 +99,6 @@ struct CanvasChatCard: View {
             card
                 .offset(x: position(CGSize(width: w, height: h)).x,
                         y: position(CGSize(width: w, height: h)).y)
-                // 量的必须是**卡片本体**。挂到最外层去测的话，
-                // 报上来的是整块画布 —— 滚轮判断就永远命中，
-                // 连 ⌘+滚轮缩放都被当成「在卡片上」放行掉了。
-                // 挂在 offset 之后，测到的才是挪动后的真实位置
-                .background(GeometryReader { g in
-                    Color.clear
-                        .onAppear { reportRect(g.frame(in: .global)) }
-                        .onChange(of: g.frame(in: .global)) { _, r in reportRect(r) }
-                        .onChange(of: minimized) { _, _ in reportRect(g.frame(in: .global)) }
-                })
                 .opacity(minimized ? 0 : 1)
                 .allowsHitTesting(!minimized)
             if minimized {
@@ -121,14 +111,33 @@ struct CanvasChatCard: View {
         // 占满画布，位置全靠上面的 offset 算
         .frame(width: containerSize.width, height: containerSize.height, alignment: .topLeading)
         .onDisappear { project.canvas.chatCardRect = .zero }
+        .onAppear { reportRect() }
+        .onChange(of: rectKey) { _, _ in reportRect() }
         .onAppear { enterCanvasConversation() }
         .onDisappear { leaveCanvasConversation() }
     }
 
-    /// 收起时报 .zero：卡片还在层级里（留着不丢草稿），
-    /// 但那片地方已经看不见，不该再把滚轮从画布那儿截走
-    private func reportRect(_ r: CGRect) {
-        project.canvas.chatCardRect = minimized ? .zero : r
+    /// 卡片占的地方，报给画布用（滚轮、右键、⌘V 都靠它分流）。
+    ///
+    /// **不能用 GeometryReader 量**：卡片是靠 `.offset` 摆位置的，
+    /// 而 offset 只影响绘制、不改布局，`frame(in: .global)` 报的是挪动**前**
+    /// 的位置（原点恒在左上角）。直接拿算位置那套来构造。
+    /// y 要补上 topGap —— 画布容器从窗口顶部往下让了这么多，
+    /// 而监听那边拿到的是窗口内容坐标
+    private func reportRect() {
+        guard !minimized else {
+            project.canvas.chatCardRect = .zero
+            return
+        }
+        let size = CGSize(width: w, height: h)
+        let p = position(size)
+        project.canvas.chatCardRect = CGRect(x: p.x, y: p.y + project.canvas.topGap,
+                                             width: size.width, height: size.height)
+    }
+
+    /// 位置 / 尺寸 / 收起状态一变就重报
+    private var rectKey: String {
+        "\(w)|\(h)|\(edgeRight)|\(storedTop)|\(minimized)|\(containerSize.width)|\(containerSize.height)|\(project.canvas.topGap)"
     }
 
     /// 画布聊天记录存在这张画布自己的会话里，跟侧栏那条分开

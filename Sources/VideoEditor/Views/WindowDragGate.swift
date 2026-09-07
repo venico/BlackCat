@@ -64,6 +64,8 @@ enum FileDropRouter {
     enum Payload {
         case files([URL])
         case asset(UUID)
+        /// 素材库里拖动文件夹格子 —— 用来排序，不是往里放东西
+        case folder(UUID)
         case shape(ShapeType)
         case filter(FilterKind)
         case effect(EffectKind)
@@ -92,6 +94,9 @@ enum FileDropRouter {
         let onDrop: (Payload, CGPoint) -> Void
         /// 拖拽进出这块区域时的通知，用来点亮"松开以导入"
         let onTargetChange: (Bool) -> Void
+        /// 悬停时的落点和载荷。素材区靠它判断「悬在哪个文件夹上」——
+        /// 光有 onTargetChange 那个布尔，只知道进没进这块区，不知道进到哪儿
+        let onHoverPoint: ((CGPoint, Payload) -> Void)?
     }
 
     /// 按窗口分开存。多窗口下不区分的话，A 窗口的素材区矩形会拿去匹配 B 窗口的拖拽
@@ -100,9 +105,11 @@ enum FileDropRouter {
     static func register(_ id: WindowID, kind: Kind, rect: CGRect,
                          accepts: @escaping (Payload) -> Bool,
                          onDrop: @escaping (Payload, CGPoint) -> Void,
-                         onTargetChange: @escaping (Bool) -> Void) {
+                         onTargetChange: @escaping (Bool) -> Void,
+                         onHoverPoint: ((CGPoint, Payload) -> Void)? = nil) {
         zones[id, default: [:]][kind] = Zone(rect: rect, accepts: accepts,
-                                             onDrop: onDrop, onTargetChange: onTargetChange)
+                                             onDrop: onDrop, onTargetChange: onTargetChange,
+                                             onHoverPoint: onHoverPoint)
     }
 
     /// 只收 Finder 文件的区（素材库用），保持原来的调用形状
@@ -114,7 +121,8 @@ enum FileDropRouter {
                  onDrop: { payload, _ in
                      if case .files(let urls) = payload { onFiles(urls) }
                  },
-                 onTargetChange: onTargetChange)
+                 onTargetChange: onTargetChange,
+                 onHoverPoint: nil)
     }
 
     static func unregister(_ id: WindowID) { zones[id] = nil }
@@ -131,6 +139,10 @@ enum FileDropRouter {
     static func pasteboardString(for kind: EffectKind) -> String { effectPrefix + kind.rawValue }
     /// 调节只有一种，载荷是个固定串
     static let adjustPasteboardString = "adjust:default"
+    /// 文件夹格子拖出去的载荷。**不能拖裸 UUID** —— 那会被认成素材，
+    /// 落到别的文件夹上就成了「把素材归档」，而不是排序
+    static let folderPrefix = "folder:"
+    static func pasteboardString(forFolder id: UUID) -> String { folderPrefix + id.uuidString }
 
     private static func hit(at point: CGPoint, for payload: Payload,
                             in id: WindowID) -> (kind: Kind, zone: Zone)? {
@@ -153,7 +165,9 @@ enum FileDropRouter {
         guard let all = zones[id] else { return }
         let hitKind = targeted ? hit(at: point, for: payload, in: id)?.kind : nil
         for (k, z) in all {
-            z.onTargetChange(k == hitKind)
+            let on = k == hitKind
+            z.onTargetChange(on)
+            if on { z.onHoverPoint?(point, payload) }
         }
     }
 
@@ -210,6 +224,10 @@ final class GatedHostingView<Content: View>: NSHostingView<Content> {
         let pb = sender.draggingPasteboard
         if let s = pb.string(forType: .string) {
             if let uuid = UUID(uuidString: s) { return .asset(uuid) }
+            if s.hasPrefix(FileDropRouter.folderPrefix),
+               let id = UUID(uuidString: String(s.dropFirst(FileDropRouter.folderPrefix.count))) {
+                return .folder(id)
+            }
             if s.hasPrefix(FileDropRouter.shapePrefix),
                let t = ShapeType(rawValue: String(s.dropFirst(FileDropRouter.shapePrefix.count))) {
                 return .shape(t)
@@ -280,6 +298,7 @@ final class GatedHostingView<Content: View>: NSHostingView<Content> {
         case .filter(let k):   what = "滤镜=\(k.rawValue)"
         case .effect(let k):   what = "特效=\(k.rawValue)"
         case .adjust:          what = "调节"
+        case .folder(let id):  what = "文件夹=\(id.uuidString.prefix(8))"
         }
         DiagLog.log("[拖入] 落点=\(pt) \(what) 收下的区=\(landed.map(String.init(describing:)) ?? "没人收")")
         return landed != nil

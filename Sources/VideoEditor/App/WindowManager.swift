@@ -256,6 +256,14 @@ final class WindowManager: NSObject {
         canvasScrollMonitors[id] = monitor
     }
 
+    /// 点画布时把键盘焦点从聊天输入框收回来的那个监听
+    private var canvasFocusMonitors: [WindowID: Any] = [:]
+
+    func setCanvasFocusMonitor(_ monitor: Any?, for id: WindowID) {
+        if let old = canvasFocusMonitors[id] { NSEvent.removeMonitor(old) }
+        canvasFocusMonitors[id] = monitor
+    }
+
     private var canvasRightClickMonitors: [WindowID: Any] = [:]
 
     func setCanvasRightClickMonitor(_ monitor: Any?, for id: WindowID) {

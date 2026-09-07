@@ -410,6 +410,45 @@ final class AppSettings: ObservableObject {
         ud.string(forKey: K.providerReasoning(provider)) ?? ""
     }
 
+    // MARK: 按会话保存 / 还原
+    //
+    // 子模型和推理强度是按**供应商**存的（settings.ai.model.<provider>），
+    // 要让每条会话各有一套，只能整份存走再整份写回。
+    // 供应商就二十来个，一次全量拷贝可以忽略
+
+    func snapshotProviderModels() -> [String: String] {
+        var out: [String: String] = [:]
+        for p in AIVideoService.Provider.allCases {
+            let v = providerModel(for: p.rawValue)
+            if !v.isEmpty { out[p.rawValue] = v }
+        }
+        return out
+    }
+
+    func snapshotProviderReasonings() -> [String: String] {
+        var out: [String: String] = [:]
+        for p in AIVideoService.Provider.allCases {
+            let v = providerReasoning(for: p.rawValue)
+            if !v.isEmpty { out[p.rawValue] = v }
+        }
+        return out
+    }
+
+    /// 没记录的一律清空，回到该家的默认 —— 不清的话上一条会话选的会渗过来
+    func restoreProviderModels(_ map: [String: String]) {
+        for p in AIVideoService.Provider.allCases {
+            ud.set(map[p.rawValue] ?? "", forKey: K.providerModel(p.rawValue))
+        }
+        objectWillChange.send()
+    }
+
+    func restoreProviderReasonings(_ map: [String: String]) {
+        for p in AIVideoService.Provider.allCases {
+            ud.set(map[p.rawValue] ?? "", forKey: K.providerReasoning(p.rawValue))
+        }
+        objectWillChange.send()
+    }
+
     func setProviderReasoning(_ level: String, for provider: String) {
         ud.set(level, forKey: K.providerReasoning(provider))
         objectWillChange.send()

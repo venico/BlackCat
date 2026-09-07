@@ -73,7 +73,10 @@ struct ContentView: View {
                     .frame(height: toolbarH)
 
                     // Content
-                    MediaLibraryView()
+                    // 宽度传下去给宫格算列数。**必须从这儿给** ——
+                    // 素材区自己拿 GeometryReader 量的话，量到的宽度会被
+                    // 自己算出来的列数影响，绕成环、拉窄时列减不回来
+                    MediaLibraryView(sidebarWidth: sidebarWidth)
                 }
                 .frame(width: sidebarWidth)
                 .frame(maxHeight: .infinity)
@@ -395,6 +398,16 @@ struct ContentView: View {
                 MediaPreviewOverlay(item: item) { project.mediaPreview = nil }
             }
         }
+        // 输入区 ＋ 菜单。挂最外层是因为它比侧栏宽，
+        // 挂侧栏里溢出去的那半收不到鼠标、还会被时间轴压住
+        .overlay {
+            if let anchor = project.plusMenuAnchor {
+                PlusMenuOverlay(anchor: anchor,
+                                onPick: { project.plusMenuPick = $0
+                                          project.plusMenuAnchor = nil },
+                                onClose: { project.plusMenuAnchor = nil })
+            }
+        }
 
         .canvasKeyMonitor(canvas: project.canvas, windowID: windowID, isActive: project.showCanvas)
         .onReceive(NotificationCenter.default.publisher(for: .showSettings)) { note in
@@ -682,6 +695,8 @@ struct ContentView: View {
             if project.showNewProjectSheet { return event }
             // 画布是最上层，esc 先关它。不光靠 CanvasOverlay 的 onExitCommand ——
             // 那个依赖 SwiftUI 焦点落在画布上，焦点跑到别处就不灵了
+            // 菜单在最上层，esc 先关它
+            if project.plusMenuAnchor != nil { project.plusMenuAnchor = nil; return nil }
             // 预览层盖在画布之上，esc 也该先关它
             if project.mediaPreview != nil { project.mediaPreview = nil; return nil }
             if project.showCanvas { project.showCanvas = false; return nil }

@@ -37,14 +37,20 @@ struct CanvasContextPanel: View {
                 }
             }
 
-            row(SidebarSVGIcon.load("copy", size: 13), "复制") { canvas.copy(ids: targets) }
+            // 空白处右键时 targets 是空的：复制 / 创建副本 / 删除都无从谈起，
+            // 只留粘贴
+            if !targets.isEmpty {
+                row(SidebarSVGIcon.load("copy", size: 13), "复制") { canvas.copy(ids: targets) }
+            }
             // 画布里没复制过卡片时看系统剪贴板 —— 截图、访达里复制的文件、
             // 一段文字，都能直接落成卡片
             row(SidebarSVGIcon.load("paste", size: 13), "粘贴",
                 enabled: canvas.canPaste) { canvas.pasteHere(at: pastePoint) }
-            row(SidebarSVGIcon.load("copy", size: 13), "创建副本") { canvas.duplicate(ids: targets) }
-            Divider().opacity(0.12).padding(.vertical, 4)
-            row(TimelineSVGIcon.load("delete", size: 13), "删除") { canvas.delete(ids: targets) }
+            if !targets.isEmpty {
+                row(SidebarSVGIcon.load("copy", size: 13), "创建副本") { canvas.duplicate(ids: targets) }
+                Divider().opacity(0.12).padding(.vertical, 4)
+                row(TimelineSVGIcon.load("delete", size: 13), "删除") { canvas.delete(ids: targets) }
+            }
 
             // 色板摆在最后一行
             if let gid = groupID {

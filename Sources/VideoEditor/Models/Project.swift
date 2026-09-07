@@ -1064,6 +1064,9 @@ final class ProjectState: ObservableObject {
 
     /// 当前看的是哪类素材。只在素材库那一栏有意义；
     /// 文字/图形是预置面板、转场和 AI 更不是素材，都返回 nil
+    /// 素材区框选中的那些。多选后右键可以整批移动 / 删除
+    @Published var selectedAssetIDs: Set<UUID> = []
+
     var currentLibraryAssetType: AssetType? {
         guard mediaLibraryTab == "library" else { return nil }
         switch libraryCategory {
@@ -1080,7 +1083,12 @@ final class ProjectState: ObservableObject {
         case duration = "时长"
         case importDate = "导入时间"
         case fileSize = "文件大小"
+        /// 用户自己拖出来的顺序。拖动文件夹排序会自动切到这一档
+        case custom = "自定义"
     }
+    /// 素材区里选中的**文件夹**。跟 `selectedAssetIDs` 分开存 ——
+    /// 混在一起的话删除、移动这些操作会把文件夹当素材误伤
+    @Published var selectedFolderIDs: Set<UUID> = []
     @Published var mediaSortOrder: MediaSortOrder = .importDate
     @Published var mediaSortAscending: Bool = false
     @Published var mediaSearchText: String = ""
@@ -1194,6 +1202,15 @@ final class ProjectState: ObservableObject {
     @Published var showCanvas = false
     /// 聊天区点开的图片/视频，全屏查看用。nil 表示没在看
     @Published var mediaPreview: MediaPreviewItem?
+    /// 输入区 ＋ 菜单：按钮在窗口里的位置（nil = 菜单关着）。
+    /// 菜单挂在窗口最外层渲染，不然比侧栏宽的那半收不到鼠标
+    @Published var plusMenuAnchor: CGRect?
+    /// 菜单里点了什么，聊天面板收到后自己去执行
+    @Published var plusMenuPick: PlusPick?
+    /// 菜单是谁开的：画布上那份会话，还是侧栏那份。
+    /// 画布开着的时候侧栏那个面板**并没有消失**，两个实例都会收到回调 ——
+    /// 不分清楚就会各插一次，界面上冒出两个一样的命令标签
+    @Published var plusMenuFromCanvas = false
     /// 画布的视图状态（缩放/平移/撤销栈）
     let canvas = CanvasState()
     @Published var showSettings = false

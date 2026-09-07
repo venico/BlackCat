@@ -21,6 +21,21 @@ struct SlashCommand: Identifiable, Equatable {
     }
 }
 
+extension SlashCommand {
+    /// 描述拆成中英两行。
+    ///
+    /// 约定 SKILL.md 的 description 写两行：上中文、下英文。
+    /// 老的单行写法照旧只显示一行，英文那行留空
+    var descLines: (zh: String, en: String) {
+        let parts = detail
+            .split(separator: "\n", omittingEmptySubsequences: true)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+        guard let first = parts.first else { return ("", "") }
+        return (first, parts.count > 1 ? parts[1] : "")
+    }
+}
+
 enum SlashCommands {
     /// 当前能用的全部命令：装好的 Skill + 配好 Key 的生成模型
     @MainActor
@@ -173,6 +188,25 @@ extension NSAttributedString.Key {
 /// 纯属性做不出标签：`.backgroundColor` 是方角、贴着字、也没有内边距。
 /// 底色只能自己在这一层画。
 final class ChipLayoutManager: NSLayoutManager {
+    /// 标签右边那颗 × 的边长
+    static let closeWidth: CGFloat = 11
+    /// 画不画那颗 ×。只有输入框里要 —— 已经发出去的气泡是只读的，
+    /// 标签上挂个删不掉的 × 只会让人以为还能改
+    var showsClose = false
+    /// 每颗 × 在哪儿（视图坐标），按标签起点存。
+    ///
+    /// **不能每次 drawBackground 都清空**：局部重绘时 glyphsToShow 只覆盖脏区，
+    /// 不在脏区的标签这一轮不会被重新登记，命中区就丢了 —— 表现是
+    /// 点不中、光标也不变。改成按 key 覆盖，文本变了才整体清
+    private(set) var closeRects: [Int: (range: NSRange, rect: CGRect)] = [:]
+
+    func resetCloseRects() { closeRects.removeAll() }
+
+    /// 点在哪颗 × 上了。给的是**视图坐标**
+    func chipCloseRange(at point: CGPoint) -> NSRange? {
+        closeRects.values.first { $0.rect.contains(point) }?.range
+    }
+
     /// 斜杠一个像素都不画。
     ///
     /// 原来靠 `.foregroundColor = .clear` 藏它，**选中时会露出来** ——
@@ -268,6 +302,29 @@ final class ChipLayoutManager: NSLayoutManager {
                 NSColor.white.withAlphaComponent(0.10).setStroke()
                 path.lineWidth = 1
                 path.stroke()
+
+                guard self.showsClose else { return }
+                // 右边那颗 ×：点它把整段命令删掉，回到没选模型的状态。
+                // 位置记进 closeRects，命中判定在 ChatInputInner.mouseDown 里做 ——
+                // 文本里并没有这个字符，纯画上去的，所以命令解析不受影响
+                let cw = Self.closeWidth
+                // 竖直方向对着**文字的视觉中线**（x-height 的一半），不是框的中心 ——
+                // 框是按 ascender/descender 撑的，中心比小写字母看着高一截
+                let midY = baselineY - f.xHeight / 2
+                let box = NSRect(x: r.maxX - cw - 3, y: midY - cw / 2, width: cw, height: cw)
+                let inset = cw * 0.3
+                let x1 = NSBezierPath()
+                x1.move(to: NSPoint(x: box.minX + inset, y: box.minY + inset))
+                x1.line(to: NSPoint(x: box.maxX - inset, y: box.maxY - inset))
+                x1.move(to: NSPoint(x: box.maxX - inset, y: box.minY + inset))
+                x1.line(to: NSPoint(x: box.minX + inset, y: box.maxY - inset))
+                x1.lineWidth = 1.2
+                x1.lineCapStyle = .round
+                NSColor(Color(hex: "#E8A54B")).withAlphaComponent(0.75).setStroke()
+                x1.stroke()
+
+                // 命中区比图形本身大一圈，好点一些
+                self.closeRects[range.location] = (range, box.insetBy(dx: -3, dy: -3))
             }
         }
     }
@@ -276,7 +333,7 @@ final class ChipLayoutManager: NSLayoutManager {
 extension NSMutableAttributedString {
     /// 把文本里成形的 `/命令` 变成标签：斜杠收掉不显示，名字上主色黄 + 圆角底
     @MainActor
-    func applyCommandChips(fontSize: CGFloat = 12) {
+    func applyCommandChips(fontSize: CGFloat = 12, reserveClose: Bool = false) {
         // 行高取的是这一行里最高的那个字体。斜杠本来就画不出来（透明 + 负字距），
         // 正好拿它当撑杆：给它一个更大的字号，整行就高出来，标签在行内居中放得下，
         // 既不用顶出行外挨裁，也不会压到上下行
@@ -305,8 +362,8 @@ extension NSMutableAttributedString {
                            .font: NSFont.systemFont(ofSize: fontSize),
                            .chipTag: fontSize],
                           range: name)
-            // 末字加 6pt 字距，同样是 4pt 内边距 + 2pt 间距
-            addAttribute(.kern, value: 6,
+            // 末字加字距：4pt 内边距 + 2pt 间距，再给关闭按钮留 \(ChipLayoutManager.closeWidth)pt
+            addAttribute(.kern, value: 6 + (reserveClose ? ChipLayoutManager.closeWidth : 0),
                          range: NSRange(location: name.location + name.length - 1, length: 1))
         }
     }

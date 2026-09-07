@@ -21,8 +21,9 @@ struct AgentAttachment: Identifiable, Equatable {
 }
 
 enum AgentAttachmentIO {
-    /// 能当图片看的
-    static let imageExts: Set<String> = ["png", "jpg", "jpeg", "gif", "webp", "bmp", "tiff", "heic"]
+    /// 能当图片看的。跟 AIVideoService 那张表一致，免得「拖得进画布、
+    /// 却当不了聊天附件」这种对不上的情况
+    static let imageExts: Set<String> = AIVideoService.imageExts
     /// 能读成文字的。二进制不收 —— 塞一堆乱码进提示词只会把模型带偏
     static let textExts: Set<String> = [
         "txt", "md", "markdown", "json", "csv", "tsv", "log", "yml", "yaml", "xml",
@@ -30,9 +31,22 @@ enum AgentAttachmentIO {
         "c", "h", "cpp", "sh", "toml", "ini", "conf", "srt", "vtt"
     ]
 
+    /// 视频 / 音频也收 —— 用户可能还没点名生成模型，先放附件里存着，
+    /// 之后打了 `/命令`，promoteAttachmentsToReference 会按那家支持的类型
+    /// 把它们收进参考区，收不下的继续留在附件
+    static func isMedia(_ url: URL) -> Bool {
+        let e = url.pathExtension.lowercased()
+        return AIVideoService.videoExts.contains(e) || AIVideoService.audioExts.contains(e)
+    }
+
+    /// 能读成文字贴进提示词的
+    static func isTextDoc(_ url: URL) -> Bool {
+        textExts.contains(url.pathExtension.lowercased())
+    }
+
     static func accepts(_ url: URL) -> Bool {
         let e = url.pathExtension.lowercased()
-        return imageExts.contains(e) || textExts.contains(e)
+        return imageExts.contains(e) || textExts.contains(e) || isMedia(url)
     }
 
     static func make(_ url: URL) -> AgentAttachment? {
@@ -40,7 +54,9 @@ enum AgentAttachmentIO {
         if imageExts.contains(e) {
             return AgentAttachment(url: url, thumb: NSImage(contentsOf: url))
         }
-        return textExts.contains(e) ? AgentAttachment(url: url, thumb: nil) : nil
+        // 视频 / 音频没有缩略图，卡片上显示成文件图标
+        return (textExts.contains(e) || isMedia(url))
+            ? AgentAttachment(url: url, thumb: nil) : nil
     }
 
     /// 图片压成 JPEG 再发。原图动辄几 MB，base64 之后更大，
@@ -64,6 +80,22 @@ enum AgentAttachmentIO {
         guard let out = ctx.makeImage() else { return nil }
         return NSBitmapImageRep(cgImage: out)
             .representation(using: .jpeg, properties: [.compressionFactor: 0.8])
+    }
+
+    /// 把粘贴板里的位图存成 PNG。
+    ///
+    /// 放历史记录旁边，别塞系统临时目录 —— 那儿会被清掉，
+    /// 素材库里就成了失效链接
+    static func savePastedImage(_ image: NSImage) -> URL? {
+        guard let tiff = image.tiffRepresentation,
+              let rep = NSBitmapImageRep(data: tiff),
+              let png = rep.representation(using: .png, properties: [:]) else { return nil }
+        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("BlackCat/pasted", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let url = dir.appendingPathComponent("粘贴_\(Int(Date().timeIntervalSince1970)).png")
+        do { try png.write(to: url) } catch { return nil }
+        return url
     }
 
     /// 文本文件读出来，太长的截断 —— 整本日志塞进去会把上下文吃光

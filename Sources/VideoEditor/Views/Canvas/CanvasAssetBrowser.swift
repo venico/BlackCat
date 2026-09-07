@@ -127,6 +127,8 @@ struct CanvasAssetBrowser: View {
             return list.sorted { asc ? $0.date < $1.date : $0.date > $1.date }
         case .fileSize:
             return list.sorted { asc ? $0.fileSize < $1.fileSize : $0.fileSize > $1.fileSize }
+        case .custom:
+            return list   // 自定义排的是素材库的文件夹，这儿保持原顺序
         }
     }
 

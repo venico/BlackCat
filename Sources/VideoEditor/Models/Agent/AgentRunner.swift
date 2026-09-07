@@ -28,6 +28,9 @@ final class AgentRunner: ObservableObject {
         var isError = false
     }
 
+    // 下面这几个 @Published 是**当前正看着那条会话**的镜像。
+    // 真身在 states 里按会话分开存 —— 一条会话在跑，不该让另一条的
+    // 发送按钮变成「停止」，更不该点一下把别人的活儿停了
     @Published var isRunning = false
     @Published var steps: [Step] = []
     /// 这一轮跑了多久。计时器每 0.5 秒推一次
@@ -36,11 +39,57 @@ final class AgentRunner: ObservableObject {
     @Published var totalTokens = 0
     /// 此刻在干什么：「正在思考」还是「正在跑某个工具」
     @Published var phase = ""
-    private var startedAt: Date?
-    private var ticker: Timer?
     @Published var streamingText = ""
     /// 正等着用户点确认的那个工具调用
     @Published var pendingConfirm: PendingConfirm?
+
+    /// 一条会话跑一轮的全部状态
+    private struct RunState {
+        var isRunning = false
+        var runningMessageID: UUID?
+        var steps: [Step] = []
+        var elapsed: TimeInterval = 0
+        var totalTokens = 0
+        var phase = ""
+        var streamingText = ""
+        var pendingConfirm: PendingConfirm?
+        var startedAt: Date?
+        var task: Task<Void, Never>?
+        var ticker: Timer?
+    }
+    private var states: [UUID: RunState] = [:]
+    /// 界面正看着哪条会话
+    private var visibleID: UUID?
+
+    /// 切会话：把镜像换成那条自己的状态
+    func switchTo(_ id: UUID?) {
+        visibleID = id
+        publish(id.flatMap { states[$0] } ?? RunState())
+    }
+
+    private func publish(_ st: RunState) {
+        isRunning = st.isRunning
+        runningMessageID = st.runningMessageID
+        steps = st.steps
+        elapsed = st.elapsed
+        totalTokens = st.totalTokens
+        phase = st.phase
+        streamingText = st.streamingText
+        pendingConfirm = st.pendingConfirm
+    }
+
+    private func mutate(_ id: UUID, _ body: (inout RunState) -> Void) {
+        var st = states[id] ?? RunState()
+        body(&st)
+        states[id] = st
+        if id == visibleID { publish(st) }
+    }
+
+    /// 这一轮挂在哪条会话上。外部（聊天面板）设置正在跑的那条回复用
+    func setRunningMessage(_ msgID: UUID?, in convID: UUID?) {
+        guard let convID else { return }
+        mutate(convID) { $0.runningMessageID = msgID }
+    }
 
     struct PendingConfirm: Identifiable {
         let id = UUID()
@@ -51,12 +100,18 @@ final class AgentRunner: ObservableObject {
 
     /// 一轮最多让它调多少次工具。绕圈子的话到这就停
     private let maxSteps = 24
-    private var task: Task<Void, Never>?
 
+    /// 停的是**当前看着那条**的活儿
     func cancel() {
-        task?.cancel()
-        task = nil
-        isRunning = false
+        guard let id = visibleID else { return }
+        states[id]?.task?.cancel()
+        states[id]?.ticker?.invalidate()
+        mutate(id) {
+            $0.task = nil
+            $0.ticker = nil
+            $0.isRunning = false
+            $0.phase = ""
+        }
     }
 
     /// 中断时也要把抑制标志放掉，否则后面手工操作就再也进不了撤销栈
@@ -73,10 +128,14 @@ final class AgentRunner: ObservableObject {
              project: ProjectState,
              webSearch: Bool = false,
              onFinish: @escaping (String) -> Void) {
-        guard !isRunning else { return }
-        isRunning = true
-        steps = []
-        streamingText = ""
+        // 这一轮归哪条会话。整轮的状态都写进它名下，别的会话不受影响
+        let cid = AIVideoService.shared.currentConversationId ?? UUID()
+        guard states[cid]?.isRunning != true else { return }
+        mutate(cid) {
+            $0.isRunning = true
+            $0.steps = []
+            $0.streamingText = ""
+        }
 
         history.append(.user(prompt, images: images))
         var msgs = history
@@ -100,40 +159,48 @@ final class AgentRunner: ObservableObject {
                    + AgentMemory.shared.promptSection
                    + AgentSkills.shared.promptSection
 
-        startedAt = Date()
-        elapsed = 0
-        totalTokens = 0
-        phase = "正在思考"
-        ticker?.invalidate()
-        ticker = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
-            guard let self, let t = self.startedAt else { return }
-            Task { @MainActor in self.elapsed = Date().timeIntervalSince(t) }
+        let began = Date()
+        states[cid]?.ticker?.invalidate()
+        let ticker = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                self?.mutate(cid) { $0.elapsed = Date().timeIntervalSince(began) }
+            }
+        }
+        mutate(cid) {
+            $0.startedAt = began
+            $0.elapsed = 0
+            $0.totalTokens = 0
+            $0.phase = "正在思考"
+            $0.ticker = ticker
         }
 
-        task = Task { [weak self] in
+        let task = Task { [weak self] in
             guard let self else { return }
             var finalText = ""
             do {
                 for _ in 0..<maxSteps {
                     if Task.isCancelled { break }
-                    self.phase = "正在思考"
+                    self.mutate(cid) { $0.phase = "正在思考" }
                     let turn = try await AgentLLM.send(messages: msgs, tools: tools,
                                                        systemPrompt: system, webSearch: webSearch)
-                    self.totalTokens += turn.tokens
+                    self.mutate(cid) { $0.totalTokens += turn.tokens }
                     if !turn.text.isEmpty {
                         finalText = turn.text
-                        self.streamingText = turn.text
+                        self.mutate(cid) { $0.streamingText = turn.text }
                     }
                     guard !turn.toolCalls.isEmpty else { break }
                     msgs.append(.assistant(text: turn.text, calls: turn.toolCalls))
 
                     for call in turn.toolCalls {
                         if Task.isCancelled { break }
-                        self.phase = AgentPhaseText.phase(for: call.name)
-                        let result = await self.execute(call, mode: mode, project: project)
-                        self.steps.append(Step(toolName: call.name,
-                                               summary: String(result.text.prefix(120)),
-                                               isError: result.isError))
+                        self.mutate(cid) { $0.phase = AgentPhaseText.phase(for: call.name) }
+                        let result = await self.execute(call, mode: mode, project: project,
+                                                        convID: cid)
+                        self.mutate(cid) {
+                            $0.steps.append(Step(toolName: call.name,
+                                                 summary: String(result.text.prefix(120)),
+                                                 isError: result.isError))
+                        }
                         msgs.append(.toolResult(callID: call.id, name: call.name,
                                                 text: result.text, imageData: result.imageData))
                     }
@@ -142,24 +209,29 @@ final class AgentRunner: ObservableObject {
                 // 用户自己按的停止，不该报成错
                 let cancelled = error.isUserCancellation
                 finalText = cancelled ? "已取消" : "出错了：\(error.localizedDescription)"
-                self.steps.append(Step(toolName: "模型", summary: finalText, isError: !cancelled))
+                self.mutate(cid) {
+                    $0.steps.append(Step(toolName: "模型", summary: finalText, isError: !cancelled))
+                }
             }
             if !finalText.isEmpty { msgs.append(.assistant(text: finalText, calls: [])) }
             project.suppressUndoPush = false
-            self.ticker?.invalidate()
-            self.ticker = nil
-            if let t = self.startedAt { self.elapsed = Date().timeIntervalSince(t) }
-            self.phase = ""
-            self.isRunning = false
+            self.states[cid]?.ticker?.invalidate()
+            self.mutate(cid) {
+                $0.ticker = nil
+                $0.elapsed = Date().timeIntervalSince(began)
+                $0.phase = ""
+                $0.isRunning = false
+            }
             onFinish(finalText)
         }
+        mutate(cid) { $0.task = task }
         history = msgs
     }
 
     // MARK: - 单个工具
 
     private func execute(_ call: AgentToolCall, mode: AgentMode,
-                         project: ProjectState) async -> AgentToolResult {
+                         project: ProjectState, convID: UUID) async -> AgentToolResult {
         let all = AgentToolbox.readTools + AgentToolbox.editTools
                 + AgentToolbox.generateTools + AgentToolbox.skillTools
                 + AgentToolbox.shellTools + AgentToolbox.searchTools
@@ -169,7 +241,7 @@ final class AgentRunner: ObservableObject {
         // 模式先拦一道
         if let reason = mode.rejection(for: spec.risk) { return .fail(reason) }
         if mode.needsConfirm(for: spec.risk) {
-            let ok = await confirm(spec.name, detail: describe(call))
+            let ok = await confirm(spec.name, detail: describe(call), convID: convID)
             guard ok else { return .fail("用户拒绝了这一步，换个做法或者停下来问问他。") }
         }
 
@@ -194,11 +266,13 @@ final class AgentRunner: ObservableObject {
         return .fail("工具 \(call.name) 还没接上。")
     }
 
-    private func confirm(_ tool: String, detail: String) async -> Bool {
+    private func confirm(_ tool: String, detail: String, convID: UUID) async -> Bool {
         await withCheckedContinuation { cont in
-            pendingConfirm = PendingConfirm(toolName: tool, detail: detail) { [weak self] ok in
-                self?.pendingConfirm = nil
-                cont.resume(returning: ok)
+            mutate(convID) {
+                $0.pendingConfirm = PendingConfirm(toolName: tool, detail: detail) { [weak self] ok in
+                    self?.mutate(convID) { $0.pendingConfirm = nil }
+                    cont.resume(returning: ok)
+                }
             }
         }
     }

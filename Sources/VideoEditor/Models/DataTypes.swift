@@ -43,6 +43,24 @@ enum AssetType: String, Codable {
 
 // MARK: - Media Asset
 
+/// 素材库里的虚拟文件夹。
+///
+/// **只是分组，不动磁盘**：素材文件还在原处，文件夹只记「谁归谁」。
+/// 每个标签页（视频/音频/图片/字幕）各有各的文件夹，互不串
+struct LibraryFolder: Identifiable, Equatable, Codable {
+    var id = UUID()
+    var name: String
+    var type: AssetType
+    var createdAt = Date()
+    /// 自定义颜色。nil = 默认那身灰
+    var colorHex: String?
+    /// 自定义排序里的位次。拖动排序时改它
+    var sortIndex: Int = 0
+    /// 上一级文件夹。nil = 就在根一层。**Optional 是有意的**：
+    /// 旧存档里没这个字段，合成解码走 decodeIfPresent，缺了就是 nil
+    var parentID: UUID?
+}
+
 struct MediaAsset: Identifiable, Equatable, Codable {
     var id = UUID()
     var url: URL
@@ -51,6 +69,8 @@ struct MediaAsset: Identifiable, Equatable, Codable {
     var duration: Double = 0
     var importDate: Date?
     var fileSize: Int64?
+    /// 归在哪个虚拟文件夹下。nil = 放在根一层
+    var folderID: UUID?
     var fileExists: Bool { FileManager.default.fileExists(atPath: url.path) }
     static func == (lhs: MediaAsset, rhs: MediaAsset) -> Bool { lhs.id == rhs.id }
 }

@@ -1013,7 +1013,17 @@ struct SettingsView: View {
                     .font(.system(size: 10))
                     .foregroundColor(Color.labelSecondary.opacity(0.6))
                     .lineLimit(1)
+                // 只露中文那一行（约定 SKILL.md 的 description 上中下英）。
+                // 英文和被截掉的部分都在 .help 气泡里
+                let lines = skillDescLines(sk)
+                if !lines.zh.isEmpty {
+                    Text(lines.zh)
+                        .font(.system(size: 10))
+                        .foregroundColor(Color.labelSecondary.opacity(0.6))
+                        .lineLimit(1)
+                }
             }
+            .help(sk.description)
 
             Spacer()
 
@@ -1040,6 +1050,17 @@ struct SettingsView: View {
     }
 
     /// 副标题里塞作者、更新时间和描述 —— 一行说清这是谁的、多新、干什么
+    /// 描述拆成中英两行，跟聊天框 ＋ 菜单里用的是同一套约定
+    private func skillDescLines(_ sk: AgentSkill) -> (zh: String, en: String) {
+        let parts = sk.description
+            .split(separator: "\n", omittingEmptySubsequences: true)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+        guard let first = parts.first else { return ("", "") }
+        return (first, parts.count > 1 ? parts[1] : "")
+    }
+
+    /// 只放元信息，描述另起两行 —— 挤在一行里描述基本看不见
     private func skillSubtitle(_ sk: AgentSkill) -> String {
         var parts: [String] = [sk.author]
         if sk.updatedAt > .distantPast {
@@ -1047,7 +1068,6 @@ struct SettingsView: View {
             f.dateFormat = "yy/M/d"
             parts.append("更新于 " + f.string(from: sk.updatedAt))
         }
-        if !sk.description.isEmpty { parts.append(sk.description) }
         return parts.joined(separator: " · ")
     }
 

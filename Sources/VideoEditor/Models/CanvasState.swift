@@ -168,6 +168,13 @@ final class CanvasState: ObservableObject {
     /// **不用 @Published**：拖动调卡片尺寸时每帧都在变，发布出去等于每帧重绘画布。
     /// 也不用 onHover 判断，那个在快速移动时会漏掉 exit，漏一次画布就再也滚不动
     var chatCardRect: CGRect = .zero
+
+    /// 最近一次点击落在会话卡片里没有。
+    ///
+    /// ⌘V 这类键盘事件没有位置，只能靠它分流。**不能只看 firstResponder** ——
+    /// 卡片里那个 NSTextView 会一直占着，点了画布空白也不放手
+    /// （`makeFirstResponder(nil)` 常常当场被还回去）
+    var chatCardFocused = false
     /// 画布标题，历史列表里显示
     @Published var title: String = "未命名画布"
 
@@ -992,7 +999,11 @@ final class CanvasState: ObservableObject {
         // 走默认的 1:1 会把 16:9 的视频塞进方卡片里
         let new = addNode(kind: kind, at: pos, ratio: CanvasNode.originalRatio)
         updateNode(id: new.id) { $0.mediaPath = url.path }
-        project?.importFile(url)
+        // 已经在库里就别再导 —— 生成产物落卡片时早进过一次，
+        // 重复导入会冒一条「已跳过重复素材」
+        if project?.mediaAssets.contains(where: { $0.url == url }) != true {
+            project?.importFile(url)
+        }
         if let asset = project?.mediaAssets.first(where: { $0.url == url }) {
             updateNode(id: new.id) { $0.assetID = asset.id }
         }
@@ -1072,10 +1083,19 @@ final class CanvasState: ObservableObject {
     /// 画布自己复制过卡片就粘卡片，否则看系统剪贴板
     var canPaste: Bool { !clipboard.isEmpty || systemPasteboardHasContent }
 
+    /// 画布内部复制那份的时间戳（对应系统剪贴板的 changeCount）
+    var clipboardStamp: Int = -1
+
+    /// 粘贴。**谁新用谁** —— 内部复制过卡片之后又在别处复制了文字，
+    /// 无脑优先内部那份的话，粘出来的是上次那张卡片，跟手里复制的东西对不上
     @discardableResult
     func pasteHere(at point: CGPoint? = nil) -> Bool {
+        let systemIsNewer = NSPasteboard.general.changeCount > clipboardStamp
+        if !clipboard.isEmpty, !systemIsNewer { paste(); return true }
+        if pasteFromPasteboard(at: point) { return true }
+        // 系统剪贴板里没有能落成卡片的东西，退回内部那份
         if !clipboard.isEmpty { paste(); return true }
-        return pasteFromPasteboard(at: point)
+        return false
     }
 
     /// 系统剪贴板里的东西落成卡片：文件、图片位图、纯文字都收
@@ -1089,7 +1109,8 @@ final class CanvasState: ObservableObject {
             return dropFiles(urls, at: point) > 0
         }
         // ② 截图这类是内存里的位图，得先落成文件才能进素材库
-        if let img = NSImage(pasteboard: pb), let url = saveToPasted(img) {
+        if let img = NSImage(pasteboard: pb),
+           let url = AgentAttachmentIO.savePastedImage(img) {
             dropGeneratedMedia(url: url, kind: .image, at: point)
             return true
         }
@@ -1103,19 +1124,7 @@ final class CanvasState: ObservableObject {
         return false
     }
 
-    /// 把粘贴板里的位图存成 PNG。跟历史记录放一块，别塞进系统临时目录 ——
-    /// 那儿会被清掉，素材库里就成了失效链接
-    private func saveToPasted(_ image: NSImage) -> URL? {
-        guard let tiff = image.tiffRepresentation,
-              let rep = NSBitmapImageRep(data: tiff),
-              let png = rep.representation(using: .png, properties: [:]) else { return nil }
-        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("BlackCat/pasted", isDirectory: true)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        let url = dir.appendingPathComponent("粘贴_\(Int(Date().timeIntervalSince1970)).png")
-        do { try png.write(to: url) } catch { return nil }
-        return url
-    }
+
 
     /// 上游完成后，把等着它的下游拉起来
     private func resumeWaitingNodes(provider: AIVideoService.Provider, settings: AppSettings) {

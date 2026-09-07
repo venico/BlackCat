@@ -660,7 +660,11 @@ private struct CanvasSurface: View {
             ctxLocation = viewPoint
             return
         }
-        ctxLocation = nil   // 点在空白处：不弹菜单
+        // 点在空白处也弹，只是菜单里只剩「粘贴」这类不依赖选中目标的项 ——
+        // 空白右键正是要往这儿粘东西的时候
+        ctxTargets = []
+        ctxGroupID = nil
+        ctxLocation = viewPoint
     }
 
     /// 落一个节点。从某个节点的 + 点出来的，自动连上去
@@ -1291,10 +1295,29 @@ struct CanvasKeyMonitor: ViewModifier {
             // ⌘C / ⌘V。正在输入文字时不拦 —— 那时候归输入框自己复制粘贴
             if event.type == .keyDown, !editing,
                event.modifierFlags.contains(.command) {
-                // 光标在某个能编辑的文本框里（聊天卡片的输入框就是）：
-                // 复制粘贴是它的事，别把剪贴板里的东西落成画布卡片。
-                // 只认 isEditable —— 会话里那片只读的回复区不算
-                if let tv = w.firstResponder as? NSTextView, tv.isEditable { return event }
+                // 焦点在**聊天卡片的输入框**里才让给它。
+                //
+                // 原来只判断「是不是可编辑文本框」，而那个 NSTextView 会长期
+                // 占着 firstResponder（卡片收起了也占着）—— 结果画布再也粘不了东西。
+                // 现在还要求它确实落在卡片那块地方上，卡片收起时 rect 是 zero，
+                // 一律归画布
+                // 焦点在能编辑的文本框里就让给它，但**会话卡片要单独判断**：
+                // 它那个 NSTextView 会长期霸着 firstResponder，点了画布空白
+                // 也不放手，只认焦点的话画布就再也粘不了东西。
+                // 节点的提示词栏、文本卡片没这毛病，焦点在就是在
+                if let tv = w.firstResponder as? NSTextView, tv.isEditable,
+                   let content = w.contentView {
+                    let inWindow = tv.convert(tv.bounds, to: nil)
+                    let inContent = content.convert(inWindow, from: nil)
+                    let r = content.isFlipped
+                        ? inContent
+                        : CGRect(x: inContent.minX,
+                                 y: content.bounds.height - inContent.maxY,
+                                 width: inContent.width, height: inContent.height)
+                    let isChatCard = !canvas.chatCardRect.isEmpty
+                                  && canvas.chatCardRect.intersects(r)
+                    if isChatCard ? canvas.chatCardFocused : true { return event }
+                }
                 switch event.charactersIgnoringModifiers?.lowercased() {
                 case "c":
                     let ids = canvas.selectedGroupID.map { canvas.nodeIDs(inGroup: $0) }
@@ -1362,6 +1385,22 @@ struct CanvasKeyMonitor: ViewModifier {
             return nil   // 吞掉，免得底下的时间轴拿去播放/暂停
         }
 
+        // 点在画布上（不是聊天卡片）就把键盘焦点从输入框收回来。
+        // 不收的话它一直是 firstResponder，⌘V / delete 这些永远轮不到画布
+        let focusMonitor = NSEvent.addLocalMonitorForEvents(matching: .leftMouseDown) { event in
+            guard let w = event.window,
+                  WindowManager.shared.id(of: w) == windowID,
+                  let content = w.contentView
+            else { return event }
+            let inContent = content.convert(event.locationInWindow, from: nil)
+            let pt = content.isFlipped
+                ? inContent
+                : CGPoint(x: inContent.x, y: content.bounds.height - inContent.y)
+            canvas.chatCardFocused = !canvas.chatCardRect.isEmpty
+                                   && canvas.chatCardRect.contains(pt)
+            return event
+        }
+
         let scrollMonitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { event in
             guard let w = event.window,
                   WindowManager.shared.id(of: w) == windowID else { return event }
@@ -1422,6 +1461,16 @@ struct CanvasKeyMonitor: ViewModifier {
             // 不放行的话这条 monitor 会一律吞掉，面板上的 .contextMenu 永远弹不出来
             if canvas.assetPanelHovered { return event }
 
+            // 指针在 Agent 会话卡片上：右键归卡片里的输入框 / 消息自己。
+            // 这条 monitor 是一律吞的，不放行的话会话里右键完全没反应
+            if !canvas.chatCardRect.isEmpty, let content = w.contentView {
+                let inContent = content.convert(event.locationInWindow, from: nil)
+                let pt = content.isFlipped
+                    ? inContent
+                    : CGPoint(x: inContent.x, y: content.bounds.height - inContent.y)
+                if canvas.chatCardRect.contains(pt) { return event }
+            }
+
             let winH = w.contentView?.bounds.height ?? 0
             let containerH = max(1, winH - canvas.topGap)
             let viewPoint = CGPoint(x: event.locationInWindow.x, y: containerH - event.locationInWindow.y)
@@ -1448,6 +1497,7 @@ struct CanvasKeyMonitor: ViewModifier {
 
         WindowManager.shared.setCanvasSpaceMonitor(keyMonitor, for: windowID)
         WindowManager.shared.setCanvasScrollMonitor(scrollMonitor, for: windowID)
+        WindowManager.shared.setCanvasFocusMonitor(focusMonitor, for: windowID)
         WindowManager.shared.setCanvasRightClickMonitor(rightMonitor, for: windowID)
     }
 
@@ -1461,6 +1511,7 @@ struct CanvasKeyMonitor: ViewModifier {
         canvas.isSpaceHeld = false
         WindowManager.shared.setCanvasSpaceMonitor(nil, for: windowID)
         WindowManager.shared.setCanvasScrollMonitor(nil, for: windowID)
+        WindowManager.shared.setCanvasFocusMonitor(nil, for: windowID)
         WindowManager.shared.setCanvasRightClickMonitor(nil, for: windowID)
     }
 }

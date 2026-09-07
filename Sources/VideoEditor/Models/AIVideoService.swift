@@ -581,9 +581,92 @@ final class AIVideoService: ObservableObject {
     @Published var agentInputText: String = ""
     @Published var agentAttachments: [AgentAttachment] = []
 
-    static let imageExts: Set<String> = ["jpg","jpeg","png","gif","bmp","tiff","webp","heic"]
-    static let videoExts: Set<String> = ["mp4","mov","m4v","avi","mkv","webm"]
-    static let audioExts: Set<String> = ["mp3","wav","m4a","aac","flac","ogg"]
+    // MARK: - 每条会话自己的输入状态
+    //
+    // 草稿、附件、参考内容原来是单例上的**一份**，侧栏和画布卡片共用 ——
+    // 在普通会话里粘的附件会跑到画布的聊天里去。改成切会话时存走 / 取回。
+
+    private struct InputDraft {
+        var text = ""
+        var attachments: [AgentAttachment] = []
+        var references: [RefContent] = []
+        var firstFrame: (url: URL, image: NSImage)?
+        var lastFrame: (url: URL, image: NSImage)?
+        var imageMode: ImageInputMode = .reference
+        // 生成参数也是各会话各一套。nil = 这条会话没设过，沿用当前值
+        var duration: String?
+        var ratio: String?
+        var imageRatio: String?
+        var resolution: String?
+        var agentMode: AgentMode?
+        var provider: Provider?
+        /// 子模型 / 推理强度是按供应商存的，整份带走
+        var providerModels: [String: String]?
+        var providerReasonings: [String: String]?
+    }
+    private var inputDrafts: [UUID: InputDraft] = [:]
+
+    /// 把手上这份存到当前会话名下
+    private func stashInputDraft() {
+        guard let id = currentConversationId else { return }
+        inputDrafts[id] = InputDraft(text: agentInputText,
+                                     attachments: agentAttachments,
+                                     references: referenceContents,
+                                     firstFrame: firstFrameImage,
+                                     lastFrame: lastFrameImage,
+                                     imageMode: imageMode,
+                                     duration: settings.aiDuration,
+                                     ratio: settings.aiRatio,
+                                     imageRatio: settings.aiImageRatio,
+                                     resolution: settings.aiResolution,
+                                     agentMode: settings.agentMode,
+                                     provider: selectedProvider,
+                                     providerModels: settings.snapshotProviderModels(),
+                                     providerReasonings: settings.snapshotProviderReasonings())
+    }
+
+    /// 换成这条会话自己那份（没有就是空的）
+    private func restoreInputDraft(_ id: UUID) {
+        // Agent 的运行状态也各会话一份，镜像跟着切 ——
+        // 不切的话 A 会话在跑，B 的发送按钮也显示成「停止」
+        // 这条路径本来就在主线程上跑，同步切 —— 用 Task 异步切会晚一拍，
+        // 界面先闪一下上一条会话的运行状态
+        MainActor.assumeIsolated { AgentRunner.shared.switchTo(id) }
+        let d = inputDrafts[id] ?? InputDraft()
+        agentInputText = d.text
+        agentAttachments = d.attachments
+        referenceContents = d.references
+        firstFrameImage = d.firstFrame
+        lastFrameImage = d.lastFrame
+        imageMode = d.imageMode
+        // 生成参数写回全局那份：界面各处照旧读 settings，不用改读取点。
+        // 没设过（nil）就不动，沿用当前值
+        if let v = d.duration { settings.aiDuration = v }
+        if let v = d.ratio { settings.aiRatio = v }
+        if let v = d.imageRatio { settings.aiImageRatio = v }
+        if let v = d.resolution { settings.aiResolution = v }
+        if let v = d.agentMode { settings.agentMode = v }
+        if let v = d.provider { selectedProvider = v }
+        // 这两份必须整份写回（包括「没记录就清空」），
+        // 否则上一条会话选的子模型会渗到这条来
+        if let m = d.providerModels { settings.restoreProviderModels(m) }
+        if let r = d.providerReasonings { settings.restoreProviderReasonings(r) }
+    }
+
+    // 三张表管着「这文件算不算素材」：拖入、粘贴、导入、落成画布卡片都查它。
+    // 按 ffmpeg 实际能吃的常见容器列，不要只列最眼熟那几个 ——
+    // 漏一个的表现是「拖进去 / 粘进去毫无反应」，用户根本不知道为什么
+    static let imageExts: Set<String> = [
+        "jpg","jpeg","jfif","png","gif","bmp","tif","tiff","webp","heic","heif","avif","ico"
+    ]
+    static let videoExts: Set<String> = [
+        "mp4","mov","m4v","avi","mkv","webm","flv","wmv","mpg","mpeg","m2v",
+        "ts","m2ts","mts","3gp","3g2","ogv","asf","vob","rm","rmvb","f4v","divx"
+    ]
+    static let audioExts: Set<String> = [
+        "mp3","wav","m4a","aac","flac","ogg","oga","opus","wma","aiff","aif","aifc",
+        "ac3","eac3","amr","ape","caf","mka","wv","dts","mp2","au","voc"
+    ]
 
     enum AddReferenceResult {
         case added
@@ -743,6 +826,18 @@ final class AIVideoService: ObservableObject {
             selectedProvider = p
         }
         loadHistory()
+        selectFirstConversation()
+    }
+
+    /// 启动时把第一条标成选中（列表里有底色），**页面仍停在历史列表**。
+    ///
+    /// 只设 id 不载 messages 是不行的 —— 那会让「当前是哪条」和手里的消息对不上，
+    /// 点进去看到的是别人的记录。所以照常走 loadConversation，
+    /// 只是不切页面。这会儿 messages 还是空的，它开头那次
+    /// saveCurrentConversation 不会写任何东西
+    private func selectFirstConversation() {
+        guard let first = history.first else { return }
+        loadConversation(first.id)
     }
 
     /// 发起一次生成，返回任务 id（画布要用它做取消/重试和依赖调度）。
@@ -993,11 +1088,13 @@ final class AIVideoService: ObservableObject {
         // 手上那条先存了再走，顺手把消息清空 —— 只改 id 不清 messages 的话，
         // 新画布的聊天区里会挂着上一条会话的记录（画布里那张卡片直接就看得见）
         saveCurrentConversation()
+        stashInputDraft()
         let id = UUID()
         history.insert(ConversationRecord(id: id, title: "未命名画布", createdAt: Date(),
                                           entries: [], canvas: .init()), at: 0)
         // 画布跟聊天一样算「当前会话」，否则历史列表的高亮会一直停在上次那条对话上
         currentConversationId = id
+        restoreInputDraft(id)       // 新会话：草稿附件都是空的
         messages.removeAll()
         saveHistoryToDisk()
         return id
@@ -1021,11 +1118,13 @@ final class AIVideoService: ObservableObject {
     /// 看着像没生效
     func newConversation() {
         saveCurrentConversation()
+        stashInputDraft()
         messages.removeAll()
         let id = UUID()
         history.insert(ConversationRecord(id: id, title: "新对话", createdAt: Date(),
                                           entries: [], canvas: nil), at: 0)
         currentConversationId = id
+        restoreInputDraft(id)       // 新会话：草稿附件都是空的
         saveHistoryToDisk()
     }
 
@@ -1033,9 +1132,17 @@ final class AIVideoService: ObservableObject {
 
     /// 用户那条消息先落进会话，Agent 回答回来再补一条
     @discardableResult
-    func appendUserEntry(_ text: String) -> UUID {
+    /// 造一条附件记录。书签一起带上 —— 用户之后挪了文件也还认得
+    func makeAttachment(url: URL, kind: AttachmentKind) -> Attachment {
+        Attachment(url: url, kind: kind, bookmark: createBookmark(for: url))
+    }
+
+    /// `attachments` 是这一轮挂上去的参考图 / 参考内容 / 普通附件。
+    /// 不带的话发出去的气泡是光秃秃一行字，翻记录根本看不出当时给了什么图
+    func appendUserEntry(_ text: String, attachments: [Attachment] = []) -> UUID {
         if currentConversationId == nil { newConversation() }
-        let msg = ChatMessage(role: .user, content: text)
+        var msg = ChatMessage(role: .user, content: text)
+        msg.attachments = attachments
         messages.append(msg)
         persist(msg, isUser: true, steps: nil)
         return msg.id
@@ -1123,8 +1230,10 @@ final class AIVideoService: ObservableObject {
 
     func loadConversation(_ id: UUID) {
         saveCurrentConversation()
+        stashInputDraft()
         guard let conv = history.first(where: { $0.id == id }) else { return }
         currentConversationId = conv.id
+        restoreInputDraft(conv.id)
         messages = conv.entries.map { entry in
             if entry.isUser {
                 var msg = ChatMessage(id: entry.id, role: .user, content: entry.text)
@@ -1132,19 +1241,19 @@ final class AIVideoService: ObservableObject {
                 return msg
             } else {
                 if let url = resolveMediaURL(path: entry.videoPath, bookmark: entry.videoBookmark) {
-                    var msg = ChatMessage(role: .assistant, content: entry.text, videoURL: url, status: .completed(url: url))
+                    var msg = ChatMessage(id: entry.id, role: .assistant, content: entry.text, videoURL: url, status: .completed(url: url))
                     msg.videoBookmark = entry.videoBookmark
                     return msg
                 } else if let url = resolveMediaURL(path: entry.imagePath, bookmark: entry.imageBookmark) {
-                    var msg = ChatMessage(role: .assistant, content: entry.text, imageURL: url, status: .completedImage(url: url))
+                    var msg = ChatMessage(id: entry.id, role: .assistant, content: entry.text, imageURL: url, status: .completedImage(url: url))
                     msg.imageBookmark = entry.imageBookmark
                     return msg
                 } else if let url = resolveMediaURL(path: entry.audioPath, bookmark: entry.audioBookmark) {
-                    var msg = ChatMessage(role: .assistant, content: entry.text, audioURL: url, status: .completedAudio(url: url))
+                    var msg = ChatMessage(id: entry.id, role: .assistant, content: entry.text, audioURL: url, status: .completedAudio(url: url))
                     msg.audioBookmark = entry.audioBookmark
                     return msg
                 } else {
-                    var msg = ChatMessage(role: .assistant, content: entry.text,
+                    var msg = ChatMessage(id: entry.id, role: .assistant, content: entry.text,
                                           status: entry.failedError.map { .failed(error: $0) } ?? .idle)
                     msg.agentSteps = entry.agentSteps
                     msg.agentElapsed = entry.agentElapsed

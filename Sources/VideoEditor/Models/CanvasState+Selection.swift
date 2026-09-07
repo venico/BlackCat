@@ -176,6 +176,9 @@ extension CanvasState {
         // 只带**两端都在选中集里**的线；连到集合外的线粘出来会指向别人的卡片
         clipboard = Clipboard(nodes: picked,
                               edges: edges.filter { ids.contains($0.from) && ids.contains($0.to) })
+        // 记下此刻系统剪贴板的版本号：之后粘贴时靠它分辨
+        // 「画布内部这份」和「系统剪贴板」谁更新
+        clipboardStamp = NSPasteboard.general.changeCount
     }
 
     func paste() {

@@ -19,6 +19,11 @@ final class MediaLibrary: ObservableObject {
         didSet { scheduleSave() }
     }
 
+    /// 虚拟文件夹。只管分组，磁盘上什么都不动
+    @Published var folders: [LibraryFolder] = [] {
+        didSet { scheduleSave() }
+    }
+
     /// 保持 security scope 的 URL，app 活着期间不释放
     private var accessedURLs: [URL] = []
     private var saveWorkItem: DispatchWorkItem?
@@ -42,6 +47,13 @@ final class MediaLibrary: ObservableObject {
         var importDate: Date?
         var fileSize: Int64?
         var bookmark: Data?
+        var folderID: UUID?
+    }
+
+    /// 盘上的整份。老版本存的是**裸数组**，解不出这个结构时按老格式再试一次
+    private struct StoredLibrary: Codable {
+        var assets: [StoredAsset]
+        var folders: [LibraryFolder]
     }
 
     private var fileURL: URL {
@@ -74,9 +86,11 @@ final class MediaLibrary: ObservableObject {
                         fileSize: a.fileSize,
                         bookmark: try? a.url.bookmarkData(options: .withSecurityScope,
                                                           includingResourceValuesForKeys: nil,
-                                                          relativeTo: nil))
+                                                          relativeTo: nil),
+                        folderID: a.folderID)
         }
-        guard let data = try? JSONEncoder().encode(stored) else {
+        guard let data = try? JSONEncoder().encode(StoredLibrary(assets: stored,
+                                                                 folders: folders)) else {
             DiagLog.log("[素材库] 编码失败，未保存")
             return
         }
@@ -88,8 +102,18 @@ final class MediaLibrary: ObservableObject {
     }
 
     private func load() {
-        guard let data = try? Data(contentsOf: fileURL),
-              let stored = try? JSONDecoder().decode([StoredAsset].self, from: data) else {
+        guard let data = try? Data(contentsOf: fileURL) else {
+            migrateFromLegacyDefaults()
+            return
+        }
+        let stored: [StoredAsset]
+        if let lib = try? JSONDecoder().decode(StoredLibrary.self, from: data) {
+            stored = lib.assets
+            folders = lib.folders
+        } else if let old = try? JSONDecoder().decode([StoredAsset].self, from: data) {
+            // 老格式：一个裸数组，那会儿还没有文件夹
+            stored = old
+        } else {
             migrateFromLegacyDefaults()
             return
         }
@@ -113,9 +137,11 @@ final class MediaLibrary: ObservableObject {
             }
             // 文件不在了也保留条目 —— 让用户看得见「丢失」并能重新链接，
             // 直接丢掉的话时间轴片段会莫名其妙找不到源
+            // folderID 一定要接回来 —— save 是写了的，这儿漏掉的话
+            // 每次重启所有素材都退回根一层，看着就像「文件夹被清空了」
             restored.append(MediaAsset(id: s.id, url: url, name: s.name, type: s.type,
                                        duration: s.duration, importDate: s.importDate,
-                                       fileSize: s.fileSize))
+                                       fileSize: s.fileSize, folderID: s.folderID))
         }
         assets = restored
         saveWorkItem?.cancel()   // load 触发的 didSet 不必回写
@@ -174,6 +200,35 @@ final class MediaLibrary: ObservableObject {
 
         if !added.isEmpty { assets.append(contentsOf: added) }
         return remap
+    }
+
+    // MARK: - 文件夹
+
+    /// 在 `parent` 这一层新建一个文件夹，顺手把给定的素材和子文件夹收进去
+    ///（macOS 上那条「新建包含所选项目的文件夹」）。
+    /// 名字自动避重，只在同一层里论
+    @discardableResult
+    func makeFolder(type: AssetType, parent: UUID?,
+                    collectingAssets assetIDs: Set<UUID> = [],
+                    folders folderIDs: Set<UUID> = []) -> LibraryFolder {
+        var name = "新建文件夹"
+        var n = 2
+        let taken = Set(folders.filter { $0.type == type && $0.parentID == parent }.map(\.name))
+        while taken.contains(name) { name = "新建文件夹 \(n)"; n += 1 }
+        let folder = LibraryFolder(name: name, type: type, parentID: parent)
+        folders.append(folder)
+
+        if !assetIDs.isEmpty {
+            for i in assets.indices where assetIDs.contains(assets[i].id) {
+                assets[i].folderID = folder.id
+            }
+        }
+        if !folderIDs.isEmpty {
+            for i in folders.indices where folderIDs.contains(folders[i].id) {
+                folders[i].parentID = folder.id
+            }
+        }
+        return folder
     }
 
     // MARK: - 增删

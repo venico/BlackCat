@@ -2,6 +2,11 @@ import SwiftUI
 import UniformTypeIdentifiers
 
 struct MediaLibraryView: View {
+    /// 侧栏总宽（含左侧 44pt 图标栏）。宫格的列数和列间距按它算
+    var sidebarWidth: CGFloat = 320
+
+    /// 文件夹列表和颜色都读它。不观察的话改完颜色 / 改完名界面纹丝不动
+    @ObservedObject private var library = MediaLibrary.shared
     @EnvironmentObject private var project: ProjectState
     /// 拖入接收区按窗口登记，多窗口时各认各的
     @Environment(\.windowID) private var windowID
@@ -14,8 +19,10 @@ struct MediaLibraryView: View {
     private var isShapeTab: Bool { project.mediaLibraryTab == "library" && project.libraryCategory == "shape" }
 
     /// 只有视频和图片有缩略图可看，能在两种视图之间切
+    /// 四个素材标签页都能在宫格 / 列表之间切。
+    /// 音频和字幕没有画面，宫格里用分类图标顶上（跟空状态那张同一套 SVG）
     private var canSwitchViewMode: Bool {
-        selectedAssetType == .video || selectedAssetType == .image
+        project.currentLibraryAssetType != nil
     }
 
     /// 素材库里六个标签页，按用户定的顺序
@@ -32,8 +39,66 @@ struct MediaLibraryView: View {
         }
     }
 
+    /// 当前进到哪个虚拟文件夹里。nil = 根一层
+    @State private var currentFolderID: UUID?
+    /// 正在重命名的文件夹
+    @State private var renamingFolderID: UUID?
+    @State private var folderDraftName = ""
+    @FocusState private var folderNameFocused: Bool
+    /// 每个文件夹格子占的地方（窗口坐标），拖素材进来靠它命中
+    @State private var folderRects: [UUID: CGRect] = [:]
+    /// 拖着素材正悬在哪个文件夹上
+    @State private var folderDropTarget: UUID?
+    /// 鼠标悬在哪个文件夹上（前盖会做「要打开」的动效）
+    @State private var folderHover: UUID?
+    /// 框选：每个素材格子占的地方（素材区坐标系）
+    @State private var assetRects: [UUID: CGRect] = [:]
+    @State private var marqueeStart: CGPoint?
+    @State private var marqueeEnd: CGPoint?
+    /// 起框那一刻已经选中的那些。按住 shift/⌘ 拉框是**往上加**，不是重选
+    @State private var marqueeBase: Set<UUID> = []
+    @State private var marqueeFolderBase: Set<UUID> = []
+    /// 正在被拖走的那个文件夹。原位留个淡影，跟 iOS 主屏一个意思
+    @State private var draggingFolder: UUID?
+    /// 上一次让位时压在谁身上。每帧都会回调，不记一笔会来回抽搐
+    @State private var lastReorderTarget: UUID?
+    /// 拖着文件夹压在谁的正中间 —— 松手就搬进它里头当子文件夹
+    @State private var folderNestCandidate: UUID?
+    /// 路径栏上鼠标停在哪一级
+    @State private var crumbHover: UUID?
+    @State private var crumbBackHover = false
+
+    /// 这一下点击（或起框）是不是「加减选」。
+    /// SwiftUI 的 tap 手势不带修饰键，只能现问 NSEvent 当前按着什么
+    static var additiveClick: Bool {
+        let f = NSEvent.modifierFlags
+        return f.contains(.shift) || f.contains(.command)
+    }
+
+    private var marqueeRect: CGRect? {
+        guard let a = marqueeStart, let b = marqueeEnd else { return nil }
+        return CGRect(x: min(a.x, b.x), y: min(a.y, b.y),
+                      width: abs(a.x - b.x), height: abs(a.y - b.y))
+    }
+
+    /// 这个标签页下、当前这一层的文件夹（`parentID` 指着我们正待着的那层）
+    private var visibleFolders: [LibraryFolder] {
+        let q = project.mediaSearchText.trimmingCharacters(in: .whitespaces).lowercased()
+        let list = library.folders
+            .filter { $0.parentID == currentFolderID }
+            .filter { $0.type == selectedAssetType }
+            .filter { q.isEmpty || $0.name.lowercased().contains(q) }
+        // 自定义 = 用户拖出来的那个顺序；其余档位文件夹一律按建立先后，
+        // 时长/大小对文件夹没有意义，不跟着素材那套走
+        return project.mediaSortOrder == .custom
+            ? list.sorted { $0.sortIndex < $1.sortIndex }
+            : list.sorted { $0.createdAt < $1.createdAt }
+    }
+
     private var filteredAssets: [MediaAsset] {
         var result = project.mediaAssets.filter { $0.type == selectedAssetType }
+        // 根一层只看没归档的；进了文件夹只看它里头的
+        result = result.filter { $0.folderID == currentFolderID }
         let q = project.mediaSearchText.trimmingCharacters(in: .whitespaces).lowercased()
         if !q.isEmpty {
             result = result.filter { $0.name.lowercased().contains(q) }
@@ -51,8 +116,18 @@ struct MediaLibraryView: View {
         case .fileSize:
             result.sort { asc ? ($0.fileSize ?? 0) < ($1.fileSize ?? 0)
                               : ($0.fileSize ?? 0) > ($1.fileSize ?? 0) }
+        case .custom:
+            break   // 素材保持素材库里的原始顺序，排的是文件夹
         }
         return result
+    }
+
+    /// 宫格的列。**格子宽度钉死 128**（= 侧栏 320pt 时两列的宽度：
+    /// 320 − 44 图标栏 − 13 左右内边距 = 263，两列各 129.5），
+    /// 拖宽拉窄都是加减列数，格子和缩略图一动不动。
+    ///
+    private var gridColumns: [GridItem] {
+        sidebarGridColumns(sidebarWidth: sidebarWidth, minGap: 4)
     }
 
     private func countFor(_ type: AssetType) -> Int {
@@ -67,24 +142,38 @@ struct MediaLibraryView: View {
             } else {
             VStack(spacing: 0) {
             // Section header
-            HStack {
+            // spacing 0：标题和后面那个刷新贴着走，按钮自己 24pt 见方、
+            // 图标只有 14，左右各 5 的留白已经够当间距了
+            HStack(spacing: 0) {
                 Text(isTransitionTab ? "效果" : "素材库")
                     .font(.system(size: 11, weight: .semibold))
                     .foregroundColor(Color.labelSecondary)
                     .textCase(.uppercase)
-                Spacer()
-                // 转场/文字/图形面板没有素材可清，不显示按钮
-                if let type = project.currentLibraryAssetType {
-                    MediaToolBtn(svgName: "clear",
-                                 enabled: project.mediaAssets.contains { $0.type == type },
-                                 help: "清空\(type.label)素材") {
-                        project.showClearLibraryConfirm = true
+                // 刷新挪到标题后头，右边那个位置让给「新建文件夹」
+                if project.currentLibraryAssetType != nil {
+                    MediaToolBtn(svgName: "refresh", help: "刷新素材库") {
+                        project.refreshMediaLibrary()
                     }
                 }
-                MediaToolBtn(svgName: "refresh", help: "刷新素材库") {
-                    project.refreshMediaLibrary()
+                Spacer()
+                HStack(spacing: 4) {
+                    // 转场/文字/图形面板没有素材可清，不显示按钮
+                    if let type = project.currentLibraryAssetType {
+                        MediaToolBtn(svgName: "clear",
+                                     enabled: project.mediaAssets.contains { $0.type == type },
+                                     help: "清空\(type.label)素材") {
+                            project.showClearLibraryConfirm = true
+                        }
+                    }
+                    // 视频/音频/图片/字幕四个标签页才有文件夹
+                    if project.currentLibraryAssetType != nil {
+                        MediaToolBtn(svgName: "newFile", help: "新建文件夹") { newFolder() }
+                    }
                 }
             }
+            // 行高钉死 24（= 工具按钮的高度）。文字和图形这两页没有刷新 / 清空 /
+            // 新建文件夹按钮，行高会塌到文字本身那么高，标题跟着往上跳一截
+            .frame(height: 24)
             .padding(.leading, 3)
             .padding(.trailing, 10)
             .padding(.top, 8)
@@ -142,6 +231,23 @@ struct MediaLibraryView: View {
                 .padding(.bottom, 6)
             }
 
+            // 切标签页时退回根一层 —— 视频页进的文件夹拿到音频页去过滤，
+            // 一条都匹配不上，整页会空得莫名其妙
+            Color.clear.frame(height: 0)
+                .onChange(of: selectedAssetType) { _, _ in currentFolderID = nil }
+                // 换了一层就把选择清掉 —— 留着的话选中项在别处看不见，
+                // 右键批量操作会莫名其妙作用到上一层的东西
+                .onChange(of: currentFolderID) { _, _ in
+                    project.selectedAssetIDs = []
+                    project.selectedFolderIDs = []
+                }
+                .onChange(of: library.folders) { _, list in
+                    // 文件夹被删了也要退回来
+                    if let id = currentFolderID, !list.contains(where: { $0.id == id }) {
+                        currentFolderID = nil
+                    }
+                }
+
             // Asset list + drag-drop target
             ZStack {
                 if isShapeTab {
@@ -150,35 +256,105 @@ struct MediaLibraryView: View {
                     TextLayerPanel()
                 } else if isTransitionTab {
                     switch project.effectCategory {
-                    case "effTransition": TransitionPanel()
-                    case "effFilter": FilterPanel()
-                    case "effAdjust": AdjustPanel()
-                    default: EffectPanel()
+                    case "effTransition": TransitionPanel(sidebarWidth: sidebarWidth)
+                    case "effFilter": FilterPanel(sidebarWidth: sidebarWidth)
+                    case "effAdjust": AdjustPanel(sidebarWidth: sidebarWidth)
+                    default: EffectPanel(sidebarWidth: sidebarWidth)
                     }
-                } else if filteredAssets.isEmpty {
+                } else if filteredAssets.isEmpty && visibleFolders.isEmpty {
                     emptyState
                 } else {
                     ScrollView(showsIndicators: false) {
                         // 缩略图两列 / 列表一条条。只有**视频和图片**能切，
                         // 音频和字幕固定列表
                         if project.mediaGridMode, canSwitchViewMode {
-                            LazyVGrid(columns: [GridItem(.flexible(), spacing: 4),
-                                                GridItem(.flexible(), spacing: 4)], spacing: 4) {
+                            LazyVGrid(columns: gridColumns, alignment: .leading, spacing: 4) {
+                                // 文件夹排在素材前头
+                                ForEach(visibleFolders) { f in folderCell(f) }
                                 ForEach(filteredAssets) { asset in
-                                    AssetRow(assetID: asset.id)
+                                    AssetRow(assetID: asset.id, currentFolder: currentFolderID)
                                 }
                             }
+                            .frame(maxWidth: .infinity, alignment: .leading)
                             .padding(.leading, 3).padding(.trailing, 10)
                             .padding(.bottom, 8)
                         } else {
                             VStack(spacing: 2) {
+                                ForEach(visibleFolders) { f in folderCell(f) }
                                 ForEach(filteredAssets) { asset in
-                                    AssetRow(assetID: asset.id)
+                                    AssetRow(assetID: asset.id, currentFolder: currentFolderID)
                                 }
                             }
                             .padding(.leading, 3).padding(.trailing, 10)
                             .padding(.bottom, 8)
                         }
+                        // 列表底下垫一段，短列表也有地方右键（菜单挂在整片上，见下）
+                        Color.clear
+                            .frame(maxWidth: .infinity)
+                            .frame(height: 60)
+                    }
+                    // **这一条是关键**：ScrollView 只在竖向滚，横向的理想尺寸默认取
+                    // 内容宽度 —— 格子一超宽，它就把外面的 ZStack / VStack 一起撑开，
+                    // 底下量宽度的 GeometryReader 于是读到被撑大的值，列数再也减不回来。
+                    // maxWidth: .infinity 让它老老实实用父级提议的宽度，环就断了
+                    .frame(maxWidth: .infinity)
+                    // 列数万一有一帧没跟上，横着溢出的也裁掉，别糊到左边图标栏上
+                    .clipped()
+                    // 空白处右键 —— 格子之间的缝、行末的空位、底下那一大片都算。
+                    // 压在素材上时 AssetRow 自己的 .contextMenu 更靠内、会先接；
+                    // 压在文件夹上时 RightClickCatcher 那个 NSView 直接吃掉右键，
+                    // 两种都轮不到这一层
+                    .contentShape(Rectangle())
+                    .contextMenu {
+                        if project.currentLibraryAssetType != nil {
+                            Button("新建文件夹") { newFolder() }
+                        }
+                    }
+                    .coordinateSpace(name: "assetArea")
+                    .onPreferenceChange(AssetFramePref.self) { assetRects = $0 }
+                    // 框出来的矩形跟每个格子求交，碰到就选上
+                    .overlay(alignment: .topLeading) {
+                        if let r = marqueeRect {
+                            Rectangle()
+                                .fill(Color.accent.opacity(0.10))
+                                .overlay(Rectangle().strokeBorder(Color.accent.opacity(0.8),
+                                                                  lineWidth: 1))
+                                .frame(width: r.width, height: r.height)
+                                .offset(x: r.minX, y: r.minY)
+                                .allowsHitTesting(false)
+                        }
+                    }
+                    .gesture(
+                        DragGesture(minimumDistance: 4, coordinateSpace: .named("assetArea"))
+                            .onChanged { v in
+                                if marqueeStart == nil {
+                                    marqueeStart = v.startLocation
+                                    let add = Self.additiveClick
+                                    marqueeBase = add ? project.selectedAssetIDs : []
+                                    marqueeFolderBase = add ? project.selectedFolderIDs : []
+                                }
+                                marqueeEnd = v.location
+                                if let r = marqueeRect {
+                                    // assetRects 里素材和文件夹都有，按当前这层的文件夹 id 分流
+                                    let ids = Set(visibleFolders.map(\.id))
+                                    let hit = assetRects.filter { $0.value.intersects(r) }.keys
+                                    project.selectedAssetIDs = marqueeBase.union(
+                                        hit.filter { !ids.contains($0) })
+                                    project.selectedFolderIDs = marqueeFolderBase.union(
+                                        hit.filter { ids.contains($0) })
+                                }
+                            }
+                            .onEnded { _ in
+                                marqueeStart = nil
+                                marqueeEnd = nil
+                                marqueeBase = []
+                                marqueeFolderBase = []
+                            }
+                    )
+                    // 点空白清掉选择
+                    .onTapGesture {
+                        project.selectedAssetIDs = []
+                        project.selectedFolderIDs = []
                     }
                 }
 
@@ -191,6 +367,8 @@ struct MediaLibraryView: View {
             }
             // 把这块登记成文件拖入的接收区，drop 由宿主统一收了再按坐标分发过来。
             // 这里不能用 SwiftUI 的 .onDrop——实测收不到 Finder 拖拽，原因见 FileDropRouter
+            // 同上：这层也不许被内容撑开，量出来的宽度才是侧栏真给的那个
+            .frame(maxWidth: .infinity)
             .background(GeometryReader { g in
                 Color.clear
                     .onAppear { registerDropZone(g.frame(in: .global)) }
@@ -199,6 +377,60 @@ struct MediaLibraryView: View {
             })
 
             Spacer()
+
+            // 进了文件夹时的路径栏。**吸在面板最底下**，不跟着列表滚。
+            // 放在 Spacer 后面就是 VStack 的最后一个子视图 ——
+            // 不能塞进上面那个 ZStack，那里的子视图是层叠的，
+            // 它会被居中摆着、还压在列表下层，位置怪也点不动
+            if currentFolderID != nil {
+                let chain = folderChain(currentFolderID)
+                HStack(spacing: 4) {
+                    // 返回**上一级**，不是一路回根 —— 嵌套之后回根就跳太远了
+                    Button { currentFolderID = chain.dropLast().last?.id } label: {
+                        Image(systemName: "chevron.left")
+                            .font(.system(size: 9, weight: .semibold))
+                            .foregroundColor(crumbBackHover ? Color.accent : Color.labelSecondary)
+                            .frame(width: 12, height: 20)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .onHover { crumbBackHover = $0 }
+
+                    Image(nsImage: SidebarSVGIcon.load("folderFill", size: 11))
+                        .renderingMode(.template)
+
+                    // 面包屑：中间任意一级都能点回去
+                    ForEach(Array(chain.enumerated()), id: \.element.id) { i, f in
+                        if i > 0 {
+                            Text("/").font(.system(size: 10)).opacity(0.45)
+                        }
+                        // 最后一级就是当前待着的这层，点它没有去处，不算可点的
+                        let isLast = i == chain.count - 1
+                        Button { currentFolderID = f.id } label: {
+                            Text(f.name)
+                                .font(.system(size: 11, weight: isLast ? .medium : .regular))
+                                .foregroundColor(!isLast && crumbHover == f.id
+                                                 ? Color.accent : Color.labelSecondary)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                                .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .onHover { on in
+                            guard !isLast else { return }
+                            crumbHover = on ? f.id : (crumbHover == f.id ? nil : crumbHover)
+                        }
+                    }
+                    Spacer(minLength: 0)
+                }
+                .foregroundColor(Color.labelSecondary)
+                .frame(height: 24)
+                // 鼠标快速甩出去时，单个 Button 的 onHover(false) 会漏发，
+                // 那一级就一直黄着 —— 整条路径栏再兜一次底
+                .onHover { if !$0 { crumbHover = nil; crumbBackHover = false } }
+                .padding(.leading, 7).padding(.trailing, 10)
+                .padding(.bottom, 6)
+            }
             }
             } // else (non-AI tabs)
         }
@@ -216,10 +448,631 @@ struct MediaLibraryView: View {
         if !isAITab { FileDropRouter.unregister(windowID, kind: .aiChat) }
     }
 
+    /// 文件夹格子。双击进去，右键有重命名 / 收集素材 / 删除。
+    /// 宫格模式下摆成跟素材一样大的卡片，列表模式下是一行
+    @ViewBuilder
+    private func folderCell(_ f: LibraryFolder) -> some View {
+        Group {
+            if project.mediaGridMode, canSwitchViewMode {
+                folderCard(f)
+            } else {
+                folderRow(f)
+            }
+        }
+        // 拖自己出去是**排序**，载荷带 folder: 前缀 ——
+        // 拖裸 UUID 会被认成素材，落到别的文件夹上就成了归档。
+        //
+        // **必须挂在底色之前**：拖拽快照取的是它修饰的那一层，
+        // 挂在最外面的话 hover 底色会被一起拍进快照，光标上就跟着一块灰底板
+        .onDrag {
+            folderHover = nil
+            draggingFolder = f.id
+            lastReorderTarget = nil
+            return NSItemProvider(
+                object: FileDropRouter.pasteboardString(forFolder: f.id) as NSString)
+        }
+        // 底色跟素材卡片**同一个尺寸**：内外都不加单边 padding，
+        // 留白由 folderCard / folderRow 自己出，两者才对得齐
+        .background(
+            RoundedRectangle(cornerRadius: 8)
+                .fill(folderDropTarget == f.id || project.selectedFolderIDs.contains(f.id)
+                      ? Color.accent.opacity(0.18)
+                      : (folderHover == f.id ? Color.white.opacity(0.08) : Color.clear))
+        )
+        // 位置报两份：global 那份给拖放判命中，assetArea 那份给框选算相交
+        .background(GeometryReader { g in
+            Color.clear
+                .onAppear { folderRects[f.id] = g.frame(in: .global) }
+                .onChange(of: g.frame(in: .global)) { _, r in folderRects[f.id] = r }
+                .preference(key: AssetFramePref.self,
+                            value: [f.id: g.frame(in: .named("assetArea"))])
+        })
+        // 被拖走的那个**整格藏起来**（连底色一起），位置空着当槽 ——
+        // 系统已经把它的快照挂在光标上了，原位再露出个影子或底色，
+        // 看着就像凭空多出来一个。opacity 0 不影响占位，让位动画照常
+        .opacity(draggingFolder == f.id ? 0 : 1)
+        .task(id: f.id) { requestFolderThumbs(f) }
+        .onHover { folderHover = $0 ? f.id : (folderHover == f.id ? nil : folderHover) }
+        // 双击写在前面：SwiftUI 按声明顺序让高 count 先要这一下
+        .onTapGesture(count: 2) { currentFolderID = f.id }
+        .onTapGesture(count: 1) {
+            if Self.additiveClick {
+                if project.selectedFolderIDs.contains(f.id) {
+                    project.selectedFolderIDs.remove(f.id)
+                } else {
+                    project.selectedFolderIDs.insert(f.id)
+                }
+            } else {
+                project.selectedFolderIDs = [f.id]
+                project.selectedAssetIDs = []
+            }
+        }
+        // 自绘 NSMenu，不用 SwiftUI 的 .contextMenu ——
+        // 色点要横着排成一行，系统菜单只能一行一项竖着摆
+        .onRightClick { showFolderMenu(f) }
+    }
+
+    /// 压到谁身上就顶掉谁，其余的顺势让一格 —— iOS 主屏挪图标那套。
+    ///
+    /// **拖动过程中就改顺序**，不是松手才改：格子得一路跟着让位，
+    /// 动画由 grid 上的 `.animation(_:value:)` 接管，人看到的是它们自己滑开
+    private func liveReorderFolder(_ dragged: UUID, onto target: UUID) {
+        // 每帧都会回调一次，同一个目标只处理头一遍，否则来回抽搐
+        guard dragged != target, lastReorderTarget != target else { return }
+        var list = visibleFolders
+        guard let from = list.firstIndex(where: { $0.id == dragged }),
+              let to = list.firstIndex(where: { $0.id == target }) else { return }
+        lastReorderTarget = target
+
+        let moved = list.remove(at: from)
+        list.insert(moved, at: to)
+        // 动画包在这一次改动上，**不能挂在 grid 上**：
+        // 挂 `.animation(_:value:)` 的话，进出文件夹时整列表换一批内容也算「变了」，
+        // 素材会从下往上飘一遍
+        withAnimation(.spring(response: 0.30, dampingFraction: 0.78)) {
+            for (i, f) in list.enumerated() {
+                if let j = library.folders.firstIndex(where: { $0.id == f.id }) {
+                    library.folders[j].sortIndex = i
+                }
+            }
+            // 不切档位的话顺序写进去了，界面还按建立先后显示，看着像没生效
+            project.mediaSortOrder = .custom
+        }
+    }
+
+    /// 这个落点算不算「搬进某个文件夹里头」。
+    /// 压在格子正中间那半才算，蹭到两边是排序让位
+    private func nestTarget(dragging id: UUID, at p: CGPoint) -> UUID? {
+        guard let hit = folderID(at: p), hit != id,
+              // 塞进自己的子孙里会让 parentID 连成环
+              !folderSubtree(id).contains(hit),
+              let r = folderRects[hit] else { return nil }
+        let grid = project.mediaGridMode && canSwitchViewMode
+        let t = grid ? (p.x - r.minX) / max(r.width, 1)
+                     : (p.y - r.minY) / max(r.height, 1)
+        return (t > 0.25 && t < 0.75) ? hit : nil
+    }
+
+    /// 递归造「移动到」的菜单树，一层文件夹对一层子菜单。
+    /// `exclude` 是整棵不能进的子树（拖动/移动的那个自己和它的子孙）
+    private func moveTargetMenu(parent: UUID?, type: AssetType, exclude: Set<UUID>,
+                                onPick: @escaping (UUID?) -> Void) -> NSMenu {
+        let menu = NSMenu()
+        let kids = library.folders
+            .filter { $0.type == type && $0.parentID == parent && !exclude.contains($0.id) }
+            .sorted { $0.name.localizedCompare($1.name) == .orderedAscending }
+        for f in kids {
+            let inner = moveTargetMenu(parent: f.id, type: type, exclude: exclude, onPick: onPick)
+            if inner.numberOfItems > 0 {
+                // 底下还有一层：展成子菜单，「根目录」= 就放在这个文件夹自己这层
+                inner.insertItem(.separator(), at: 0)
+                inner.insertItem(MenuRowView.item(title: "根目录", width: 200) {
+                    onPick(f.id)
+                }, at: 0)
+                menu.addItem(MenuRowView.item(title: f.name, width: 200, submenu: inner))
+            } else {
+                menu.addItem(MenuRowView.item(title: f.name, width: 200) { onPick(f.id) })
+            }
+        }
+        return menu
+    }
+
+    /// 把一个文件夹搬到另一个下面（`target` 给 nil = 挪回根一层）。
+    /// 进了新的一层排在末尾，原来那层的顺序不动
+    private func moveFolder(_ dragged: UUID, into target: UUID?) {
+        guard dragged != target,
+              let i = library.folders.firstIndex(where: { $0.id == dragged }) else { return }
+        // 塞进自己的子孙里会让 parentID 连成环，路径栏会一路走不到头
+        if let t = target, folderSubtree(dragged).contains(t) { return }
+        library.folders[i].parentID = target
+        let siblings = library.folders.filter { $0.parentID == target && $0.id != dragged }
+        library.folders[i].sortIndex = (siblings.map(\.sortIndex).max() ?? -1) + 1
+    }
+
+    /// 拖着搬进去，跟菜单里那条走同一套
+    private func nestFolder(_ dragged: UUID, into target: UUID) {
+        moveFolder(dragged, into: target)
+    }
+
+    /// 拖拽收尾：淡影、防抖记录、落点候选都清掉
+    private func endFolderDrag() {
+        draggingFolder = nil
+        lastReorderTarget = nil
+        folderNestCandidate = nil
+        folderDropTarget = nil
+    }
+
+    private func showFolderMenu(_ f: LibraryFolder) {
+        let menu = NSMenu()
+        menu.minimumWidth = 200
+
+        // 选了一批、右键的又正是其中之一 → 头一条是「把这批收进一个新文件夹」
+        let picked = project.selectedAssetIDs.count + project.selectedFolderIDs.count
+        if picked > 1, project.selectedFolderIDs.contains(f.id) {
+            menu.addItem(MenuRowView.item(title: "用已选 \(picked) 个素材新建文件夹",
+                                          width: 200) {
+                newFolderWithSelection(type: f.type)
+            })
+            menu.addItem(.separator())
+        }
+        menu.addItem(MenuRowView.item(title: "重命名", width: 200) {
+            renamingFolderID = f.id
+            folderDraftName = f.name
+        })
+        menu.addItem(MenuRowView.item(title: "收集素材…", width: 200) { collectFolder(f) })
+
+        // 移动到文件夹。菜单**照着文件夹树本身分层**，不是把路径拼成一行平铺 ——
+        // 有子文件夹的那项自己再展开一级，头一条「根目录」表示就放在它这一层。
+        // 自己这棵子树整个排除掉：塞进自己的子孙会让 parentID 连成环
+        let sub = moveTargetMenu(parent: nil, type: f.type,
+                                 exclude: folderSubtree(f.id)) { target in
+            moveFolder(f.id, into: target)
+        }
+        if f.parentID != nil {
+            if sub.numberOfItems > 0 { sub.insertItem(.separator(), at: 0) }
+            sub.insertItem(MenuRowView.item(title: "素材库", width: 200) {
+                moveFolder(f.id, into: nil)
+            }, at: 0)
+        }
+        if sub.numberOfItems > 0 {
+            menu.addItem(MenuRowView.item(title: "移动到文件夹", width: 200, submenu: sub))
+        }
+
+        // 一排色点。跟画布上给组换颜色是同一套色板
+        let colorItem = NSMenuItem()
+        let row = NSHostingView(rootView: FolderColorRow(current: f.colorHex) { hex in
+            setFolderColor(f.id, hex)
+            menu.cancelTracking()
+        })
+        row.frame = NSRect(x: 0, y: 0, width: 200, height: 30)
+        colorItem.view = row
+        menu.addItem(colorItem)
+
+        menu.addItem(.separator())
+        menu.addItem(MenuRowView.item(title: "删除文件夹", width: 200) { deleteFolder(f.id) })
+        menu.popUp(positioning: nil, at: NSEvent.mouseLocation, in: nil)
+    }
+
+    private func setFolderColor(_ id: UUID, _ hex: String?) {
+        guard let i = library.folders.firstIndex(where: { $0.id == id }) else { return }
+        library.folders[i].colorHex = hex
+    }
+
+    /// 里面前几个素材的缩略图，露在文件夹口上。**只读，不碰状态**
+    private func folderPeek(_ f: LibraryFolder) -> [NSImage] {
+        project.mediaAssets
+            .filter { $0.folderID == f.id }
+            .prefix(3)
+            .compactMap { project.mediaThumbnails[$0.id] }
+    }
+
+    /// 催一下缩略图。素材进了文件夹就没在列表里露过面，那份可能压根没做过。
+    ///
+    /// **必须在 body 之外调** —— 写在 body 求值里等于「视图更新期间改状态」，
+    /// SwiftUI 会连锁重算，表现是动一个文件夹、其它的跟着一起变
+    private func requestFolderThumbs(_ f: LibraryFolder) {
+        for a in project.mediaAssets.filter({ $0.folderID == f.id }).prefix(3)
+        where project.mediaThumbnails[a.id] == nil
+           && (a.type == .video || a.type == .image) {
+            project.loadMediaThumbnail(assetID: a.id, url: a.url)
+        }
+    }
+
+    /// 宫格：毛玻璃前盖，后面露出里面素材的缩略图。
+    /// 悬停时前盖往下沉一点、缩略图往上抬 —— 就是「要打开了」那个意思
+    private func folderCard(_ f: LibraryFolder) -> some View {
+        // 里头有几样东西：直属素材 + 直属子文件夹，子文件夹也算一件
+        let count = project.mediaAssets.count { $0.folderID == f.id }
+                  + library.folders.count { $0.parentID == f.id }
+        let peek = folderPeek(f)
+        let open = folderHover == f.id || folderDropTarget == f.id
+        let tint = f.colorHex.map { Color(hex: $0) } ?? Color(white: 0.62)
+        let back = FolderBackShape()
+        let front = FolderFrontShape(openness: open ? 1 : 0)
+        return VStack(spacing: 0) {
+            // 外框先撑满宽度再取 4:3，**用 Color.clear 打底**：
+            // 直接把 aspectRatio 挂在 ZStack 上，ZStack 会带着自己的理想尺寸
+            // （固定高度的后板前盖）去跟比例较劲 —— 一行里全是文件夹、没有素材
+            // 撑着高度时，.fit 会把宽度反过来压窄一截，看着就是「样式没生效」。
+            //
+            // 里面的尺寸全按 w / h 取比例，行高怎么变都不会跑形
+            Color.clear
+                .frame(maxWidth: .infinity)
+                .aspectRatio(4.0 / 3.0, contentMode: .fit)
+                .overlay {
+                    GeometryReader { g in
+                        let w = g.size.width
+                        let h = g.size.height
+                        // 里面素材的缩略图，错开叠着。这一组画两遍：
+                        // 一遍露在前盖上头，一遍糊掉透在前盖里，当「隔着毛玻璃看见的颜色」
+                        let peekLayer = ZStack {
+                            ForEach(Array(peek.enumerated().reversed()), id: \.offset) { i, img in
+                                Image(nsImage: img)
+                                    .resizable()
+                                    .aspectRatio(contentMode: .fill)
+                                    .frame(width: w * 0.395, height: h * 0.393)
+                                    .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                                    .rotationEffect(.degrees(Double(i - 1) * 7))
+                                    .offset(x: CGFloat(i - 1) * w * 0.112,
+                                            y: CGFloat(i) * -h * 0.014)
+                                    .shadow(color: .black.opacity(0.35), radius: 3, y: 1)
+                            }
+                        }
+                        .offset(y: -h * (open ? 0.388 : 0.302))
+
+                        ZStack(alignment: .bottom) {
+                            // 最底层：后板。上沿**左凸右凹**，那道台阶就是文件夹的轮廓 ——
+                            // 画成平顶矩形的话，空文件夹看着就是块光板
+                            back
+                                .fill(tint.opacity(0.22))
+                                // 板面往下压暗：有明暗差才看得出这是块「凹进去」的板
+                                .overlay(back.fill(LinearGradient(
+                                    colors: [.black.opacity(0.14), .black.opacity(0.02)],
+                                    startPoint: .top, endPoint: .bottom)))
+                                // 一圈微高光，上沿最亮
+                                .overlay(back.stroke(LinearGradient(
+                                    colors: [.white.opacity(0.34), .white.opacity(0.06)],
+                                    startPoint: .top, endPoint: .bottom), lineWidth: 0.8))
+                                .frame(width: w * 0.750, height: h * 0.714)
+                                .offset(y: -h * 0.129)
+
+                            // 中层：露在前盖上头的那截缩略图
+                            peekLayer
+
+                            // 前盖：**背景模糊**（毛玻璃），不是简单的半透明色块。
+                            // 打开时上边往两侧长、同时下沉，下边钉死 —— 盖子朝外翻，立体感就来了
+                            front
+                                .fill(.ultraThinMaterial)
+                                .frame(width: w * 0.80, height: h * 0.630)
+                                // 隔着毛玻璃看见的那点颜色。
+                                // **`.ultraThinMaterial` 办不到这件事**：SwiftUI 的 Material
+                                // 采样的是自己背后的**窗口背景**，取不到 ZStack 里同层的兄弟视图，
+                                // 前盖挡住的那几张缩略图它压根看不见，盖子就成了一块死色板。
+                                // 所以把缩略图按**同一套坐标**再画一遍，糊掉再裁进前盖轮廓 ——
+                                // 两边底边都对着 ZStack 的底，offset 直接沿用，位置天然对上
+                                .overlay(alignment: .bottom) {
+                                    ZStack(alignment: .bottom) { peekLayer }
+                                        .frame(width: w * 0.80, height: h * 0.630)
+                                        .blur(radius: max(w * 0.055, 3))
+                                        .opacity(0.65)
+                                        .mask(front)
+                                        .allowsHitTesting(false)
+                                }
+                                .overlay(front.fill(tint.opacity(open ? 0.34 : 0.26)))
+                                // 底部反光：光从下面反上来，越靠底越亮，过半高就没了
+                                .overlay(front.fill(LinearGradient(
+                                    stops: [.init(color: .white.opacity(0),    location: 0.50),
+                                            .init(color: .white.opacity(0.14), location: 1.00)],
+                                    startPoint: .top, endPoint: .bottom)))
+                                // 一圈微高光：上沿最亮，侧面淡下去，底沿又亮回来一点
+                                .overlay(front.stroke(LinearGradient(
+                                    colors: [.white.opacity(0.46), .white.opacity(0.10),
+                                             .white.opacity(0.28)],
+                                    startPoint: .top, endPoint: .bottom), lineWidth: 0.9))
+                                .overlay(alignment: .bottomLeading) {
+                                    if count > 0 {
+                                        Text("\(count)")
+                                            .font(.system(size: 13, weight: .medium).monospacedDigit())
+                                            .foregroundColor(.white.opacity(0.85))
+                                            .padding(.leading, 11).padding(.bottom, 5)
+                                    }
+                                }
+                                .offset(y: open ? h * 0.043 : 0)
+                                .shadow(color: .black.opacity(0.30), radius: 4, y: 2)
+                        }
+                        .frame(width: w, height: h)
+                        // 图形不占满格子（格子本身还是跟素材一样大）。
+                        // anchor 取 .bottom：缩放后底边仍贴着 4:3 框的底，
+                        // 跟素材缩略图的下沿对齐，名字离图形也就近了
+                        .scaleEffect(0.77, anchor: .bottom)
+                        .animation(.easeOut(duration: 0.16), value: open)
+                    }
+                }
+
+            folderName(f)
+                .padding(.horizontal, 4)
+                .padding(.top, 4)
+                .padding(.bottom, 6)
+        }
+        // 底色框由 folderCell 铺在外面，跟素材同宽
+        .padding(.leading, 4)
+    }
+
+    /// 列表：一行。图标颜色跟宫格同一套 —— 没设过就是那身默认灰
+    private func folderRow(_ f: LibraryFolder) -> some View {
+        let tint = f.colorHex.map { Color(hex: $0) } ?? Color(white: 0.62)
+        // 里头有几样东西：直属素材 + 直属子文件夹，子文件夹也算一件
+        let count = project.mediaAssets.count { $0.folderID == f.id }
+                  + library.folders.count { $0.parentID == f.id }
+        return HStack(spacing: 6) {
+            Image(nsImage: SidebarSVGIcon.load("folderFill", size: 13))
+                .renderingMode(.template)
+                .foregroundColor(tint)
+                .frame(width: 16, height: 16)
+            folderName(f)
+            Spacer(minLength: 4)
+            if renamingFolderID != f.id, count > 0 {
+                Text("\(count)")
+                    .font(.system(size: 10).monospacedDigit())
+                    .foregroundColor(Color.labelSecondary.opacity(0.6))
+            }
+        }
+        // leading 12 = 原来的「外层 4 + 自身 8」，观感不变
+        .padding(.leading, 12).padding(.trailing, 8)
+        .frame(height: 30)
+        .contentShape(Rectangle())
+    }
+
+    /// 名字：重命名时换成输入框
+    @ViewBuilder
+    private func folderName(_ f: LibraryFolder) -> some View {
+        if renamingFolderID == f.id {
+            TextField("", text: $folderDraftName)
+                .textFieldStyle(.plain)
+                .font(.system(size: 11))
+                .foregroundColor(Color.labelPrimary)
+                .focused($folderNameFocused)
+                .onSubmit { commitFolderRename() }
+                // 点到别处也算确认，跟素材重命名一个规矩
+                .onChange(of: folderNameFocused) { _, f in if !f { commitFolderRename() } }
+                .onAppear { folderNameFocused = true }
+                .onDisappear { commitFolderRename() }
+        } else {
+            Text(f.name)
+                .font(.system(size: 11))
+                .foregroundColor(Color.labelPrimary)
+                .lineLimit(1)
+        }
+    }
+
+    /// 把这个文件夹里的素材**复制**一份到用户选的位置。
+    /// 复制不是移动 —— 本地素材原地不动，素材库里的引用也不变，
+    /// 纯粹是「把这个项目要用的素材归拢出来带走」
+    private func collectFolder(_ f: LibraryFolder) {
+        // 连子文件夹里的一起收 —— 平铺到同一个目录，重名的在下面自动加序号
+        let scope = folderSubtree(f.id)
+        let items = project.mediaAssets.filter { $0.folderID.map(scope.contains) == true }
+        guard !items.isEmpty else {
+            project.showSuccessToast(icon: "exclamationmark.circle.fill", iconColor: .orange,
+                                     title: "这个文件夹是空的", subtitle: f.name)
+            return
+        }
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.canCreateDirectories = true
+        panel.prompt = "收集到这里"
+        panel.message = "选一个位置，把「\(f.name)」里的素材复制过去"
+        panel.begin { resp in
+            guard resp == .OK, let dir = panel.url else { return }
+            DispatchQueue.global(qos: .userInitiated).async {
+                let fm = FileManager.default
+                let root = dir.appendingPathComponent(f.name, isDirectory: true)
+                try? fm.createDirectory(at: root, withIntermediateDirectories: true)
+                var ok = 0, failed = 0
+                for a in items {
+                    guard fm.fileExists(atPath: a.url.path) else { failed += 1; continue }
+                    var dest = root.appendingPathComponent(a.url.lastPathComponent)
+                    // 重名的加序号，别把前一个盖掉
+                    var n = 2
+                    let base = dest.deletingPathExtension().lastPathComponent
+                    let ext = dest.pathExtension
+                    while fm.fileExists(atPath: dest.path) {
+                        dest = root.appendingPathComponent("\(base) \(n)")
+                            .appendingPathExtension(ext)
+                        n += 1
+                    }
+                    do { try fm.copyItem(at: a.url, to: dest); ok += 1 }
+                    catch { failed += 1 }
+                }
+                DispatchQueue.main.async {
+                    project.showSuccessToast(
+                        icon: failed == 0 ? "checkmark.circle.fill" : "exclamationmark.circle.fill",
+                        iconColor: failed == 0 ? .green : .orange,
+                        title: "已收集 \(ok) 个素材",
+                        subtitle: failed == 0 ? f.name : "\(f.name) · \(failed) 个没找到文件")
+                }
+            }
+        }
+    }
+
+    /// 在**当前所在的这一层**新建一个虚拟文件夹。
+    /// 进了某个文件夹再点新建，建出来的就是它的子文件夹
+    private func newFolder() {
+        guard let type = project.currentLibraryAssetType else { return }
+        library.makeFolder(type: type, parent: currentFolderID)
+    }
+
+    /// 新建一个文件夹，把当前选中的素材和文件夹一并收进去
+    private func newFolderWithSelection(type: AssetType) {
+        library.makeFolder(type: type, parent: currentFolderID,
+                           collectingAssets: project.selectedAssetIDs,
+                           folders: project.selectedFolderIDs)
+        project.selectedAssetIDs = []
+        project.selectedFolderIDs = []
+    }
+
+    /// 从根到 `id` 的那条链，路径栏按它铺面包屑
+    private func folderChain(_ id: UUID?) -> [LibraryFolder] {
+        var chain: [LibraryFolder] = []
+        var cur = id
+        // 万一数据出环，拿层数兜住
+        while let c = cur, chain.count < 32,
+              let f = library.folders.first(where: { $0.id == c }) {
+            chain.insert(f, at: 0)
+            cur = f.parentID
+        }
+        return chain
+    }
+
+    /// 这个文件夹连同它所有子孙的 id
+    private func folderSubtree(_ id: UUID) -> Set<UUID> {
+        var all: Set<UUID> = [id]
+        var grew = true
+        while grew {
+            grew = false
+            for f in library.folders where !all.contains(f.id) {
+                if let p = f.parentID, all.contains(p) { all.insert(f.id); grew = true }
+            }
+        }
+        return all
+    }
+
+    private func commitFolderRename() {
+        defer { renamingFolderID = nil }
+        guard let id = renamingFolderID,
+              let i = library.folders.firstIndex(where: { $0.id == id }) else { return }
+        let t = folderDraftName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !t.isEmpty else { return }
+        library.folders[i].name = t
+    }
+
+    /// 删掉文件夹本身**和它的所有子文件夹**，里头的素材退到被删这层的父级
+    ///（不是一路退回根，那样嵌得深的素材会突然跑到最外面）。素材和磁盘文件都不动
+    private func deleteFolder(_ id: UUID) {
+        let doomed = folderSubtree(id)
+        let parent = library.folders.first { $0.id == id }?.parentID
+        for i in project.mediaAssets.indices {
+            if let fid = project.mediaAssets[i].folderID, doomed.contains(fid) {
+                project.mediaAssets[i].folderID = parent
+            }
+        }
+        library.folders.removeAll { doomed.contains($0.id) }
+        if let cur = currentFolderID, doomed.contains(cur) { currentFolderID = parent }
+    }
+
     private func registerDropZone(_ rect: CGRect) {
-        FileDropRouter.register(windowID, rect: rect,
-                                onFiles: { urls in project.importFiles(urls) },
-                                onTargetChange: { isDragOver = $0 })
+        FileDropRouter.register(
+            windowID, kind: .mediaLibrary, rect: rect,
+            accepts: { payload in
+                switch payload {
+                case .files: return true
+                // 素材拖到文件夹格子上 = 归档。落点不在任何格子上就不接，
+                // 让它继续找下一个区（比如时间轴）
+                case .asset(let id): return folderHit(atLocal: nil, assetID: id) != nil || true
+                // 文件夹排序：这一层得先有格子才谈得上插到哪儿
+                case .folder: return !visibleFolders.isEmpty
+                default: return false
+                }
+            },
+            onDrop: { payload, local in
+                switch payload {
+                case .files(let urls):
+                    project.importFiles(urls)
+                case .asset(let id):
+                    guard let fid = folderHit(atLocal: CGPoint(x: local.x + rect.minX,
+                                                               y: local.y + rect.minY),
+                                              assetID: id) else { return }
+                    // 框选了一批、拖的又是其中之一 → 整批一起挪；
+                    // 拖的是选区外的那个，就只挪它自己（跟访达一个规矩）
+                    let batch = project.selectedAssetIDs.contains(id)
+                             && project.selectedAssetIDs.count > 1
+                    let targets = batch ? project.selectedAssetIDs : [id]
+                    for t in targets { moveAsset(t, to: fid) }
+                    // 挪进去就从当前这层消失了，选区留着没意义
+                    project.selectedAssetIDs = []
+                case .folder(let id):
+                    // 顺序在拖动过程里已经改完了；只有「搬进去」要落地时才动手。
+                    //
+                    // **落点必须现场重算**：宿主在 performDragOperation 开头先调
+                    // clearTarget()，那一下会把所有区的 onTargetChange(false) 走一遍，
+                    // 我们存的 folderNestCandidate 早在 onDrop 之前就被清成 nil 了
+                    let g = CGPoint(x: local.x + rect.minX, y: local.y + rect.minY)
+                    if let target = nestTarget(dragging: id, at: g) {
+                        nestFolder(id, into: target)
+                    }
+                    endFolderDrag()
+                default: break
+                }
+                folderDropTarget = nil
+            },
+            onTargetChange: { on in
+                if !on {
+                    isDragOver = false
+                    folderDropTarget = nil
+                    endFolderDrag()
+                }
+            },
+            onHoverPoint: { p, payload in
+                switch payload {
+                case .asset:
+                    // 拖的是素材：只让落点下面那个文件夹亮，
+                    // 整块素材区不染色 —— 那是「从访达拖文件进来导入」的反馈
+                    isDragOver = false
+                    folderDropTarget = folderID(at: p)
+                case .files:
+                    isDragOver = true
+                    folderDropTarget = nil
+                case .folder(let id):
+                    // 拖的是文件夹：压在格子**正中间**是搬进去，蹭到左右（列表是上下）
+                    // 边缘才是排序让位 —— 用位置分，不用悬停计时，反馈没有延迟
+                    isDragOver = false
+                    guard let hit = folderID(at: p) else {
+                        folderDropTarget = nil
+                        folderNestCandidate = nil
+                        break
+                    }
+                    // 压在自己身上：多半是刚让完位、自己被挪到了鼠标底下。
+                    // **这时什么都不能改** —— 清掉候选的话，刚点亮的目标会闪一下就没
+                    if hit == id { break }
+                    if let nest = nestTarget(dragging: id, at: p) {
+                        folderNestCandidate = nest
+                        // 复用素材归档那套高亮：底色亮起来、前盖跟着张开
+                        folderDropTarget = nest
+                        lastReorderTarget = nil
+                    } else {
+                        folderNestCandidate = nil
+                        folderDropTarget = nil
+                        liveReorderFolder(id, onto: hit)
+                    }
+                default:
+                    break
+                }
+            })
+    }
+
+    /// 落点砸在哪个**当前这页可见**的文件夹格子上。
+    ///
+    /// **必须拿 visibleFolders 过一道**：`folderRects` 是 @State，切标签页时
+    /// 上一页那些文件夹的位置还留在表里，而两页的格子位置几乎完全重合，
+    /// 直接问 Dictionary 命中的可能是视频页的文件夹 —— 于是图片素材被归进
+    /// 一个视频文件夹，图片页的根目录和文件夹里都看不见它，
+    /// 表现就是用户说的「拖进去，文件不见了」
+    private func folderID(at p: CGPoint) -> UUID? {
+        let ids = Set(visibleFolders.map(\.id))
+        return folderRects.first { ids.contains($0.key) && $0.value.contains(p) }?.key
+    }
+
+    /// 这个落点砸在哪个文件夹格子上。`atLocal` 给 nil 只是问「有没有格子」
+    private func folderHit(atLocal point: CGPoint?, assetID: UUID) -> UUID? {
+        guard let point else { return visibleFolders.first?.id }
+        return folderID(at: point)
+    }
+
+    /// 把素材归到某个文件夹（nil = 挪回根一层）。**只改归属，磁盘文件不动**
+    private func moveAsset(_ assetID: UUID, to folderID: UUID?) {
+        guard let i = project.mediaAssets.firstIndex(where: { $0.id == assetID }) else { return }
+        project.mediaAssets[i].folderID = folderID
     }
 
     // 左侧竖排图标标签栏
@@ -363,6 +1216,15 @@ struct MediaLibraryView: View {
         // 摆在空白区上方三分之一处，不居中——居中的话整组图文会掉到视觉重心以下，
         // 素材区又高又窄，看着像沉在底下
         .modifier(PositionedAtOneThird())
+        // **这一层也得能右键新建**：进到空文件夹里整片就只剩这个空状态，
+        // 列表底下那块「空白右键区」压根没画出来，不挂在这儿就没地方点
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .contentShape(Rectangle())
+        .contextMenu {
+            if project.currentLibraryAssetType != nil {
+                Button("新建文件夹") { newFolder() }
+            }
+        }
     }
 
     /// 把内容摆到容器高度 1/3 的位置（水平居中）
@@ -432,8 +1294,12 @@ private class ImportExportMenuHandler: NSObject {
 // MARK: - Asset Row
 
 private struct AssetRow: View {
+    /// 文件夹列表在这儿读，不观察的话改完名右键菜单还是老名字
+    @ObservedObject private var library = MediaLibrary.shared
     @EnvironmentObject private var project: ProjectState
     let assetID: UUID
+    /// 当前待着的这一层。「用已选…新建文件夹」要建在这儿
+    var currentFolder: UUID? = nil
     @State private var hovered = false
     @State private var editName = ""
     @State private var editingAsset = false
@@ -475,33 +1341,72 @@ private struct AssetRow: View {
 
     var body: some View {
         Group {
-            // 视频和图片跟着**视图模式**走；音频和字幕没有画面，
-            // 摆成网格全是一样的占位图标，没意义 —— 固定用列表
-            if project.mediaGridMode, asset.type == .video || asset.type == .image {
+            // 四类素材都跟着**视图模式**走。音频和字幕没有封面，
+            // 宫格里拿分类图标顶上
+            if project.mediaGridMode {
                 videoAssetCard
             } else {
                 normalAssetRow
             }
         }
-        // 内容不贴着底色边缘 —— 音频和字幕没有封面打头，标题会直接顶到边上
-        .padding(.leading, 4)
+        // 底色直接铺在卡片上：卡片自己的 padding 就是内容到底色边缘的留白，
+        // **别再在外面单加一边的 padding** —— 加了底色就往那边胖一块，
+        // 缩略图在框里看着偏。列表那一行的留白写在 normalAssetRow 自己身上
         .background(
             RoundedRectangle(cornerRadius: 8)
-                .fill(hovered ? Color.white.opacity(0.08) : Color.clear)
+                .fill(project.selectedAssetIDs.contains(assetID)
+                      ? Color.accent.opacity(0.18)
+                      : (hovered ? Color.white.opacity(0.08) : Color.clear))
         )
+        // 位置报给框选用
+        .background(GeometryReader { g in
+            Color.clear.preference(key: AssetFramePref.self,
+                                   value: [assetID: g.frame(in: .named("assetArea"))])
+        })
         .contentShape(RoundedRectangle(cornerRadius: 8))
         .onDrag {
             guard asset.fileExists else { return NSItemProvider() }
             return NSItemProvider(object: asset.id.uuidString as NSString)
         }
         .onHover { hovered = $0 }
-        .gesture(TapGesture(count: 2).onEnded {
+        // 双击写在前面：SwiftUI 按声明顺序让高 count 先要这一下，
+        // 反过来写单击会先触发、双击永远等不到
+        .onTapGesture(count: 2) {
             if asset.fileExists { project.addToTimeline(asset) } else { relinkAsset() }
-        })
+        }
+        .onTapGesture(count: 1) {
+            if MediaLibraryView.additiveClick {
+                // 已选中的再点一下是**取消**，不是重复加
+                if project.selectedAssetIDs.contains(assetID) {
+                    project.selectedAssetIDs.remove(assetID)
+                } else {
+                    project.selectedAssetIDs.insert(assetID)
+                }
+            } else {
+                project.selectedAssetIDs = [assetID]
+            }
+        }
         .contextMenu {
-            if asset.fileExists {
+            // 框选了一批、且右键的正是其中之一 → 这几项作用于整批。
+            // 文件夹也可能一起被选中，所以总数要把它算进来
+            let picked = project.selectedAssetIDs.count + project.selectedFolderIDs.count
+            let batch = picked > 1 && project.selectedAssetIDs.contains(assetID)
+            let targets: Set<UUID> = batch ? project.selectedAssetIDs : [assetID]
+            if batch {
+                Button("用已选 \(picked) 个素材新建文件夹") { newFolderWithSelection() }
+                Divider()
+            }
+            if asset.fileExists, !batch {
                 Button("添加到时间轴") { project.addToTimeline(asset) }
                 Button("添加到 AI 参考") { addToAIReference() }
+            }
+            // 移动到文件夹。跟拖进去是一回事 —— 只改归属，磁盘文件不动
+            if library.folders.contains(where: { $0.type == asset.type }) {
+                Menu(batch ? "把这 \(targets.count) 个移动到" : "移动到文件夹") {
+                    Button("素材库") { setFolder(nil, targets) }
+                    Divider()
+                    moveMenuTree(parent: nil, type: asset.type, targets: targets)
+                }
             }
             if !asset.fileExists {
                 Button("重新关联文件…") { relinkAsset() }
@@ -513,11 +1418,60 @@ private struct AssetRow: View {
                 }
             }
             Divider()
-            Button("移除", role: .destructive) { confirmDeleteAsset() }
+            Button(batch ? "移除这 \(targets.count) 个" : "移除", role: .destructive) {
+                if batch {
+                    for id in targets { project.removeAsset(id: id) }
+                    project.selectedAssetIDs = []
+                } else {
+                    confirmDeleteAsset()
+                }
+            }
         }
     }
 
     // MARK: Video asset card — thumbnail on top, name below
+
+    /// 「移动到」菜单，一层文件夹对一层子菜单。
+    ///
+    /// 返回 `AnyView` 是必须的：SwiftUI 的 ViewBuilder 递归会推出无限类型，
+    /// 直接写 `some View` 编不过
+    private func moveMenuTree(parent: UUID?, type: AssetType, targets: Set<UUID>) -> AnyView {
+        let kids = library.folders
+            .filter { $0.type == type && $0.parentID == parent }
+            .sorted { $0.name.localizedCompare($1.name) == .orderedAscending }
+        return AnyView(
+            ForEach(kids) { f in
+                if library.folders.contains(where: { $0.type == type && $0.parentID == f.id }) {
+                    // 底下还有一层：展成子菜单，「根目录」= 就放在这个文件夹自己这层
+                    Menu(f.name) {
+                        Button("根目录") { setFolder(f.id, targets) }
+                        Divider()
+                        moveMenuTree(parent: f.id, type: type, targets: targets)
+                    }
+                } else {
+                    Button(f.name) { setFolder(f.id, targets) }
+                }
+            }
+        )
+    }
+
+    /// 新建一个文件夹，把当前选中的素材和文件夹一并收进去
+    private func newFolderWithSelection() {
+        guard let type = project.currentLibraryAssetType else { return }
+        library.makeFolder(type: type, parent: currentFolder,
+                           collectingAssets: project.selectedAssetIDs,
+                           folders: project.selectedFolderIDs)
+        project.selectedAssetIDs = []
+        project.selectedFolderIDs = []
+    }
+
+    /// 归到某个虚拟文件夹（nil = 放回根一层）。一次可以处理一批
+    private func setFolder(_ id: UUID?, _ targets: Set<UUID>) {
+        for i in project.mediaAssets.indices where targets.contains(project.mediaAssets[i].id) {
+            project.mediaAssets[i].folderID = id
+        }
+        project.selectedAssetIDs = []
+    }
 
     private var videoAssetCard: some View {
         VStack(spacing: 0) {
@@ -532,15 +1486,20 @@ private struct AssetRow: View {
                                 .resizable()
                                 .aspectRatio(contentMode: .fill)
                         )
-                        .clipShape(RoundedRectangle(cornerRadius: 6))
+                        .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
                 } else {
-                    RoundedRectangle(cornerRadius: 6)
+                    // 分类图标 —— 跟素材区空状态那张是同一套 SVG。
+                    // 音频和字幕没有封面可抽，永远走这条
+                    RoundedRectangle(cornerRadius: 9, style: .continuous)
                         .fill(Color.white.opacity(0.06))
                         .aspectRatio(4.0/3.0, contentMode: .fit)
                         .overlay(
-                            Image(systemName: asset.type == .image ? "photo" : "film")
-                                .font(.system(size: 22, weight: .ultraLight))
-                                .foregroundColor(Color.labelSecondary.opacity(0.3))
+                            Image(nsImage: SidebarSVGIcon.load(asset.type.svgIcon))
+                                .renderingMode(.template)
+                                .resizable()
+                                .aspectRatio(contentMode: .fit)
+                                .frame(width: 30, height: 30)
+                                .foregroundColor(Color.labelSecondary.opacity(0.32))
                         )
                 }
                 // Duration badge
@@ -556,7 +1515,7 @@ private struct AssetRow: View {
                 }
                 // Missing overlay
                 if !asset.fileExists {
-                    RoundedRectangle(cornerRadius: 6)
+                    RoundedRectangle(cornerRadius: 9, style: .continuous)
                         .fill(Color.black.opacity(0.5))
                         .overlay(
                             VStack(spacing: 4) {
@@ -600,10 +1559,11 @@ private struct AssetRow: View {
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.horizontal, 4)
-            .padding(.vertical, 5)
+            .padding(.top, 5)
         }
-        .padding(4)
+        // 四周 16pt 的留白。图和名字都收在这圈里，左边缘自然对齐 ——
+        // 缩放的办法做不到：scaleEffect 是绕中心缩的，图会往里飘、跟名字错开
+        .padding(16)
     }
 
     // MARK: Normal asset row — audio / subtitle
@@ -664,7 +1624,7 @@ private struct AssetRow: View {
             // 音频和字幕没有画面，不占这个位置
             if asset.type == .video || asset.type == .image {
                 ZStack {
-                    RoundedRectangle(cornerRadius: 4).fill(Color.white.opacity(0.06))
+                    RoundedRectangle(cornerRadius: 6, style: .continuous).fill(Color.white.opacity(0.06))
                     if let thumb = project.mediaThumbnails[asset.id] {
                         Color.clear.overlay(
                             Image(nsImage: thumb).resizable().aspectRatio(contentMode: .fill)
@@ -676,7 +1636,7 @@ private struct AssetRow: View {
                     }
                 }
                 .frame(width: 34, height: 34)
-                .clipShape(RoundedRectangle(cornerRadius: 4))
+                .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
                 .padding(.trailing, 6)
             }
             // 正常状态不再放类型图标：音频/字幕列表本来就按标签页分好了类，
@@ -730,7 +1690,8 @@ private struct AssetRow: View {
                 }
             }
         }
-        .padding(.leading, 3).padding(.trailing, 10)
+        // leading 7 = 原来的「外层 4 + 自身 3」，观感不变
+        .padding(.leading, 7).padding(.trailing, 10)
         .padding(.vertical, 7)
     }
 
@@ -1929,6 +2890,12 @@ private struct TextTemplateCard: View {
 // MARK: - Transition Panel
 
 private struct TransitionPanel: View {
+    /// 侧栏总宽，宫格按它算列数和列间距
+    var sidebarWidth: CGFloat = 320
+    private var gridColumns: [GridItem] {
+        sidebarGridColumns(sidebarWidth: sidebarWidth, minGap: 6)
+    }
+
     @EnvironmentObject private var project: ProjectState
 
     private var selectedClipTransition: Transition? {
@@ -1949,8 +2916,7 @@ private struct TransitionPanel: View {
                         .padding(.top, 4)
                 }
 
-                LazyVGrid(columns: [GridItem(.flexible(), spacing: 6),
-                                    GridItem(.flexible(), spacing: 6)], spacing: 6) {
+                LazyVGrid(columns: gridColumns, alignment: .leading, spacing: 6) {
                     ForEach(TransitionType.allCases, id: \.self) { type in
                         TransitionPreviewCard(
                             type: type,
@@ -2118,6 +3084,8 @@ private class SortMenuTarget: NSObject {
         let allCases = ProjectState.MediaSortOrder.allCases
         guard sender.tag >= 0, sender.tag < allCases.count else { return }
         let order = allCases[sender.tag]
+        // 自定义就是用户拖出来那一版，没有正序倒序之分
+        if order == .custom { project.mediaSortOrder = .custom; return }
         if project.mediaSortOrder == order {
             project.mediaSortAscending.toggle()
         } else {
@@ -2135,7 +3103,7 @@ func showSortNSMenu(project: ProjectState) {
 
     let menu = NSMenu()
     for (i, order) in ProjectState.MediaSortOrder.allCases.enumerated() {
-        let arrow = project.mediaSortOrder == order
+        let arrow = (project.mediaSortOrder == order && order != .custom)
             ? (project.mediaSortAscending ? " ↑" : " ↓") : ""
         let item = NSMenuItem(title: order.rawValue + arrow, action: #selector(SortMenuTarget.pick(_:)), keyEquivalent: "")
         item.target = target
@@ -2575,14 +3543,19 @@ enum TaskETA {
 /// 滤镜列表。卡片的封面是**那帧素材套上各自滤镜**的实拍效果，
 /// 不是画个示意图 —— 一眼能看出这个滤镜到底把画面变成什么样
 struct FilterPanel: View {
+    /// 侧栏总宽，宫格按它算列数和列间距
+    var sidebarWidth: CGFloat = 320
+    private var gridColumns: [GridItem] {
+        sidebarGridColumns(sidebarWidth: sidebarWidth, minGap: 6)
+    }
+
     @EnvironmentObject private var project: ProjectState
     @State private var importHover = false
 
     var body: some View {
         VStack(spacing: 0) {
             ScrollView(showsIndicators: false) {
-                LazyVGrid(columns: [GridItem(.flexible(), spacing: 6),
-                                    GridItem(.flexible(), spacing: 6)], spacing: 6) {
+                LazyVGrid(columns: gridColumns, alignment: .leading, spacing: 6) {
                     ForEach(FilterKind.builtins, id: \.self) { kind in
                         FilterCard(kind: kind) { project.addFilter(kind: kind) }
                     }
@@ -2637,12 +3610,17 @@ struct FilterPanel: View {
 /// 调节只有一张卡片：加一段调节片段，参数在属性区里调。
 /// 卡片封面直接拿那帧素材演示一个偏暖提亮的调子，比画个图标直观
 struct AdjustPanel: View {
+    /// 侧栏总宽，宫格按它算列数和列间距
+    var sidebarWidth: CGFloat = 320
+    private var gridColumns: [GridItem] {
+        sidebarGridColumns(sidebarWidth: sidebarWidth, minGap: 6)
+    }
+
     @EnvironmentObject private var project: ProjectState
 
     var body: some View {
         ScrollView(showsIndicators: false) {
-            LazyVGrid(columns: [GridItem(.flexible(), spacing: 6),
-                                GridItem(.flexible(), spacing: 6)], spacing: 6) {
+            LazyVGrid(columns: gridColumns, alignment: .leading, spacing: 6) {
                 AdjustCard { project.addAdjust() }
             }
             .padding(.leading, 3).padding(.trailing, 10)
@@ -2775,6 +3753,12 @@ enum FormatTagImage {
 
 /// 特效列表。跟滤镜那页一样，卡片封面是**素材帧套上各自特效**的实拍效果
 struct EffectPanel: View {
+    /// 侧栏总宽，宫格按它算列数和列间距
+    var sidebarWidth: CGFloat = 320
+    private var gridColumns: [GridItem] {
+        sidebarGridColumns(sidebarWidth: sidebarWidth, minGap: 6)
+    }
+
     @EnvironmentObject private var project: ProjectState
 
     /// 按类别分组显示 —— 26 个平铺下来找不着东西
@@ -2795,8 +3779,7 @@ struct EffectPanel: View {
                         .font(.system(size: 10, weight: .medium))
                         .foregroundColor(Color.labelSecondary)
                         .padding(.leading, 3)
-                    LazyVGrid(columns: [GridItem(.flexible(), spacing: 6),
-                                        GridItem(.flexible(), spacing: 6)], spacing: 6) {
+                    LazyVGrid(columns: gridColumns, alignment: .leading, spacing: 6) {
                         ForEach(group.1, id: \.self) { kind in
                             EffectCard(kind: kind) { project.addEffect(kind: kind) }
                         }
@@ -2858,5 +3841,205 @@ enum EffectThumbnails {
         let img = NSImage(cgImage: cg, size: ci.extent.size)
         cache[kind] = img
         return img
+    }
+}
+
+/// 把一串顶点连成**曲率连续**的圆角多边形 —— iOS 那种「squircle」角。
+///
+/// `addArc(tangent1End:…)` 拐出来的是一段正圆弧：直线段曲率是 0、圆弧段是 1/r，
+/// 交界处曲率**跳变**，小尺寸下眼睛能看出那道折痕。这里改成三次贝塞尔，
+/// 把圆角摊到相邻两条边上（影响范围 1.42r，比正圆弧长四成），
+/// 曲率从 0 慢慢长起来、过了顶点再落回 0，边和角之间没有接缝
+///
+/// - Parameter pts: 顶点 + 该顶点的圆角半径，按顺时针给
+private func continuousRoundedPath(_ pts: [(CGPoint, CGFloat)]) -> Path {
+    var path = Path()
+    let n = pts.count
+    guard n >= 3 else { return path }
+
+    func dist(_ a: CGPoint, _ b: CGPoint) -> CGFloat { hypot(b.x - a.x, b.y - a.y) }
+    /// 从 a 朝 b 走 d
+    func step(_ a: CGPoint, _ b: CGPoint, _ d: CGFloat) -> CGPoint {
+        let len = max(dist(a, b), 0.0001)
+        let t = min(d / len, 1)
+        return CGPoint(x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t)
+    }
+
+    let spread: CGFloat = 1.42   // 圆角摊开多远。正圆弧是 1.0
+    let grip: CGFloat = 0.62     // 控制点离顶点多近。越大角越紧
+
+    // 每个顶点先算出进入点 / 离开点：沿两条边各退 spread·r，
+    // 退的距离夹在边长一半以内，相邻两个角才不会打架
+    var entry = [CGPoint](repeating: .zero, count: n)
+    var exit  = [CGPoint](repeating: .zero, count: n)
+    for i in 0..<n {
+        let (c, r) = pts[i]
+        let prev = pts[(i + n - 1) % n].0
+        let next = pts[(i + 1) % n].0
+        entry[i] = step(c, prev, min(r * spread, dist(c, prev) * 0.5))
+        exit[i]  = step(c, next, min(r * spread, dist(c, next) * 0.5))
+    }
+
+    path.move(to: exit[0])
+    for i in 1...n {
+        let j = i % n
+        let c = pts[j].0
+        path.addLine(to: entry[j])
+        // 两个控制点都落在「顶点—端点」的连线上：这样曲线在两端
+        // 跟边**相切**，切完还能一路平滑地把曲率带过去
+        path.addCurve(to: exit[j],
+                      control1: step(entry[j], c, dist(entry[j], c) * grip),
+                      control2: step(exit[j],  c, dist(exit[j],  c) * grip))
+    }
+    path.closeSubpath()
+    return path
+}
+
+/// 文件夹后板：**左边一段高（那个标签），右边低**，中间斜着过渡 ——
+/// 就是文件夹最认得出来的那个轮廓。
+/// 四角和那道台阶的两个钝角全走曲率连续圆角，硬折角看着像贴纸、不像实体
+private struct FolderBackShape: Shape {
+    func path(in r: CGRect) -> Path {
+        let cr = min(r.width, r.height) * 0.12    // 四角。比前盖收敛，窄板配大圆角显得胀
+        let tabW = r.width * 0.30                 // 左边凸起占 3 成，右边低的那段占 7 成
+        let drop = r.height * 0.12                // 右边比左边低多少
+        let slope = r.width * 0.10                // 斜过渡多长
+        let kr = min(drop, slope) * 0.85          // 台阶那两个钝角的圆角
+
+        return continuousRoundedPath([
+            (CGPoint(x: r.minX, y: r.minY), cr),                              // 左上
+            (CGPoint(x: r.minX + tabW, y: r.minY), kr),                       // 台阶上拐点
+            (CGPoint(x: r.minX + tabW + slope, y: r.minY + drop), kr),        // 台阶下拐点
+            (CGPoint(x: r.maxX, y: r.minY + drop), cr),                       // 右上
+            (CGPoint(x: r.maxX, y: r.maxY), cr),                              // 右下
+            (CGPoint(x: r.minX, y: r.maxY), cr),                              // 左下
+        ])
+    }
+}
+
+/// 文件夹前盖。`openness` 从 0 到 1：0 是正面的圆角矩形，
+/// 1 是**上宽下窄**的梯形 —— 盖子朝外翻开，底边离得远所以看着窄
+private struct FolderFrontShape: Shape {
+    var openness: CGFloat
+
+    var animatableData: CGFloat {
+        get { openness }
+        set { openness = newValue }
+    }
+
+    func path(in r: CGRect) -> Path {
+        // 底边钉死不动；顶边往两侧长出去、同时往下沉 ——
+        // 盖子朝观察者倒下来，near 的那条边看着更宽更低
+        let grow = r.width * 0.075 * openness
+        let drop = r.height * 0.22 * openness
+        let top = r.minY + drop
+        let cr = min(r.width, r.height - drop) * 0.16
+
+        return continuousRoundedPath([
+            (CGPoint(x: r.minX - grow, y: top), cr),
+            (CGPoint(x: r.maxX + grow, y: top), cr),
+            (CGPoint(x: r.maxX, y: r.maxY), cr),
+            (CGPoint(x: r.minX, y: r.maxY), cr),
+        ])
+    }
+}
+
+/// 侧栏里所有宫格共用的列。**封面宽度钉死**，富余的宽度全摊到列间距上，
+/// 拖宽拉窄只加减列数，卡片本身一动不动。
+///
+/// 宽度取的是**外面传进来的侧栏宽**，不是自己量的：自己量会绕成一个环 ——
+/// 列数算多了 → grid 变宽 → 把外面撑开 → 量到更大的宽度 → 列数更多，
+/// 拉窄时列就再也减不回来
+func sidebarGridColumns(sidebarWidth: CGFloat,
+                        cell target: CGFloat = 128,
+                        minGap: CGFloat) -> [GridItem] {
+    // 44 = 左侧图标栏，13 = grid 的 leading 3 + trailing 10
+    let w = max(sidebarWidth - 44 - 13, 60)
+    // 侧栏窄到一列都装不下时，卡片只好跟着缩
+    let cell = min(target, w)
+    let cols = max(1, Int((w + minGap) / (cell + minGap)))
+    let gap = cols > 1
+        ? max(minGap, (w - CGFloat(cols) * cell) / CGFloat(cols - 1))
+        : minGap
+    return Array(repeating: GridItem(.fixed(cell), spacing: gap), count: cols)
+}
+
+/// 素材格子把自己的位置报上来，框选靠它算命中
+struct AssetFramePref: PreferenceKey {
+    static var defaultValue: [UUID: CGRect] = [:]
+    static func reduce(value: inout [UUID: CGRect], nextValue: () -> [UUID: CGRect]) {
+        value.merge(nextValue()) { _, b in b }
+    }
+}
+
+/// 菜单里那排色点。横着平铺 —— 这正是不用系统菜单的原因
+private struct FolderColorRow: View {
+    let current: String?
+    let onPick: (String?) -> Void
+
+    var body: some View {
+        HStack(spacing: 7) {
+            dot(nil, isCurrent: current == nil)
+            ForEach(CanvasState.groupColors, id: \.hex) { c in
+                dot(c.hex, isCurrent: current == c.hex)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 12)
+        .frame(height: 30)
+    }
+
+    private func dot(_ hex: String?, isCurrent: Bool) -> some View {
+        Button { onPick(hex) } label: {
+            Circle()
+                .fill(hex.map { Color(hex: $0) } ?? Color.white.opacity(0.28))
+                .frame(width: 15, height: 15)
+                .overlay(Circle().strokeBorder(Color.white.opacity(isCurrent ? 0.85 : 0),
+                                               lineWidth: 1.5))
+                .contentShape(Circle())
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+/// 右键回调。SwiftUI 没有现成的，包一层 NSView 自己接
+private struct RightClickCatcher: NSViewRepresentable {
+    let action: () -> Void
+
+    func makeNSView(context: Context) -> NSView {
+        let v = Catcher()
+        v.action = action
+        return v
+    }
+
+    func updateNSView(_ v: NSView, context: Context) {
+        (v as? Catcher)?.action = action
+    }
+
+    final class Catcher: NSView {
+        var action: () -> Void = {}
+        override func rightMouseDown(with event: NSEvent) { action() }
+
+        /// **只接右键**，别的事件一律放过去。
+        ///
+        /// 这层盖在卡片上，AppKit 的命中测试认 NSView 不认 SwiftUI ——
+        /// 不放行的话双击、hover 全被它吃掉，文件夹就打不开了
+        override func hitTest(_ point: NSPoint) -> NSView? {
+            guard let e = NSApp.currentEvent else { return nil }
+            switch e.type {
+            case .rightMouseDown, .rightMouseUp, .rightMouseDragged:
+                return super.hitTest(point)
+            case .leftMouseDown where e.modifierFlags.contains(.control):
+                return super.hitTest(point)     // ⌃+左键也是右键菜单
+            default:
+                return nil
+            }
+        }
+    }
+}
+
+extension View {
+    func onRightClick(perform action: @escaping () -> Void) -> some View {
+        overlay(RightClickCatcher(action: action))
     }
 }
