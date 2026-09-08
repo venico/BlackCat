@@ -6,6 +6,12 @@ struct SettingsView: View {
     @ObservedObject private var memory = AgentMemory.shared
     @ObservedObject private var skills = AgentSkills.shared
     @ObservedObject private var mcp = AgentMCP.shared
+    /// 哪些 MCP 服务的工具清单是展开的。默认都收着
+    @State private var mcpToolsExpanded: Set<UUID> = []
+    /// 哪些主 Skill 的子技能是展开的。默认都收着
+    @State private var expandedSkills: Set<String> = []
+    /// 哪些 MCP 服务正在改地址。平时收着，点铅笔才展开
+    @State private var mcpEditing: Set<UUID> = []
     @State private var skillImportError: String?
     @EnvironmentObject var project: ProjectState
     @State private var modelStates: [WhisperTranscriber.ModelSize: ModelState] = [:]
@@ -52,21 +58,19 @@ struct SettingsView: View {
                 .fill(Color.white.opacity(0.10))
                 .frame(width: 1)
             VStack(spacing: 0) {
-                HStack {
+                HStack(spacing: 4) {
                     Text(selectedTab >= agentTabBase
                          ? agentTabs[min(selectedTab - agentTabBase, agentTabs.count - 1)]
                          : tabs[min(selectedTab, tabs.count - 1)])
                         .font(.system(size: 15, weight: .semibold))
                         .foregroundColor(Color.labelPrimary)
-                    Spacer()
-                    // Skills / MCP 有内容时，添加入口摆在关闭左边
+                    // Skills / MCP 的添加入口就跟在标题后头，跟时间轴那个 + 同一个图标
                     if selectedTab == agentTabBase + 1, !skills.skills.isEmpty {
-                        smallActionButton("添加") { importSkill() }
-                            .padding(.trailing, 24)
+                        addPlusButton("新增Skills") { importSkill() }
                     } else if selectedTab == agentTabBase + 2, !mcp.servers.isEmpty {
-                        smallActionButton("添加") { mcp.add() }
-                            .padding(.trailing, 24)
+                        addPlusButton("新增MCP服务") { mcp.add() }
                     }
+                    Spacer()
                     Button { dismiss() } label: {
                         Image(systemName: "xmark")
                             .font(.system(size: 12, weight: .medium))
@@ -241,7 +245,7 @@ struct SettingsView: View {
                         .foregroundColor(Color.accent)
                         .padding(.horizontal, 10).frame(height: 24)
                         .background(Color.accent.opacity(0.15))
-                        .cornerRadius(4)
+                        .clipShape(Capsule())
                 }
                 .buttonStyle(.plain)
 
@@ -266,7 +270,7 @@ struct SettingsView: View {
                             .foregroundColor(Color.accent)
                             .padding(.horizontal, 8).frame(height: 24)
                             .background(Color.accent.opacity(0.15))
-                            .cornerRadius(4)
+                            .clipShape(Capsule())
                     }
                     .buttonStyle(.plain)
                 }
@@ -447,7 +451,7 @@ struct SettingsView: View {
                         .foregroundColor(Color.labelPrimary)
                         .padding(.horizontal, 8).frame(height: 24)
                         .background(Color.white.opacity(0.08))
-                        .cornerRadius(4)
+                        .clipShape(Capsule())
                 }
                 .buttonStyle(.plain)
                 .disabled(separatedFiles.isEmpty)
@@ -459,7 +463,7 @@ struct SettingsView: View {
                         .foregroundColor(Color.accent)
                         .padding(.horizontal, 10).frame(height: 24)
                         .background(Color.accent.opacity(0.15))
-                        .cornerRadius(4)
+                        .clipShape(Capsule())
                 }
                 .buttonStyle(.plain)
                 .disabled(separatedFiles.isEmpty)
@@ -946,8 +950,21 @@ struct SettingsView: View {
                         .font(.system(size: 10))
                         .foregroundColor(Color(hex: "#FF9230"))
                 }
-                ForEach(skills.skills) { sk in
-                    skillCard(sk)
+                ForEach(skillGroups) { g in
+                    VStack(spacing: 6) {
+                        skillCard(g.parent, childCount: g.children.count,
+                                  expanded: expandedSkills.contains(g.id)) {
+                            if expandedSkills.contains(g.id) { expandedSkills.remove(g.id) }
+                            else { expandedSkills.insert(g.id) }
+                        }
+                        if expandedSkills.contains(g.id) {
+                            ForEach(g.children) { c in
+                                skillCard(c)
+                                    // 往里缩一截，一眼看出是谁的下属
+                                    .padding(.leading, 18)
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -976,13 +993,29 @@ struct SettingsView: View {
                         .foregroundColor(Color.labelSecondary)
                         .padding(.horizontal, 10).frame(height: 24)
                         .background(Color.white.opacity(0.08))
-                        .cornerRadius(4)
+                        .clipShape(Capsule())
                 }
                 .buttonStyle(.plain)
             }
         }
         .frame(maxWidth: .infinity)
         .padding(.top, 40)
+    }
+
+    /// 标题旁边那个 +。用时间轴那张 SVG，跟主界面加轨道是同一个图标
+    private func addPlusButton(_ help: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(nsImage: TimelineSVGIcon.load("add"))
+                .renderingMode(.template)
+                .resizable()
+                .aspectRatio(contentMode: .fit)
+                .frame(width: 16, height: 16)
+                .foregroundColor(Color.labelSecondary)
+                .frame(width: 24, height: 24)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(help)
     }
 
     private func smallActionButton(_ title: String, action: @escaping () -> Void) -> some View {
@@ -992,12 +1025,52 @@ struct SettingsView: View {
                 .foregroundColor(Color.accent)
                 .padding(.horizontal, 10).frame(height: 24)
                 .background(Color.accent.opacity(0.15))
-                .cornerRadius(4)
+                .clipShape(Capsule())
         }
         .buttonStyle(.plain)
     }
 
-    private func skillCard(_ sk: AgentSkill) -> some View {
+    /// 一主多子的一组。caveman 是主，caveman-commit 这些是子
+    private struct SkillGroup: Identifiable {
+        let parent: AgentSkill
+        let children: [AgentSkill]
+        var id: String { parent.folderURL.lastPathComponent }
+    }
+
+    /// **按来源仓库分组**：一个仓库来的算一组。
+    /// 主卡片优先挑名字跟仓库同名的那个（caveman 仓库里的 caveman）；
+    /// 没有同名的就拿组里头一个当主。没有来源记录的（手动拖进来的）各算一组
+    private var skillGroups: [SkillGroup] {
+        let all = skills.skills
+        var order: [String] = []          // 保持出现顺序，列表不会跳来跳去
+        var buckets: [String: [AgentSkill]] = [:]
+
+        for s in all {
+            // 没有来源的用自己的路径当键，等于自成一组
+            let key = s.source.isEmpty ? "local:" + s.folderURL.path : s.source
+            if buckets[key] == nil { order.append(key) }
+            buckets[key, default: []].append(s)
+        }
+
+        return order.compactMap { key in
+            guard var group = buckets[key] else { return nil }
+            // 仓库地址最后一段就是仓库名，caveman.git → caveman
+            let repoName = key
+                .replacingOccurrences(of: ".git", with: "")
+                .split(separator: "/").last.map(String.init) ?? ""
+            let headIdx = group.firstIndex { $0.folderURL.lastPathComponent == repoName } ?? 0
+            let head = group.remove(at: headIdx)
+            return SkillGroup(parent: head,
+                              children: group.sorted {
+                                  $0.folderURL.lastPathComponent < $1.folderURL.lastPathComponent
+                              })
+        }
+    }
+
+    private func skillCard(_ sk: AgentSkill,
+                           childCount: Int = 0,
+                           expanded: Bool = false,
+                           onToggleChildren: (() -> Void)? = nil) -> some View {
         HStack(spacing: 10) {
             VStack(alignment: .leading, spacing: 1) {
                 HStack(spacing: 4) {
@@ -1008,24 +1081,48 @@ struct SettingsView: View {
                         // 带脚本要标出来：装别人的 Skill 等于跑别人的代码
                         InfoBadge(text: "这个 Skill 带可执行脚本，运行前会先让你确认命令内容")
                     }
+                    if childCount > 0, let onToggleChildren {
+                        Button(action: onToggleChildren) {
+                            HStack(spacing: 3) {
+                                Text("\(childCount) 项")
+                                    .font(.system(size: 9, weight: .medium))
+                                Image(systemName: "chevron.right")
+                                    .font(.system(size: 7, weight: .bold))
+                                    .rotationEffect(.degrees(expanded ? 90 : 0))
+                            }
+                            .foregroundColor(Color.accent.opacity(0.9))
+                            .padding(.horizontal, 6)
+                            .frame(height: 16)
+                            .background(Color.accent.opacity(0.12))
+                            .clipShape(Capsule())
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .help(expanded ? "收起子技能" : "展开子技能")
+                    }
+                    // 作者和更新时间跟标题同一排，卡片就只占两行
+                    Text(skillSubtitle(sk))
+                        .font(.system(size: 10))
+                        .foregroundColor(Color.labelSecondary.opacity(0.5))
+                        .lineLimit(1)
                 }
-                Text(skillSubtitle(sk))
-                    .font(.system(size: 10))
-                    .foregroundColor(Color.labelSecondary.opacity(0.6))
-                    .lineLimit(1)
-                // 只露中文那一行（约定 SKILL.md 的 description 上中下英）。
-                // 英文和被截掉的部分都在 .help 气泡里
+                // 只露中文那一行，英文和被截掉的部分在 hover 气泡里。
+                // 气泡就挂在**这一行文字**上并给它铺满宽度的命中区 ——
+                // 挂在外层 VStack 上会盖住标题行那个展开按钮，点不动
                 let lines = skillDescLines(sk)
                 if !lines.zh.isEmpty {
                     Text(lines.zh)
                         .font(.system(size: 10))
                         .foregroundColor(Color.labelSecondary.opacity(0.6))
                         .lineLimit(1)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .contentShape(Rectangle())
+                        .help(sk.description)
                 }
             }
-            .help(sk.description)
+            .frame(maxWidth: .infinity, alignment: .leading)
 
-            Spacer()
+            Spacer(minLength: 4)
 
             Button { NSWorkspace.shared.open(sk.folderURL) } label: {
                 Image(nsImage: SidebarSVGIcon.load("folder"))
@@ -1040,7 +1137,7 @@ struct SettingsView: View {
 
             Toggle("", isOn: Binding(get: { sk.isEnabled },
                                      set: { skills.setEnabled($0, for: sk) }))
-                .toggleStyle(.switch).controlSize(.mini).labelsHidden()
+                .settingsSwitch()
 
             // 跟组件卡片同一个控件：静止显示「已安装」，悬停变「卸载」并转红
             InstalledBadge(label: "已安装", onUninstall: { skills.delete(sk) })
@@ -1097,45 +1194,192 @@ struct SettingsView: View {
                         }
                     }))
             } else {
-                Text("接外部工具。本地进程填可执行命令，远程填完整 URL。")
-                    .font(.system(size: 10))
-                    .foregroundColor(Color.labelSecondary.opacity(0.6))
+                HStack {
+                    Text("接外部工具。本地进程填可执行命令，远程填完整 URL。")
+                        .font(.system(size: 10))
+                        .foregroundColor(Color.labelSecondary.opacity(0.6))
+                    Spacer()
+                    Button("全部重连") { Task { await mcp.connectAll() } }
+                        .buttonStyle(.plain)
+                        .font(.system(size: 10))
+                        .foregroundColor(Color.accent)
+                }
                 ForEach($mcp.servers) { $srv in
-                    VStack(spacing: 8) {
+                    let editing = mcpEditing.contains(srv.id)
+                    VStack(alignment: .leading, spacing: 8) {
                         HStack(spacing: 10) {
-                            VStack(alignment: .leading, spacing: 1) {
-                                TextField("名字", text: $srv.name)
-                                    .textFieldStyle(.plain)
-                                    .font(.system(size: 12, weight: .semibold))
-                                    .foregroundColor(Color.labelPrimary)
-                                Text(srv.transport.rawValue
-                                     + (srv.command.isEmpty ? " · 还没填地址" : " · " + srv.command))
-                                    .font(.system(size: 10))
-                                    .foregroundColor(Color.labelSecondary.opacity(0.6))
-                                    .lineLimit(1)
+                            VStack(alignment: .leading, spacing: 2) {
+                                // 第一行：名字 + 铅笔 + 连接状态
+                                HStack(spacing: 6) {
+                                    TextField("名字", text: $srv.name)
+                                        .textFieldStyle(.plain)
+                                        .font(.system(size: 12, weight: .semibold))
+                                        .foregroundColor(Color.labelPrimary)
+                                        .fixedSize()
+                                    // 状态跟折叠箭头连在一起：点状态那一行就能展开工具清单
+                                    mcpStatusLine(srv)
+                                    Spacer(minLength: 0)
+                                }
+                                // 第二行：一句中文说明，鼠标停上去中英都给
+                                if !srv.descZh.isEmpty {
+                                    Text(srv.descZh)
+                                        .font(.system(size: 10))
+                                        .foregroundColor(Color.labelSecondary.opacity(0.6))
+                                        .lineLimit(1)
+                                        .help(srv.descEn.isEmpty ? srv.descZh
+                                                                 : srv.descZh + "\n" + srv.descEn)
+                                }
                             }
                             Spacer()
+                            Button {
+                                if editing { mcpEditing.remove(srv.id) }
+                                else { mcpEditing.insert(srv.id) }
+                            } label: {
+                                Image(nsImage: SidebarSVGIcon.load("newChat", size: 13))
+                                    .renderingMode(.template)
+                                    .foregroundColor(editing ? Color.accent
+                                                             : Color.labelSecondary.opacity(0.8))
+                                    .frame(width: 24, height: 24)
+                                    .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+                            .help(editing ? "收起设置" : "改地址和连接方式")
+
                             Toggle("", isOn: $srv.isEnabled)
-                                .toggleStyle(.switch).controlSize(.mini).labelsHidden()
+                                .settingsSwitch()
+                            mcpConnectButton(srv)
                             InstalledBadge(label: "已添加", onUninstall: { mcp.remove(srv.id) })
                         }
 
-                        Picker("", selection: $srv.transport) {
-                            ForEach(MCPServerConfig.Transport.allCases, id: \.self) {
-                                Text($0.rawValue).tag($0)
+                        // 地址和连接方式平时收着，点铅笔才露出来
+                        if editing {
+                            MCPTransportPicker(selection: $srv.transport)
+
+                            // 跟设置里其它输入框同一副长相：深底、7 圆角、32 高
+                            TextField(srv.transport == .stdio
+                                      ? "npx -y @modelcontextprotocol/server-memory"
+                                      : "https://example.com/mcp",
+                                      text: $srv.command)
+                                .textFieldStyle(.plain)
+                                .font(.system(size: 12))
+                                .foregroundColor(Color.labelPrimary)
+                                .padding(.horizontal, 10)
+                                .frame(height: 32)
+                                .background(Color.white.opacity(0.06))
+                                .cornerRadius(7)
+
+                            // 远程服务多半要带令牌，直接给个口子，省得让人去猜
+                            if srv.transport == .http {
+                                TextField("Authorization（可留空，例：Bearer sk-xxx）",
+                                          text: Binding(
+                                            get: { srv.headers["Authorization"] ?? "" },
+                                            set: { v in
+                                                if v.isEmpty { srv.headers.removeValue(forKey: "Authorization") }
+                                                else { srv.headers["Authorization"] = v }
+                                            }))
+                                    .textFieldStyle(.plain)
+                                    .font(.system(size: 12))
+                                    .foregroundColor(Color.labelPrimary)
+                                    .padding(.horizontal, 10)
+                                    .frame(height: 32)
+                                    .background(Color.white.opacity(0.06))
+                                    .cornerRadius(7)
                             }
                         }
-                        .pickerStyle(.segmented).labelsHidden().controlSize(.small)
 
-                        TextField(srv.transport == .stdio ? "npx -y some-mcp"
-                                                          : "https://example.com/mcp",
-                                  text: $srv.command)
-                            .textFieldStyle(.roundedBorder)
-                            .font(.system(size: 11))
+                        mcpToolList(srv)
                     }
                     .padding(.horizontal, 12).padding(.vertical, 10)
                     .background(RoundedRectangle(cornerRadius: 8).fill(Color.white.opacity(0.05)))
                 }
+            }
+        }
+        // 打开这一页时连一次，让人一眼看到通没通
+        .task { await mcp.ensureConnected() }
+    }
+
+    /// 状态那一行：一个色点 + 一句话
+    @ViewBuilder
+    private func mcpStatusLine(_ srv: MCPServerConfig) -> some View {
+        let st = mcp.status[srv.id] ?? .idle
+        let count = (mcp.tools[srv.id] ?? []).count
+        let open = mcpToolsExpanded.contains(srv.id)
+        let (color, text): (Color, String) = {
+            switch st {
+            case .idle:            return (Color.labelSecondary.opacity(0.4), "未连接")
+            case .connecting:      return (Color(hex: "#E8A54B"), "连接中…")
+            case .ready(let n):    return (Color(hex: "#5DB85D"), "已连接 · \(n) 个工具")
+            case .failed(let m):   return (Color(hex: "#FF6B6B"), "连不上：" + m)
+            }
+        }()
+        Button {
+            guard count > 0 else { return }
+            if open { mcpToolsExpanded.remove(srv.id) } else { mcpToolsExpanded.insert(srv.id) }
+        } label: {
+            HStack(spacing: 4) {
+                Circle().fill(color).frame(width: 5, height: 5)
+                Text(text)
+                    .font(.system(size: 10))
+                    .foregroundColor(color)
+                    .lineLimit(1)
+                if count > 0 {
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 7, weight: .bold))
+                        .foregroundColor(color.opacity(0.8))
+                        .rotationEffect(.degrees(open ? 90 : 0))
+                }
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(count == 0)
+        .help(count > 0 ? (open ? "收起工具清单" : "看看有哪些工具") : text)
+    }
+
+    /// 连接按钮。跟右边「已添加」同一副长相，宽度也一样，两个挨着才齐
+    private func mcpConnectButton(_ srv: MCPServerConfig) -> some View {
+        let busy = mcp.status[srv.id] == .connecting
+        return Button { Task { await mcp.connect(srv.id) } } label: {
+            Text(busy ? "连接中" : "连接")
+                .font(.system(size: 10, weight: .medium))
+                .foregroundColor(Color.accent.opacity(busy ? 0.5 : 0.9))
+                .frame(width: 52, height: 24)
+                .background(Color.accent.opacity(0.12))
+                .clipShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .disabled(busy)
+        .help("重新连一次这个服务")
+    }
+
+    /// 对方给出的工具清单。默认收起 —— 一个服务动辄十几二十个工具，
+    /// 全摊开的话设置页要滚半天
+    @ViewBuilder
+    private func mcpToolList(_ srv: MCPServerConfig) -> some View {
+        let list = mcp.tools[srv.id] ?? []
+        if !list.isEmpty {
+            // 展不展开由状态那一行的箭头管，这里只负责列
+            if mcpToolsExpanded.contains(srv.id) {
+                VStack(alignment: .leading, spacing: 3) {
+                    ForEach(list) { t in
+                        HStack(alignment: .top, spacing: 5) {
+                            Text("·").foregroundColor(Color.labelSecondary.opacity(0.5))
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text(t.name)
+                                    .font(.system(size: 10, weight: .medium))
+                                    .foregroundColor(Color.labelPrimary.opacity(0.85))
+                                if !t.description.isEmpty {
+                                    Text(t.description)
+                                        .font(.system(size: 9))
+                                        .foregroundColor(Color.labelSecondary.opacity(0.6))
+                                        .lineLimit(2)
+                                }
+                            }
+                        }
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.top, 2)
             }
         }
     }
@@ -1143,21 +1387,49 @@ struct SettingsView: View {
     private var agentGeneralTab: some View {
         VStack(alignment: .leading, spacing: 14) {
             VStack(alignment: .leading, spacing: 8) {
-                sectionTitle("记忆")
-                HStack {
-                    Text("记住你的习惯")
-                        .font(.system(size: 11, weight: .medium))
-                        .foregroundColor(Color.labelSecondary)
-                    Spacer()
-                    Toggle("", isOn: Binding(get: { settings.agentMemoryEnabled },
-                                             set: { settings.agentMemoryEnabled = $0 }))
-                        .toggleStyle(.switch)
-                        .controlSize(.small)
-                        .labelsHidden()
-                }
-                Text("关掉之后它不再读也不再写记忆，下面这些条目会留着但不生效。")
+                sectionTitle("聊天界面")
+                // 跟属性区一个长相。ICapsuleSlider 自带胶囊底，不再套外层卡片，
+                // 不然是卡片里再嵌一层底色。rounded() 是因为它是连续滑块，
+                // 没有 step，不收一下字号会变成 13.7 这种
+                ICapsuleSlider(label: "正文字号", value: Binding(
+                    get: { settings.chatFontSize },
+                    set: { settings.chatFontSize = $0.rounded() }
+                ), range: 11...20, unit: "pt", labelWidth: 48)
+                Text("你发的话、AI 的回答、输入框都跟着这个字号走。")
                     .font(.system(size: 10))
                     .foregroundColor(Color.labelSecondary.opacity(0.6))
+
+                sectionTitle("记忆")
+                // 跟 Skill / MCP 一个长相的卡片
+                HStack(spacing: 10) {
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text("记住你的习惯")
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundColor(Color.labelPrimary)
+                        Text("关掉之后它不再读也不再写记忆，下面这些条目会留着但不生效。")
+                            .font(.system(size: 10))
+                            .foregroundColor(Color.labelSecondary.opacity(0.6))
+                            .lineLimit(1)
+                    }
+                    Spacer()
+                    Button { NSWorkspace.shared.open(AgentMemory.folderURL) } label: {
+                        Image(nsImage: SidebarSVGIcon.load("folder"))
+                            .renderingMode(.template)
+                            .resizable().aspectRatio(contentMode: .fit)
+                            .frame(width: 14, height: 14)
+                            .foregroundColor(Color.labelSecondary)
+                            .frame(width: 24, height: 24)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .help("在访达中打开记忆文件所在的文件夹")
+
+                    Toggle("", isOn: Binding(get: { settings.agentMemoryEnabled },
+                                             set: { settings.agentMemoryEnabled = $0 }))
+                        .settingsSwitch()
+                }
+                .padding(.horizontal, 12).padding(.vertical, 10)
+                .background(RoundedRectangle(cornerRadius: 8).fill(Color.white.opacity(0.05)))
 
                 memoryList(title: "长期习惯（所有项目通用）",
                            entries: memory.global, isGlobal: true)
@@ -1453,7 +1725,7 @@ struct SettingsView: View {
                         .foregroundColor(Color.accent)
                         .padding(.horizontal, 8).frame(height: 22)
                         .background(Color.accent.opacity(0.15))
-                        .cornerRadius(4)
+                        .clipShape(Capsule())
                 }
                 .buttonStyle(.plain)
             }
@@ -1988,6 +2260,40 @@ private struct ClarityEnginePicker: View {
     }
 }
 
+/// 连接方式的下拉。样式跟设置里其它几个选择器一致：整行、深底、右边一个箭头
+private struct MCPTransportPicker: View {
+    @Binding var selection: MCPServerConfig.Transport
+    @State private var hov = false
+
+    var body: some View {
+        Button(action: showMenu) {
+            HStack(spacing: 6) {
+                Text(selection.rawValue)
+                    .font(.system(size: 12))
+                    .foregroundColor(Color.labelPrimary)
+                    .lineLimit(1)
+                Spacer(minLength: 4)
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundColor(Color.labelSecondary)
+            }
+            .padding(.horizontal, 10)
+            .frame(maxWidth: .infinity, minHeight: 32, maxHeight: 32)
+            .background(Color.white.opacity(hov ? 0.10 : 0.06))
+            .cornerRadius(7)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .onHover { hov = $0 }
+    }
+
+    private func showMenu() {
+        NSMenu.picker(MCPServerConfig.Transport.allCases.map { t in
+            (label: t.rawValue, checked: t == selection, action: { selection = t })
+        }).popUpHere()
+    }
+}
+
 private struct SearchEnginePicker: View {
     @Binding var selection: AppSettings.SearchEngine
     @State private var hov = false
@@ -2022,6 +2328,18 @@ private struct SearchEnginePicker: View {
 }
 
 
+private extension View {
+    /// 设置里的开关。长相照抄属性区（橙色、缩到 0.53），但要把缩放空出来的
+    /// 布局宽度收掉 —— `scaleEffect` 只缩画面不缩占位，开关画得只有 20 点宽、
+    /// 却仍按 38 点占地方，左边就空出十几个点，跟前面那个图标离得老远。
+    /// 视频页的组件卡片（图标紧挨着「已下载」）是没有这段空的，对齐它
+    func settingsSwitch() -> some View {
+        // trailing 对齐：缩放是按右边缘缩的，画面本来就贴在占位区的右侧，
+        // 容器也靠右对齐，开关才落得进来（左边多出来的是空的，不挡图标点击）
+        inspectorSwitch().frame(width: 22, alignment: .trailing)
+    }
+}
+
 /// 已下载徽章：静止显示「已下载」，指针移上去变「卸载」并转红。
 /// 独立成 View 是因为要有自己的 hover 状态——写在 componentCard 里的话
 /// 几张卡片会共用同一个 @State，悬停一张其余全跟着变。
@@ -2039,7 +2357,7 @@ private struct InstalledBadge: View {
                 .padding(.horizontal, 8)
                 .frame(width: 52, height: 24)   // 定宽，免得换词时按钮宽度跳
                 .background((hovering ? Color.red : Color.green).opacity(hovering ? 0.15 : 0.1))
-                .cornerRadius(4)
+                .clipShape(Capsule())
         }
         .buttonStyle(.plain)
         .onHover { hovering = $0 }

@@ -35,6 +35,12 @@ final class AgentMemory: ObservableObject {
     /// 每次改动同步一份到这里给它读
     nonisolated(unsafe) static var projectSnapshot: [MemoryEntry] = []
 
+    /// 记忆文件所在的文件夹。设置里那个小文件夹图标点开的就是它
+    static var folderURL: URL {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("黑猫剪辑", isDirectory: true)
+    }
+
     private let fileURL: URL = {
         let dir = FileManager.default.urls(for: .applicationSupportDirectory,
                                            in: .userDomainMask)[0]
@@ -61,6 +67,19 @@ final class AgentMemory: ObservableObject {
         guard !t.isEmpty, !project.contains(where: { $0.text == t }) else { return }
         project.append(MemoryEntry(text: t))
         if project.count > 60 { project.removeFirst(project.count - 60) }
+    }
+
+    /// 按内容删掉一条。给开头几个字就行，找不着就把现有的列出来让模型重挑
+    func forget(matching text: String, isGlobal: Bool) -> AgentToolResult {
+        let key = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let list = isGlobal ? global : project
+        guard let hit = list.first(where: { $0.text.contains(key) || key.contains($0.text) }) else {
+            return .fail(list.isEmpty
+                ? "这里本来就没记东西。"
+                : "没找到「\(key)」。现在记着：" + list.map(\.text).joined(separator: " / "))
+        }
+        remove(id: hit.id, isGlobal: isGlobal)
+        return .ok("忘掉了：\(hit.text)")
     }
 
     func update(id: UUID, text: String, isGlobal: Bool) {

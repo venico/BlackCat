@@ -61,6 +61,9 @@ final class AppSettings: ObservableObject {
         static let ttsSpeed = "settings.subtitle.ttsSpeed"
         static let ttsAutoFit = "settings.subtitle.ttsAutoFit"
         static let biRefNetModel = "settings.image.biRefNetModel"
+        static let subtitleFontSizeCJK = "settings.subtitle.fontSizeCJK"
+        static let subtitleFontSizeLatin = "settings.subtitle.fontSizeLatin"
+        static let chatFontSize = "settings.agent.chatFontSize"
     }
 
     // MARK: - Fish Audio 音色模型
@@ -559,6 +562,19 @@ final class AppSettings: ObservableObject {
         didSet { ud.set(ttsAutoFit, forKey: K.ttsAutoFit) }
     }
 
+    /// AI 聊天界面的正文字号。气泡、输入框、回答正文都跟着它走
+    @Published var chatFontSize: Double {
+        didSet { ud.set(chatFontSize, forKey: K.chatFontSize) }
+    }
+
+    /// 新字幕的默认字号，中英各一档（中文笔画密，同样字号看着比英文小）
+    @Published var subtitleFontSizeCJK: Double {
+        didSet { ud.set(subtitleFontSizeCJK, forKey: K.subtitleFontSizeCJK) }
+    }
+    @Published var subtitleFontSizeLatin: Double {
+        didSet { ud.set(subtitleFontSizeLatin, forKey: K.subtitleFontSizeLatin) }
+    }
+
     /// 可选的语音模型
     /// 跟「AI 设置」里声音生成那栏用同一份清单 —— 那边隐藏掉的，这里也不该还能选
     static var ttsProviders: [AIVideoService.Provider] {
@@ -735,6 +751,9 @@ final class AppSettings: ObservableObject {
         let savedSpeed = ud.double(forKey: K.ttsSpeed)
         ttsSpeed = savedSpeed > 0 ? savedSpeed : 1.0
         ttsAutoFit = ud.object(forKey: K.ttsAutoFit) as? Bool ?? true
+        subtitleFontSizeCJK = ud.object(forKey: K.subtitleFontSizeCJK) as? Double ?? 48
+        subtitleFontSizeLatin = ud.object(forKey: K.subtitleFontSizeLatin) as? Double ?? 32
+        chatFontSize = ud.object(forKey: K.chatFontSize) as? Double ?? 13
         biRefNetModel = BiRefNetModel(rawValue: ud.string(forKey: K.biRefNetModel) ?? "") ?? .lite
 
         deeplAPIKey = ud.string(forKey: K.deeplAPIKey) ?? ""

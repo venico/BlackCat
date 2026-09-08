@@ -879,14 +879,18 @@ private struct CanvasSurface: View {
         }
         // 触控板双指捏合缩放。跟时间轴那边一个套路：
         // 手势给的是**累积倍率**，所以要记住捏之前的 zoom 当基准，
-        // 每次拿 base × magnification 算，不能在当前值上反复乘（会越缩越快）
+        // 每次拿 base × magnification 算，不能在当前值上反复乘（会越缩越快）。
+        //
+        // 锚点用手势**起手那一下**的位置，不是容器中心 —— 光标底下的东西
+        // 缩放前后钉在原地，跟 ⌘+滚轮那条一致。整个手势期间锚点不变，
+        // 逐帧取当前位置的话，手指在触控板上微动画面就会跟着漂
         .gesture(
             MagnifyGesture(minimumScaleDelta: 0.005)
                 .onChanged { value in
                     if pinchBaseZoom == nil { pinchBaseZoom = canvas.zoom }
                     let base = pinchBaseZoom ?? canvas.zoom
                     canvas.setZoom(base * value.magnification,
-                                   anchor: nil, containerSize: containerSize)
+                                   anchor: value.startLocation, containerSize: containerSize)
                 }
                 .onEnded { _ in pinchBaseZoom = nil }
         )

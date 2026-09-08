@@ -81,7 +81,7 @@ struct SubtitleStyle: Equatable, Codable {
     // 思源黑体简体。**用族名不用 PostScript 名**：粗体是靠选同族的 Bold 成员实现的，
     // 写死 SourceHanSansSC-Regular 的话字重就切不动了
     var fontName: String  = "Source Han Sans SC"
-    var fontSize: CGFloat = 48
+    var fontSize: CGFloat = SubtitleStyle.cjkDefaultSize
     var bold: Bool        = false
     var italic: Bool      = false
     var textColor: Color      = .white
@@ -104,7 +104,18 @@ struct SubtitleStyle: Equatable, Codable {
                 || (0xAC00...0xD7AF).contains(u.value) // 谚文
             }
         }
-        return hasCJK ? 48 : 32
+        return hasCJK ? cjkDefaultSize : latinDefaultSize
+    }
+
+    /// 新字幕的默认字号，中英各一档。设置里能改，Agent 也能改 ——
+    /// **直读 UserDefaults**：这是个 static，不好去碰 @MainActor 的 AppSettings
+    static var cjkDefaultSize: CGFloat {
+        let v = UserDefaults.standard.double(forKey: "settings.subtitle.fontSizeCJK")
+        return v > 0 ? CGFloat(v) : 48
+    }
+    static var latinDefaultSize: CGFloat {
+        let v = UserDefaults.standard.double(forKey: "settings.subtitle.fontSizeLatin")
+        return v > 0 ? CGFloat(v) : 32
     }    // 合并换行：去掉字幕中的手动换行，按宽度自动重排
 
     /// 字幕层的排版尺寸（文字尺寸 + 内边距），**预览和导出共用这一份**。

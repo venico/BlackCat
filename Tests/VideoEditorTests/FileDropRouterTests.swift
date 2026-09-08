@@ -37,7 +37,7 @@ final class FileDropRouterTests: XCTestCase {
             accepts: {
                 switch $0 {
                 case .asset, .shape, .filter, .adjust, .effect: return true
-                case .files:                                   return false
+                case .files, .folder:                          return false
                 }
             },
             onDrop: { payload, local in
@@ -45,7 +45,7 @@ final class FileDropRouterTests: XCTestCase {
                 case .asset(let id): onAsset(id, local)
                 case .shape(let t):  onShape(t, local)
                 case .filter, .adjust, .effect: break
-                case .files:         break
+                case .files, .folder: break
                 }
             },
             onTargetChange: tlTargeted)
@@ -56,9 +56,10 @@ final class FileDropRouterTests: XCTestCase {
         var got: (ShapeType, CGPoint)?
         registerBoth(onShape: { got = ($0, $1) })
 
+        // deliver 返回「收下它的是哪个区」，nil = 没人收
         let hit = FileDropRouter.deliver(.shape(.ellipse), at: CGPoint(x: 700, y: 450), in: win)
 
-        XCTAssertTrue(hit)
+        XCTAssertEqual(hit, .timeline)
         XCTAssertEqual(got?.0, .ellipse)
         XCTAssertEqual(got?.1.x, 500)
     }
@@ -66,8 +67,8 @@ final class FileDropRouterTests: XCTestCase {
     /// 图形拖回素材区不该被接收
     func testShapeDroppedOnMediaLibraryIsRejected() {
         registerBoth()
-        XCTAssertFalse(FileDropRouter.deliver(.shape(.rectangle),
-                                              at: CGPoint(x: 100, y: 200), in: win))
+        XCTAssertNil(FileDropRouter.deliver(.shape(.rectangle),
+                                            at: CGPoint(x: 100, y: 200), in: win))
     }
 
     /// pasteboard 串要能原样解回来，且跟素材的裸 UUID 区分得开
@@ -100,7 +101,7 @@ final class FileDropRouterTests: XCTestCase {
 
         let hit = FileDropRouter.deliver(.asset(asset), at: CGPoint(x: 500, y: 450), in: win)
 
-        XCTAssertTrue(hit)
+        XCTAssertEqual(hit, .timeline)
         XCTAssertEqual(got?.0, asset)
         // 落点 500 在时间轴区（起点 200）里的本地坐标是 300
         XCTAssertEqual(got?.1.x, 300)
@@ -114,7 +115,7 @@ final class FileDropRouterTests: XCTestCase {
 
         let hit = FileDropRouter.deliver(.asset(UUID()), at: CGPoint(x: 100, y: 200), in: win)
 
-        XCTAssertFalse(hit, "素材区不收应用内拖来的素材 id")
+        XCTAssertNil(hit, "素材区不收应用内拖来的素材 id")
         XCTAssertFalse(libCalled)
     }
 
@@ -126,7 +127,7 @@ final class FileDropRouterTests: XCTestCase {
         let hit = FileDropRouter.deliver(.files([URL(fileURLWithPath: "/tmp/a.mp4")]),
                                          at: CGPoint(x: 500, y: 450), in: win)
 
-        XCTAssertFalse(hit)
+        XCTAssertNil(hit)
         XCTAssertFalse(assetCalled)
     }
 
@@ -137,14 +138,14 @@ final class FileDropRouterTests: XCTestCase {
         let hit = FileDropRouter.deliver(.files([URL(fileURLWithPath: "/tmp/a.mp4")]),
                                          at: CGPoint(x: 100, y: 200), in: win)
 
-        XCTAssertTrue(hit)
+        XCTAssertNotNil(hit)
         XCTAssertEqual(got.count, 1)
     }
 
     /// 落在两块区之外一律不收
     func testDropOutsideAnyZoneIsRejected() {
         registerBoth()
-        XCTAssertFalse(FileDropRouter.deliver(.asset(UUID()), at: CGPoint(x: 900, y: 50), in: win))
+        XCTAssertNil(FileDropRouter.deliver(.asset(UUID()), at: CGPoint(x: 900, y: 50), in: win))
         XCTAssertFalse(FileDropRouter.canAccept(CGPoint(x: 900, y: 50),
                                                 payload: .asset(UUID()), in: win))
     }
@@ -177,8 +178,8 @@ final class FileDropRouterTests: XCTestCase {
     func testZonesAreIsolatedPerWindow() {
         let other = WindowID()
         registerBoth()
-        XCTAssertFalse(FileDropRouter.deliver(.asset(UUID()),
-                                              at: CGPoint(x: 500, y: 450), in: other))
+        XCTAssertNil(FileDropRouter.deliver(.asset(UUID()),
+                                            at: CGPoint(x: 500, y: 450), in: other))
     }
 
     /// 只注销时间轴那块，素材区照常工作（关掉时间轴视图不该连带废掉素材导入）
@@ -188,10 +189,10 @@ final class FileDropRouterTests: XCTestCase {
 
         FileDropRouter.unregister(win, kind: .timeline)
 
-        XCTAssertFalse(FileDropRouter.deliver(.asset(UUID()),
-                                              at: CGPoint(x: 500, y: 450), in: win))
-        XCTAssertTrue(FileDropRouter.deliver(.files([URL(fileURLWithPath: "/tmp/a.mp4")]),
-                                             at: CGPoint(x: 100, y: 200), in: win))
+        XCTAssertNil(FileDropRouter.deliver(.asset(UUID()),
+                                            at: CGPoint(x: 500, y: 450), in: win))
+        XCTAssertEqual(FileDropRouter.deliver(.files([URL(fileURLWithPath: "/tmp/a.mp4")]),
+                                              at: CGPoint(x: 100, y: 200), in: win), .mediaLibrary)
         XCTAssertTrue(libCalled)
     }
 }

@@ -171,6 +171,8 @@ enum AgentLLM {
             }
         }
         if !toolList.isEmpty { body["tools"] = toolList }
+        DiagLog.log("[Agent] → \(providerName) 模型=\(body["model"] as? String ?? "?")"
+                  + " 工具 \(toolList.count) 个")
 
         let data = try await post(currentBaseURL(), key: key,
                                   headers: ["Authorization": "Bearer \(key)"], body: body)
@@ -194,6 +196,9 @@ enum AgentLLM {
                 id: id, name: name,
                 arguments: parseArgs(f["arguments"] as? String ?? "{}")))
         }
+        DiagLog.log("[Agent] ← \(providerName) 文本 \(turn.text.count) 字，"
+                  + "工具调用 \(turn.toolCalls.count) 个"
+                  + (turn.toolCalls.isEmpty ? "" : "：" + turn.toolCalls.map(\.name).joined(separator: "、")))
         return turn
     }
 
@@ -250,6 +255,10 @@ enum AgentLLM {
             toolList.append(["type": "web_search_20260209", "name": "web_search"])
         }
         if !toolList.isEmpty { body["tools"] = toolList }
+        DiagLog.log("[Agent] → Claude 地址=\(currentBaseURL()) 模型=\(body["model"] as? String ?? "?")"
+                  + " 工具 \(toolList.count) 个"
+                  + (toolList.contains { ($0["name"] as? String) == "remember" }
+                     ? "（含 remember）" : "（**不含 remember**）"))
 
         let data = try await post(currentBaseURL(), key: key,
                                   headers: ["x-api-key": key,
@@ -275,6 +284,12 @@ enum AgentLLM {
             default: break
             }
         }
+        // 工具调用为 0 时要能分清是「模型主动没调」还是「回来了我们没认出来」：
+        // stop_reason=tool_use 却解析出 0 个 → 是解析的锅；end_turn → 是模型没调
+        DiagLog.log("[Agent] ← Claude 文本 \(turn.text.count) 字，工具调用 \(turn.toolCalls.count) 个"
+                  + (turn.toolCalls.isEmpty ? "" : "：" + turn.toolCalls.map(\.name).joined(separator: "、"))
+                  + " stop=\(root["stop_reason"] as? String ?? "?")"
+                  + " blocks=\(content.map { $0["type"] as? String ?? "?" })")
         return turn
     }
 

@@ -115,8 +115,9 @@ final class AIVideoService: ObservableObject {
                 return [("Fable5", "claude-fable-5"), ("Opus5", "claude-opus-5"),
                         ("Sonnet5", "claude-sonnet-5"), ("Opus4.6", "claude-opus-4-6")]
             case .gpt56:
-                return [("GPT-5.6-Sol", "gpt-5.6-sol"), ("GPT-5.6-Terra", "gpt-5.6-terra"),
-                        ("GPT-5.6-Luna", "gpt-5.6-luna"), ("GPT-5.5", "gpt-5.5")]
+                return [("GPT-6-Astra", "gpt-6-astra"),
+                        ("GPT-5.6-Sol", "gpt-5.6-sol"), ("GPT-5.6-Terra", "gpt-5.6-terra"),
+                        ("GPT-5.5", "gpt-5.5")]
             case .deepseek_ai:
                 return [("Deepseek-V4-Flash", "deepseek-v4-flash"),
                         ("Deepseek-V4-Pro", "deepseek-v4-pro")]
@@ -535,6 +536,11 @@ final class AIVideoService: ObservableObject {
             var tool: String
             var summary: String
             var isError: Bool = false
+            /// 下面三样是 v5.8.5 之后加的，**都得是 Optional** ——
+            /// 旧存档里没有这几个键，非 Optional 会让整份记录解不出来
+            var args: String?
+            var detail: String?
+            var thinking: String?
         }
     }
 
@@ -1203,6 +1209,8 @@ final class AIVideoService: ObservableObject {
                           elapsed: TimeInterval = 0, tokens: Int = 0) {
         guard let i = messages.firstIndex(where: { $0.id == id }) else { return }
         messages[i].content = text.isEmpty ? "（没有输出）" : text
+        DiagLog.log("[会话] 存回复：步骤 \(steps.count) 步"
+                  + (steps.isEmpty ? "" : "（\(steps.map(\.tool).joined(separator: "、"))）"))
         messages[i].agentSteps = steps.isEmpty ? nil : steps
         messages[i].agentElapsed = elapsed > 0 ? elapsed : nil
         messages[i].agentTokens = tokens > 0 ? tokens : nil
@@ -1331,6 +1339,14 @@ final class AIVideoService: ObservableObject {
             entry.imageBookmark = imageBookmark
             entry.audioBookmark = audioBookmark
             entry.attachments = msg.attachments.isEmpty ? nil : msg.attachments
+            // **步骤/耗时/用量/失败原因必须一起带上**：这个方法是拿 messages 全量
+            // 重建 entries 再整个覆盖回去的，漏掉的字段等于被清空 ——
+            // finishAgentReply 刚 persist 好的步骤，会在切会话/关窗时被冲成 nil。
+            // 现象是「跑的时候步骤条在，重启就没了」（存档 337 条一条步骤都没剩下）
+            entry.agentSteps = msg.agentSteps
+            entry.agentElapsed = msg.agentElapsed
+            entry.agentTokens = msg.agentTokens
+            if case .failed(let e) = msg.status { entry.failedError = e }
             return entry
         }
         let title = String((validMessages.first(where: { $0.role == .user })?.content ?? "对话").prefix(30))

@@ -94,6 +94,11 @@ struct AgentStepsView: View {
                                 .opacity(pulsing ? 1 : 0.25)
                                 .animation(.easeInOut(duration: 0.8).repeatForever(autoreverses: true),
                                            value: pulsing)
+                                // 把这个点的几何变化跟外面隔开。
+                                // **不隔的话呼吸动画会把「位置」也一起接管**：
+                                // 拖侧栏宽度时整行要重新排版，这个点的新位置被
+                                // repeatForever 那条动画慢慢补间，看着就是上下乱跳
+                                .geometryGroup()
                                 .onAppear { pulsing = true }
                                 .onDisappear { pulsing = false }
                         }
@@ -130,12 +135,28 @@ struct AgentStepsView: View {
                                 .fill(s.isError ? Color(hex: "#FF6B6B") : Color.labelSecondary.opacity(0.5))
                                 .frame(width: 4, height: 4)
                                 .padding(.top, 5)
-                            Text("\(s.tool) · \(s.summary)")
-                                .font(.system(size: 10))
-                                // 一条步骤常常自己就折成三四行，行内也得松一点
-                                .lineSpacing(2.5)
-                                .foregroundColor(Color.labelSecondary.opacity(0.85))
-                                .fixedSize(horizontal: false, vertical: true)
+                            VStack(alignment: .leading, spacing: 3) {
+                                // 动手前它说的那段话就是思路，摆在最前面
+                                if let think = s.thinking, !think.isEmpty {
+                                    Text(think)
+                                        .font(.system(size: 9.5))
+                                        .italic()
+                                        .lineSpacing(2)
+                                        .foregroundColor(Color.labelSecondary.opacity(0.5))
+                                        .fixedSize(horizontal: false, vertical: true)
+                                }
+                                Text(s.tool + (s.args.map { $0.isEmpty ? "" : "（\($0)）" } ?? ""))
+                                    .font(.system(size: 10, weight: .medium))
+                                    .foregroundColor(Color.labelSecondary)
+                                    .fixedSize(horizontal: false, vertical: true)
+                                // 有完整结果就显示完整的，没有才退回那 120 字的摘要
+                                Text((s.detail?.isEmpty == false ? s.detail! : s.summary))
+                                    .font(.system(size: 10))
+                                    .lineSpacing(2.5)
+                                    .foregroundColor(Color.labelSecondary.opacity(0.85))
+                                    .textSelection(.enabled)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
                         }
                     }
                     }
@@ -163,7 +184,8 @@ struct AgentConfirmBar: View {
                 Image(nsImage: SidebarSVGIcon.load("toastWarn", size: 13))
                     .renderingMode(.template)
                     .foregroundColor(Color(hex: "#FF9230"))
-                Text(toolName == "run_command" ? "要在你的电脑上跑一条命令" : "这一步会改动不好回头的东西")
+                Text(toolName == "run_command" ? "需要在你的电脑上运行以下命令"
+                                               : "这一步改动需要你的确认")
                     .font(.system(size: 11, weight: .medium))
                     .foregroundColor(Color.labelPrimary)
             }

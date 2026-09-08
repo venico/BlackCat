@@ -136,8 +136,14 @@ struct PlayerView: View {
             ctrl.seek(to: clock.currentTime)
         }
         .onChange(of: clock.refreshSeekRequest) {
-            let jitter = (1.0 / 600.0) * (clock.refreshSeekRequest % 2 == 0 ? 1.0 : -1.0)
-            ctrl.seek(to: clock.currentTime + jitter)
+            // AVPlayer seek 到**同一个** CMTime 不会触发 compositor 重绘，
+            // 所以每次都得给个不一样的时刻。
+            //
+            // **不能正负交替**：那样连续拖滑块时画面会在两个相差 1/300 秒的时刻
+            // 之间来回横跳，看着就是抖。改成始终朝同一个方向、在 1/600 秒内
+            // 取四档循环 —— 相邻两次的差最多 1/2400 秒，远小于一帧，画面稳得住
+            let step = (1.0 / 2400.0) * Double(clock.refreshSeekRequest % 4 + 1)
+            ctrl.seek(to: clock.currentTime + step)
         }
         .onAppear {
             // 绑定回调：Timer 驱动 currentTime，不依赖 AVPlayer

@@ -43,12 +43,49 @@ extension AgentToolbox {
                     "required": ["skill", "script"]
                 ],
                 risk: .dangerous),
+
+            AgentToolSpec(
+                name: "install_skill",
+                description: """
+                装一个新 Skill 进来。给 GitHub（或任意 git）仓库地址就行，会克隆下来、
+                找出里面带 SKILL.md 的文件夹装上，同名的按更新覆盖。
+                **用户给的地址原样传，别删掉 /tree/… 那段子路径** —— 那段就是他要的那一个。
+                仓库里不止一个 Skill 时，工具会把清单退回来让你问用户装哪几个，
+                别自己替他决定；他答复之后用 only 点名，说了「全都装」才用 all。
+                **别自己去读网页再拼文件** —— 用这个工具，一步到位。
+                """,
+                parameters: [
+                    "type": "object",
+                    "properties": [
+                        "repo": ["type": "string",
+                                 "description": "仓库地址，例如 https://github.com/someone/some-skill。用户给的原样传，别删子路径"],
+                        "only": ["type": "array", "items": ["type": "string"],
+                                 "description": "只装这几个（文件夹名）。仓库里有多个时用它点名"],
+                        "all": ["type": "boolean",
+                                "description": "整仓库全装。只有用户明确说了「全都装」才传 true"]
+                    ] as [String: Any],
+                    "required": ["repo"]
+                ],
+                risk: .mutating),
         ]
     }
 
     @MainActor
     static func runSkillTool(_ name: String, args: [String: Any]) async -> AgentToolResult? {
         switch name {
+        case "install_skill":
+            guard let repo = (args["repo"] as? String)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines), !repo.isEmpty else {
+                return .fail("缺 repo，给个 git 仓库地址")
+            }
+            let only = (args["only"] as? [String]) ?? []
+            let all  = (args["all"] as? Bool) ?? false
+            let msg = await AgentSkills.shared.installFromGit(repo, only: only, all: all)
+            // 「先别急着装」是让模型回头问用户，不是出错 —— 标成 fail 的话
+            // 会话里那一步会显示成红的，模型也容易当成失败去重试
+            let okish = msg.hasPrefix("装好了") || msg.hasPrefix("先别急着装")
+            return okish ? .ok(msg) : .fail(msg)
+
         case "read_skill":
             guard let want = args["name"] as? String else { return .fail("缺 name") }
             guard let sk = AgentSkills.shared.skills.first(where: {

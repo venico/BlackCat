@@ -27,6 +27,12 @@ struct CanvasAssetBrowser: View {
 
     @State private var keyword = ""
     @State private var tab: Tab = .all
+    /// 正待在哪个文件夹里。nil = 最外层。跟侧栏素材库是同一份数据，
+    /// 那边建的文件夹这儿立刻就有
+    @State private var currentFolderID: UUID?
+    /// 鼠标停在哪个文件夹上（前盖跟着张开）
+    @State private var hoveredFolder: UUID?
+    @ObservedObject private var library = MediaLibrary.shared
     /// 滚到哪儿了（0~1）、视口占内容多少（决定滑块多长）。
     /// 都由底层 NSScrollView 的 bounds 变化推上来
     @State private var scrollFraction: Double = 0
@@ -106,7 +112,12 @@ struct CanvasAssetBrowser: View {
         // 不按 limitKinds 过滤 —— 不能选的素材照样列出来，只是格子置灰。
         // 直接藏掉的话用户会以为素材库里没有那些东西
         if let want = tab.nodeKind { list = list.filter { $0.kind == want } }
-        if !keyword.isEmpty {
+        if keyword.isEmpty {
+            // 只看这一层。**搜索时反过来不看层**，不然搜到的东西
+            // 明明在库里却因为躺在别的文件夹里而不显示
+            let here = Set(project.mediaAssets.filter { $0.folderID == currentFolderID }.map(\.id))
+            list = list.filter { here.contains($0.assetID) }
+        } else {
             list = list.filter { $0.name.localizedCaseInsensitiveContains(keyword) }
         }
         return sorted(list)
@@ -135,10 +146,121 @@ struct CanvasAssetBrowser: View {
     /// 用列表还是缩略图。按自己的标签页记，跟侧边栏素材库分开 ——
     /// 一边切了另一边跟着变，跟排序设置一个待遇。
     /// 音频没有画面，摆成网格全是一样的图标 —— 那一栏固定用列表
-    private var showsAsList: Bool { tab == .audio || !project.gridMode(for: "canvas.\(tab.rawValue)") }
+    private var showsAsList: Bool { !project.gridMode(for: "canvas.\(tab.rawValue)") }
 
-    /// 音频那栏没缩略图可看，不给切换按钮
-    private var canSwitchViewMode: Bool { tab != .audio }
+    /// 四类都能切宫格。音频没有封面，格子里拿分类图标顶上
+    private var canSwitchViewMode: Bool { true }
+
+    /// 路径栏：素材库 / A / B，点哪一级回哪一级
+    private var folderCrumb: some View {
+        HStack(spacing: 3) {
+            Button { currentFolderID = nil } label: {
+                Text("素材库")
+                    .font(.system(size: 11))
+                    .foregroundColor(Color.labelSecondary)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            ForEach(Array(folderChain.enumerated()), id: \.element.id) { i, f in
+                Text("/").font(.system(size: 10)).foregroundColor(Color.labelSecondary.opacity(0.45))
+                Button { currentFolderID = f.id } label: {
+                    Text(f.name)
+                        .font(.system(size: 11,
+                                      weight: i == folderChain.count - 1 ? .medium : .regular))
+                        .foregroundColor(i == folderChain.count - 1
+                                         ? Color.labelPrimary : Color.labelSecondary)
+                        .lineLimit(1)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 20)
+        .padding(.bottom, 6)
+    }
+
+    /// 宫格里的文件夹格子。皮相跟侧栏素材库共用同一个组件，双击进去
+    private func folderCell(_ f: LibraryFolder) -> some View {
+        VStack(spacing: 0) {
+            LibraryFolderCard(
+                folder: f,
+                open: hoveredFolder == f.id,
+                peek: project.mediaAssets
+                    .filter { $0.folderID == f.id }
+                    .prefix(3)
+                    .compactMap { project.mediaThumbnails[$0.id] },
+                count: project.mediaAssets.count { $0.folderID == f.id }
+                     + library.folders.count { $0.parentID == f.id })
+            Text(f.name)
+                .font(.system(size: 10))
+                .foregroundColor(Color.labelSecondary)
+                .lineLimit(1)
+                .multilineTextAlignment(.center)
+                .frame(maxWidth: .infinity)
+                .padding(.top, 5)
+        }
+        .contentShape(Rectangle())
+        .onHover { hoveredFolder = $0 ? f.id : (hoveredFolder == f.id ? nil : hoveredFolder) }
+        .onTapGesture(count: 2) { currentFolderID = f.id }
+        // 文件夹里的素材没在列表里露过面，缩略图可能压根没做过
+        .task(id: f.id) {
+            for a in project.mediaAssets.filter({ $0.folderID == f.id }).prefix(3)
+            where project.mediaThumbnails[a.id] == nil
+               && (a.type == .video || a.type == .image) {
+                project.loadMediaThumbnail(assetID: a.id, url: a.url)
+            }
+        }
+    }
+
+    /// 列表里的文件夹一行
+    private func folderRow(_ f: LibraryFolder) -> some View {
+        let count = project.mediaAssets.count { $0.folderID == f.id }
+                  + library.folders.count { $0.parentID == f.id }
+        let tint = f.colorHex.map { Color(hex: $0) } ?? Color(white: 0.62)
+        return HStack(spacing: 8) {
+            Image(nsImage: SidebarSVGIcon.load("folderFill", size: 13))
+                .renderingMode(.template)
+                .foregroundColor(tint)
+                .frame(width: 16, height: 16)
+            Text(f.name)
+                .font(.system(size: 12))
+                .foregroundColor(Color.labelPrimary)
+                .lineLimit(1)
+            Spacer(minLength: 4)
+            if count > 0 {
+                Text("\(count)")
+                    .font(.system(size: 10).monospacedDigit())
+                    .foregroundColor(Color.labelSecondary.opacity(0.6))
+            }
+        }
+        .padding(.horizontal, 8)
+        .frame(height: 30)
+        .contentShape(Rectangle())
+        .onTapGesture(count: 2) { currentFolderID = f.id }
+    }
+
+    /// 当前这一层的文件夹。搜索时不列 —— 那会儿是跨层找素材
+    private var visibleFolders: [LibraryFolder] {
+        guard keyword.isEmpty else { return [] }
+        return library.folders
+            .filter { $0.parentID == currentFolderID }
+            // 「全部」标签页把四类文件夹都列出来；选了某一类就只看那一类
+            .filter { tab.assetType == nil || $0.type == tab.assetType }
+            .sorted { $0.createdAt < $1.createdAt }
+    }
+
+    /// 从最外层到当前的那条路径，面包屑照它铺
+    private var folderChain: [LibraryFolder] {
+        var chain: [LibraryFolder] = []
+        var cur = currentFolderID
+        while let c = cur, chain.count < 32,
+              let f = library.folders.first(where: { $0.id == c }) {
+            chain.insert(f, at: 0)
+            cur = f.parentID
+        }
+        return chain
+    }
 
     struct Item: Identifiable {
         var id: URL { url }
@@ -158,7 +280,9 @@ struct CanvasAssetBrowser: View {
             tabBar
             searchRow
 
-            if items.isEmpty {
+            if !folderChain.isEmpty { folderCrumb }
+
+            if items.isEmpty && visibleFolders.isEmpty {
                 Spacer()
                 Text(emptyHint)
                     .font(.system(size: 12))
@@ -178,6 +302,7 @@ struct CanvasAssetBrowser: View {
 
                     if showsAsList {
                         LazyVStack(spacing: 2) {
+                            ForEach(visibleFolders) { f in folderRow(f) }
                             ForEach(items) { item in
                                 AssetRow(item: item,
                                          enabled: limitKinds?.contains(item.kind) ?? true,
@@ -197,6 +322,7 @@ struct CanvasAssetBrowser: View {
                         // 列数按面板宽度算，夹在 2~4 之间：窄了也不挤成一列，
                         // 拖宽了也不无限加列（格子跟着变宽，一屏看得清）
                         LazyVGrid(columns: gridColumns, spacing: 12) {
+                            ForEach(visibleFolders) { f in folderCell(f) }
                             ForEach(items) { item in
                                 AssetCell(item: item,
                                           // 限定了类型时，别的类型置灰不可选

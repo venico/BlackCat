@@ -160,6 +160,36 @@ extension AgentToolbox {
                 risk: .mutating),
 
             AgentToolSpec(
+                name: "forget",
+                description: """
+                删掉一条已经记住的东西。用户说「改成…」「不是…是…」时，                **先用它把旧的那条删掉，再 remember 新的** —— 直接 remember 会变成两条并存，                下次它们会互相打架。系统提示词里列了现在记着哪些，照着写要删哪条。
+                """,
+                parameters: [
+                    "type": "object",
+                    "properties": [
+                        "text": ["type": "string", "description": "要删的那条，写开头几个字就行"],
+                        "scope": ["type": "string", "enum": ["global", "project"],
+                                  "description": "从长期习惯里删还是从本项目设定里删"]
+                    ] as [String: Any],
+                    "required": ["text"]
+                ],
+                risk: .mutating),
+
+            AgentToolSpec(
+                name: "set_subtitle_default_size",
+                description: """
+                改**新建字幕的默认字号**，中英各一档。用户说「字幕默认中文 40、英文 32」                这类话时调它 —— 光 remember 只是记个备忘，不会真的改到软件设置，                下次加字幕还是老字号。已经在时间轴上的字幕不受影响。
+                """,
+                parameters: [
+                    "type": "object",
+                    "properties": [
+                        "cjk": ["type": "number", "description": "中日韩文字的字号，比如 40"],
+                        "latin": ["type": "number", "description": "纯西文字幕的字号，比如 32"]
+                    ] as [String: Any]
+                ],
+                risk: .mutating),
+
+            AgentToolSpec(
                 name: "seek",
                 description: "把播放头移到某一秒。要看某处画面之前先移过去，再 capture_frame。",
                 parameters: [
@@ -272,6 +302,21 @@ extension AgentToolbox {
             if isGlobal { AgentMemory.shared.addGlobal(text) }
             else { AgentMemory.shared.addProject(text) }
             return .ok("记住了（\(isGlobal ? "长期习惯" : "本项目")）：\(text)")
+
+        case "forget":
+            guard let text = args["text"] as? String, !text.isEmpty else { return .fail("缺 text") }
+            let g = (args["scope"] as? String ?? "global") == "global"
+            return AgentMemory.shared.forget(matching: text, isGlobal: g)
+
+        case "set_subtitle_default_size":
+            let cjk = args["cjk"] as? Double
+            let latin = args["latin"] as? Double
+            guard cjk != nil || latin != nil else { return .fail("cjk 和 latin 至少给一个") }
+            if let c = cjk, c > 0 { AppSettings.shared.subtitleFontSizeCJK = c }
+            if let l = latin, l > 0 { AppSettings.shared.subtitleFontSizeLatin = l }
+            return .ok("以后新建字幕的默认字号：中文 \(Int(AppSettings.shared.subtitleFontSizeCJK))、"
+                     + "英文 \(Int(AppSettings.shared.subtitleFontSizeLatin))。"
+                     + "已经在时间轴上的字幕没动。")
 
         case "seek":
             guard let t = args["time"] as? Double else { return .fail("缺 time") }

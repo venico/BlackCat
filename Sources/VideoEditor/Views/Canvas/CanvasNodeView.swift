@@ -114,10 +114,6 @@ struct CanvasNodeView: View {
 
             plusButton(.leading)
             plusButton(.trailing)
-            // 连接点排在 + 后面 —— 它贴着卡片边框，要压在文本卡片的
-            // resize 热区上面，不然拖它会变成调整卡片大小
-            connectorDot(.leading)
-            connectorDot(.trailing)
         }
         // 把两侧空当算进 frame，+ 才收得到鼠标；底部再加一份给 resize 热区
         .frame(width: effectiveSize.width + Self.plusGutter * 2,
@@ -1058,41 +1054,14 @@ struct CanvasNodeView: View {
                         // ZStack 的几何中心被往下拉了半份 —— 减掉这一半才能让
                         // + 号继续落在卡片纵向中点，不随这份余量往下漂
                         y: Self.labelHeight / 2 - bottomResizeMargin / 2)
-                // 只管点击弹菜单。拉线交给卡片边缘上的连接点 ——
-                // 同一个控件既接 tap 又接 drag，轻点会被判成微小拖拽，
-                // 两种意图老打架
+                // 点它弹菜单，拖它拉线，两件事都归这一个按钮。
+                //
+                // **minimumDistance 是关键**：不设的话手指刚按下就算拖拽开始，
+                // 轻点会被判成一次微小拖动，菜单永远弹不出来。给 4pt 的余量，
+                // 没挪够就是点击，挪够了才开始拉线
                 .onTapGesture { onPlusTap(edge) }
-        }
-    }
-
-    /// 这一侧接着线没有。右边看出边（这张卡片是谁的上游），左边看入边
-    private func isConnected(_ edge: Edge) -> Bool {
-        edge == .trailing ? canvas.edges.contains { $0.from == node.id }
-                          : canvas.edges.contains { $0.to == node.id }
-    }
-
-    /// 卡片左右边缘线上的连接点：**拖它拉线**。
-    ///
-    /// 跟 + 号分工明确：+ 在卡片外的空当里，点它弹菜单；圆点贴在卡片边框上，
-    /// 拖它连到别的卡片。位置贴边也是在说明「线是从这儿出去的」
-    @ViewBuilder
-    private func connectorDot(_ edge: Edge) -> some View {
-        if isHovering || canvas.pendingEdgeFrom == node.id {
-            // 这一侧连着线才实心，空着就是个空心圈 —— 一眼看出哪边已经接上了
-            let connected = isConnected(edge)
-            Circle()
-                .fill(connected ? Color.accent : Color(red: 0.19, green: 0.19, blue: 0.20))
-                .frame(width: 9, height: 9)
-                .overlay(Circle().strokeBorder(connected ? Color.black.opacity(0.35) : Color.accent,
-                                               lineWidth: 1.5))
-                // 视觉 9pt、热区 20pt —— 只按视觉大小做热区根本抓不住
-                .frame(width: 20, height: 20)
-                .contentShape(Circle())
-                // 贴在卡片左右边框的中点上。y 的补偿跟 + 号同理（见上面）
-                .offset(x: edge == .leading ? -effectiveSize.width / 2 : effectiveSize.width / 2,
-                        y: Self.labelHeight / 2 - bottomResizeMargin / 2)
                 .gesture(
-                    DragGesture(coordinateSpace: .named("canvasContent"))
+                    DragGesture(minimumDistance: 4, coordinateSpace: .named("canvasContent"))
                         .onChanged { value in
                             canvas.pendingEdgeFrom = node.id
                             canvas.pendingEdgeIsLeading = (edge == .leading)
@@ -1102,6 +1071,13 @@ struct CanvasNodeView: View {
                 )
         }
     }
+
+    /// 这一侧接着线没有。右边看出边（这张卡片是谁的上游），左边看入边
+    private func isConnected(_ edge: Edge) -> Bool {
+        edge == .trailing ? canvas.edges.contains { $0.from == node.id }
+                          : canvas.edges.contains { $0.to == node.id }
+    }
+
 }
 
 extension Notification.Name {

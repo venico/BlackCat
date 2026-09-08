@@ -26,6 +26,12 @@ final class AgentRunner: ObservableObject {
         var toolName: String
         var summary: String
         var isError = false
+        /// 调这一步时传了什么参数
+        var args: String = ""
+        /// 工具返回的完整内容。`summary` 只是它的头一截，展开时看这个
+        var detail: String = ""
+        /// 这一步之前模型说的话（它的思路）。有些轮次会先解释再动手
+        var thinking: String = ""
     }
 
     // 下面这几个 @Published 是**当前正看着那条会话**的镜像。
@@ -146,18 +152,6 @@ final class AgentRunner: ObservableObject {
             project.suppressUndoPush = true
         }
 
-        // Skill 的列表进提示词，正文按需读 —— read_skill 是只读的，
-        // 计划模式也给，不然它连方案都拟不出来
-        let tools = AgentToolbox.readTools
-                  + AgentToolbox.skillTools.filter { mode != .plan || $0.risk == .readOnly }
-                  + (mode == .plan ? [] : AgentToolbox.editTools + AgentToolbox.generateTools
-                                         + AgentToolbox.shellTools)
-                  // 这家有原生联网就用原生（搜索在服务端跑，模型自己决定搜什么词）；
-                  // 没有、或者走了中转站发不过去，才挂这个外挂工具兜底
-                  + (webSearch && !AgentLLM.canUseNativeSearch() ? AgentToolbox.searchTools : [])
-        let system = Self.systemPrompt(mode: mode, inCanvas: project.showCanvas)
-                   + AgentMemory.shared.promptSection
-                   + AgentSkills.shared.promptSection
 
         let began = Date()
         states[cid]?.ticker?.invalidate()
@@ -176,12 +170,42 @@ final class AgentRunner: ObservableObject {
 
         let task = Task { [weak self] in
             guard let self else { return }
+            // 外接的 MCP 服务在这轮之前连一次（只连一次，之后走缓存）。
+            // **必须在 Task 里** —— run 本身是同步的，而且工具表要等连上
+            // 才知道对方有哪些工具
+            await AgentMCP.shared.ensureConnected()
+            // 用户这句话点到哪个外部服务，就挂哪个的工具
+            AgentMCP.shared.activate(matching: prompt)
+
+            // **提示词要等连上之后再拼**：外部服务清单来自刚才那次连接，
+            // 在 Task 外面拼的话第一轮永远是空的，模型根本不知道有哪些服务可要
+            let system = Self.systemPrompt(mode: mode, inCanvas: project.showCanvas)
+                       + AgentMemory.shared.promptSection
+                       + AgentSkills.shared.promptSection
+                       + AgentMCP.shared.promptSection
+
+            // Skill 的列表进提示词，正文按需读 —— read_skill 是只读的，
+            // 计划模式也给，不然它连方案都拟不出来。
+            //
+            // **每轮重算**：模型可能这一步刚 enable_service 要来一个外部服务，
+            // 下一步就得能看见那些工具；算一次存着的话它要了也用不上
+            @MainActor func buildTools() -> [AgentToolSpec] {
+                AgentToolbox.readTools
+                + AgentToolbox.skillTools.filter { mode != .plan || $0.risk == .readOnly }
+                + (mode == .plan ? [] : AgentToolbox.editTools + AgentToolbox.generateTools
+                                       + AgentToolbox.shellTools
+                                       + AgentToolbox.mcpGateTool + AgentToolbox.mcpTools)
+                // 这家有原生联网就用原生（搜索在服务端跑，模型自己决定搜什么词）；
+                // 没有、或者走了中转站发不过去，才挂这个外挂工具兜底
+                + (webSearch && !AgentLLM.canUseNativeSearch() ? AgentToolbox.searchTools : [])
+            }
+
             var finalText = ""
             do {
                 for _ in 0..<maxSteps {
                     if Task.isCancelled { break }
                     self.mutate(cid) { $0.phase = "正在思考" }
-                    let turn = try await AgentLLM.send(messages: msgs, tools: tools,
+                    let turn = try await AgentLLM.send(messages: msgs, tools: buildTools(),
                                                        systemPrompt: system, webSearch: webSearch)
                     self.mutate(cid) { $0.totalTokens += turn.tokens }
                     if !turn.text.isEmpty {
@@ -196,10 +220,23 @@ final class AgentRunner: ObservableObject {
                         self.mutate(cid) { $0.phase = AgentPhaseText.phase(for: call.name) }
                         let result = await self.execute(call, mode: mode, project: project,
                                                         convID: cid)
+                        // 参数和完整结果都留着 —— 事后要复盘「它到底传了什么、
+                        // 拿回来什么」，只存 120 字的摘要根本查不出问题。
+                        // 结果掐到 4000 字：再长也读不完，还会把存档撑大
+                        let args = call.arguments
+                            .map { "\($0.key)=\(Self.brief($0.value))" }
+                            .sorted().joined(separator: "，")
+                        let full = result.text.count > 4000
+                            ? String(result.text.prefix(4000)) + "\n……（还有 \(result.text.count - 4000) 字）"
+                            : result.text
                         self.mutate(cid) {
                             $0.steps.append(Step(toolName: call.name,
                                                  summary: String(result.text.prefix(120)),
-                                                 isError: result.isError))
+                                                 isError: result.isError,
+                                                 args: args,
+                                                 detail: full,
+                                                 // 模型这一轮动手前说的话，就是它的思路
+                                                 thinking: turn.text))
                         }
                         msgs.append(.toolResult(callID: call.id, name: call.name,
                                                 text: result.text, imageData: result.imageData))
@@ -235,6 +272,7 @@ final class AgentRunner: ObservableObject {
         let all = AgentToolbox.readTools + AgentToolbox.editTools
                 + AgentToolbox.generateTools + AgentToolbox.skillTools
                 + AgentToolbox.shellTools + AgentToolbox.searchTools
+                + AgentToolbox.mcpGateTool + AgentToolbox.mcpTools
         guard let spec = all.first(where: { $0.name == call.name }) else {
             return .fail("没有叫 \(call.name) 的工具。")
         }
@@ -263,6 +301,9 @@ final class AgentRunner: ObservableObject {
         if let r = await AgentToolbox.runSearchTool(call.name, args: call.arguments) {
             return r
         }
+        if let r = await AgentToolbox.runMCPTool(call.name, args: call.arguments) {
+            return r
+        }
         return .fail("工具 \(call.name) 还没接上。")
     }
 
@@ -275,6 +316,12 @@ final class AgentRunner: ObservableObject {
                 }
             }
         }
+    }
+
+    /// 参数值压成一行。图片这类长 base64 只留个说明，别把存档撑爆
+    static func brief(_ v: Any) -> String {
+        let s = "\(v)"
+        return s.count > 200 ? String(s.prefix(200)) + "…（略）" : s
     }
 
     private func describe(_ call: AgentToolCall) -> String {
@@ -302,6 +349,14 @@ final class AgentRunner: ObservableObject {
           用户问「好了没」的时候再去查 list_background_tasks。
         · Skill 说明书里给的命令，用 run_command 照着跑，别自己改写、也别自己发明命令。
           命令失败先看输出里的报错，按说明书里的重试链处理，连试三次还不行就停下来告诉用户。
+        · **要记住什么，必须调 remember 工具**。用户说「记住」「写进记忆」「以后都…」
+          「我习惯…」的时候，先调工具、拿到成功结果，再回话。
+          光在回复里写「已记住」是假的 —— 你这轮说完就忘，下次开新会话它根本不在。
+          装 Skill 同理：调 install_skill，别自己去读网页拼文件。
+
+        **上面的对话历史里看不到完整的工具调用记录**（为省 token 只保留了文字和
+        一行「这一轮我调用了 X」）。那不代表这个对话不用工具 —— 该调就调，
+        别因为前面几轮看着都是纯文字回答，就跟着只回文字。
 
         说话风格：中文，简短，别用「好的」「我将为您」这类开场白。**不要用 emoji**，
         该标状态就用文字（成功 / 失败 / 已完成），面板里 emoji 跟界面图标混在一起很乱。
@@ -330,10 +385,14 @@ final class AgentRunner: ObservableObject {
             """
         case .auto:
             s += """
-            当前是**自动模式**：常规改动直接做；删除、导出这类操作会弹窗问用户，
-            他拒绝了就换个思路，别硬来。
-            run_command 里装软件、改 shell 配置这种会动到环境的，先把命令和后果说清楚，
-            等用户点头再跑；只是查信息的命令不用问，直接跑。
+            当前是**自动模式**：常规改动直接做。
+
+            删除、导出这类不好回头的操作，**直接调工具就行 —— 软件自己会弹确认框**，
+            用户在框里点允许或拒绝。**不要先用文字问一遍**「确认要删吗」再等回复，
+            那样等于问两次，用户还得多打一轮字。他在框里拒绝了就换个思路，别硬来。
+
+            run_command 同理：装软件、改 shell 配置这种会动到环境的照样直接调，
+            确认框会把命令原文摊给用户看。只是查信息的命令不用问，直接跑。
             """
         case .full:
             s += """

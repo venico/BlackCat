@@ -698,6 +698,9 @@ struct AIChatPanel: View {
     /// 而 lineSpacing 加的是行间额外间距，默认单行已占约 14.3pt，所以补 2.5。
     /// 模型回复、用户气泡、输入框三处共用这一个值
     static let bodyLineSpacing: CGFloat = 2.5
+    /// 聊天正文的字号。气泡、回答、输入框都读它 ——
+    /// 散在各处写死 13 的话，设置里调一下只有一半地方跟着变
+    static var bodyFontSize: CGFloat { CGFloat(AppSettings.shared.chatFontSize) }
 
     private var inputArea: some View {
         VStack(spacing: 0) {
@@ -1742,8 +1745,13 @@ HStack(spacing: 2) {
     /// 界面上挂着上一轮的对话，Agent 却说「没有上文」—— agentHistory 是
     /// @State，重启就空了，切会话也不会跟着换。这里拿落盘的聊天记录补上。
     ///
-    /// 工具调用那些中间步骤不还原：Claude 协议要求每个 tool_use 都得配上
-    /// tool_result，缺一个就是 400。它需要的话重新查一遍就是了
+    /// 工具调用那些中间步骤不按协议还原：Claude 要求每个 tool_use 都得配上
+    /// tool_result，缺一个就是 400。它需要的话重新查一遍就是了。
+    ///
+    /// **但调过哪些工具要写进文本里**。只留纯文字问答的话，模型会照着学 ——
+    /// 实测一个 31 条全是 `user:text / assistant:text` 的历史，
+    /// 足以让它把「这个对话里我都是用文字回答的」当成规矩，
+    /// 之后连 remember、install_skill 这种明确该调的也不调了，直接编一句话回你
     private func rebuildAgentHistory() {
         // 最后一条是本轮刚 append 进去的用户消息，交给 prompt 参数带，别重复
         let past = service.messages.dropLast().suffix(30)
@@ -1763,10 +1771,21 @@ HStack(spacing: 2) {
             case .assistant:
                 // 开头必须是 user，前面没有就丢掉这条
                 guard !out.isEmpty else { continue }
+                var body = t
+                if let steps = m.agentSteps, !steps.isEmpty {
+                    // 把每步的工具、参数和结果摘要都带上 —— 模型回头要接着干活，
+                    // 光知道「调过 list_tracks」没用，得知道当时查出来的是什么
+                    let lines = steps.map { st -> String in
+                        let a = (st.args?.isEmpty == false) ? "（\(st.args!)）" : ""
+                        let r = st.summary.isEmpty ? "" : " → " + st.summary
+                        return "· \(st.tool)\(a)\(r)"
+                    }.joined(separator: "\n")
+                    body = "（这一轮我做了这些）\n\(lines)\n\n" + body
+                }
                 if case .assistant(let prev, _)? = out.last {
-                    out[out.count - 1] = .assistant(text: prev + "\n\n" + t, calls: [])
+                    out[out.count - 1] = .assistant(text: prev + "\n\n" + body, calls: [])
                 } else {
-                    out.append(.assistant(text: t, calls: []))
+                    out.append(.assistant(text: body, calls: []))
                 }
             }
         }
@@ -1886,7 +1905,10 @@ HStack(spacing: 2) {
             service.finishAgentReply(id: replyID, text: reply,
                                      steps: agent.steps.map {
                                          .init(tool: $0.toolName, summary: $0.summary,
-                                               isError: $0.isError)
+                                               isError: $0.isError,
+                                               args: $0.args.isEmpty ? nil : $0.args,
+                                               detail: $0.detail.isEmpty ? nil : $0.detail,
+                                               thinking: $0.thinking.isEmpty ? nil : $0.thinking)
                                      },
                                      elapsed: agent.elapsed, tokens: agent.totalTokens)
             agent.setRunningMessage(nil, in: service.currentConversationId)
@@ -1929,6 +1951,8 @@ private struct MessageBubble: View {
     @EnvironmentObject var project: ProjectState
     /// 正在跑的那条回复要实时长步骤，所以每条气泡都盯着 Agent
     @ObservedObject private var agent = AgentRunner.shared
+    /// 正文字号在设置里能调。不观察的话改完要重启才看得到
+    @ObservedObject private var settings = AppSettings.shared
     @Environment(\.chatListWidth) private var listWidth: CGFloat
 
     /// 用户气泡里文字的可用宽度：列表左右 3+10、跟 Spacer 之间 8、
@@ -2004,7 +2028,7 @@ private struct MessageBubble: View {
         let para = NSMutableParagraphStyle()
         para.lineSpacing = AIChatPanel.bodyLineSpacing
         let out = NSMutableAttributedString(string: message.content, attributes: [
-            .font: NSFont.systemFont(ofSize: 13),
+            .font: NSFont.systemFont(ofSize: AIChatPanel.bodyFontSize),
             .foregroundColor: NSColor.white.withAlphaComponent(0.8),
             .paragraphStyle: para
         ])
@@ -2166,7 +2190,10 @@ private struct MessageBubble: View {
     @ViewBuilder
     private var agentStepsSection: some View {
         let steps: [AIVideoService.ConversationRecord.AgentStepRecord] = isLiveAgentReply
-            ? agent.steps.map { .init(tool: $0.toolName, summary: $0.summary, isError: $0.isError) }
+            ? agent.steps.map { .init(tool: $0.toolName, summary: $0.summary, isError: $0.isError,
+                                      args: $0.args.isEmpty ? nil : $0.args,
+                                      detail: $0.detail.isEmpty ? nil : $0.detail,
+                                      thinking: $0.thinking.isEmpty ? nil : $0.thinking) }
             : (message.agentSteps ?? [])
         if !steps.isEmpty || isLiveAgentReply {
             AgentStepsView(steps: steps,
@@ -2684,6 +2711,8 @@ private struct AudioWaveformView: View {
 private struct MarkdownContentView: View {
     let text: String
     @EnvironmentObject var project: ProjectState
+    /// 回复正文的字号在设置里能调。不观察的话滑块拖了这儿不重算
+    @ObservedObject private var settings = AppSettings.shared
     @Environment(\.chatListWidth) private var listWidth: CGFloat
 
     /// 从列表宽度到这段文字的可用宽度之间，被固定占掉的部分：
@@ -2742,7 +2771,10 @@ private struct MarkdownContentView: View {
         }
 
         /// 行内 markdown（粗体/斜体/链接）交给系统解析，再补上字号和颜色
-        func appendInline(_ text: String, size: CGFloat = 13, alpha: CGFloat = 0.8) {
+        // 各档字号都从正文字号推：设置里调一档，标题、代码、项目符号一起跟着走
+        let base = AIChatPanel.bodyFontSize
+        func appendInline(_ text: String, size: CGFloat = 0, alpha: CGFloat = 0.8) {
+            let size = size > 0 ? size : base
             guard let a = try? NSAttributedString(
                 markdown: text,
                 options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)
@@ -2771,17 +2803,18 @@ private struct MarkdownContentView: View {
         }
 
         for (i, block) in parseBlocks().enumerated() {
-            if i > 0 { append("\n\n", size: 13) }
+            if i > 0 { append("\n\n", size: base) }
             switch block {
             case .heading(let level, let t):
-                appendInline(t, size: level == 1 ? 16 : level == 2 ? 14.5 : 13.5, alpha: 0.7)
+                appendInline(t, size: level == 1 ? base + 3 : level == 2 ? base + 1.5 : base + 0.5,
+                             alpha: 0.7)
             case .code(let code, _):
-                append(code, size: 11, mono: true, bg: true)
+                append(code, size: base - 2, mono: true, bg: true)
             case .bullet(let t):
-                append("•  ", size: 13, alpha: 0.5)
+                append("•  ", size: base, alpha: 0.5)
                 appendInline(t)
             case .numbered(let n, let t):
-                append("\(n).  ", size: 13, alpha: 0.5)
+                append("\(n).  ", size: base, alpha: 0.5)
                 appendInline(t)
             case .paragraph(let t):
                 appendInline(t)
@@ -3050,7 +3083,9 @@ struct SelectableMarkdownView: NSViewRepresentable {
     }
 
     func updateNSView(_ tv: ChatTextView, context: Context) {
-        if tv.textStorage?.string != attributed.string {
+        // **不能只比纯文本**：在设置里调正文字号时文字一个没变、属性全变了，
+        // 只比 string 的话这里认为「没更新」，字号就永远停在旧值上
+        if tv.textStorage?.isEqual(to: attributed) != true {
             tv.textStorage?.setAttributedString(attributed)
         }
         tv.onAddSubtitle = onAddSubtitle
@@ -3246,7 +3281,7 @@ struct ChatInputTextView: NSViewRepresentable {
         tv.isEditable = true
         tv.isSelectable = true
         tv.drawsBackground = false
-        tv.font = .systemFont(ofSize: 13)
+        tv.font = .systemFont(ofSize: ChatInputInner.inputFontSize)
         tv.textColor = .labelColor
         // 横向留 0：外层已经有 8pt 了，这里再加一份会叠成 16
         tv.textContainerInset = NSSize(width: 0, height: 2)
@@ -3264,7 +3299,7 @@ struct ChatInputTextView: NSViewRepresentable {
         para.lineSpacing = AIChatPanel.bodyLineSpacing
         tv.defaultParagraphStyle = para
         tv.typingAttributes = [
-            .font: NSFont.systemFont(ofSize: 13),
+            .font: NSFont.systemFont(ofSize: ChatInputInner.inputFontSize),
             .foregroundColor: NSColor.labelColor,
             .paragraphStyle: para
         ]
@@ -3294,7 +3329,9 @@ struct ChatInputTextView: NSViewRepresentable {
         storage.beginEditing()
         storage.addAttribute(.foregroundColor, value: NSColor.labelColor, range: full)
         // 字重也要一并还原，不然删掉命令后那几个字还留着加粗
-        storage.addAttribute(.font, value: NSFont.systemFont(ofSize: 13), range: full)
+        storage.addAttribute(.font,
+                             value: NSFont.systemFont(ofSize: ChatInputInner.inputFontSize),
+                             range: full)
         storage.removeAttribute(.chipTag, range: full)
         storage.removeAttribute(.chipSlash, range: full)
         storage.removeAttribute(.kern, range: full)
@@ -3415,7 +3452,10 @@ private final class ChatInputInner: ChatTextView {
     var showsPlaceholder = false { didSet { if showsPlaceholder != oldValue { needsDisplay = true } } }
 
     /// 正文字号。提示文字和插入点都按它算，跟真正输入的字对齐
-    private static let bodyFont = NSFont.systemFont(ofSize: 13)
+    /// 输入框自己的字号，**固定不跟设置走** —— 那个滑块管的是
+    /// 「提问和回复」的字号，输入框跟着变会把布局和光标高度一起带乱
+    static let inputFontSize: CGFloat = 13
+    private static var bodyFont: NSFont { .systemFont(ofSize: inputFontSize) }
 
     /// 插入点不跟着行高走。
     ///
