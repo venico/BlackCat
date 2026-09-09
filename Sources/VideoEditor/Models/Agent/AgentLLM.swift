@@ -309,7 +309,32 @@ enum AgentLLM {
         req.timeoutInterval = 180
         req.httpBody = try JSONSerialization.data(withJSONObject: body)
 
-        let (data, resp) = try await URLSession.shared.data(for: req)
+        // 传输层的瞬态失败自己重试。最常见的是「网络连接已中断」（-1005）——
+        // `URLSession.shared` 复用 keep-alive 连接，中转站把 idle 连接关掉之后
+        // 那条连接还在池子里，下一发请求才发现对端已经走了。重试会新建连接，基本就好了。
+        //
+        // **超时（-1001）不重试**：已经等满 180 秒才失败，再来两轮就是六分钟。
+        // 状态码错误（401/429/…）走下面的分支抛 NSError，不是 URLError，
+        // 不会误落进这里重试
+        let maxAttempts = 3
+        var attempt = 0
+        let data: Data
+        let resp: URLResponse
+        while true {
+            attempt += 1
+            do {
+                (data, resp) = try await URLSession.shared.data(for: req)
+                break
+            } catch let e as URLError where Self.isTransientNetworkError(e) && attempt < maxAttempts {
+                DiagLog.log("[Agent] 第 \(attempt) 次请求失败（\(e.code.rawValue) \(e.localizedDescription)），重试")
+                // 退避 0.6s / 1.8s。Task.sleep 在取消时会抛，正好让用户点停止能立刻生效
+                try await Task.sleep(nanoseconds: attempt == 1 ? 600_000_000 : 1_800_000_000)
+            } catch let e as URLError where Self.isTransientNetworkError(e) {
+                throw NSError(domain: "Agent", code: 5, userInfo: [NSLocalizedDescriptionKey:
+                    "\(e.localizedDescription)（已重试 \(maxAttempts - 1) 次）。"
+                    + "如果反复出现，多半是接口地址那头不稳定，可以到设置 → AI 设置里换个接口地址试试。"])
+            }
+        }
         let code = (resp as? HTTPURLResponse)?.statusCode ?? -1
         guard code == 200 else {
             let raw = String(data: data, encoding: .utf8) ?? ""
@@ -332,6 +357,19 @@ enum AgentLLM {
                 hint + "\n\n接口原文：" + String(raw.prefix(300))])
         }
         return data
+    }
+
+    /// 值得重试的传输层错误：连接被对端关掉、连不上、DNS 没解析出来、
+    /// 切网瞬间没网。**不含取消（-999）和超时（-1001）** ——
+    /// 取消是用户按了停止，超时已经等够久了
+    private static func isTransientNetworkError(_ e: URLError) -> Bool {
+        switch e.code {
+        case .networkConnectionLost, .cannotConnectToHost, .cannotFindHost,
+             .dnsLookupFailed, .notConnectedToInternet, .secureConnectionFailed:
+            return true
+        default:
+            return false
+        }
     }
 
     private static func jsonString(_ obj: [String: Any]) -> String {

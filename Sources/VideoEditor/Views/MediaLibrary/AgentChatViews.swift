@@ -177,6 +177,35 @@ struct AgentConfirmBar: View {
     let toolName: String
     let detail: String
     let onAnswer: (Bool) -> Void
+    @State private var expanded = false
+
+    /// 详情默认最多三行，长了给个箭头。
+    /// **命令原文不走这个** —— 那是要用户逐字看过才点允许的东西，
+    /// 默认折叠等于诱导人草率放行
+    @ViewBuilder
+    private func clampedDetail(_ text: String) -> some View {
+        // 10 号字三行大概九十来个字符，超了基本就被截了
+        let canExpand = text.count > 90 || text.components(separatedBy: "\n").count > 3
+        HStack(alignment: .top, spacing: 4) {
+            Text(text)
+                .font(.system(size: 10))
+                .foregroundColor(Color.labelSecondary)
+                .lineLimit(expanded ? nil : 3)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            if canExpand {
+                Button { expanded.toggle() } label: {
+                    Image(systemName: expanded ? "chevron.up" : "chevron.down")
+                        .font(.system(size: 8, weight: .semibold))
+                        .foregroundColor(Color.labelSecondary)
+                        .frame(width: 14, height: 14)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help(expanded ? "收起" : "展开完整内容")
+            }
+        }
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -194,10 +223,7 @@ struct AgentConfirmBar: View {
                 // 免得跟上面那句说明混成一片，看漏了才点确认
                 let parts = detail.components(separatedBy: "\n\n")
                 if parts.count > 1, !parts[0].isEmpty {
-                    Text(parts[0])
-                        .font(.system(size: 10))
-                        .foregroundColor(Color.labelSecondary)
-                        .fixedSize(horizontal: false, vertical: true)
+                    clampedDetail(parts[0])
                 }
                 Text(parts.last ?? detail)
                     .font(.system(size: 10.5, design: .monospaced))
@@ -208,10 +234,7 @@ struct AgentConfirmBar: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .background(RoundedRectangle(cornerRadius: 5).fill(Color.black.opacity(0.28)))
             } else {
-                Text(detail)
-                    .font(.system(size: 10))
-                    .foregroundColor(Color.labelSecondary)
-                    .fixedSize(horizontal: false, vertical: true)
+                clampedDetail(detail)
             }
             HStack(spacing: 6) {
                 Spacer()
@@ -262,4 +285,32 @@ struct ChatTooltip: NSViewRepresentable {
 /// 那条路不经 hitTest，所以看着「像是能用」，最容易误判。
 private final class PassthroughTipView: NSView {
     override func hitTest(_ point: NSPoint) -> NSView? { nil }
+}
+
+/// 缩略图角上的那个删除按钮。**凡是图片角上的 × 都走这个，别各写各的。**
+///
+/// 原来参考区、附件区、一摞的总删除各写了一份，写法都是
+/// `Image(xmark).frame(16).background(Circle())` —— 全都少了 `contentShape`。
+/// SwiftUI 默认拿**内容的可见形状**当热区，那个 × 只有几笔笔画，背景圆压根不算数，
+/// 于是要正好戳中笔画才有反应；叠着写 background 和 contentShape 还会让热区
+/// 跟看到的圆错位（实测「圆的左上能点、右下点不动」）。
+/// 摊成 ZStack、尺寸和热区都定在最外层一次，就不会歪
+struct ThumbCloseButton: View {
+    var size: CGFloat = 16
+    var opacity: Double = 0.65
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            ZStack {
+                Circle().fill(Color.black.opacity(opacity))
+                Image(systemName: "xmark")
+                    .font(.system(size: size * 0.45, weight: .semibold))
+                    .foregroundColor(.white)
+            }
+            .frame(width: size, height: size)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
 }

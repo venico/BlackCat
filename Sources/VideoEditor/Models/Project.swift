@@ -170,6 +170,25 @@ final class ProjectState: ObservableObject {
     ///
     /// 光栅化的结果靠它判断要不要重画 —— 图层挪了、文字改了、字幕换了一条，
     /// 指纹就变。只盯参数不盯内容的话，改完画面还停在旧的那张图上
+    /// 这一刻三类效果轨的参数指纹。
+    ///
+    /// 强度这种改动既不动时间也不动尺寸，纯图片项目那条「自己渲一帧」的路
+    /// 就认不出有变化 —— 表现是拖强度滑块没反应，非得挪一下片段才刷新。
+    /// 直接把片段整个描述出来当 key，字段以后再加也不会漏
+    func effectContentKey(at t: Double) -> String {
+        var out = ""
+        for tr in filterTracks where tr.isVisible {
+            for c in tr.clips where c.startTime <= t && c.endTime > t { out += String(describing: c) }
+        }
+        for tr in adjustTracks where tr.isVisible {
+            for c in tr.clips where c.startTime <= t && c.endTime > t { out += String(describing: c) }
+        }
+        for tr in effectTracks where tr.isVisible {
+            for c in tr.clips where c.startTime <= t && c.endTime > t { out += String(describing: c) }
+        }
+        return out
+    }
+
     func overlayContentKey(at t: Double) -> String {
         var out = ""
         for track in imageTracks where track.isVisible {

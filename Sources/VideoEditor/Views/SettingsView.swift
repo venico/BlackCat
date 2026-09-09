@@ -1548,11 +1548,13 @@ struct SettingsView: View {
                         text: Binding(get: { settings.seedanceApiKey }, set: { settings.seedanceApiKey = $0 })
                     )
                     endpointField(
-                        label: "接入点 ID / 模型名",
-                        placeholder: "ep-xxxxx 或 doubao-seedream-...",
+                        label: "接入点 ID（可留空）",
+                        placeholder: "留空就用上面选的模型",
                         text: Binding(get: { settings.seedreamEndpoint }, set: { settings.seedreamEndpoint = $0 })
                     )
-                    Text("与 Seedance 共用火山方舟 API Key；接入点 ID 在「接入点管理」中创建")
+                    Text("与 Seedance 共用火山方舟 API Key。接入点 ID 可以不填 —— "
+                         + "不填就用聊天框下拉里选的那个模型；自己在「接入点管理」里建过 ep-xxxxx 才需要填。"
+                         + "5.0 Pro 一次只能出 1 张，要一次多张就在聊天框把模型切到 5.0 Lite")
                         .font(.system(size: 10))
                         .foregroundColor(Color.labelSecondary.opacity(0.6))
                 } else if provider == .seedance || provider == .seedance15 {

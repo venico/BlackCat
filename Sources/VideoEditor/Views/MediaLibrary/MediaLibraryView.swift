@@ -213,7 +213,7 @@ struct MediaLibraryView: View {
                     }
                     // 视频/音频/图片/字幕四个标签页才有文件夹
                     if project.currentLibraryAssetType != nil {
-                        MediaToolBtn(svgName: "newFile", help: "新建文件夹") { newFolder() }
+                        MediaToolBtn(svgName: "newFolder", help: "新建文件夹") { newFolder() }
                     }
                 }
             }
@@ -1602,14 +1602,17 @@ private struct AssetRow: View {
     /// 加进 AI 参考。不跳转标签页，状态存在 AIVideoService 上，切过去时还在
     private func addToAIReference() {
         let service = AIVideoService.shared
-        switch service.addToReference(url: asset.url) {
-        case .added:
-            let target = (service.selectedProvider.category == .video && service.imageMode == .frames) ? "首尾帧" : "参考内容"
+        switch service.acceptLibraryAsset(url: asset.url) {
+        case .reference:
+            let active = service.activeUIProvider ?? service.selectedProvider
+            let target = (active.category == .video && service.imageMode == .frames) ? "首尾帧" : "参考内容"
             project.showSuccessToast(icon: "sparkles", iconColor: .purple, title: "已添加到 AI \(target)", subtitle: asset.name.truncatedFileName())
+        case .attachment:
+            project.showSuccessToast(icon: "paperclip", iconColor: .purple, title: "已添加为 AI 附件", subtitle: asset.name.truncatedFileName())
         case .duplicate:
             project.showSuccessToast(icon: "exclamationmark.triangle", iconColor: .orange, title: "已经添加过了", subtitle: asset.name.truncatedFileName())
-        case .unsupportedType:
-            project.showSuccessToast(icon: "exclamationmark.triangle", iconColor: .orange, title: "不支持当前素材类型", subtitle: "当前占位不接受该类型素材")
+        case .unsupported:
+            project.showSuccessToast(icon: "exclamationmark.triangle", iconColor: .orange, title: "不支持当前素材类型", subtitle: "这类文件聊天框收不了")
         case .limitReached(let msg):
             project.showSuccessToast(icon: "exclamationmark.triangle", iconColor: .orange, title: "无法添加", subtitle: msg)
         }
@@ -3232,6 +3235,9 @@ enum SidebarSVGIcon {
         "separateAudio": """
         <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path d="M12.9988039,18.7342304 C12.9946176,19.0812437 12.9757792,19.2876147 12.8910065,19.4539905 C12.7202884,19.7890436 12.3760389,20 12,20 C11.6239611,20 11.2797116,19.7890436 11.1089935,19.4539905 C11,19.2400788 11,18.9600525 11,18.4 L11,5.6 C11,5.03994749 11,4.75992124 11.1089935,4.5460095 C11.2797116,4.21095639 11.6239611,4 12,4 C12.3760389,4 12.7202884,4.21095639 12.8910065,4.5460095 C12.9757792,4.7123853 12.9946176,4.9187563 12.9988039,5.26576958 L12.9988039,18.7342304 Z M18.2908885,9.29289322 C17.9003642,9.68341751 17.9003642,10.3165825 18.2908885,10.7071068 L18.5837817,11 L16,11 C15.4477153,11 15,11.4477153 15,12 C15,12.5522847 15.4477153,13 16,13 L20.9979952,13 C21.8889001,13 22.3350669,11.9228581 21.705102,11.2928932 L19.705102,9.29289322 C19.3145777,8.90236893 18.6814128,8.90236893 18.2908885,9.29289322 Z M5.70911154,14.7071068 C6.09963583,14.3165825 6.09963583,13.6834175 5.70911154,13.2928932 L5.41621832,13 L8,13 C8.55228475,13 9,12.5522847 9,12 C9,11.4477153 8.55228475,11 8,11 L3.00200475,11 C2.1110999,11 1.66493311,12.0771419 2.29489797,12.7071068 L4.29489797,14.7071068 C4.68542227,15.0976311 5.31858724,15.0976311 5.70911154,14.7071068 Z" fill="black"/></svg>
         """,
+        "newFolder": """
+        <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path fill-rule="evenodd" d="M7.17366336,4 C7.64433057,4 7.7562402,4.00271564 7.94380265,4.02897407 C8.12760225,4.0547057 8.30861754,4.09743762 8.48452044,4.15662022 C8.66402452,4.21701445 8.76533401,4.26463302 9.18631155,4.47512179 L9.70811564,4.73602383 C10.0228338,4.89338289 10.1016748,4.93044059 10.1532505,4.94779326 C10.2118848,4.96752079 10.2722232,4.98176477 10.3334898,4.99034198 C10.3873808,4.99788663 10.4744711,5 10.8263366,5 L14,5 C14.5522847,5 15,5.44771525 15,6 C15,6.55228475 14.5522847,7 14,7 L10.8263366,7 C10.3556694,7 10.2437598,6.99728436 10.0561973,6.97102593 C9.87239775,6.9452943 9.69138246,6.90256238 9.51547956,6.84337978 C9.33597548,6.78298555 9.23466599,6.73536698 8.81368845,6.52487821 L8.29188436,6.26397617 C7.97716624,6.10661711 7.8983252,6.06955941 7.84674951,6.05220674 C7.78811521,6.03247921 7.72777678,6.01823523 7.66651025,6.00965802 C7.6126192,6.00211337 7.52552892,6 7.17366336,6 L6.76393202,6 C5.96189026,6 5.76556108,6.00684595 5.60266734,6.03986563 C5.0048009,6.16105725 4.49493295,6.54848188 4.21798695,7.092019 C4.03707473,7.44707923 4,7.90085237 4,9.8 L4,14.2 C4,16.0991476 4.03707473,16.5529208 4.21798695,16.907981 C4.4097337,17.2843052 4.71569481,17.5902663 5.092019,17.782013 C5.44707923,17.9629253 5.90085237,18 7.8,18 L16.2,18 C18.0991476,18 18.5529208,17.9629253 18.907981,17.782013 C19.2843052,17.5902663 19.5902663,17.2843052 19.782013,16.907981 C19.9629253,16.5529208 20,16.0991476 20,14.2 L20,12 C20,11.4477153 20.4477153,11 21,11 C21.5522847,11 22,11.4477153 22,12 L22,14.2 C22,16.5012462 21.9553296,17.0479856 21.5640261,17.815962 C21.1805326,18.5686104 20.5686104,19.1805326 19.815962,19.5640261 C19.0479856,19.9553296 18.5012462,20 16.2,20 L7.8,20 C5.49875384,20 4.95201441,19.9553296 4.184038,19.5640261 C3.43138963,19.1805326 2.8194674,18.5686104 2.4359739,17.815962 C2.04467038,17.0479856 2,16.5012462 2,14.2 L2,9.8 C2,7.49875384 2.04467038,6.95201441 2.4359739,6.184038 C2.9898659,5.09696375 4.00960181,4.32211449 5.20533469,4.07973125 C5.55869027,4.00810366 5.79108813,4 6.76393202,4 L7.17366336,4 Z M17,10 C17.5522847,10 18,10.4477153 18,11 C18,11.5522847 17.5522847,12 17,12 L7,12 C6.44771525,12 6,11.5522847 6,11 C6,10.4477153 6.44771525,10 7,10 L17,10 Z M20,3 C20.5522847,3 21,3.44771525 21,4 L21,5 L22,5 C22.5522847,5 23,5.44771525 23,6 C23,6.55228475 22.5522847,7 22,7 L21,7 L21,8 C21,8.55228475 20.5522847,9 20,9 C19.4477153,9 19,8.55228475 19,8 L19,7 L18,7 C17.4477153,7 17,6.55228475 17,6 C17,5.44771525 17.4477153,5 18,5 L19,5 L19,4 C19,3.44771525 19.4477153,3 20,3 Z" fill="black"/></svg>
+        """,
         "newFile": """
         <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path fill-rule="evenodd" d="M18.815962,3.4359739 C19.5686104,3.8194674 20.1805326,4.43138963 20.5640261,5.184038 C21,6.03968496 21,7.15978998 21,9.4 L21,14.6 C21,16.84021 21,17.960315 20.5640261,18.815962 C20.1805326,19.5686104 19.5686104,20.1805326 18.815962,20.5640261 C17.960315,21 16.84021,21 14.6,21 L9.4,21 C7.15978998,21 6.03968496,21 5.184038,20.5640261 C4.43138963,20.1805326 3.8194674,19.5686104 3.4359739,18.815962 C3,17.960315 3,16.84021 3,14.6 L3,9.4 C3,7.15978998 3,6.03968496 3.4359739,5.184038 C3.8194674,4.43138963 4.43138963,3.8194674 5.184038,3.4359739 C6.03968496,3 7.15978998,3 9.4,3 L14.6,3 C16.84021,3 17.960315,3 18.815962,3.4359739 Z M6.092019,5.21798695 C5.71569481,5.4097337 5.4097337,5.71569481 5.21798695,6.092019 C5.04690109,6.42779391 5,7.001836 5,9.4 L5,14.6 C5,16.998164 5.04690109,17.5722061 5.21798695,17.907981 C5.4097337,18.2843052 5.71569481,18.5902663 6.092019,18.782013 C6.42779391,18.9530989 7.001836,19 9.4,19 L14.6,19 C16.998164,19 17.5722061,18.9530989 17.907981,18.782013 C18.2843052,18.5902663 18.5902663,18.2843052 18.782013,17.907981 C18.9530989,17.5722061 19,16.998164 19,14.6 L19,9.4 C19,7.001836 18.9530989,6.42779391 18.782013,6.092019 C18.5902663,5.71569481 18.2843052,5.4097337 17.907981,5.21798696 L17.8418438,5.18734478 C17.4933254,5.04122166 16.8482788,5 14.6,5 L9.4,5 C7.001836,5 6.42779391,5.04690109 6.092019,5.21798695 Z M12,7 C12.3760389,7 12.7202884,7.21095639 12.8910065,7.5460095 C13,7.75992124 13,8.03994749 13,8.6 L13,11 L15.4,11 C15.9600525,11 16.2400788,11 16.4539905,11.1089935 C16.7890436,11.2797116 17,11.6239611 17,12 C17,12.3760389 16.7890436,12.7202884 16.4539905,12.8910065 C16.2400788,13 15.9600525,13 15.4,13 L13,13 L13,15.4 C13,15.9600525 13,16.2400788 12.8910065,16.4539905 C12.7202884,16.7890436 12.3760389,17 12,17 C11.6239611,17 11.2797116,16.7890436 11.1089935,16.4539905 C11,16.2400788 11,15.9600525 11,15.4 L11,13 L8.6,13 C8.03994749,13 7.75992124,13 7.5460095,12.8910065 C7.21095639,12.7202884 7,12.3760389 7,12 C7,11.6239611 7.21095639,11.2797116 7.5460095,11.1089935 C7.75992124,11 8.03994749,11 8.6,11 L11,11 L11,8.6 C11,8.03994749 11,7.75992124 11.1089935,7.5460095 C11.2797116,7.21095639 11.6239611,7 12,7 Z" fill="black"/></svg>
         """,
@@ -3445,6 +3451,7 @@ struct FilterPanel: View {
     }
 
     @EnvironmentObject private var project: ProjectState
+    @ObservedObject private var settings = AppSettings.shared
     @State private var importHover = false
 
     var body: some View {
@@ -3456,13 +3463,36 @@ struct FilterPanel: View {
                     }
                 }
                 .padding(.leading, 3).padding(.trailing, 10)
-                .padding(.bottom, 8)
+
+                // 导进来的 .cube 归到这一组。原来导入只往时间轴加一段，
+                // 库里根本不留，下次想再用还得重新翻文件
+                if !settings.customLUTs.isEmpty {
+                    HStack {
+                        Text("自定义")
+                            .font(.system(size: 10, weight: .medium))
+                            .foregroundColor(Color.labelSecondary)
+                        Spacer()
+                    }
+                    .padding(.leading, 9).padding(.trailing, 10)
+                    .padding(.top, 10).padding(.bottom, 4)
+
+                    LazyVGrid(columns: gridColumns, alignment: .leading, spacing: 6) {
+                        ForEach(settings.customLUTs, id: \.self) { path in
+                            FilterCard(kind: .lut, lutPath: path,
+                                       onAdd: { project.addFilter(kind: .lut, lutPath: path) },
+                                       onRemove: { settings.customLUTs.removeAll { $0 == path } })
+                        }
+                    }
+                    .padding(.leading, 3).padding(.trailing, 10)
+                }
             }
+            .padding(.bottom, 8)
             // 导入 LUT。吸在底部，列表滚多长都在
             Button(action: importLUT) {
                 HStack(spacing: 5) {
-                    Image(systemName: "square.and.arrow.down")
-                        .font(.system(size: 11))
+                    // 跟「导入素材」用同一个图标，别一个 SF Symbol 一个自绘 SVG
+                    Image(nsImage: SidebarSVGIcon.load("importFile", size: 12))
+                        .renderingMode(.template)
                     Text("导入 LUT")
                         .font(.system(size: 11, weight: .medium))
                 }
@@ -3495,6 +3525,9 @@ struct FilterPanel: View {
                                      title: "LUT 读不了",
                                      subtitle: "\(url.lastPathComponent) 不是有效的 .cube 文件")
             return
+        }
+        if !AppSettings.shared.customLUTs.contains(url.path) {
+            AppSettings.shared.customLUTs.append(url.path)
         }
         project.addFilter(kind: .lut, lutPath: url.path)
     }
@@ -3561,13 +3594,17 @@ private struct AdjustCard: View {
 
 private struct FilterCard: View {
     let kind: FilterKind
+    /// 自定义 LUT 才有：封面按这个文件生成，标题用文件名
+    var lutPath: String? = nil
     let onAdd: () -> Void
+    /// 自定义 LUT 才有：从库里移掉（不删磁盘上的文件）
+    var onRemove: (() -> Void)? = nil
     @State private var hover = false
 
     var body: some View {
         VStack(spacing: 4) {
             ZStack {
-                Image(nsImage: FilterThumbnails.image(for: kind))
+                Image(nsImage: FilterThumbnails.image(for: kind, lutPath: lutPath))
                     .resizable()
                     .aspectRatio(contentMode: .fill)
             }
@@ -3580,8 +3617,15 @@ private struct FilterCard: View {
                         .padding(2)
                 }
             }
+            // 自定义的才给移除入口，内置滤镜删不得
+            .overlay(alignment: .topTrailing) {
+                if hover, let remove = onRemove {
+                    ThumbCloseButton(size: 14, action: remove)
+                        .padding(2)
+                }
+            }
 
-            Text(kind.label)
+            Text(lutPath.map { ($0 as NSString).lastPathComponent } ?? kind.label)
                 .font(.system(size: 9))
                 .foregroundColor(Color.labelSecondary)
                 .lineLimit(1)
@@ -3601,21 +3645,24 @@ private struct FilterCard: View {
 
 /// 滤镜卡片的封面。拿转场那帧素材实时套一遍滤镜，算完缓存住
 enum FilterThumbnails {
-    private static var cache: [FilterKind: NSImage] = [:]
+    // 自定义 LUT 各是各的封面，缓存 key 要带上路径
+    private static var cache: [String: NSImage] = [:]
     private static let ctx = CIContext(options: [.useSoftwareRenderer: false])
 
-    static func image(for kind: FilterKind) -> NSImage {
-        if let hit = cache[kind] { return hit }
+    static func image(for kind: FilterKind, lutPath: String? = nil) -> NSImage {
+        let key = lutPath ?? kind.rawValue
+        if let hit = cache[key] { return hit }
         let base = TransitionPreviewFrames.before
         guard let tiff = base.tiffRepresentation,
               let ci = CIImage(data: tiff) else { return base }
 
         var clip = FilterClip(kind: kind, startTime: 0, endTime: 1)
         clip.intensity = 1
+        clip.lutPath = lutPath
         let out = FilterEngine.apply(clip, to: ci)
         guard let cg = ctx.createCGImage(out, from: ci.extent) else { return base }
         let img = NSImage(cgImage: cg, size: ci.extent.size)
-        cache[kind] = img
+        cache[key] = img
         return img
     }
 }

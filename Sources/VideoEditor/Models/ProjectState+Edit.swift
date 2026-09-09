@@ -1730,7 +1730,7 @@ extension ProjectState {
         let settings = AppSettings.shared
         guard !settings.llmAPIKey.isEmpty else {
             showSuccessToast(icon: "exclamationmark.triangle.fill", iconColor: .yellow,
-                             title: "大模型分析", subtitle: "请先在设置→视频分析中配置 API Key", autoCountdown: false)
+                             title: "大模型分析", subtitle: "请先在设置→AI 设置中配置所选供应商的 API Key", autoCountdown: false)
             return
         }
         guard WhisperTranscriber.modelReady else {
@@ -1788,10 +1788,16 @@ extension ProjectState {
                 try Task.checkCancellation()
                 await MainActor.run { self.llmAnalyzeProgress = 0.6 }
 
+                // 供应商在「设置 → AI 剪辑」里选，其余参数（Key / 接口地址 / 子模型 /
+                // 推理强度）全取「AI 设置」里配好的那份，跟字幕校对同一条链路
+                guard let textProvider = AIVideoService.Provider(
+                    rawValue: settings.llmProvider.sharedProviderKey) else {
+                    throw NSError(domain: "LLM", code: 11,
+                                  userInfo: [NSLocalizedDescriptionKey: "无法识别所选模型供应商"])
+                }
                 let highlights = try await LLMAnalyzer.analyze(
                     subtitles: subData,
-                    provider: settings.llmProvider,
-                    apiKey: settings.llmAPIKey
+                    send: { try await AIVideoService.shared.generateText(provider: textProvider, prompt: $0) }
                 ) { pct in
                     DispatchQueue.main.async { self.llmAnalyzeProgress = 0.6 + pct * 0.35 }
                 }
@@ -1862,6 +1868,9 @@ extension ProjectState {
         var newTrack = Track<VideoClip>(label: "精彩片段")
         newTrack.clips = keeps
         videoTracks.append(newTrack)
+        // 时间轴按 videoSectionOrder 渲染，不遍历 videoTracks。
+        // 漏这一步轨道建了也不显示，而提示照样报「已生成」
+        syncVideoSectionOrder()
 
         // Agent 跑一轮期间不打快照，整轮共用开跑前那一个
         if !suppressUndoPush {

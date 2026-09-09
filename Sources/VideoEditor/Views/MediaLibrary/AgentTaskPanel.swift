@@ -32,7 +32,11 @@ struct AgentTaskEntry: View {
             if expanded { taskCard.trackFrame { cardRect = $0 } }
             Button { expanded.toggle() } label: {
                 HStack(spacing: 4) {
-                    if tasks.runningCount > 0 {
+                    if tasks.needsConfirmCount > 0 {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .font(.system(size: 10))
+                            .foregroundColor(Color(hex: "#FFB020"))
+                    } else if tasks.runningCount > 0 {
                         ProgressView()
                             .controlSize(.mini)
                             .scaleEffect(0.7)
@@ -41,9 +45,13 @@ struct AgentTaskEntry: View {
                         Image(nsImage: SidebarSVGIcon.load("toastSuccess", size: 10))
                             .renderingMode(.template)
                     }
-                    Text(tasks.runningCount > 0
-                         ? "\(tasks.runningCount) 个任务进行中"
-                         : "后台任务")
+                    // 待确认排在最前面报 —— 它是唯一需要用户动手的状态，
+                    // 被「3 个任务进行中」盖住的话就白问了
+                    Text(tasks.needsConfirmCount > 0
+                         ? "\(tasks.needsConfirmCount) 个任务待确认"
+                         : (tasks.runningCount > 0
+                            ? "\(tasks.runningCount) 个任务进行中"
+                            : "后台任务"))
                         .font(.system(size: 10))
                     Image(systemName: expanded ? "chevron.down" : "chevron.up")
                         .font(.system(size: 7, weight: .semibold))
@@ -149,6 +157,11 @@ struct AgentTaskEntry: View {
             case .failed:
                 Image(nsImage: SidebarSVGIcon.load("toastFail", size: 12))
                     .renderingMode(.template).foregroundColor(Color(hex: "#FF6B6B"))
+            case .needsConfirm:
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .font(.system(size: 11))
+                    .foregroundColor(Color(hex: "#FFB020"))
+                    .frame(width: 12)
             }
 
             VStack(alignment: .leading, spacing: 1) {
@@ -159,7 +172,19 @@ struct AgentTaskEntry: View {
                 Text(subtitle(item))
                     .font(.system(size: 9))
                     .foregroundColor(Color.labelSecondary)
-                    .lineLimit(1)
+                    .lineLimit(2)
+                // 换一家要花一次钱，所以摆两个按钮让用户自己点，不替他决定
+                if case .needsConfirm(_, let nextName) = item.state {
+                    HStack(spacing: 5) {
+                        confirmButton("改用 \(nextName)", primary: true) {
+                            tasks.confirmRetry(id: item.id)
+                        }
+                        confirmButton("取消", primary: false) {
+                            tasks.declineRetry(id: item.id)
+                        }
+                    }
+                    .padding(.top, 3)
+                }
             }
             Spacer(minLength: 0)
 
@@ -179,6 +204,23 @@ struct AgentTaskEntry: View {
         .background(RoundedRectangle(cornerRadius: 5).fill(Color.white.opacity(0.04)))
     }
 
+    /// 卡片里那两个小按钮。走 Capsule，跟设置面板上的小按钮一套样式
+    private func confirmButton(_ title: String, primary: Bool,
+                               action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Text(title)
+                .font(.system(size: 9, weight: primary ? .semibold : .regular))
+                .foregroundColor(primary ? Color.black : Color.labelSecondary)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 3)
+                .background(
+                    Capsule().fill(primary ? Color.accent : Color.white.opacity(0.10))
+                )
+                .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+    }
+
     private func subtitle(_ item: AgentBackgroundTasks.Item) -> String {
         switch item.state {
         case .running:
@@ -187,6 +229,8 @@ struct AgentTaskEntry: View {
             return "\(item.kind.rawValue) · 已完成，素材已进库"
         case .failed(let m):
             return String(m.prefix(40))
+        case .needsConfirm(let reason, _):
+            return String(reason.prefix(60))
         }
     }
 }

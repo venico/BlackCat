@@ -205,6 +205,12 @@ struct AIChatPanel: View {
             pruneInputsForProvider()
             ensureAgentProvider()
         }
+        // 把「此刻真正生效的模型」同步出去。素材库右键「添加到 AI 参考」在别的视图里，
+        // 拿不到这儿的 `/` 命令状态 —— 不同步的话它只能看面板全局选的那个，
+        // 于是用户 `/` 点了视频模型、右键加视频素材，被判成「不支持当前素材类型」
+        // **只有打了 `/` 命令才有值**。没命令时留空，让外面知道该按附件规则收
+        .onChange(of: namedModel) { p in service.activeUIProvider = p }
+        .onAppear { service.activeUIProvider = namedModel }
         // 试听播放器是单例，view 销毁不会带走它 —— 切会话和关面板都得手动停，否则声音继续响
         .onChange(of: service.currentConversationId) { _ in
             AIInlinePlayer.shared.stop()
@@ -515,7 +521,8 @@ struct AIChatPanel: View {
     private var scrollBody: some View {
         ScrollViewReader { proxy in
             ScrollView(showsIndicators: false) {
-                LazyVStack(spacing: 12) {
+                // 每条气泡自己还带 4pt 上下内边距，两条之间实际是 12+8=20pt，太空
+                LazyVStack(spacing: 6) {
                     ForEach(service.messages) { msg in
                         MessageBubble(message: msg, onInsertToTimeline: { url in
                             insertMediaToTimeline(url)
@@ -826,6 +833,18 @@ struct AIChatPanel: View {
                             ratios.map { r in
                                 MenuChoice(label: r, checked: r == settings.aiImageRatio) {
                                     settings.aiImageRatio = r
+                                }
+                            }
+                        }
+                        // 张数。上限跟着当前模型走 —— Seedream 5.0 Pro 官方只有单图能力，
+                        // 就只列「1 张」。**只有一档也照样显示** ——
+                        // 藏起来的话切模型时这个控件忽有忽无，用户还以为出了毛病
+                        let maxN = AIVideoService.maxImages(for: uiProvider)
+                        capsuleMenu(label: "\(min(settings.aiImageCount, maxN)) 张") {
+                            (1...maxN).map { n in
+                                MenuChoice(label: "\(n) 张",
+                                           checked: n == min(settings.aiImageCount, maxN)) {
+                                    settings.aiImageCount = n
                                 }
                             }
                         }
@@ -1209,21 +1228,18 @@ HStack(spacing: 2) {
             .aspectRatio(contentMode: .fill)
             .frame(width: 48, height: 48)
             .clipShape(RoundedRectangle(cornerRadius: 6))
+            // 图片是 .fill 的，实际内容比 48×48 大。裁了显示还得锁死命中范围，
+            // 不然溢出的那部分可能压到旁边格子的删除按钮上
+            .contentShape(RoundedRectangle(cornerRadius: 6))
             .overlay(RoundedRectangle(cornerRadius: 6)
                 .stroke(Color.white.opacity(0.15), lineWidth: 0.5))
             .overlay(alignment: .topTrailing) {
-                Button {
+                ThumbCloseButton(size: 16) {
                     referenceContents.removeAll { $0.id == item.id }
                     if referenceContents.isEmpty { refExpanded = false }
-                } label: {
-                    Image(systemName: "xmark")
-                        .font(.system(size: 7, weight: .semibold))
-                        .foregroundColor(.white)
-                        .frame(width: 14, height: 14)
-                        .background(Circle().fill(Color.black.opacity(0.65)))
                 }
-                .buttonStyle(.plain)
-                .padding(2)
+                .padding(1)
+                .zIndex(1)
             }
     }
 
@@ -1332,15 +1348,9 @@ HStack(spacing: 2) {
     /// 细叉 + 黑底圆。**整颗留在框内**（原来靠 offset 顶出去一半，
     /// 越过父视图边界的那半收不到鼠标）
     private func deleteBadge(action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            Image(systemName: "xmark")
-                .font(.system(size: 8, weight: .semibold))
-                .foregroundColor(.white)
-                .frame(width: 16, height: 16)
-                .background(Circle().fill(Color.black.opacity(0.7)))
-        }
-        .buttonStyle(.plain)
-        .padding(2)
+        // 样式和热区都在 ThumbCloseButton 里，别在这儿另起一套
+        ThumbCloseButton(size: 16, opacity: 0.7, action: action)
+            .padding(2)
     }
 
     private func placeholderSlot(label: String, icon: String = "photo",
@@ -1587,7 +1597,11 @@ HStack(spacing: 2) {
             return head + "（第一张是首帧，第二张是尾帧）"
         }
         guard p.maxReferenceTotal > 0 else { return head }
-        return head + "（图片 ≤\(p.maxReferenceImages)，视频 ≤\(p.maxReferenceVideos)，"
+        // 图片模型只能挂参考图，报那一串「视频 ≤0，音频 ≤0」纯属噪音
+        if p.category == .image {
+            return head + "（参考图数量 ≤\(p.maxReferenceImages)）"
+        }
+        return head + "（参考内容 图片 ≤\(p.maxReferenceImages)，视频 ≤\(p.maxReferenceVideos)，"
              + "音频 ≤\(p.maxReferenceAudios)，总数 ≤\(p.maxReferenceTotal)）"
     }
 
@@ -1756,38 +1770,65 @@ HStack(spacing: 2) {
         // 最后一条是本轮刚 append 进去的用户消息，交给 prompt 参数带，别重复
         let past = service.messages.dropLast().suffix(30)
         var out: [AgentMessage] = []
+        // 上一条 assistant 干过哪些活，攒着挂到**下一条 user 消息**前面。
+        //
+        // 这些记录以前是拼进 assistant 正文的，两种写法都试过、都被模型学去演了：
+        // 写成「（这一轮我做了这些）」它照抄那句措辞；改成 `<tool_log>` 标签块，
+        // 它连标签一起抄，还顺手编出「已提交生成任务」「图片生成完成」——
+        // 那一轮日志里明明白白是「工具调用 0 个」。
+        // 只要记录还长在 assistant 那边，它就当成自己的说话范例。
+        // 挂到 user 那边就没这问题：模型不会模仿用户说话
+        var pendingLog: String?
         for m in past {
-            let t = m.content.trimmingCharacters(in: .whitespacesAndNewlines)
+            var t = m.content.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !t.isEmpty else { continue }
-            if case .failed = m.status { continue }
+            // 失败**不能**从历史里剔掉。原来一律跳过，模型于是不知道上一次
+            // 生成砸了 —— 用户再说一遍同样的需求，它当没做过，又提交一个。
+            // 接口原文动辄几百字符，截一截再进去，别拿 JSON 撑爆上下文
+            if case .failed = m.status {
+                // 用户主动取消的**不进历史**。界面上那条橙色「已取消」照常显示，
+                // 但让模型看见它就会当成一件没办成的事去补做 —— 实测用户取消完
+                // 再要 3 张，它交「1 张（补的）+ 3 张」，在提示里写「别补」也没用
+                if t.hasPrefix("已取消") || t.contains("已被用户取消") { continue }
+                t = "（上一次没成：" + String(t.prefix(160)) + "）"
+            }
             switch m.role {
             case .user:
+                // 攒着的执行记录挂在用户这句话前面，讲明是系统写的、不是他说的
+                var body = t
+                if let log = pendingLog {
+                    body = "[系统记录·你上一轮实际执行过的工具]\n\(log)\n[记录结束]\n\n" + t
+                    pendingLog = nil
+                }
                 // 得交替着来。连着两条同一边的，并成一条
                 if case .user(let prev, _)? = out.last {
-                    out[out.count - 1] = .user(prev + "\n\n" + t)
+                    out[out.count - 1] = .user(prev + "\n\n" + body)
                 } else {
-                    out.append(.user(t))
+                    out.append(.user(body))
                 }
             case .assistant:
                 // 开头必须是 user，前面没有就丢掉这条
                 guard !out.isEmpty else { continue }
-                var body = t
                 if let steps = m.agentSteps, !steps.isEmpty {
                     // 把每步的工具、参数和结果摘要都带上 —— 模型回头要接着干活，
                     // 光知道「调过 list_tracks」没用，得知道当时查出来的是什么
-                    let lines = steps.map { st -> String in
+                    pendingLog = steps.map { st -> String in
                         let a = (st.args?.isEmpty == false) ? "（\(st.args!)）" : ""
                         let r = st.summary.isEmpty ? "" : " → " + st.summary
                         return "· \(st.tool)\(a)\(r)"
                     }.joined(separator: "\n")
-                    body = "（这一轮我做了这些）\n\(lines)\n\n" + body
                 }
                 if case .assistant(let prev, _)? = out.last {
-                    out[out.count - 1] = .assistant(text: prev + "\n\n" + body, calls: [])
+                    out[out.count - 1] = .assistant(text: prev + "\n\n" + t, calls: [])
                 } else {
-                    out.append(.assistant(text: body, calls: []))
+                    out.append(.assistant(text: t, calls: []))
                 }
             }
+        }
+        // 最后一条要是 assistant，它那份记录没地方挂 —— 单独补一条 user 带上，
+        // 丢掉的话模型又看不见自己调过工具，绕回「不调工具」那个老毛病
+        if let log = pendingLog {
+            out.append(.user("[系统记录·你上一轮实际执行过的工具]\n\(log)\n[记录结束]"))
         }
         agentHistory = out
         historyConvID = service.currentConversationId
@@ -1891,6 +1932,10 @@ HStack(spacing: 2) {
         service.agentRoundReferences = referenceContents
         service.agentRoundFirstFrame = firstFrameImage?.url
         service.agentRoundLastFrame = lastFrameImage?.url
+        // 新一轮开工，生成名额重新算
+        service.agentRoundGenerated = []
+        // 从这轮原话里认张数，不等模型传 count
+        service.agentRoundImageCount = AIVideoService.parseImageCount(from: prompt)
         if !referenceContents.isEmpty || firstFrameImage != nil {
             prompt += "\n\n[用户挂了参考素材，调生成工具时会自动带上，不用再问他要。]"
         }
@@ -1964,6 +2009,9 @@ private struct MessageBubble: View {
     var onInsertToTimeline: (URL) -> Void
     var onRestoreAttachment: (AIVideoService.Attachment) -> Void = { _ in }
     @State private var copied = false
+    /// 报错默认只给一行。接口原文动辄几百字符（那串 Request id 尤其占地方），
+    /// 摊开来能把整屏聊天挤没
+    @State private var errorExpanded = false
 
     var body: some View {
         HStack(alignment: .top, spacing: 8) {
@@ -2161,7 +2209,10 @@ private struct MessageBubble: View {
                 }
 
             case .failed(let error):
-                HStack(spacing: 4) {
+                // 短的一行就够，长的收起来给个箭头。阈值粗估：11 号字一行
+                // 装得下三十来个字，超了基本就是被截断的
+                let canExpand = error.count > 30 || error.contains("\n")
+                HStack(alignment: .top, spacing: 4) {
                     Image(nsImage: SidebarSVGIcon.load("toastWarn", size: 12))
                         .renderingMode(.template)
                         .foregroundColor(.orange)
@@ -2169,6 +2220,20 @@ private struct MessageBubble: View {
                         .font(.system(size: 11))
                         .foregroundColor(.orange)
                         .textSelection(.enabled)
+                        .lineLimit(errorExpanded ? nil : 1)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    if canExpand {
+                        Button { errorExpanded.toggle() } label: {
+                            Image(systemName: errorExpanded ? "chevron.up" : "chevron.down")
+                                .font(.system(size: 8, weight: .semibold))
+                                .foregroundColor(.orange.opacity(0.85))
+                                .frame(width: 14, height: 14)
+                                .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .help(errorExpanded ? "收起" : "展开完整报错")
+                    }
                 }
 
             case .idle:
@@ -2190,7 +2255,11 @@ private struct MessageBubble: View {
     @ViewBuilder
     private var agentStepsSection: some View {
         let steps: [AIVideoService.ConversationRecord.AgentStepRecord] = isLiveAgentReply
-            ? agent.steps.map { .init(tool: $0.toolName, summary: $0.summary, isError: $0.isError,
+            // **id 必须原样带过来**。不传的话每次 map 都生成新 UUID，而计时器
+            // 0.5 秒推一次 elapsed 就会重算一遍 body —— ForEach 认出来的全是新元素，
+            // 展开状态下整个步骤列表（含 thinking / detail 那些长文本）每半秒
+            // 销毁重建一次，越跑越卡
+            ? agent.steps.map { .init(id: $0.id, tool: $0.toolName, summary: $0.summary, isError: $0.isError,
                                       args: $0.args.isEmpty ? nil : $0.args,
                                       detail: $0.detail.isEmpty ? nil : $0.detail,
                                       thinking: $0.thinking.isEmpty ? nil : $0.thinking) }
@@ -3242,6 +3311,55 @@ class ChatTextView: NSTextView, NSMenuDelegate {
         let t = selectedText
         guard !t.isEmpty else { return }
         onAddTitle?(t)
+    }
+
+    /// 点回复里的链接。
+    ///
+    /// 模型给的多是**相对路径**（`./shot.png`）—— 它的 shell cwd 是 home
+    /// （见 `AgentTools+Shell`），路径本身没错，但 `AttributedString(markdown:)`
+    /// 把它解析成没有 scheme 的相对 URL，交给 `NSWorkspace.open` 只会弹一个
+    /// 「应用程序无法打开。-50」（paramErr），用户完全看不出是怎么回事。
+    ///
+    /// 所以这里自己认一遍：http/https 照旧；其余当本地路径，按 agent 的工作目录
+    /// 补成绝对路径；文件不在就说清楚是哪个路径不在
+    override func clicked(onLink link: Any, at charIndex: Int) {
+        let raw: String
+        if let u = link as? URL { raw = u.scheme == nil ? u.relativeString : u.absoluteString }
+        else if let s = link as? String { raw = s }
+        else { super.clicked(onLink: link, at: charIndex); return }
+
+        // 网址、邮件这些有 scheme 的交回系统
+        if let u = URL(string: raw), let scheme = u.scheme?.lowercased(),
+           scheme != "file" {
+            NSWorkspace.shared.open(u)
+            return
+        }
+
+        // 余下按本地路径处理。file:// 先剥掉，~ 展开，相对路径接到 agent 的 cwd 上
+        var path = raw
+        if path.hasPrefix("file://") { path = String(path.dropFirst(7)) }
+        path = path.removingPercentEncoding ?? path
+        path = (path as NSString).expandingTildeInPath
+
+        let url: URL
+        if path.hasPrefix("/") {
+            url = URL(fileURLWithPath: path)
+        } else {
+            // agent 的 shell 就在 home 里跑，相对路径以它为基准
+            url = FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent(path).standardizedFileURL
+        }
+
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            let alert = NSAlert()
+            alert.messageText = "找不到这个文件"
+            alert.informativeText = url.path
+            alert.alertStyle = .warning
+            alert.addButton(withTitle: "好")
+            alert.runModal()
+            return
+        }
+        NSWorkspace.shared.open(url)
     }
 }
 

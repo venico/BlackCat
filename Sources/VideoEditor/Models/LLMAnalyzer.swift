@@ -8,14 +8,12 @@ enum LLMAnalyzer {
         let reason: String
     }
 
+    /// - Parameter send: 把 prompt 发给模型、拿回文本。由调用方注入 ——
+    ///   现在统一走「AI 设置」里配好的那家文字模型（Key / 接口地址 / 子模型 / 推理强度
+    ///   全从设置取），跟字幕校对同一条链路，不再自己拼 Claude / OpenAI 请求
     static func analyze(subtitles: [(start: Double, end: Double, text: String)],
-                         provider: AppSettings.LLMProvider,
-                         apiKey: String,
+                         send: (String) async throws -> String,
                          progress: @escaping (Double) -> Void) async throws -> [Highlight] {
-        guard !apiKey.isEmpty else {
-            throw NSError(domain: "LLM", code: 1,
-                          userInfo: [NSLocalizedDescriptionKey: "请先在设置→视频分析中配置 API Key"])
-        }
         guard !subtitles.isEmpty else {
             throw NSError(domain: "LLM", code: 2,
                           userInfo: [NSLocalizedDescriptionKey: "没有字幕数据，请先进行语音识别"])
@@ -49,17 +47,11 @@ enum LLMAnalyzer {
 
         progress(0.1)
 
-        let data: Data
-        if provider == .claude {
-            data = try await callClaude(apiKey: apiKey, prompt: prompt)
-        } else {
-            data = try await callOpenAICompatible(provider: provider, apiKey: apiKey, prompt: prompt)
-        }
+        let raw = try await send(prompt)
 
         progress(0.9)
 
-        let text = String(data: data, encoding: .utf8) ?? ""
-        let highlights = try parseResponse(text, provider: provider)
+        let highlights: [Highlight] = parseFixes(raw)
 
         guard !highlights.isEmpty else {
             throw NSError(domain: "LLM", code: 3,
@@ -69,8 +61,6 @@ enum LLMAnalyzer {
         progress(1.0)
         return highlights
     }
-
-    // MARK: - OpenAI-compatible API (OpenAI / DeepSeek / GLM)
 
     // MARK: - 字幕校对
 
@@ -187,105 +177,5 @@ enum LLMAnalyzer {
     private static func parseFixes<T: Decodable>(_ raw: String) -> [T] {
         guard let s = raw.firstIndex(of: "["), let e = raw.lastIndex(of: "]"), s < e else { return [] }
         return (try? JSONDecoder().decode([T].self, from: Data(String(raw[s...e]).utf8))) ?? []
-    }
-
-    private static func callOpenAICompatible(provider: AppSettings.LLMProvider,
-                                              apiKey: String,
-                                              prompt: String) async throws -> Data {
-        guard let url = URL(string: AppSettings.shared.effectiveLLMBaseURL) else {
-            throw NSError(domain: "LLM", code: 4, userInfo: [NSLocalizedDescriptionKey: "无效的 API 地址"])
-        }
-
-        var req = URLRequest(url: url)
-        req.httpMethod = "POST"
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
-        req.timeoutInterval = 120
-
-        let body: [String: Any] = [
-            "model": AppSettings.shared.effectiveLLMModel,
-            "messages": [
-                ["role": "system", "content": "你是专业视频剪辑助手，只返回 JSON 数组。"],
-                ["role": "user", "content": prompt]
-            ],
-            "temperature": 0.3
-        ]
-        req.httpBody = try JSONSerialization.data(withJSONObject: body)
-
-        let (data, response) = try await URLSession.shared.data(for: req)
-        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
-            let msg = String(data: data, encoding: .utf8) ?? "未知错误"
-            throw NSError(domain: "LLM", code: 5,
-                          userInfo: [NSLocalizedDescriptionKey: "API 调用失败: \(String(msg.prefix(200)))"])
-        }
-        return data
-    }
-
-    // MARK: - Claude API
-
-    private static func callClaude(apiKey: String, prompt: String) async throws -> Data {
-        guard let url = URL(string: "https://api.anthropic.com/v1/messages") else {
-            throw NSError(domain: "LLM", code: 4, userInfo: [NSLocalizedDescriptionKey: "无效的 API 地址"])
-        }
-
-        var req = URLRequest(url: url)
-        req.httpMethod = "POST"
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        req.setValue(apiKey, forHTTPHeaderField: "x-api-key")
-        req.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
-        req.timeoutInterval = 120
-
-        let body: [String: Any] = [
-            "model": AppSettings.shared.effectiveLLMModel,
-            "max_tokens": 4096,
-            "system": "你是专业视频剪辑助手，只返回 JSON 数组。",
-            "messages": [
-                ["role": "user", "content": prompt]
-            ]
-        ]
-        req.httpBody = try JSONSerialization.data(withJSONObject: body)
-
-        let (data, response) = try await URLSession.shared.data(for: req)
-        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
-            let msg = String(data: data, encoding: .utf8) ?? "未知错误"
-            throw NSError(domain: "LLM", code: 5,
-                          userInfo: [NSLocalizedDescriptionKey: "API 调用失败: \(String(msg.prefix(200)))"])
-        }
-        return data
-    }
-
-    // MARK: - Parse response
-
-    private static func parseResponse(_ raw: String, provider: AppSettings.LLMProvider) throws -> [Highlight] {
-        let content: String
-        if provider == .claude {
-            if let json = try? JSONSerialization.jsonObject(with: Data(raw.utf8)) as? [String: Any],
-               let arr = json["content"] as? [[String: Any]],
-               let first = arr.first, let text = first["text"] as? String {
-                content = text
-            } else {
-                content = raw
-            }
-        } else {
-            if let json = try? JSONSerialization.jsonObject(with: Data(raw.utf8)) as? [String: Any],
-               let choices = json["choices"] as? [[String: Any]],
-               let first = choices.first,
-               let msg = first["message"] as? [String: Any],
-               let text = msg["content"] as? String {
-                content = text
-            } else {
-                content = raw
-            }
-        }
-
-        guard let jsonStart = content.firstIndex(of: "["),
-              let jsonEnd = content.lastIndex(of: "]") else {
-            throw NSError(domain: "LLM", code: 6,
-                          userInfo: [NSLocalizedDescriptionKey: "无法解析大模型返回的 JSON"])
-        }
-
-        let jsonStr = String(content[jsonStart...jsonEnd])
-        let decoder = JSONDecoder()
-        return try decoder.decode([Highlight].self, from: Data(jsonStr.utf8))
     }
 }

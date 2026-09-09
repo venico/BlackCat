@@ -136,6 +136,7 @@ struct AgentAttachmentBar: View {
                 thumbBody(it)
                     .frame(width: Self.cell, height: Self.cell)
                     .clipShape(RoundedRectangle(cornerRadius: 6))
+                    .contentShape(RoundedRectangle(cornerRadius: 6))
                     .overlay(RoundedRectangle(cornerRadius: 6)
                         .stroke(Color.white.opacity(0.15), lineWidth: 0.5))
                     .rotationEffect(.degrees(top.count == 1 ? 0
@@ -155,15 +156,8 @@ struct AgentAttachmentBar: View {
             }
         }
         .overlay(alignment: .topTrailing) {
-            Button(action: onClear) {
-                Image(systemName: "xmark")
-                    .font(.system(size: 7, weight: .semibold))
-                    .foregroundColor(.white)
-                    .frame(width: 14, height: 14)
-                    .background(Circle().fill(Color.black.opacity(0.65)))
-            }
-            .buttonStyle(.plain)
-            .offset(x: 3, y: -3)
+            ThumbCloseButton(size: 14, action: onClear)
+                .offset(x: 3, y: -3)
         }
         .onTapGesture {
             withAnimation(.easeInOut(duration: 0.2)) { expanded = true }
@@ -225,21 +219,19 @@ struct AgentAttachmentBar: View {
                     }
                     .frame(width: 40, height: 40)
                     .clipShape(RoundedRectangle(cornerRadius: 6))
+                    // **必须锁命中范围**。缩略图是裁切填充的，实际内容比格子宽，
+                    // clipShape 只管裁显示、不裁鼠标 —— 溢出的那部分会压住
+                    // 左边那个格子的删除按钮（实测五张图时第四个的 × 右下点不动，
+                    // 删掉第五张就好了）
+                    .contentShape(RoundedRectangle(cornerRadius: 6))
                     .overlay(RoundedRectangle(cornerRadius: 6)
                         .stroke(Color.white.opacity(0.12), lineWidth: 0.5))
 
                     // 跟画布上参考图的那个删除按钮同一个样子（CanvasPromptBar
                     // 的 thumbActionButton）。**整个留在框内**：原来靠 offset
                     // 顶出去一半，越过父视图 bounds 的那半收不到鼠标
-                    Button { onRemove(it) } label: {
-                        Image(systemName: "xmark")
-                            .font(.system(size: 8, weight: .semibold))
-                            .foregroundColor(.white)
-                            .frame(width: 16, height: 16)
-                            .background(Circle().fill(Color.black.opacity(0.7)))
-                    }
-                    .buttonStyle(.plain)
-                    .padding(2)
+                    ThumbCloseButton(size: 16, opacity: 0.7) { onRemove(it) }
+                        .padding(2)
                 }
                 .help(it.name)
             }
@@ -262,6 +254,10 @@ struct AgentAttachmentBar: View {
             Image(nsImage: img)
                 .resizable()
                 .aspectRatio(contentMode: .fill)
+        } else if AIVideoService.videoExts.contains(it.url.pathExtension.lowercased()) {
+            // 视频原来一律显示文件图标。缩略图不能在 make() 里同步取 ——
+            // 取帧要解码，会把加附件那一下卡住，所以挪到这儿后台取
+            AttachmentVideoThumb(url: it.url)
         } else {
             VStack(spacing: 2) {
                 Image(systemName: "doc.text")
@@ -272,6 +268,40 @@ struct AgentAttachmentBar: View {
             .foregroundColor(Color.labelSecondary.opacity(0.7))
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(Color.white.opacity(0.06))
+        }
+    }
+}
+
+/// 附件格子里的视频封面。
+///
+/// 取帧走跟参考区同一个函数（`AIVideoService.videoFrameThumbnail`），但那是同步的、
+/// 要解码，直接在 body 里调会卡住聊天框 —— 丢到后台线程取，回来再贴上。
+/// 右下角压个播放角标，跟图片附件一眼区分得开
+private struct AttachmentVideoThumb: View {
+    let url: URL
+    @State private var img: NSImage?
+
+    var body: some View {
+        ZStack(alignment: .bottomTrailing) {
+            if let i = img {
+                Image(nsImage: i)
+                    .resizable()
+                    .aspectRatio(contentMode: .fill)
+            } else {
+                Color.white.opacity(0.06)
+            }
+            Image(systemName: "play.fill")
+                .font(.system(size: 6, weight: .bold))
+                .foregroundColor(.white)
+                .frame(width: 12, height: 12)
+                .background(Circle().fill(Color.black.opacity(0.55)))
+                .padding(2)
+        }
+        .task(id: url) {
+            let u = url
+            img = await Task.detached(priority: .utility) {
+                AIVideoService.videoFrameThumbnail(url: u)
+            }.value
         }
     }
 }

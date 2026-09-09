@@ -57,13 +57,92 @@ final class AIVideoService: ObservableObject {
         }
     }
 
+    /// 用户没选过时按这个顺序挑。**显式写死，不靠 enum 的声明顺序** ——
+    /// 那个顺序是按接入时间排的，中间插一家新的就会悄悄改掉所有人的默认模型。
+    /// 没列进来的（以后新接的）排在后面，不会漏
+    static func defaultOrder(for category: ProviderCategory) -> [Provider] {
+        switch category {
+        case .image: return [.seedream, .nanobanana2, .gptImage2, .grokImage]
+        case .video: return [.kling, .seedance, .runway, .minimax, .grokVideo]
+        case .audio: return [.elevenlabs, .openaiTTS, .fishAudio, .minimaxTTS]
+        // 文字走不到这儿 —— provider(for:) 里对 .text 特判成「跟随聊天框的选择」。
+        // 这条只是聊天框那个下拉恰好选着图片/视频模型时的最后兜底
+        case .text:  return [.claude, .gpt56, .deepseek_ai, .qwen, .glm, .grok, .kimi]
+        }
+    }
+
+    /// 火山方舟那两个 Seedream 型号的官方模型名。
+    /// 两者能力差一大截：Pro 只有「单图生成」，Lite 才带「组图生成」
+    enum SeedreamModel {
+        static let pro = "doubao-seedream-5-0-pro-260628"
+        static let lite = "doubao-seedream-5-0-260128"
+    }
+
+    /// 用户没点名模型时，图片该找谁、用它的哪个型号。
+    ///
+    /// 顺序按**要几张**分两套：
+    /// - 一张：Image2 → Seedream 5.0 Pro → Seedream 5.0 Lite
+    /// - 多张：Image2 → Seedream 5.0 Lite（Pro 官方就出不了多张，直接跳过）
+    ///
+    /// 只挑配了 Key 的。一个都没配就返回 nil，交给上面那套通用逻辑去报错
+    static func autoImagePick(count: Int, settings: AppSettings = .shared)
+        -> (provider: Provider, model: String?)? {
+        let order: [(Provider, String?)] = count > 1
+            ? [(.gptImage2, nil), (.seedream, SeedreamModel.lite)]
+            : [(.gptImage2, nil), (.seedream, SeedreamModel.pro), (.seedream, SeedreamModel.lite)]
+        return order.first { !apiKey(for: $0.0, settings: settings).isEmpty }
+            .map { (provider: $0.0, model: $0.1) }
+    }
+
+    /// 一次请求最多能出几张。**按官方公布的能力来，不是拍脑袋**：
+    ///
+    /// - Image2：OpenAI 图片接口的 `n`，1~10
+    /// - Seedream：看选的是哪个子模型。官方模型列表里
+    ///   `doubao-seedream-5-0-pro` 的能力只有「单图生成」，没有「组图生成」；
+    ///   `5-0`(lite) / `4-5` / `4-0` 才带组图，上限 15（含参考图）
+    /// - 其余各家没核实过，一律按 1 算，宁可少给不要瞎给
+    /// `model` 是自动挑出来的型号；不传就按用户在下拉里选的那个算
+    static func maxImages(for provider: Provider, model: String? = nil,
+                          settings: AppSettings = .shared) -> Int {
+        switch provider {
+        case .gptImage2:
+            return 10
+        case .seedream:
+            // 自定义接入点（ep-xxxxx）看不出是哪一版，就按下拉里选的那个算
+            let picked = (model ?? settings.providerModel(for: provider.rawValue)).lowercased()
+            let isPro = picked.isEmpty || picked.contains("pro")
+            return isPro ? 1 : 15
+        default:
+            return 1
+        }
+    }
+
     static func provider(for category: ProviderCategory, settings: AppSettings = .shared) -> Provider {
+        // 用户明确选过的最大 —— 哪怕它没配 Key，也该按他选的报错，而不是偷偷换一家
         let saved = settings.canvasProvider(for: category.rawValue)
         if let p = Provider(rawValue: saved), p.category == category, !p.isHidden {
             return p
         }
+        // 文字（Agent 模型）不按写死的顺序挑，**跟着聊天框底部那个下拉走** ——
+        // 那才是用户眼里「现在用的是哪个模型」，给它定个默认顺序只会跟界面对不上。
+        // 但要挡一道类型：全局选中的可能是图片模型，直接拿会报「Image2 不支持文字生成」
+        if category == .text {
+            let picked = AIVideoService.shared.selectedProvider
+            if picked.category == .text, !picked.isHidden { return picked }
+        }
+
         let matching = Provider.allCases.filter { !$0.isHidden && $0.category == category }
-        return matching.first ?? AIVideoService.shared.selectedProvider
+        let preferred = defaultOrder(for: category).filter { !$0.isHidden && $0.category == category }
+        let ordered = preferred + matching.filter { !preferred.contains($0) }
+
+        // **先挑配了 Key 的**。原来只取顺序第一个，结果用户给另一家配了 Key 也用不上：
+        // 默认落在 seedream 上，直接报「seedream 还没配 API Key」，
+        // 而他其实配好了 gpt-image-2
+        if let configured = ordered.first(where: { !apiKey(for: $0).isEmpty }) {
+            return configured
+        }
+        // 一家都没配，返回顺序第一个，让下游报「这家没配 Key」
+        return ordered.first ?? AIVideoService.shared.selectedProvider
     }
 
     enum Provider: String, CaseIterable, Identifiable {
@@ -155,7 +234,11 @@ final class AIVideoService: ObservableObject {
             case .gptImage2:
                 return [("gpt-image-2", "gpt-image-2")]
             case .seedream:
-                return [("Seedream 5.0 Pro", "seedream")]
+                // id 直接就是官方模型名，可以不建接入点直接发。
+                // **Pro 没有组图能力**（官方模型列表里它只有「单图生成」，
+                // lite / 4.5 / 4.0 那几个才带「组图生成」），所以要一次多张只能选 lite
+                return [("Seedream 5.0 Pro", SeedreamModel.pro),
+                        ("Seedream 5.0 Lite", SeedreamModel.lite)]
             case .seedance:
                 // 这里的 id 不是模型名，是「用哪个接入点」的标记 ——
                 // 火山方舟要按模型分别建接入点，真正发出去的是设置里填的 ep-xxxxx
@@ -531,7 +614,9 @@ final class AIVideoService: ObservableObject {
         }
 
         /// 一次工具调用的留痕
-        struct AgentStepRecord: Identifiable, Codable {
+        /// Equatable 是给 SwiftUI 用的：步骤列表每半秒会因为计时器重算一次，
+        /// 能逐条比出「这行没变」才不会连带重画里面的长文本
+        struct AgentStepRecord: Identifiable, Codable, Equatable {
             var id = UUID()
             var tool: String
             var summary: String
@@ -583,6 +668,37 @@ final class AIVideoService: ObservableObject {
     var agentRoundReferences: [RefContent] = []
     var agentRoundFirstFrame: URL?
     var agentRoundLastFrame: URL?
+
+    /// 这一轮已经提交过哪几类生成任务。**一轮每类只放行一次**。
+    ///
+    /// 模型总爱多提交：用户取消了一个再要 3 张，它交「1 张（补做的）+ 3 张」；
+    /// 提示词里写死「取消就是不要了，不要补做」也照样补。
+    /// 要多张走 count 参数，所以这道拦截不会误伤
+    var agentRoundGenerated: Set<ProviderCategory> = []
+
+    /// 从用户这轮原话里解析出来的张数（「生成3张海报」→ 3）。
+    ///
+    /// **不指望模型传 count**：实测跟它说「用户说了几张就传几」，它照样第一次
+    /// 只调 1 张、第二次再调一次，被一轮一次的拦截挡下，最后只出 1 张。
+    /// 这里自己认数字，不看它脸色
+    var agentRoundImageCount: Int?
+
+    /// 认「3张 / 三张 / 3幅 / 3个」这类说法。认不出返回 nil
+    static func parseImageCount(from text: String) -> Int? {
+        let cn = ["一": 1, "两": 2, "二": 2, "三": 3, "四": 4, "五": 5,
+                  "六": 6, "七": 7, "八": 8, "九": 9, "十": 10]
+        let unit = "张|幅|个|副"
+        if let m = text.range(of: "\\d+\\s*(\(unit))", options: .regularExpression),
+           let n = Int(text[m].filter(\.isNumber)) {
+            return n
+        }
+        for (word, n) in cn {
+            if text.range(of: "\(word)\\s*(\(unit))", options: .regularExpression) != nil {
+                return n
+            }
+        }
+        return nil
+    }
 
     @Published var agentInputText: String = ""
     @Published var agentAttachments: [AgentAttachment] = []
@@ -687,7 +803,9 @@ final class AIVideoService: ObservableObject {
     /// 传进来 —— 上限、首尾帧支不支持都得按它算，不然拿 Agent 模型去问
     /// 「能塞几张参考图」，答案永远是 0
     func addToReference(url: URL, provider: Provider? = nil) -> AddReferenceResult {
-        let p = provider ?? selectedProvider
+        // 优先用「此刻真正生效的模型」—— 用户 `/` 点名了哪家就是哪家。
+        // 只看 selectedProvider 的话，点名视频模型后加视频素材会被判成不支持
+        let p = provider ?? activeUIProvider ?? selectedProvider
         let ext = url.pathExtension.lowercased()
         let type: RefContentType
         if Self.imageExts.contains(ext) { type = .image }
@@ -699,6 +817,41 @@ final class AIVideoService: ObservableObject {
             return addAsFrame(url: url, type: type, provider: p)
         }
         return addAsReference(url: url, type: type, provider: p)
+    }
+
+    enum LibraryAcceptResult {
+        case reference          // 收进了参考区
+        case attachment         // 收进了附件
+        case duplicate
+        case unsupported
+        case limitReached(String)
+    }
+
+    /// 素材库右键「添加到 AI 参考」该往哪放。**按输入框此刻的状态判**：
+    ///
+    /// - 打了 `/` 命令 → 按点名那家的参考规则收进参考区，那家收不下就落到附件
+    /// - 没打命令 → 直接当附件收（附件连视频音频都收，等打了命令再收进参考区）
+    ///
+    /// 不这么分的话，没打命令时只能按面板全局选的模型判 —— 它可能是个图片模型，
+    /// 视频素材就被判成「不支持当前素材类型」，可附件区明明收得下
+    func acceptLibraryAsset(url: URL) -> LibraryAcceptResult {
+        if let p = activeUIProvider {
+            let takesReference = p.maxReferenceTotal > 0
+                || (p.category == .video && imageMode == .frames && p.supportsFirstFrame)
+            if takesReference {
+                switch addToReference(url: url, provider: p) {
+                case .added:                 return .reference
+                case .duplicate:             return .duplicate
+                case .limitReached(let m):   return .limitReached(m)
+                case .unsupportedType:       break   // 这家不收这类，往下落到附件
+                }
+            }
+        }
+        guard AgentAttachmentIO.accepts(url) else { return .unsupported }
+        guard !agentAttachments.contains(where: { $0.url == url }) else { return .duplicate }
+        guard let a = AgentAttachmentIO.make(url) else { return .unsupported }
+        agentAttachments.append(a)
+        return .attachment
     }
 
     /// 首尾帧模式：先点的进首帧，后点的进尾帧，都满了从首帧重新开始
@@ -810,6 +963,10 @@ final class AIVideoService: ObservableObject {
 
     @Published var messages: [ChatMessage] = []
     @Published var selectedProvider: Provider = .kling
+
+    /// 聊天框此刻真正生效的模型：`/` 点名了就是点名那个，没点名就等于 selectedProvider。
+    /// 由 AIChatPanel 同步进来，给面板外面的入口（素材库右键之类）判断用
+    @Published var activeUIProvider: Provider?
 
     /// 在跑的生成任务，按 id 存。画布上会同时跑很多个，
     /// 原来那个 `isGenerating` 布尔 + 单个 generatingMessageId 只够伺候一个任务
@@ -933,6 +1090,7 @@ final class AIVideoService: ObservableObject {
                            referenceAudios: [URL] = [],
                            firstFrame: URL? = nil,
                            lastFrame: URL? = nil,
+                           modelOverride: String? = nil,
                            onFinish: @escaping (Result<URL, Error>) -> Void) -> UUID {
         let taskID = UUID()
         let category = provider.category
@@ -955,13 +1113,19 @@ final class AIVideoService: ObservableObject {
                                                       firstFrame: firstFrame, lastFrame: lastFrame)
                     case .image:
                         url = try await generateImage(provider: provider, prompt: prompt,
-                                                      referenceImages: referenceImages, ratio: imageRatio)
+                                                      referenceImages: referenceImages, ratio: imageRatio,
+                                                      modelOverride: modelOverride)
                     case .audio:
                         url = try await generateAudio(provider: provider, prompt: prompt)
                     case .text:
                         // 文本节点不走生成，它就是个提示词输入框
                         throw AIError.apiError("文本节点不需要生成")
                     }
+                    // **拿到结果也得再验一次有没有被取消。**
+                    // `Task.cancel()` 只是竖个标志，请求要是已经跑完了，
+                    // 底下的 await 根本不会抛 —— 用户点了取消，图照样出、照样进素材库。
+                    // 这一句让它走 catch 的取消分支，结果直接丢掉
+                    try Task.checkCancellation()
                     onFinish(.success(url))
                 } catch {
                     onFinish(.failure(error))
@@ -1015,6 +1179,9 @@ final class AIVideoService: ObservableObject {
 
     /// 取消一个任务
     func cancel(taskID: UUID) {
+        let had = runningTasks[taskID]?.handle != nil
+        DiagLog.log("[生成] 取消任务 \(taskID.uuidString.prefix(8))："
+                    + (had ? "已向它发出取消" : "**找不到它的执行句柄，取消发不出去**"))
         runningTasks[taskID]?.handle?.cancel()
         runningTasks.removeValue(forKey: taskID)
     }
@@ -1186,6 +1353,18 @@ final class AIVideoService: ObservableObject {
     ///
     /// 进行中那条占位是去掉了（跟左上角后台任务标签重复），但**结束态得有** ——
     /// 不然点了取消，聊天里什么都没发生，看着像没取消掉
+    /// 往会话里记一句普通说明（不是报错）。
+    ///
+    /// 后台任务结束得让模型知道 —— 它只清楚自己提交过，之后是成了、砸了、
+    /// 还是被用户取消了，一概看不到。不留痕的话用户再说一遍同样的需求，
+    /// 它当没做过又提交一个，任务就这么一轮一轮累加上去
+    func appendAgentNote(_ text: String) {
+        if currentConversationId == nil { newConversation() }
+        let msg = ChatMessage(role: .assistant, content: text)
+        messages.append(msg)
+        persist(msg, isUser: false, steps: nil)
+    }
+
     func appendAgentFailure(_ text: String) {
         if currentConversationId == nil { newConversation() }
         let msg = ChatMessage(role: .assistant, content: text,
@@ -1204,11 +1383,40 @@ final class AIVideoService: ObservableObject {
     }
 
     /// 跑完了，把正文和这一轮的步骤填进那条占位回复，同时落盘
+    /// 兜底：把模型伪造的执行记录从回复里抠掉。
+    ///
+    /// 模型有时一个工具都没调，却照着历史里的记录格式编一段
+    /// 「`<tool_log>` · generate_image(…) → 已提交后台任务」出来，用户信以为真、
+    /// 等一个根本不存在的任务。提示词和历史格式都改过，仍不能保证它老实，
+    /// 所以真调过工具才允许出现这种段落，没调过就整段删掉
+    static func stripFakeToolLog(_ text: String, didCallTools: Bool) -> String {
+        guard !didCallTools else { return text }
+        var s = text
+        // 成对标签整块删；只有开标签没闭合的，从标签处截断
+        while let open = s.range(of: "<tool_log>") {
+            if let close = s.range(of: "</tool_log>", range: open.upperBound..<s.endIndex) {
+                s.removeSubrange(open.lowerBound..<close.upperBound)
+            } else {
+                s = String(s[s.startIndex..<open.lowerBound])
+                break
+            }
+        }
+        if let r = s.range(of: "[系统记录·你上一轮实际执行过的工具]") {
+            s = String(s[s.startIndex..<r.lowerBound])
+        }
+        let out = s.trimmingCharacters(in: .whitespacesAndNewlines)
+        if out != text.trimmingCharacters(in: .whitespacesAndNewlines) {
+            DiagLog.log("[会话] 这一轮一个工具都没调，回复里却带着伪造的执行记录，已删掉那段")
+        }
+        return out
+    }
+
     func finishAgentReply(id: UUID, text: String,
                           steps: [ConversationRecord.AgentStepRecord],
                           elapsed: TimeInterval = 0, tokens: Int = 0) {
         guard let i = messages.firstIndex(where: { $0.id == id }) else { return }
-        messages[i].content = text.isEmpty ? "（没有输出）" : text
+        let clean = Self.stripFakeToolLog(text, didCallTools: !steps.isEmpty)
+        messages[i].content = clean.isEmpty ? "（没有输出）" : clean
         DiagLog.log("[会话] 存回复：步骤 \(steps.count) 步"
                   + (steps.isEmpty ? "" : "（\(steps.map(\.tool).joined(separator: "、"))）"))
         messages[i].agentSteps = steps.isEmpty ? nil : steps
@@ -1903,10 +2111,12 @@ final class AIVideoService: ObservableObject {
 
     // MARK: - 图片生成
 
-    private func generateImage(provider: Provider, prompt: String, referenceImages: [URL] = [], ratio: String = "1:1") async throws -> URL {
+    private func generateImage(provider: Provider, prompt: String, referenceImages: [URL] = [], ratio: String = "1:1",
+                               modelOverride: String? = nil) async throws -> URL {
         // Seedream 与 Seedance 同属火山方舟，共用 seedanceApiKey
         if provider == .seedream {
-            return try await generateWithSeedream(prompt: prompt, referenceImages: referenceImages, ratio: ratio)
+            return try await generateWithSeedream(prompt: prompt, referenceImages: referenceImages, ratio: ratio,
+                                                  modelOverride: modelOverride)
         }
         let apiKey = settings.providerAPIKey(for: provider.rawValue)
         guard !apiKey.isEmpty else {
@@ -1932,14 +2142,25 @@ final class AIVideoService: ObservableObject {
 
     // MARK: - Seedream 5.0 Pro (火山方舟)
 
-    private func generateWithSeedream(prompt: String, referenceImages: [URL] = [], ratio: String = "1:1") async throws -> URL {
+    private func generateWithSeedream(prompt: String, referenceImages: [URL] = [], ratio: String = "1:1",
+                                      modelOverride: String? = nil) async throws -> URL {
         let apiKey = settings.seedanceApiKey
         guard !apiKey.isEmpty else {
             throw AIError.missingAPIKey("请先在设置中填写火山方舟 API Key")
         }
-        let ep = settings.seedreamEndpoint.trimmingCharacters(in: .whitespacesAndNewlines)
+        // 接入点填了以它为准（用户自己建的 ep-xxxxx），没填就用下拉里选的官方模型名。
+        // 以前这里必须填才能用，其实火山方舟直接发模型名就行，没必要逼人先去建接入点
+        let custom = settings.seedreamEndpoint.trimmingCharacters(in: .whitespacesAndNewlines)
+        let ids = Provider.seedream.subModels.map(\.id)
+        let picked = settings.providerModel(for: Provider.seedream.rawValue)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        // 存的可能是早先版本留下的旧值（那会儿 id 是 "seedream"），认不出就回到第一个
+        let fromMenu = ids.contains(picked) ? picked : (ids.first ?? "")
+        // 自动挑出来的型号最优先 —— 用户要三张时是靠它落到 Lite 上的，
+        // 让下拉里存的 Pro 盖过去就白挑了
+        let ep = modelOverride ?? (custom.isEmpty ? fromMenu : custom)
         guard !ep.isEmpty else {
-            throw AIError.missingAPIKey("请先在设置中填写 Seedream 的接入点 ID 或模型名")
+            throw AIError.missingAPIKey("请先在设置里选一个 Seedream 模型，或填自己的接入点 ID")
         }
 
         let url = URL(string: "https://ark.cn-beijing.volces.com/api/v3/images/generations")!

@@ -26,6 +26,8 @@ final class AppSettings: ObservableObject {
         static let aiRatio = "settings.ai.ratio"
         static let aiResolution = "settings.ai.resolution"
         static let aiImageRatio = "settings.ai.imageRatio"
+        static let aiImageCount = "settings.ai.imageCount"
+        static let customLUTs = "settings.filter.customLUTs"
         static let separateKeepStems = "settings.audio.separateKeepStems"
         static let seedanceApiKey = "settings.ai.seedance.apiKey"
         static let seedanceEndpoint = "settings.ai.seedance.endpoint"
@@ -372,6 +374,17 @@ final class AppSettings: ObservableObject {
         didSet { ud.set(aiResolution, forKey: K.aiResolution) }
     }
     /// 图片生成比例，与视频比例独立存储，避免切模型时互相覆盖
+    /// 导入过的 .cube 路径。滤镜库「自定义」那一组就是它 ——
+    /// 原来导进来只往时间轴上加一段，下次想再用还得重新选一遍文件
+    @Published var customLUTs: [String] {
+        didSet { ud.set(customLUTs, forKey: K.customLUTs) }
+    }
+
+    /// 一次出几张。聊天框那排下拉里选，模型在话里说了数量的话以他说的为准
+    @Published var aiImageCount: Int {
+        didSet { ud.set(aiImageCount, forKey: K.aiImageCount) }
+    }
+
     @Published var aiImageRatio: String {
         didSet { ud.set(aiImageRatio, forKey: K.aiImageRatio) }
     }
@@ -769,6 +782,11 @@ final class AppSettings: ObservableObject {
         aiRatio = ud.string(forKey: K.aiRatio) ?? "16:9"
         aiResolution = ud.string(forKey: K.aiResolution) ?? "720P"
         aiImageRatio = ud.string(forKey: K.aiImageRatio) ?? "1:1"
+        // 没存过是 0，按 1 张算
+        aiImageCount = max(1, ud.integer(forKey: K.aiImageCount))
+        // 文件可能已经被删/移走，开机时先滤一遍，免得列表里挂着一堆点不开的
+        customLUTs = (ud.stringArray(forKey: K.customLUTs) ?? [])
+            .filter { FileManager.default.fileExists(atPath: $0) }
         separateKeepStems = (ud.array(forKey: K.separateKeepStems) as? [Int]) ?? [3, 2, 0]
         seedanceApiKey = ud.string(forKey: K.seedanceApiKey) ?? ""
         seedanceEndpoint = ud.string(forKey: K.seedanceEndpoint) ?? ""

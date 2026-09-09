@@ -255,10 +255,30 @@ private struct OverlayStack: View {
             // 有效果轨道时，画面**整帧**由合成器出（叠加层也在里面），
             // 这层只留透明的命中区接鼠标 —— 再画一遍内容就会出现
             // 「合成器扭一套、SwiftUI 扭另一套」两份对不上的画面
-            if hasEffectLayer(layersBottomUp) {
+            // **合成器只有在有视频垫底时才跑**。纯图片项目（时间轴上一条视频都没有）
+            // 走这条就成了：叠加层这边把自己藏了交给合成器，合成器却根本没启动 ——
+            // 画面全黑，看着像「滤镜对图片不生效」，其实是图片没了
+            if hasEffectLayer(layersBottomUp), hasVideoAtPlayhead {
                 ForEach(Array(layersBottomUp.enumerated()), id: \.element.trackID) { i, ref in
                     layerView(ref)
                         .opacity(0)          // 内容归合成器画，这里只要命中区
+                        .zIndex(Double(i))
+                }
+            } else if hasEffectLayer(layersBottomUp) {
+                // 没视频垫底、又有效果轨：自己跑一遍**合成器那套**渲染，出一张整帧图。
+                //
+                // 不走 overlayChain 了 —— 它靠把视图重塞进新的 NSHostingView 来挂
+                // CALayer.filters，实测滤镜、调节、特效三种全是黑屏（内容整个没了）。
+                // 直接拿 ColorCompositor.drawOverlays 出图，跟有视频时是同一份代码，
+                // 效果也就天然一致
+                ComposedOverlayFrame(renderSize: project.previewRenderSize,
+                                     time: clock.currentTime,
+                                     contentKey: project.overlayContentKey(at: clock.currentTime),
+                                     effectKey: project.effectContentKey(at: clock.currentTime))
+                // 内容归上面那张图，这里只留命中区接鼠标
+                ForEach(Array(layersBottomUp.enumerated()), id: \.element.trackID) { i, ref in
+                    layerView(ref)
+                        .opacity(0)
                         .zIndex(Double(i))
                 }
             } else if false {
@@ -314,6 +334,18 @@ private struct OverlayStack: View {
     }
 
     /// 有没有效果类轨道。有的话整帧交给合成器出
+    /// 这一刻有没有视频画面垫底。没有的话合成器不会跑，效果得自己在这层套
+    private var hasVideoAtPlayhead: Bool {
+        let t = clock.currentTime
+        if project.videoTracks.contains(where: { tr in
+            tr.isVisible && tr.clips.contains { $0.startTime <= t && $0.endTime > t }
+        }) { return true }
+        // 复合片段里可能包着视频，那种也是合成器出画面
+        return project.compoundTracks.contains { tr in
+            tr.isVisible && tr.clips.contains { $0.startTime <= t && $0.endTime > t }
+        }
+    }
+
     private func hasEffectLayer(_ layers: [ProjectState.OverlayTrackRef]) -> Bool {
         layers.contains {
             switch $0 {
@@ -335,7 +367,9 @@ private struct OverlayStack: View {
                     } ?? []
                 let fs = clips.flatMap(\.adjust.ciFilters)
                 guard !fs.isEmpty else { return acc }
-                return AnyView(CILayerEffect(filters: fs) { acc })
+                return AnyView(CILayerEffect(filters: fs) {
+                    acc.environmentObject(project).environmentObject(clock)
+                })
             }
             if case .effect(let id) = ref {
                 let clips = project.effectTracks.first { $0.id == id }
@@ -1707,6 +1741,8 @@ private struct VideoTransformOverlay: View {
                                 anchor: rotationAnchor(clip: clip, info: info, in: geo.size))
             }
         }
+        // 同图片：手势要在不参与旋转的这层里量，不然参考点跟着手柄转，画面抖
+        .coordinateSpace(name: TransformBox.space)
     }
 
     /// 把画面中心换算成 rotationEffect 要的 UnitPoint
@@ -2131,6 +2167,10 @@ private struct ImageTransformOverlay: View {
                                 anchor: imageRotationAnchor(clip: clip, info: info, in: geo.size))
             }
         }
+        // **坐标系声明在旋转外面**。旋转手柄自己就跟着角度在转，
+        // 手势要是拿它所在那层的坐标去量，参考点每帧都在动 —— 画面就抖。
+        // 挂在 GeometryReader 这层，量到的始终是预览区里那个不动的坐标
+        .coordinateSpace(name: TransformBox.space)
     }
 
     /// 图片画面中心 → rotationEffect 的 UnitPoint
@@ -3519,6 +3559,11 @@ final class PlayerController: ObservableObject {
 /// 效果等同于线性混合。**交互留给下面那层**，否则强度拉满时预览区就点不动了
 struct OverlayFilterEffect: ViewModifier {
     let clips: [FilterClip]
+    // **必须显式往下传**。CILayerEffect 会把内容重新塞进一个新的 NSHostingView，
+    // 那是一棵新的视图树，拿不到外面注入的环境对象 —— 里面的图片/文字层
+    // 读 @EnvironmentObject 时就渲染不出来，画面整个是空的
+    @EnvironmentObject private var project: ProjectState
+    @EnvironmentObject private var clock: PlaybackClock
 
     func body(content: Content) -> some View {
         clips.reduce(AnyView(content)) { view, clip in
@@ -3527,9 +3572,11 @@ struct OverlayFilterEffect: ViewModifier {
             guard k > 0.001, !fs.isEmpty else { return view }
             return AnyView(ZStack {
                 view
-                CILayerEffect(filters: fs) { view }
-                    .opacity(k)
-                    .allowsHitTesting(false)
+                CILayerEffect(filters: fs) {
+                    view.environmentObject(project).environmentObject(clock)
+                }
+                .opacity(k)
+                .allowsHitTesting(false)
             })
         }
     }
@@ -3699,5 +3746,43 @@ struct EffectCenterHandle: View {
                 .onEnded { _ in onEnd() }
         )
         .position(x: canvas.width * clip.centerX, y: canvas.height * clip.centerY)
+    }
+}
+
+/// 没有视频垫底时的整帧画面。
+///
+/// 合成器（ColorCompositor）只在有视频轨的时候才跑，纯图片项目一旦加了
+/// 滤镜/调节/特效轨，叠加层这边把自己藏起来交给合成器，合成器却没启动 ——
+/// 画面就全黑了。这里直接调合成器那份 `drawOverlays` 自己出图：
+/// 图层顺序、效果串接、强度混合全是同一份代码，不会出现两套画面对不上
+struct ComposedOverlayFrame: View {
+    let renderSize: CGSize
+    let time: Double
+    /// 叠加层内容指纹：图片位置、文字这些变了要重画
+    let contentKey: String
+    /// 效果参数指纹：**强度这类改动全靠它** —— 不带的话时间和尺寸都没变，
+    /// SwiftUI 认为这个视图没变化，画面就停在旧的上，非得挪一下片段才刷新
+    let effectKey: String
+
+    private static let ctx = CIContext(options: [.useSoftwareRenderer: false])
+
+    var body: some View {
+        if let img = Self.render(renderSize: renderSize, at: time) {
+            Image(nsImage: img)
+                .resizable()
+                .aspectRatio(contentMode: .fit)
+                .allowsHitTesting(false)
+        }
+    }
+
+    static func render(renderSize: CGSize, at t: Double) -> NSImage? {
+        guard renderSize.width > 1, renderSize.height > 1 else { return nil }
+        let box = CGRect(origin: .zero, size: renderSize)
+        // 透明底：预览区自己的黑底透上来，不用在这儿铺一层黑
+        let base = CIImage(color: CIColor.clear).cropped(to: box)
+        let out = ColorCompositor.drawOverlays(base, at: t, renderSize: renderSize)
+            .cropped(to: box)
+        guard let cg = ctx.createCGImage(out, from: box) else { return nil }
+        return NSImage(cgImage: cg, size: renderSize)
     }
 }

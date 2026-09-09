@@ -183,6 +183,11 @@ struct TransformBox: View {
         }
     }
 
+    /// 量手势用的坐标系名。**由外面那层不参与旋转的容器声明**
+    /// （`PlayerView` 的预览容器）—— 定在变换框自己身上没用，
+    /// 它整层跟着图片一起 `rotationEffect`，坐标系跟着转，参考点照样漂
+    static let space = "previewTransformSpace"
+
     // MARK: 手柄样子
 
     private func handleDot() -> some View {
@@ -275,7 +280,7 @@ struct TransformBox: View {
     }
 
     private func rotateGesture(center c: CGPoint) -> some Gesture {
-        DragGesture(minimumDistance: 1)
+        DragGesture(minimumDistance: 1, coordinateSpace: .named(Self.space))
             .onChanged { v in
                 if mode != 3 {
                     onBegin(); mode = 3

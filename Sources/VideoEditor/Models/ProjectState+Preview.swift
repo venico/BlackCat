@@ -602,10 +602,15 @@ extension ProjectState {
             // Build AVVideoComposition to layer image tracks on top of video tracks.
             let allVideoTracks = videoCompTracks.map(\.track) + imageCompTracks.map(\.track)
             var videoComposition: AVMutableVideoComposition? = nil
-            // 没有视频轨时也要清掉静态存的滤镜，不然上一个项目的还留着
+            // 没有视频轨（纯图片项目）时合成器不会跑，但预览那层会自己调
+            // `ColorCompositor.drawOverlays` 出整帧图 —— **照样得把这三样灌进去**。
+            // 原来这儿是清空的（怕留着上个项目的），结果那条路读到空数组，
+            // 滤镜/调节/特效全被跳过，画面出得来却一点效果没有。
+            // 灌当前项目的值同样不会串项目
             if allVideoTracks.isEmpty {
-                ColorCompositor.setFilterTracks([]); ColorCompositor.setAdjustTracks([])
-                ColorCompositor.setEffectTracks([])
+                ColorCompositor.setFilterTracks(fTracks)
+                ColorCompositor.setAdjustTracks(adjTracks)
+                ColorCompositor.setEffectTracks(fxTracks)
             }
             if !allVideoTracks.isEmpty && composition.duration.seconds > 0.01 {
                 let vc = AVMutableVideoComposition()
