@@ -2801,17 +2801,52 @@ private struct MarkdownContentView: View {
         // 宽度显式传下去，高度由它按这个宽度自己算。之前是「SwiftUI 按 proposal
         // 问一次高度就记住」，侧边栏一拉高度还是旧的：拉宽了框太高、文字缩在下半截
         // 顶上空一片，拉窄了框不够高第一行被裁半个字
-        SelectableMarkdownView(
-            attributed: nsAttributed(),
-            onAddSubtitle: { project.insertSubtitleAtPlayhead(text: $0) },
-            onAddTitle: { project.addTextAtPlayhead(text: $0) },
-            layoutWidth: textWidth
-        )
+        // 表格得用真控件画，画不进 NSTextView，所以按「表格 / 非表格」切成几段：
+        // 连着的普通块还是合成一个 NSTextView（整段能一次选中），表格块单独出来。
+        // 代价是有表格的回复选中会在表格处断开 —— 换表格的观感，这个值
+        let groups = Self.groupBlocks(parseBlocks())
+        VStack(alignment: .leading, spacing: 8) {
+            ForEach(Array(groups.enumerated()), id: \.offset) { _, group in
+                switch group {
+                case .text(let blocks):
+                    SelectableMarkdownView(
+                        attributed: nsAttributed(blocks),
+                        onAddSubtitle: { project.insertSubtitleAtPlayhead(text: $0) },
+                        onAddTitle: { project.addTextAtPlayhead(text: $0) },
+                        layoutWidth: textWidth
+                    )
+                case .table(let header, let rows):
+                    MarkdownTableView(header: header, rows: rows)
+                        .frame(maxWidth: textWidth, alignment: .leading)
+                }
+            }
+        }
+    }
+
+    /// 相邻的普通块并成一组，表格各自单独一组
+    enum BlockGroup {
+        case text([Block])
+        case table([String], [[String]])
+    }
+
+    static func groupBlocks(_ blocks: [Block]) -> [BlockGroup] {
+        var out: [BlockGroup] = []
+        var buf: [Block] = []
+        for b in blocks {
+            if case .table(let h, let r) = b {
+                if !buf.isEmpty { out.append(.text(buf)); buf = [] }
+                out.append(.table(h, r))
+            } else {
+                buf.append(b)
+            }
+        }
+        if !buf.isEmpty { out.append(.text(buf)) }
+        return out
     }
 
     /// 把解析出的块拼成 NSAttributedString。
     /// 行距按 1.4 倍行高走段落样式，比逐段设 lineSpacing 更准
-    private func nsAttributed() -> NSAttributedString {
+    private func nsAttributed(_ blocks: [Block]) -> NSAttributedString {
         let out = NSMutableAttributedString()
         let para = NSMutableParagraphStyle()
         para.lineSpacing = AIChatPanel.bodyLineSpacing
@@ -2871,7 +2906,7 @@ private struct MarkdownContentView: View {
             out.append(m)
         }
 
-        for (i, block) in parseBlocks().enumerated() {
+        for (i, block) in blocks.enumerated() {
             if i > 0 { append("\n\n", size: base) }
             switch block {
             case .heading(let level, let t):
@@ -2887,6 +2922,13 @@ private struct MarkdownContentView: View {
                 appendInline(t)
             case .paragraph(let t):
                 appendInline(t)
+            case .table(let header, let rows):
+                if Self.tableFits(header, rows) {
+                    // 等宽字体按列宽补空格对齐，不画边框
+                    append(Self.tableAsAligned(header, rows), size: base - 1.5, alpha: 0.85, mono: true)
+                } else {
+                    appendInline(Self.tableAsList(header, rows))
+                }
             }
         }
         return out
@@ -2920,6 +2962,15 @@ private struct MarkdownContentView: View {
                 out += num + inlineAttr(t)
             case .paragraph(let t):
                 out += inlineAttr(t)
+            case .table(let header, let rows):
+                if Self.tableFits(header, rows) {
+                    var a = AttributedString(Self.tableAsAligned(header, rows))
+                    a.font = .system(size: 11, design: .monospaced)
+                    a.foregroundColor = .white.opacity(0.85)
+                    out += a
+                } else {
+                    out += inlineAttr(Self.tableAsList(header, rows))
+                }
             }
         }
         return out
@@ -2940,12 +2991,70 @@ private struct MarkdownContentView: View {
         return a
     }
 
-    private enum Block {
+    enum Block {
         case heading(Int, String)
         case code(String, String?)
         case bullet(String)
         case numbered(Int, String)
         case paragraph(String)
+        /// markdown 表格。第一行是表头，后面是数据行
+        case table([String], [[String]])
+    }
+
+    /// `|---|:--:|---:|` 这种分隔行
+    private static func isTableSeparator(_ line: String) -> Bool {
+        let t = line.trimmingCharacters(in: .whitespaces)
+        guard t.hasPrefix("|") else { return false }
+        let body = t.trimmingCharacters(in: CharacterSet(charactersIn: "| "))
+        guard !body.isEmpty else { return false }
+        return body.allSatisfy { "-:| ".contains($0) } && body.contains("-")
+    }
+
+    private static func splitRow(_ line: String) -> [String] {
+        line.trimmingCharacters(in: CharacterSet(charactersIn: "| "))
+            .components(separatedBy: "|")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+    }
+
+    /// 表格能不能按格子排。**聊天面板就四百来点宽**，列一多、格子一长就挤成一团，
+    /// 那种情况退回「字段: 值」的列表，比硬排好读
+    private static func tableFits(_ header: [String], _ rows: [[String]]) -> Bool {
+        // 有了真表格控件，格子里的长文本会自己换行，不用再按长度卡。
+        // 只挡列数：聊天区四百来点宽，超过四列每列就窄得没法读了
+        header.count <= 4
+    }
+
+    /// 排不下时的退化形式：一行一条，格子写成「表头: 值」
+    private static func tableAsList(_ header: [String], _ rows: [[String]]) -> String {
+        rows.map { r in
+            r.enumerated().map { i, cell in
+                let key = i < header.count ? header[i] : ""
+                return key.isEmpty ? cell : "\(key): \(cell)"
+            }.joined(separator: "　·　")
+        }.joined(separator: "\n")
+    }
+
+    /// 等宽对齐成文本表格。中文按两个字宽算，不然列对不齐
+    private static func tableAsAligned(_ header: [String], _ rows: [[String]]) -> String {
+        func width(_ s: String) -> Int {
+            s.unicodeScalars.reduce(0) { $0 + (($1.value > 0x2E80) ? 2 : 1) }
+        }
+        let cols = max(header.count, rows.map(\.count).max() ?? 0)
+        var w = [Int](repeating: 0, count: cols)
+        for r in [header] + rows {
+            for (i, c) in r.enumerated() where i < cols { w[i] = max(w[i], width(c)) }
+        }
+        func pad(_ r: [String]) -> String {
+            (0..<cols).map { i -> String in
+                let c = i < r.count ? r[i] : ""
+                return c + String(repeating: " ", count: max(0, w[i] - width(c)))
+            }.joined(separator: "  ")
+            .trimmingCharacters(in: .whitespaces)
+        }
+        var out = [pad(header)]
+        out.append(w.map { String(repeating: "─", count: $0) }.joined(separator: "  "))
+        out += rows.map(pad)
+        return out.joined(separator: "\n")
     }
 
     private func parseBlocks() -> [Block] {
@@ -2966,6 +3075,23 @@ private struct MarkdownContentView: View {
                 }
                 blocks.append(.code(codeLines.joined(separator: "\n"), lang.isEmpty ? nil : lang))
                 i += 1
+                continue
+            }
+
+            // 表格：`| a | b |` 开头，第二行是 `|---|---|` 那种分隔行
+            if trimmed.hasPrefix("|"), i + 1 < lines.count,
+               Self.isTableSeparator(lines[i + 1]) {
+                let header = Self.splitRow(trimmed)
+                var rows: [[String]] = []
+                var j = i + 2
+                while j < lines.count {
+                    let t = lines[j].trimmingCharacters(in: .whitespaces)
+                    guard t.hasPrefix("|") else { break }
+                    rows.append(Self.splitRow(t))
+                    j += 1
+                }
+                blocks.append(.table(header, rows))
+                i = j
                 continue
             }
 
@@ -3040,6 +3166,20 @@ private struct MarkdownContentView: View {
                 .font(.system(size: 12))
                 .lineSpacing(AIChatPanel.bodyLineSpacing)
                 .foregroundColor(Color.white.opacity(0.7))
+
+        case .table(let header, let rows):
+            if Self.tableFits(header, rows) {
+                Text(Self.tableAsAligned(header, rows))
+                    .font(.system(size: 11, design: .monospaced))
+                    .lineSpacing(AIChatPanel.bodyLineSpacing)
+                    .foregroundColor(Color.white.opacity(0.85))
+                    .fixedSize(horizontal: false, vertical: true)
+            } else {
+                inlineMarkdown(Self.tableAsList(header, rows))
+                    .font(.system(size: 12))
+                    .lineSpacing(AIChatPanel.bodyLineSpacing)
+                    .foregroundColor(Color.white.opacity(0.7))
+            }
         }
     }
 
@@ -3847,5 +3987,52 @@ struct HistoryStatusDot: View {
                    value: dim)
         .onAppear { dim = (state == .running) }
         .onChange(of: state) { _, s in dim = (s == .running) }
+    }
+}
+
+/// Agent 回复里的表格。
+///
+/// 画不进 NSTextView，所以单独拿出来用 Grid 画：表头带底色、行间细分隔线、
+/// 整体圆角描边。列宽由内容自己撑，长文本在格子里换行
+struct MarkdownTableView: View {
+    let header: [String]
+    let rows: [[String]]
+
+    private var columnCount: Int { max(header.count, rows.map(\.count).max() ?? 0) }
+
+    var body: some View {
+        Grid(alignment: .topLeading, horizontalSpacing: 0, verticalSpacing: 0) {
+            GridRow {
+                ForEach(0..<columnCount, id: \.self) { c in
+                    cell(c < header.count ? header[c] : "", bold: true)
+                }
+            }
+            .background(Color.white.opacity(0.07))
+
+            ForEach(Array(rows.enumerated()), id: \.offset) { _, row in
+                Divider().opacity(0.25)
+                    .gridCellColumns(columnCount)
+                GridRow {
+                    ForEach(0..<columnCount, id: \.self) { c in
+                        cell(c < row.count ? row[c] : "")
+                    }
+                }
+            }
+        }
+        .background(RoundedRectangle(cornerRadius: 6).fill(Color.white.opacity(0.035)))
+        .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.white.opacity(0.12), lineWidth: 0.5))
+        .clipShape(RoundedRectangle(cornerRadius: 6))
+        .textSelection(.enabled)
+    }
+
+    private func cell(_ text: String, bold: Bool = false) -> some View {
+        Text(text)
+            .font(.system(size: 11, weight: bold ? .semibold : .regular))
+            .foregroundColor(Color.white.opacity(bold ? 0.9 : 0.72))
+            .lineSpacing(2)
+            .fixedSize(horizontal: false, vertical: true)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 7)
+            .padding(.vertical, 5)
     }
 }

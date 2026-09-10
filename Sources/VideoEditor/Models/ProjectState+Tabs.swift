@@ -94,6 +94,89 @@ extension ProjectState {
         activateTab(activeTab)
     }
 
+    /// 复制一条时间线，插在被复制的那条后面并切过去。
+    ///
+    /// 轨道 id 和片段 id **全部换新**：两条时间线里出现同一个 id，选中态、
+    /// 预览的片段-轨道映射这些按 id 找东西的地方就会串台。
+    /// 换了轨道 id，三张顺序表（overlay / video / audio）里的引用必须跟着改，
+    /// 漏改的表现是复制出来的时间线轨道一条都不显示。
+    /// 复合片段**内部**的 id 不动 —— 它自带一套自己的顺序表，是自包含的
+    func duplicateTab(id: UUID) {
+        guard let i = tabs.firstIndex(where: { $0.id == id }) else { return }
+        pushUndo()
+        // 复合片段栈是全局一份，复制前先收干净，免得内容写进复制出来的那条
+        while isInsideCompound { exitCompound() }
+
+        var copy = tabs[i]
+        copy.id = UUID()
+        copy.isTabOpen = true
+        var base = tabs[i].name + " 复制"
+        let used = Set(tabs.map(\.name))
+        if used.contains(base) {
+            var n = 2
+            while used.contains("\(base) \(n)") { n += 1 }
+            base = "\(base) \(n)"
+        }
+        copy.name = base
+
+        var map: [UUID: UUID] = [:]
+        copy.videoTracks     = ProjectState.reIDTracks(copy.videoTracks, &map)
+        copy.audioTracks     = ProjectState.reIDTracks(copy.audioTracks, &map)
+        copy.imageTracks     = ProjectState.reIDTracks(copy.imageTracks, &map)
+        copy.subtitleTracks  = ProjectState.reIDTracks(copy.subtitleTracks, &map)
+        copy.textTracks      = ProjectState.reIDTracks(copy.textTracks, &map)
+        copy.shapeTracks     = ProjectState.reIDTracks(copy.shapeTracks, &map)
+        copy.filterTracks    = ProjectState.reIDTracks(copy.filterTracks, &map)
+        copy.adjustTracks    = ProjectState.reIDTracks(copy.adjustTracks, &map)
+        copy.effectTracks    = ProjectState.reIDTracks(copy.effectTracks, &map)
+        copy.compoundTracks  = ProjectState.reIDTracks(copy.compoundTracks, &map)
+
+        copy.overlayTrackOrder = copy.overlayTrackOrder.map { ref in
+            guard let n = map[ref.trackID] else { return ref }
+            switch ref {
+            case .image:    return .image(n)
+            case .subtitle: return .subtitle(n)
+            case .text:     return .text(n)
+            case .shape:    return .shape(n)
+            case .filter:   return .filter(n)
+            case .adjust:   return .adjust(n)
+            case .effect:   return .effect(n)
+            case .compound: return .compound(n)
+            }
+        }
+        copy.videoSectionOrder = copy.videoSectionOrder.map { ref in
+            guard let n = map[ref.trackID] else { return ref }
+            switch ref {
+            case .video:    return .video(n)
+            case .compound: return .compound(n)
+            }
+        }
+        copy.audioSectionOrder = copy.audioSectionOrder.map { ref in
+            guard let n = map[ref.trackID] else { return ref }
+            switch ref {
+            case .audio:    return .audio(n)
+            case .compound: return .compound(n)
+            }
+        }
+
+        tabs.insert(copy, at: i + 1)
+        isSaved = false
+        activateTab(i + 1)
+    }
+
+    /// 轨道和片段换一批新 id，顺带把「老轨道 id → 新轨道 id」记进 map 供顺序表重映射
+    static func reIDTracks<C: UUIDIdentified>(_ tracks: [Track<C>],
+                                              _ map: inout [UUID: UUID]) -> [Track<C>] {
+        tracks.map { t in
+            var nt = t
+            let newID = UUID()
+            map[t.id] = newID
+            nt.id = newID
+            nt.clips = t.clips.map { var c = $0; c.id = UUID(); return c }
+            return nt
+        }
+    }
+
     func renameTab(id: UUID, to name: String) {
         let trimmed = name.trimmingCharacters(in: .whitespaces)
         guard !trimmed.isEmpty, let i = tabs.firstIndex(where: { $0.id == id }) else { return }
@@ -109,3 +192,20 @@ extension ProjectState {
         return nil
     }
 }
+
+
+/// 片段的 id 可以就地换掉（复制时间线要用）
+protocol UUIDIdentified: Identifiable, Equatable, Codable {
+    var id: UUID { get set }
+}
+
+extension VideoClip: UUIDIdentified {}
+extension AudioClip: UUIDIdentified {}
+extension ImageClip: UUIDIdentified {}
+extension SubtitleClip: UUIDIdentified {}
+extension TextClip: UUIDIdentified {}
+extension ShapeClip: UUIDIdentified {}
+extension FilterClip: UUIDIdentified {}
+extension AdjustClip: UUIDIdentified {}
+extension EffectClip: UUIDIdentified {}
+extension CompoundClip: UUIDIdentified {}

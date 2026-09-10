@@ -490,6 +490,15 @@ enum Translator {
     ///
     /// 不走 NLLanguageRecognizer：字幕大量是三五个字的短句，短文本上它很不稳。
     /// 改成数字形——先用假名/谚文把日文韩文排掉（它们也含汉字），再看汉字在字母里的占比。
+    /// 有没有汉字。判「翻没翻成中文」用它，别用占比 —— 夹个英文品牌名占比就过不了线
+    static func containsHan(_ s: String) -> Bool {
+        s.unicodeScalars.contains {
+            (0x4E00...0x9FFF).contains($0.value)      // CJK 基本区
+            || (0x3400...0x4DBF).contains($0.value)   // 扩展 A
+            || (0xF900...0xFAFF).contains($0.value)   // 兼容汉字
+        }
+    }
+
     static func isChineseText(_ s: String) -> Bool {
         let trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return false }
@@ -629,8 +638,15 @@ enum Translator {
                 // 校验译文**确实是目标语言**：有的引擎会静默降级，
                 // 既没报错也没翻对，用户拿到一条"翻译过却还是原文语言的轨"。
                 // 只在中文目标上校验（这是已知会降级的场景），太短的不查
+                // 判「引擎没按目标语言翻」的标准要**宽**：译文里只要出现汉字就算翻了。
+                //
+                // 原来拿 `isAlreadyTarget`（按主导语言判）来卡，夹着英文专有名词的
+                // 短句必然中招 —— 「It's an iPhone.」翻成「这是一部 iPhone。」，
+                // 汉字只占四成，被判成英语，于是误报「该引擎不支持这个目标语言」，
+                // 好好的译文被丢掉退回原文。
+                // 真没翻的样子只有两种：一个汉字都没有，或者原样退回来
                 if isChineseTarget(engineLang), result.count >= 4,
-                   !isAlreadyTarget(result, lang: engineLang) {
+                   !containsHan(result) || result == text {
                     DiagLog.log("[翻译] 引擎未按目标语言返回 目标=\(engineLang)，译文=\(result.prefix(30))")
                     await TranslateDiagnostics.record("该引擎不支持这个目标语言，请换一个翻译引擎")
                     return text

@@ -146,6 +146,7 @@ struct TimelineTabBar: View {
                 DispatchQueue.main.async { renameFocused = true }
             }
             Divider()
+            Button("复制时间线") { project.duplicateTab(id: tab.id) }
             Button("关闭标签页") { project.closeTab(id: tab.id) }
             Button("删除时间线", role: .destructive) { deletingTab = tab }
         }
@@ -176,5 +177,34 @@ struct TimelineTabBar: View {
         .menuIndicator(.hidden)
         .frame(width: 22, height: 22)
         .onHover { moreHover = $0 }
+    }
+}
+
+/// 所有时间线都收起来时，轨道区显示这个。
+///
+/// 关闭 ≠ 删除：内容还在，从「…」菜单里能全部展开回来
+struct ClosedTimelinePlaceholder: View {
+    @EnvironmentObject private var project: ProjectState
+
+    var body: some View {
+        VStack(spacing: 10) {
+            Image(systemName: "rectangle.stack")
+                .font(.system(size: 26, weight: .light))
+                .foregroundColor(Color.labelSecondary.opacity(0.4))
+            Text("时间线都收起来了")
+                .font(.system(size: 12))
+                .foregroundColor(Color.labelSecondary)
+            Text("内容还在，没有删掉")
+                .font(.system(size: 10))
+                .foregroundColor(Color.labelSecondary.opacity(0.6))
+            Button("全部展开") { project.showAllTabs() }
+                .buttonStyle(.plain)
+                .font(.system(size: 11, weight: .medium))
+                .foregroundColor(.black)
+                .padding(.horizontal, 12).frame(height: 24)
+                .background(Capsule().fill(Color.accent))
+                .padding(.top, 2)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 }

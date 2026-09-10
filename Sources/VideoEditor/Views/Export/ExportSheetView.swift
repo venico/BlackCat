@@ -636,29 +636,7 @@ struct ExportSheetView: View {
         let cleanName = baseName.hasSuffix(ext) ? baseName : "\(baseName)\(ext)"
         let outputURL = outputDir.appendingPathComponent(cleanName)
 
-        let orderedSubs = project.orderedSubtitleIndices.map { project.subtitleTracks[$0] }
-        let snapshot = ExportInput(
-            videoTracks: project.videoTracks,
-            audioTracks: project.audioTracks,
-            subtitleTracks: orderedSubs,
-            imageTracks: project.imageTracks,
-            textTracks: project.textTracks,
-            shapeTracks: project.shapeTracks,
-            filterTracks: project.filterTracks,
-            adjustTracks: project.adjustTracks,
-            effectTracks: project.effectTracks,
-            compoundTracks: project.compoundTracks,
-            overlayTrackOrder: project.overlayTrackOrder,
-            subtitleBottomMargin: project.subtitleBottomMargin,
-            subtitleLineSpacing: project.subtitleLineSpacing,
-            previewRenderSize: project.previewRenderSize,
-            customOutputSize: CGSize(width: project.customOutputWidth, height: project.customOutputHeight),
-            settings: project.exportSettings,
-            outputURL: outputURL,
-            coverImagePath: project.cover?.renderedPath.flatMap { rel in
-                project.projectFileURL?.deletingLastPathComponent()
-                    .appendingPathComponent(rel).path
-            })
+        let snapshot = project.makeExportInput(outputURL: outputURL)
 
         // 立即关闭导出面板，进度在右下角气泡显示
         dismiss()

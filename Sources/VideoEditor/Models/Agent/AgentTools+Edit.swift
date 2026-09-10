@@ -13,6 +13,24 @@ extension AgentToolbox {
     static var editTools: [AgentToolSpec] {
         [
             AgentToolSpec(
+                name: "import_media",
+                description: """
+                把电脑上的一个文件导入**当前项目的素材库**（视频 / 音频 / 图片 / 字幕都行）。
+
+                自己下载的、生成的、用户给了路径的文件，都用它送进来 ——                 **你就跑在这个剪辑软件里**，不用也不要去操作别的剪辑 app。
+                导入后调 list_assets 拿到它的 id，再用 add_asset_to_timeline 放上时间线。
+                """,
+                parameters: [
+                    "type": "object",
+                    "properties": [
+                        "path": ["type": "string",
+                                 "description": "文件绝对路径，`~` 开头也认"]
+                    ] as [String: Any],
+                    "required": ["path"]
+                ],
+                risk: .mutating),
+
+            AgentToolSpec(
                 name: "add_asset_to_timeline",
                 description: "把素材库里的一个素材加到时间轴。视频/音频/图片都走它，会自动落到对应类型的轨道上。",
                 parameters: [
@@ -204,6 +222,21 @@ extension AgentToolbox {
     @MainActor
     static func runEditTool(_ name: String, args: [String: Any], project p: ProjectState) -> AgentToolResult? {
         switch name {
+        case "import_media":
+            guard let raw = (args["path"] as? String)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty
+            else { return .fail("缺 path") }
+            let path = (raw as NSString).expandingTildeInPath
+            guard FileManager.default.fileExists(atPath: path) else {
+                return .fail("这个路径上没有文件：\(path)")
+            }
+            let fileURL = URL(fileURLWithPath: path)
+            p.importFile(fileURL)
+            return .ok("""
+                已经把「\(fileURL.lastPathComponent)」导进素材库了（大文件可能还在转码，稍等一下）。
+                接着调 list_assets 拿它的 id，再用 add_asset_to_timeline 放到时间线上。
+                """)
+
         case "add_asset_to_timeline":
             guard let key = args["asset_id"] as? String,
                   let asset = p.mediaAssets.first(where: { "\($0.id)".hasPrefix(key) })

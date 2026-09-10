@@ -67,3 +67,19 @@ enum AgentMode: String, CaseIterable, Codable {
         self == .auto && risk == .dangerous
     }
 }
+
+extension AgentToolbox {
+    /// **所有工具的清单，一处为准。**
+    ///
+    /// 执行前要按名字查出 spec 才知道它的 risk（计划模式拦哪些、自动模式问哪些）。
+    /// 这份清单原来是在 `AgentRunner.execute` 里现拼的，加了新工具忘了同步 ——
+    /// 表现极具误导性：模型那边看得见、也调得动，执行时却回一句
+    /// 「没有叫 xxx 的工具」，看着像工具压根没挂上（实测 mediaTools 整组中招）。
+    /// 以后新增工具组，只往这儿加一次
+    @MainActor
+    static var allSpecs: [AgentToolSpec] {
+        readTools + editTools + mediaTools + studioTools + studioTools2
+        + generateTools + skillTools
+        + shellTools + searchTools + mcpGateTool + mcpTools
+    }
+}

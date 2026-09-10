@@ -16,14 +16,30 @@ extension ProjectState {
     /// 表现就是「加了效果轨道之后，图层怎么调都没反应」。
     /// 整份 composition 重建照旧走防抖，这里只更新数据，很轻
     func refreshOverlayComposite() {
-        guard !isShutDown, overlayDrawnByCompositor else { return }
+        // **数据必须无条件推**。原来这儿一并挡了 `overlayDrawnByCompositor` ——
+        // 没有效果轨时直接返回，可合成器只要有视频就一直在跑，手上那份叠加层数据
+        // 还是上次推的：隐藏字幕轨之后画面上照样留着那条字幕，SwiftUI 这层明明
+        // 已经不画了。删掉视频轨再加回来就好，正是因为那样触发了完整重建
+        guard !isShutDown else { return }
         // 三类效果轨道的参数也一起推。只推图层不推它们的话，
         // 拖滤镜强度、改特效参数时合成器手上还是旧的那份
         ColorCompositor.setFilterTracks(filterTracks)
         ColorCompositor.setAdjustTracks(adjustTracks)
         ColorCompositor.setEffectTracks(effectTracks)
-        ColorCompositor.setOverlayInput(makeOverlayInput())
-        clock.refreshSeekRequest &+= 1
+        // 叠加层归谁画，就只让谁手上有数据。
+        //
+        // **不归合成器画的时候要主动清空它那份**：`drawOverlays` 是无条件跑的，
+        // 只要有视频轨它就照着手上那份画。以前这儿是「不归它画就整个函数返回」——
+        // 既不推新的也不清旧的，于是隐藏字幕轨之后，SwiftUI 这层老实不画了，
+        // 合成器却还照着上次推的数据继续画，画面上就留着那条字幕。
+        // 删掉视频轨再加回来能好，正是因为那样触发了完整重建、重推了数据
+        if overlayDrawnByCompositor {
+            ColorCompositor.setOverlayInput(makeOverlayInput())
+            // jitter seek 逼合成器重画。SwiftUI 自己会重绘，不用多跳这一次
+            clock.refreshSeekRequest &+= 1
+        } else {
+            ColorCompositor.setOverlayInput(ColorCompositor.OverlayInput())
+        }
     }
 
     /// 叠加层是不是交给合成器画的。有效果轨道时才是 ——
@@ -651,8 +667,17 @@ extension ProjectState {
                 ColorCompositor.setAdjustTracks(adjTracks)
                 ColorCompositor.setEffectTracks(fxTracks)
                 // 叠加层也交给合成器画。**这样特效才是作用在合成后的整帧上**，
-                // 跟导出完全一致；预览再单独画一遍的话，几何类特效两边对不上
-                ColorCompositor.setOverlayInput(makeOverlayInput())
+                // 跟导出完全一致；预览再单独画一遍的话，几何类特效两边对不上。
+                //
+                // **但只在归它画的时候给数据**。原来这儿是无条件推的：没有效果轨时
+                // 叠加层本该由 SwiftUI 画，合成器却也拿着一份照着画 —— 之后隐藏
+                // 某条字幕轨，SwiftUI 那层不画了，合成器手上还是重建时那份，
+                // 画面上就留着一条抹不掉的字幕
+                if overlayDrawnByCompositor {
+                    ColorCompositor.setOverlayInput(makeOverlayInput())
+                } else {
+                    ColorCompositor.setOverlayInput(ColorCompositor.OverlayInput())
+                }
                 var colorInstructions: [AVVideoCompositionInstruction] = []
                 for i in 0..<(sortedCM.count - 1) {
                     let segStartCM = sortedCM[i]
@@ -1077,5 +1102,92 @@ extension ProjectState {
         input.markAsFinished()
         await writer.finishWriting()
         return writer.status == .completed ? outputURL : nil
+    }
+}
+
+// MARK: - 导出输入
+
+extension ProjectState {
+    /// 把当前项目打包成一份导出快照。
+    ///
+    /// 导出面板和 Agent 的 `export_video` 共用这一份 —— 两边各拼一次的话，
+    /// 以后加了轨道类型必然漏一边，导出内容就对不上
+    func makeExportInput(outputURL: URL) -> ExportInput {
+        // 时间线开头留空时（把片段左边拖着裁掉一段就会这样），成片前面会是一整段黑屏。
+        // 导出时整体前移，让第一个有内容的片段贴着 0 开始。
+        // 起点只看**出画面/出声音**的轨道，效果轨（滤镜/调节/特效）本身不产生画面，
+        // 拿它算起点的话，一条从 0 铺开的效果轨会让平移永远不发生
+        let subs = orderedSubtitleIndices.map { subtitleTracks[$0] }
+        var starts: [Double] = []
+        starts += videoTracks.filter(\.isVisible).flatMap(\.clips).map(\.startTime)
+        starts += audioTracks.filter { !$0.isMuted }.flatMap(\.clips).map(\.startTime)
+        starts += imageTracks.filter(\.isVisible).flatMap(\.clips).map(\.startTime)
+        starts += subs.filter(\.isVisible).flatMap(\.clips).map(\.startTime)
+        starts += textTracks.filter(\.isVisible).flatMap(\.clips).map(\.startTime)
+        starts += shapeTracks.filter(\.isVisible).flatMap(\.clips).map(\.startTime)
+        starts += compoundTracks.filter(\.isVisible).flatMap(\.clips).map(\.startTime)
+        let lead = max(0, starts.min() ?? 0)
+        let shift = lead > 0.05 ? lead : 0
+
+        return ExportInput(
+            videoTracks: videoTracks.shiftedForExport(by: shift),
+            audioTracks: audioTracks.shiftedForExport(by: shift),
+            subtitleTracks: subs.shiftedForExport(by: shift),
+            imageTracks: imageTracks.shiftedForExport(by: shift),
+            textTracks: textTracks.shiftedForExport(by: shift),
+            shapeTracks: shapeTracks.shiftedForExport(by: shift),
+            filterTracks: filterTracks.shiftedForExport(by: shift),
+            adjustTracks: adjustTracks.shiftedForExport(by: shift),
+            effectTracks: effectTracks.shiftedForExport(by: shift),
+            compoundTracks: compoundTracks.shiftedForExport(by: shift),
+            overlayTrackOrder: overlayTrackOrder,
+            subtitleBottomMargin: subtitleBottomMargin,
+            subtitleLineSpacing: subtitleLineSpacing,
+            previewRenderSize: previewRenderSize,
+            customOutputSize: CGSize(width: customOutputWidth, height: customOutputHeight),
+            settings: exportSettings,
+            outputURL: outputURL,
+            coverImagePath: cover?.renderedPath.flatMap { rel in
+                projectFileURL?.deletingLastPathComponent().appendingPathComponent(rel).path
+            })
+    }
+}
+
+
+// MARK: - 导出前整体前移
+
+/// 顶层片段的时间区间。复合片段内部的子片段用的是自己那套坐标（配 `internalStart`），
+/// 平移只动顶层，内部不能碰
+protocol ExportTimeShiftable {
+    var startTime: Double { get set }
+    var endTime: Double { get set }
+}
+
+extension VideoClip: ExportTimeShiftable {}
+extension AudioClip: ExportTimeShiftable {}
+extension ImageClip: ExportTimeShiftable {}
+extension SubtitleClip: ExportTimeShiftable {}
+extension TextClip: ExportTimeShiftable {}
+extension ShapeClip: ExportTimeShiftable {}
+extension FilterClip: ExportTimeShiftable {}
+extension AdjustClip: ExportTimeShiftable {}
+extension EffectClip: ExportTimeShiftable {}
+extension CompoundClip: ExportTimeShiftable {}
+
+extension Array {
+    /// 整条轨道的片段一起往前挪 `d` 秒。`d` 为 0 时原样返回
+    func shiftedForExport<C: ExportTimeShiftable>(by d: Double) -> [Track<C>]
+        where Element == Track<C> {
+        guard d > 0 else { return self }
+        return map { track in
+            var t = track
+            t.clips = t.clips.map { clip in
+                var c = clip
+                c.startTime = Swift.max(0, c.startTime - d)
+                c.endTime   = Swift.max(0, c.endTime - d)
+                return c
+            }
+            return t
+        }
     }
 }

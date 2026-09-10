@@ -142,6 +142,7 @@ final class AgentRunner: ObservableObject {
             $0.steps = []
             $0.streamingText = ""
         }
+        AgentToolbox.ocrCallsThisRound = 0
 
         history.append(.user(prompt, images: images))
         var msgs = history
@@ -192,7 +193,9 @@ final class AgentRunner: ObservableObject {
             @MainActor func buildTools() -> [AgentToolSpec] {
                 AgentToolbox.readTools
                 + AgentToolbox.skillTools.filter { mode != .plan || $0.risk == .readOnly }
-                + (mode == .plan ? [] : AgentToolbox.editTools + AgentToolbox.generateTools
+                + (mode == .plan ? [] : AgentToolbox.editTools + AgentToolbox.mediaTools
+                                       + AgentToolbox.studioTools + AgentToolbox.studioTools2
+                                       + AgentToolbox.generateTools
                                        + AgentToolbox.shellTools
                                        + AgentToolbox.mcpGateTool + AgentToolbox.mcpTools)
                 // 这家有原生联网就用原生（搜索在服务端跑，模型自己决定搜什么词）；
@@ -201,6 +204,8 @@ final class AgentRunner: ObservableObject {
             }
 
             var finalText = ""
+            // 循环是自然跑完（步数用尽）还是它自己收尾的，收场白不一样
+            var ranOut = true
             do {
                 for _ in 0..<maxSteps {
                     if Task.isCancelled { break }
@@ -212,7 +217,7 @@ final class AgentRunner: ObservableObject {
                         finalText = turn.text
                         self.mutate(cid) { $0.streamingText = turn.text }
                     }
-                    guard !turn.toolCalls.isEmpty else { break }
+                    guard !turn.toolCalls.isEmpty else { ranOut = false; break }
                     msgs.append(.assistant(text: turn.text, calls: turn.toolCalls))
 
                     for call in turn.toolCalls {
@@ -245,10 +250,22 @@ final class AgentRunner: ObservableObject {
             } catch {
                 // 用户自己按的停止，不该报成错
                 let cancelled = error.isUserCancellation
+                ranOut = false
                 finalText = cancelled ? "已取消" : "出错了：\(error.localizedDescription)"
                 self.mutate(cid) {
                     $0.steps.append(Step(toolName: "模型", summary: finalText, isError: !cancelled))
                 }
+            }
+            // **步数用光要明说**。原来跑满就悄悄退出，用户看到的是它说了半截话
+            // 然后不动了，压根不知道活儿没干完（实测它逐帧 OCR 刷了 243 步被截断）
+            if ranOut && !Task.isCancelled {
+                let note = "（这一轮的步数用完了，活儿没干完就停在这儿了。"
+                    + "跟我说「接着做」我从这儿继续；要是它在反复做同一件事，换个说法直接告诉它怎么做更快。）"
+                finalText = finalText.isEmpty ? note : finalText + "\n\n" + note
+                self.mutate(cid) {
+                    $0.steps.append(Step(toolName: "模型", summary: "步数用完，未完成", isError: true))
+                }
+                DiagLog.log("[Agent] 步数用尽（\(maxSteps) 轮），任务未完成")
             }
             if !finalText.isEmpty { msgs.append(.assistant(text: finalText, calls: [])) }
             project.suppressUndoPush = false
@@ -269,11 +286,7 @@ final class AgentRunner: ObservableObject {
 
     private func execute(_ call: AgentToolCall, mode: AgentMode,
                          project: ProjectState, convID: UUID) async -> AgentToolResult {
-        let all = AgentToolbox.readTools + AgentToolbox.editTools
-                + AgentToolbox.generateTools + AgentToolbox.skillTools
-                + AgentToolbox.shellTools + AgentToolbox.searchTools
-                + AgentToolbox.mcpGateTool + AgentToolbox.mcpTools
-        guard let spec = all.first(where: { $0.name == call.name }) else {
+        guard let spec = AgentToolbox.allSpecs.first(where: { $0.name == call.name }) else {
             return .fail("没有叫 \(call.name) 的工具。")
         }
         // 模式先拦一道
@@ -293,6 +306,15 @@ final class AgentRunner: ObservableObject {
             return r
         }
         if let r = await AgentToolbox.runSkillTool(call.name, args: call.arguments) {
+            return r
+        }
+        if let r = await AgentToolbox.runMediaTool(call.name, args: call.arguments, project: project) {
+            return r
+        }
+        if let r = AgentToolbox.runStudioTool(call.name, args: call.arguments, project: project) {
+            return r
+        }
+        if let r = AgentToolbox.runStudioTool2(call.name, args: call.arguments, project: project) {
             return r
         }
         if let r = await AgentToolbox.runShellTool(call.name, args: call.arguments) {
@@ -340,6 +362,9 @@ final class AgentRunner: ObservableObject {
         你是黑猫剪辑里的剪辑助手，直接操作用户当前打开的项目。
 
         怎么干活：
+        · **你就跑在这个剪辑软件里面**，项目、素材库、时间轴都归你直接操作。
+          需要把电脑上的文件弄进来就调 import_media —— 绝不要去开剪映之类的别家剪辑
+          软件，也不用 AppleScript 绕。（实测出过：让它导入下载好的视频，它跑去开剪映了）
         · 动手之前先调 get_project 和 list_tracks 看清楚现状，别凭空猜时间轴上有什么。
         · 要改某条片段必须先拿到它的 id（list_tracks 会给），不要按名字猜。
         · 涉及画面好坏的判断（太暗、主体位置、有没有穿帮），调 capture_frame 亲眼看，别靠推测。
@@ -367,6 +392,12 @@ final class AgentRunner: ObservableObject {
           **要做事就真的发起工具调用；没发起调用，就不许说自己做了。**
           说「已提交」「正在生成」「图片生成完成」「已记住」而实际没调工具，
           等于骗用户 —— 他会一直等一个根本不存在的任务。
+
+        **什么时候用表格**：只有「同结构的多条数据」才排表格 —— 轨道清单、素材清单、
+        任务状态、参数对照这种。三个硬条件，缺一个就别用：**三行以上**、
+        **每格十来个字以内**、**最多三列**。聊天区就四百来点宽，四列必然挤烂。
+        一两条信息、讲你做了什么、格子里是长句子的，一律用句子或短横线列表。
+        `list_tracks`、`list_assets` 返回的本来就是表格，可以原样贴出来。
 
         说话风格：中文，简短，别用「好的」「我将为您」这类开场白。**不要用 emoji**，
         该标状态就用文字（成功 / 失败 / 已完成），面板里 emoji 跟界面图标混在一起很乱。
@@ -441,6 +472,31 @@ enum AgentPhaseText {
         "web_search":            "正在联网搜索",
         "run_command":           "正在执行命令",
         "run_skill_script":      "正在跑 Skill",
+        "import_media":          "正在导入素材",
+        "export_video":          "正在导出成片",
+        "transcribe":            "正在识别语音",
+        "update_clip":           "正在调整片段",
+        "trim_clip":             "正在裁剪片段",
+        "read_frame_text":       "正在认画面上的字",
+        "scan_text":             "正在扫画面上的文字",
+        "add_transition":        "正在加转场",
+        "add_shape":             "正在加图形",
+        "translate_subtitles":   "正在翻译字幕",
+        "subtitles_to_speech":   "正在配音",
+        "enhance_clarity":       "正在提升清晰度",
+        "remove_background_music": "正在分离人声",
+        "scene_split":           "正在检测镜头",
+        "analyze_highlights":    "正在挑精彩片段",
+        "save_project":          "正在保存",
+        "undo":                  "正在撤销",
+        "redo":                  "正在重做",
+        "rename":                "正在改名",
+        "delete_asset":          "正在删素材",
+        "group_clips":           "正在打包片段",
+        "ungroup_clip":          "正在拆开复合片段",
+        "new_timeline":          "正在新建时间线",
+        "switch_timeline":       "正在切换时间线",
+        "remove_image_background": "正在抠图",
         "add_asset_to_timeline": "正在放进时间轴",
         "add_subtitle":          "正在加字幕",
         "add_text":              "正在加标题文字",

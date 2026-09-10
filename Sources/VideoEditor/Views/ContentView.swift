@@ -195,9 +195,17 @@ struct ContentView: View {
                                 .fixedSize(horizontal: false, vertical: true)
                             TimelineToolbar()
                                 .fixedSize(horizontal: false, vertical: true)
-                            TimelineView()
-                                .frame(maxHeight: .infinity)
-                                .clipped()
+                            // 时间线全收起来时，轨道区也要空掉。
+                            // 关掉最后一条时 activeTab 还指着那条已关闭的，
+                            // 不判这一下的话标签栏空了、轨道却照样铺着内容
+                            if project.tabs.contains(where: \.isTabOpen) {
+                                TimelineView()
+                                    .frame(maxHeight: .infinity)
+                                    .clipped()
+                            } else {
+                                ClosedTimelinePlaceholder()
+                                    .frame(maxHeight: .infinity)
+                            }
                             CompoundBreadcrumb()
                                 .fixedSize(horizontal: false, vertical: true)
                         }

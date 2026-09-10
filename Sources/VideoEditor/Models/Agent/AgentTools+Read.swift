@@ -110,10 +110,15 @@ extension AgentToolbox {
         _ kind: String, _ track: Track<C>?, label: (C) -> String
     ) -> String where C: Equatable & Codable {
         guard let t = track else { return "" }
-        var s = "· \(kind)轨「\(t.label)」\(t.isVisible ? "" : "（已隐藏）") \(t.clips.count) 段\n"
+        var s = "\n**\(kind)轨「\(t.label)」**\(t.isVisible ? "" : "（已隐藏）")　\(t.clips.count) 段\n"
+        guard !t.clips.isEmpty else { return s }
+        // 片段列成表格，模型转述时可以直接用
+        s += "\n| id | 时间 | 内容 |\n|---|---|---|\n"
         for c in t.clips {
-            let time = (c as? any AgentTimedClip).map { " \(fmt($0.startTime))–\(fmt($0.endTime))" } ?? ""
-            s += "    - id=\(String("\(c.id)".prefix(8)))\(time) \(label(c))\n"
+            let time = (c as? any AgentTimedClip).map { "\(fmt($0.startTime))–\(fmt($0.endTime))" } ?? "—"
+            // 竖线会把表格切错列，先转义掉
+            let text = label(c).replacingOccurrences(of: "|", with: "／")
+            s += "| \(String("\(c.id)".prefix(8))) | \(time) | \(text) |\n"
         }
         return s
     }
@@ -125,11 +130,14 @@ extension AgentToolbox {
             want == "all" || a.type.rawValue.lowercased() == want
         }
         guard !list.isEmpty else { return "素材库里没有\(want == "all" ? "" : want)素材。" }
-        var s = "素材库（\(list.count) 个）：\n"
+        // 表格形式给回去，模型可以原样贴出来 —— 省得它自己组织，界面上也整齐。
+        // 列压在三列以内：聊天面板窄，再多就排不下了
+        var s = "素材库（\(list.count) 个）：\n\n"
+        s += "| id | 类型 | 名称 |\n|---|---|---|\n"
         for a in list {
             let dur = a.duration > 0 ? " \(fmt(a.duration))" : ""
-            let missing = a.fileExists ? "" : "  ⚠️源文件已丢失"
-            s += "- id=\(String("\(a.id)".prefix(8))) [\(a.type.rawValue)]\(dur) \(a.name)\(missing)\n"
+            let missing = a.fileExists ? "（源文件丢失）" : ""
+            s += "| \(String("\(a.id)".prefix(8))) | \(a.type.rawValue)\(dur) | \(a.name)\(missing) |\n"
         }
         return s
     }
