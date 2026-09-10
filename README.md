@@ -5,7 +5,7 @@
 <h1 align="center">黑猫剪辑 BlackCat</h1>
 
 <p align="center">
-  macOS 原生视频编辑器，剪辑与 AI 创作合在一处<br>
+  macOS 原生AI创作及视频剪辑工具<br>
   Swift · SwiftUI · AVFoundation · Core Image · Core ML · whisper.cpp
 </p>
 
