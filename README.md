@@ -20,6 +20,17 @@
 
 <p align="center">
   <img src="screenshot.png" width="900" alt="黑猫剪辑界面截图">
+  <br><sub>多轨时间轴 —— 视频、图片、字幕、文字、图形各走各的轨道</sub>
+</p>
+
+<p align="center">
+  <img src="screenshot-agent.png" width="900" alt="AI 创作面板">
+  <br><sub>AI 创作 —— 说一句话，素材自己生成好、进素材库，再叫它放上时间轴</sub>
+</p>
+
+<p align="center">
+  <img src="screenshot-canvas.png" width="900" alt="AI 画布">
+  <br><sub>AI 画布 —— 卡片连线，上游就是下游的参考素材</sub>
 </p>
 
 ---
