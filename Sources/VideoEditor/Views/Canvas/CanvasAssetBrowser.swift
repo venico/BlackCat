@@ -146,7 +146,9 @@ struct CanvasAssetBrowser: View {
     /// 用列表还是缩略图。按自己的标签页记，跟侧边栏素材库分开 ——
     /// 一边切了另一边跟着变，跟排序设置一个待遇。
     /// 音频没有画面，摆成网格全是一样的图标 —— 那一栏固定用列表
-    private var showsAsList: Bool { !project.gridMode(for: "canvas.\(tab.rawValue)") }
+    private var viewModeKey: String { "canvas.\(tab.rawValue)" }
+    private var viewMode: ProjectState.MediaViewMode { project.viewMode(for: viewModeKey) }
+    private var showsAsList: Bool { viewMode == .list }
 
     /// 四类都能切宫格。音频没有封面，格子里拿分类图标顶上
     private var canSwitchViewMode: Bool { true }
@@ -332,6 +334,7 @@ struct CanvasAssetBrowser: View {
                                           editName: $editName,
                                           onCommitRename: { commitRename(item) },
                                           onRelink: { relink(item) },
+                                          viewMode: viewMode,
                                           menu: { menu(for: item) }) {
                                     onPick(item.url, item.kind)
                                 }
@@ -546,10 +549,8 @@ struct CanvasAssetBrowser: View {
             searchField
             // 缩略图 / 列表切换，跟侧边栏那个同一个开关
             if canSwitchViewMode {
-            Button { project.setGridMode(!project.gridMode(for: "canvas.\(tab.rawValue)"),
-                                        for: "canvas.\(tab.rawValue)") } label: {
-                Image(nsImage: SidebarSVGIcon.load(project.gridMode(for: "canvas.\(tab.rawValue)") ? "gridView" : "listView",
-                                                   size: 13))
+            Button { project.setViewMode(viewMode.next, for: viewModeKey) } label: {
+                Image(nsImage: SidebarSVGIcon.load(viewMode.svgName, size: 13))
                     .renderingMode(.template)
                     .resizable()
                     .aspectRatio(contentMode: .fit)
@@ -560,7 +561,7 @@ struct CanvasAssetBrowser: View {
                     .contentShape(RoundedRectangle(cornerRadius: 8))
             }
             .buttonStyle(.plain)
-            .help(project.gridMode(for: "canvas.\(tab.rawValue)") ? "缩略图（点击切列表）" : "列表（点击切缩略图）")
+            .help(viewMode.help)
             }
 
             Button { showSortNSMenu(project: project) } label: {
@@ -596,6 +597,8 @@ private struct AssetCell<Menu: View>: View {
     @Binding var editName: String
     let onCommitRename: () -> Void
     let onRelink: () -> Void
+    /// 等比宫格还是按原始比例
+    var viewMode: ProjectState.MediaViewMode = .grid
     @ViewBuilder let menu: () -> Menu
     let action: () -> Void
 
@@ -604,6 +607,14 @@ private struct AssetCell<Menu: View>: View {
 
     /// 文件还在不在。丢了要盖一层提示，跟侧边栏一样
     private var fileExists: Bool { FileManager.default.fileExists(atPath: item.url.path) }
+
+    /// 这个格子多高。「原始比例」跟着缩略图走，其余一律 10:7。
+    /// 缩略图还没加载出来时先按 10:7 占位，来了再自己变形
+    private var cellRatio: CGFloat {
+        guard viewMode == .original, let t = thumbnail,
+              t.size.width > 0, t.size.height > 0 else { return 10.0 / 7.0 }
+        return t.size.width / t.size.height
+    }
 
     var body: some View {
         Button(action: action) {
@@ -627,7 +638,8 @@ private struct AssetCell<Menu: View>: View {
                                 .foregroundColor(Color.labelSecondary.opacity(0.4))
                         }
                     }
-                    .aspectRatio(10.0 / 7.0, contentMode: .fit)
+                    // 「原始比例」模式下按缩略图自己的宽高比撑开，等比宫格一律 10:7
+                    .aspectRatio(cellRatio, contentMode: .fit)
                     .frame(maxWidth: .infinity)
                     .clipShape(RoundedRectangle(cornerRadius: 8))
                     // 多选勾上的：主色描边 + 左上角一个勾
@@ -797,9 +809,12 @@ struct CanvasAssetPicker: View {
         .padding(.vertical, 16)
     }
 
-    /// 标题跟着能选的类型走
+    /// 标题跟着能选的类型走。图片视频音频**三样全收时就不必一一列出来**了 ——
+    /// 「选择图片 / 视频 / 音频素材」又长又没信息量，不如就叫「选择素材」
     private var title: String {
         guard let ks = limitKinds, !ks.isEmpty else { return "从素材库选择" }
+        let media: Set<CanvasNode.Kind> = [.image, .video, .audio]
+        if media.isSubset(of: ks) { return "选择素材" }
         let names = CanvasNode.Kind.allCases.filter { ks.contains($0) }.map(\.label)
         return "选择" + names.joined(separator: " / ") + "素材"
     }

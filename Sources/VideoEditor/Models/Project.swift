@@ -1066,14 +1066,72 @@ final class ProjectState: ObservableObject {
     /// 原先是一个全局开关：在图片里切成列表，回到视频也跟着变成列表
     @Published var mediaGridModeByKey: [String: Bool] = [:]
 
-    /// 侧边栏素材库当前分类用哪种视图
-    var mediaGridMode: Bool {
-        get { gridMode(for: libraryCategory) }
-        set { setGridMode(newValue, for: libraryCategory) }
+    /// 素材怎么摆。三种循环切：等比宫格 → 原始比例 → 列表
+    enum MediaViewMode: String, CaseIterable {
+        /// 一律 4:3 裁切，排得整整齐齐
+        case grid
+        /// 按素材本身的宽高比显示，竖图就是竖的 —— 挑图时这个更认得出来
+        case original
+        case list
+
+        var next: MediaViewMode {
+            switch self {
+            case .grid: return .original
+            case .original: return .list
+            case .list: return .grid
+            }
+        }
+
+        /// 图标显示**当前是哪种**，跟原来那个按钮一个规矩
+        var svgName: String {
+            switch self {
+            case .grid: return "gridView"
+            // 大小不一的方块，正好是「按自己的比例摆」那个意思
+            case .original: return "freeCanvas"
+            case .list: return "listView"
+            }
+        }
+
+        var help: String {
+            switch self {
+            case .grid: return "等比宫格（点击切原始比例）"
+            case .original: return "原始比例（点击切列表）"
+            case .list: return "列表（点击切等比宫格）"
+            }
+        }
     }
 
-    func gridMode(for key: String) -> Bool { mediaGridModeByKey[key] ?? true }
-    func setGridMode(_ on: Bool, for key: String) { mediaGridModeByKey[key] = on }
+    /// 每个分类各记各的，跟原来那个开关一个待遇
+    @Published var mediaViewModeByKey: [String: String] = [:]
+
+    var mediaViewMode: MediaViewMode {
+        get { viewMode(for: libraryCategory) }
+        set { setViewMode(newValue, for: libraryCategory) }
+    }
+
+    func viewMode(for key: String) -> MediaViewMode {
+        if let raw = mediaViewModeByKey[key], let m = MediaViewMode(rawValue: raw) { return m }
+        // 还没切过的：沿用旧的那个布尔开关，老项目打开不会突然换个样子
+        return (mediaGridModeByKey[key] ?? true) ? .grid : .list
+    }
+
+    func setViewMode(_ m: MediaViewMode, for key: String) {
+        mediaViewModeByKey[key] = m.rawValue
+        // 旧开关同步着写，还在读它的地方（画布素材库那些）行为不变
+        mediaGridModeByKey[key] = m != .list
+    }
+
+    /// 侧边栏素材库当前分类是不是宫格（原始比例也算宫格）。
+    /// **保留它**是因为好几处只关心「是不是列表」，没必要都改成三态
+    var mediaGridMode: Bool {
+        get { mediaViewMode != .list }
+        set { mediaViewMode = newValue ? .grid : .list }
+    }
+
+    func gridMode(for key: String) -> Bool { viewMode(for: key) != .list }
+    func setGridMode(_ on: Bool, for key: String) {
+        setViewMode(on ? .grid : .list, for: key)
+    }
 
     /// 项目封面的设计稿。属性区那个入口点开就是编辑它，
     /// 确认后渲染成 PNG 给欢迎页用（见 `ProjectCover`）

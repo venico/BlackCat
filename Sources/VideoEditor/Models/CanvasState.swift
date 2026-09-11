@@ -883,6 +883,9 @@ final class CanvasState: ObservableObject {
         // 不再一律用全局那个 —— 素材卡片和空卡片本来就该不一样
         let ratio = generationRatio(for: node, settings: settings)
 
+        // 这活儿是**哪张画布**派的。用户随时可能切到别的画布去，
+        // 结果回来时得认得出「这不是当前这张」，好把结果写回它自己的存档
+        let ownerConv = conversationID
         let taskID = AIVideoService.shared.generateForCanvas(
             prompt: prompt,
             provider: provider,
@@ -896,6 +899,23 @@ final class CanvasState: ObservableObject {
             firstFrame: firstFrame,
             lastFrame: lastFrame) { [weak self] result in
                 guard let self else { return }
+                // 画布已经切走了：当前内存里的 nodes 是别人的，改它毫无意义。
+                // 把结果落到那张画布**自己的存档**上，用户切回去就能看到成品
+                if let owner = ownerConv, owner != self.conversationID {
+                    self.applyResultToStoredCanvas(owner: owner, nodeID: nodeID,
+                                                   hadContent: hadContent, result: result)
+                    self.runningTaskIDs.removeValue(forKey: nodeID)
+                    switch result {
+                    case .success(let url):
+                        Task { @MainActor in AgentBackgroundTasks.shared.finish(id: nodeID, url: url) }
+                    case .failure(let e):
+                        Task { @MainActor in
+                            AgentBackgroundTasks.shared.fail(id: nodeID,
+                                (e is CancellationError) ? "已取消" : e.localizedDescription)
+                        }
+                    }
+                    return
+                }
                 let kind = self.node(nodeID)?.kind
                 self.updateNode(id: nodeID) {
                     $0.isGenerating = false
@@ -918,6 +938,19 @@ final class CanvasState: ObservableObject {
                     project?.importFile(url)
                     if let asset = project?.mediaAssets.first(where: { $0.url == url }) {
                         self.updateNode(id: landed) { $0.assetID = asset.id }
+                    }
+                }
+                // 后台任务清单里登记过的（Agent 派的）要了结掉，这样会话里才会
+                // 报一声「生成好了 / 失败了」。用户自己点生成的没登记过，
+                // finish/fail 找不到 id 会直接忽略
+                // 这个回调不在主 actor 上，后台任务清单是 @MainActor 的，切过去再动
+                let outcome: Result<URL, Error> = result
+                Task { @MainActor in
+                    switch outcome {
+                    case .success(let url): AgentBackgroundTasks.shared.finish(id: nodeID, url: url)
+                    case .failure(let e):
+                        AgentBackgroundTasks.shared.fail(id: nodeID,
+                            (e is CancellationError) ? "已取消" : e.localizedDescription)
                     }
                 }
                 self.runningTaskIDs.removeValue(forKey: nodeID)
@@ -1140,6 +1173,39 @@ final class CanvasState: ObservableObject {
         }
     }
 
+    /// 结果落到一张**不在眼前**的画布存档里：填素材、停掉转圈、记进产物清单。
+    /// 原卡片已经有内容的，照界面上的规矩另起一张新卡片摆在旁边
+    private func applyResultToStoredCanvas(owner: UUID, nodeID: UUID,
+                                           hadContent: Bool, result: Result<URL, Error>) {
+        let svc = AIVideoService.shared
+        svc.editCanvasSnapshot(id: owner) { snap in
+            guard let i = snap.nodes.firstIndex(where: { $0.id == nodeID }) else { return }
+            snap.nodes[i].isGenerating = false
+            snap.nodes[i].isWaiting = false
+            switch result {
+            case .failure(let e):
+                snap.nodes[i].failure = (e is CancellationError) ? "已取消" : e.localizedDescription
+            case .success(let url):
+                snap.nodes[i].failure = nil
+                if hadContent {
+                    // 原卡片留着，产物摆到它右边 —— 跟在画布上时的行为一致
+                    var fresh = snap.nodes[i]
+                    fresh.id = UUID()
+                    fresh.position = CGPoint(x: fresh.position.x + fresh.size.width + 40,
+                                             y: fresh.position.y)
+                    fresh.mediaPath = url.path
+                    fresh.assetID = nil
+                    fresh.prompt = snap.nodes[i].prompt
+                    snap.nodes.append(fresh)
+                } else {
+                    snap.nodes[i].mediaPath = url.path
+                }
+            }
+        }
+        // 产物照样进素材库，跟在画布上时一样
+        if case .success(let url) = result { project?.importFile(url) }
+    }
+
     /// 取消某个节点的生成
     func cancelGeneration(nodeID: UUID) {
         if let taskID = runningTaskIDs[nodeID] {
@@ -1301,6 +1367,15 @@ extension CanvasState {
         offset = CGSize(width: snap.offsetX, height: snap.offsetY)
         self.conversationID = conversationID
         self.title = title
+        // 存档里残留的「生成中」要清掉：那是上次关掉 app 时的状态，
+        // 任务早随进程没了，留着就是永远转圈。这一轮真在跑的不受影响 ——
+        // 它们的结果会直接写回存档
+        for i in nodes.indices where nodes[i].isGenerating || nodes[i].isWaiting {
+            if runningTaskIDs[nodes[i].id] == nil {
+                nodes[i].isGenerating = false
+                nodes[i].isWaiting = false
+            }
+        }
         selectedNodeIDs = []
         selectedGroupID = nil
         editingTextNodeID = nil

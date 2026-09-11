@@ -109,6 +109,7 @@ enum AgentAttachmentIO {
 
 /// 输入框上方那排附件缩略图
 struct AgentAttachmentBar: View {
+    @EnvironmentObject private var project: ProjectState
     let items: [AgentAttachment]
     /// 能用多宽（由面板那层量好传进来）。**不自己量** ——
     /// 量自己会被网格内容撑大，量到的又是撑大后的值，列数再也减不回去
@@ -232,6 +233,13 @@ struct AgentAttachmentBar: View {
                     // 顶出去一半，越过父视图 bounds 的那半收不到鼠标
                     ThumbCloseButton(size: 16, opacity: 0.7) { onRemove(it) }
                         .padding(2)
+                }
+                // 40 点的格子看不清内容，点一下放大。用的是生成结果那套全屏层；
+                // 文本类没什么可看的，不给点
+                .onTapGesture {
+                    guard it.thumb != nil || AgentAttachmentIO.isMedia(it.url) else { return }
+                    project.mediaPreview = MediaPreviewItem(
+                        url: it.url, isVideo: AgentAttachmentIO.isMedia(it.url))
                 }
                 .help(it.name)
             }

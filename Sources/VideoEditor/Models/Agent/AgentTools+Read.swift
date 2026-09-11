@@ -132,12 +132,20 @@ extension AgentToolbox {
         guard !list.isEmpty else { return "素材库里没有\(want == "all" ? "" : want)素材。" }
         // 表格形式给回去，模型可以原样贴出来 —— 省得它自己组织，界面上也整齐。
         // 列压在三列以内：聊天面板窄，再多就排不下了
-        var s = "素材库（\(list.count) 个）：\n\n"
+        // 素材可以有好几百个，全量吐回去光这一条就上万字，而且历史每轮重发。
+        // 超过这个数就只给前面一批，剩下的让它按 type 缩小范围再问
+        let cap = 40
+        var s = "素材库（\(list.count) 个\(list.count > cap ? "，下面只列前 \(cap) 个" : "")）：\n\n"
         s += "| id | 类型 | 名称 |\n|---|---|---|\n"
-        for a in list {
+        for a in list.prefix(cap) {
             let dur = a.duration > 0 ? " \(fmt(a.duration))" : ""
-            let missing = a.fileExists ? "（源文件丢失）" : ""
+            // 这里原来写反了：文件在的反而标「源文件丢失」
+            let missing = a.fileExists ? "" : "（源文件丢失）"
             s += "| \(String("\(a.id)".prefix(8))) | \(a.type.rawValue)\(dur) | \(a.name)\(missing) |\n"
+        }
+        if list.count > cap {
+            s += "\n还有 \(list.count - cap) 个没列出来。要找特定的东西就加 type 参数"
+                + "（video / audio / image）缩小范围。\n"
         }
         return s
     }

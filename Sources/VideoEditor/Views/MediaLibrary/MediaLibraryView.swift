@@ -263,10 +263,9 @@ struct MediaLibraryView: View {
                     // 缩略图 / 列表切换。一个按钮循环切，图标显示**当前**是哪种。
                     // 音频和字幕没有画面，不给这个按钮
                     if canSwitchViewMode {
-                        MediaToolBtn(svgName: project.mediaGridMode ? "gridView" : "listView",
-                                     help: project.mediaGridMode ? "缩略图（点击切列表）"
-                                                                 : "列表（点击切缩略图）") {
-                            project.mediaGridMode.toggle()
+                        MediaToolBtn(svgName: project.mediaViewMode.svgName,
+                                     help: project.mediaViewMode.help) {
+                            project.mediaViewMode = project.mediaViewMode.next
                         }
                     }
                     MediaToolBtn(svgName: "sort", help: "排序") {
@@ -1373,9 +1372,14 @@ private struct AssetRow: View {
             // Thumbnail
             ZStack(alignment: .topTrailing) {
                 if let thumb = project.mediaThumbnails[asset.id] {
+                    // 「原始比例」模式下按缩略图自己的宽高比撑开，竖图就是竖的；
+                    // 等比宫格一律 4:3 裁切，排得齐
+                    let ratio: CGFloat = project.mediaViewMode == .original
+                        && thumb.size.width > 0 && thumb.size.height > 0
+                        ? thumb.size.width / thumb.size.height : 4.0 / 3.0
                     Color.clear
                         .frame(maxWidth: .infinity)
-                        .aspectRatio(4.0/3.0, contentMode: .fit)
+                        .aspectRatio(ratio, contentMode: .fit)
                         .overlay(
                             Image(nsImage: thumb)
                                 .resizable()

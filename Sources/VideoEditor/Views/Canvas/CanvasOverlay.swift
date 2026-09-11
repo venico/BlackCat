@@ -1055,6 +1055,10 @@ private struct CanvasSurface: View {
                 CanvasAssetPicker(canvas: canvas,
                                   limitKinds: fillTargetNode.flatMap { canvas.node($0)?.kind }
                                                              .map { Set([$0]) }) { picks in
+                    // 双击 = 两次单击，格子本身是个 Button，两次都会回调过来 ——
+                    // 不挡住的话一次双击往画布上落两张一模一样的卡片（实测）。
+                    // 面板关闭还带 0.2 秒动画，这期间第二次点击照样能进来
+                    guard showAssetPicker else { return }
                     let asset = picks.first
                     showAssetPicker = false
                     guard let asset else { fillTargetNode = nil; return }
@@ -1132,10 +1136,22 @@ private struct CanvasSurface: View {
         // 因此这些卡片没有 assetID，缩略图/波形一律走 `canvas.thumbKey(...)` 取缓存 key
         .onReceive(NotificationCenter.default.publisher(for: .canvasNodeToTimeline)) { note in
             guard let id = note.object as? UUID, let n = canvas.node(id), let url = n.mediaURL else { return }
-            project.importFile(url)
+            // 卡片上的东西多半已经在素材库里了（生成产物落卡片时就导过一次）。
+            // 不先查一下直接再导，会被判成重复，右下角冒一条「已跳过重复素材」——
+            // 用户点的明明是「添加到时间轴」，看到的却是个警告
+            if !project.mediaAssets.contains(where: { $0.url == url }) {
+                project.importFile(url)
+            }
             guard let asset = project.mediaAssets.first(where: { $0.url == url }) else { return }
             project.addToTimelineAt(asset, time: project.currentTime)
-            flashReject("已添加到时间轴")
+            let icon: String
+            switch n.kind {
+            case .video: icon = "video"
+            case .audio: icon = "audio"
+            default:     icon = "image"
+            }
+            project.showSuccessToast(icon: icon, iconColor: .accent,
+                                     title: "已添加到时间轴", subtitle: asset.name)
         }
         .onReceive(NotificationCenter.default.publisher(for: .canvasNodeToSubtitle)) { note in
             guard let id = note.object as? UUID, let n = canvas.node(id) else { return }
@@ -1261,6 +1277,21 @@ struct CanvasKeyMonitor: ViewModifier {
             .onAppear { if isActive { install() } }
     }
 
+    /// 光标是不是正落在画布那张聊天卡片的输入框里
+    private func typingInChatCard(_ w: NSWindow) -> Bool {
+        guard canvas.chatCardFocused, !canvas.chatCardRect.isEmpty,
+              let tv = w.firstResponder as? NSTextView, tv.isEditable,
+              let content = w.contentView else { return false }
+        let inWindow = tv.convert(tv.bounds, to: nil)
+        let inContent = content.convert(inWindow, from: nil)
+        let r = content.isFlipped
+            ? inContent
+            : CGRect(x: inContent.minX,
+                     y: content.bounds.height - inContent.maxY,
+                     width: inContent.width, height: inContent.height)
+        return canvas.chatCardRect.intersects(r)
+    }
+
     private func install() {
         remove()
         let keyMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .keyUp]) { event in
@@ -1274,7 +1305,12 @@ struct CanvasKeyMonitor: ViewModifier {
             // 哪怕用户没点过它、界面上也没有光标。按 firstResponder 判断的话
             // editing 会永远为真，delete / ⌘Z / ⇧⌘Z 全被放行给输入框，
             // 表现就是「选中卡片按 delete 没反应」（诊断日志实测到的）
+            // 聊天卡片的输入框也算「正在打字」：光标在那儿的时候 ⌘Z、delete、空格
+            // 都该归输入框，画布不能抢（实测在里头按 ⌘Z，撤销的是画布上的操作）。
+            // 它不能只看 firstResponder —— 那个 NSTextView 一挂上视图层级就自动
+            // 成了第一响应者，得再要求「用户确实点进了卡片那块地方」
             let editing = canvas.promptBarFocused || canvas.editingTextNodeID != nil
+                       || typingInChatCard(w)
             if event.type == .keyDown, event.keyCode == 51 || event.keyCode == 117 {
                 let a = "editing=\(editing) promptFocus=\(canvas.promptBarFocused)"
                 let b = "editingText=\(canvas.editingTextNodeID != nil)"
@@ -1320,7 +1356,10 @@ struct CanvasKeyMonitor: ViewModifier {
                                  width: inContent.width, height: inContent.height)
                     let isChatCard = !canvas.chatCardRect.isEmpty
                                   && canvas.chatCardRect.intersects(r)
-                    if isChatCard ? canvas.chatCardFocused : true { return event }
+                    if isChatCard ? canvas.chatCardFocused : true {
+                        DiagLog.log("[画布] 按键让给文本框 isChatCard=\(isChatCard) tvRect=\(r)")
+                        return event
+                    }
                 }
                 switch event.charactersIgnoringModifiers?.lowercased() {
                 case "c":

@@ -193,8 +193,9 @@ struct AIChatPanel: View {
         }
         .onChange(of: namedModel) { _, now in
             if now == nil {
-                // 命令没了，参考区跟着不显示 —— 里头的东西转成普通附件留着
-                demoteReferencesToAttachments()
+                // 命令没了**也不再把参考区清空**：素材该待在参考区，
+                // 生成时按内置顺序挑模型，不依赖用户有没有打 `/`
+                promoteAttachmentsToReference()
             } else {
                 // 顺序要紧：先把附件里的图收进参考区，再按新模型裁掉多余的
                 promoteAttachmentsToReference()
@@ -220,7 +221,10 @@ struct AIChatPanel: View {
 
     /// 切换模型后，裁掉新模型不支持的参考内容，避免带着旧模型的数据发出去被静默丢弃
     private func pruneInputsForProvider() {
-        let provider = uiProvider
+        // 同样按 referenceProvider 裁 —— 用 uiProvider 的话，没打 `/命令` 时
+        // 它是文字模型、参考上限为 0，这里会把刚收进来的东西**整个清空**，
+        // 用户看到的就是「从素材库加了，什么都没加上」
+        let provider = referenceProvider
         if !provider.supportsLastFrame { lastFrameImage = nil }
         if !provider.supportsFirstFrame { firstFrameImage = nil }
 
@@ -429,7 +433,14 @@ struct AIChatPanel: View {
         if service.runningTasks.values.contains(where: { $0.convId == conv.id }) { return .running }
         guard let canvas = conv.canvas else { return .idle }
         if canvas.nodes.contains(where: { $0.failure != nil }) { return .failed }
-        if !canvas.producedAssets.isEmpty { return .done }
+        // 「出过成品」＝ 有卡片写过提示词、而且已经有画面了。
+        //
+        // **不能用 producedAssets 判断** —— 那是老版本「产物只登记画布、
+        // 不进素材库」留下的字段，现在打开画布时会被并进素材库然后清空，
+        // 永远是空的，于是绿点永远不出现（实测）
+        if canvas.nodes.contains(where: { !$0.prompt.isEmpty && $0.mediaPath != nil }) {
+            return .done
+        }
         return .idle
     }
 
@@ -478,6 +489,19 @@ struct AIChatPanel: View {
     /// 这一轮实际按哪家的规则摆控件
     private var uiProvider: AIVideoService.Provider {
         namedModel ?? service.selectedProvider
+    }
+
+    /// 判断「参考区收不收这个、还装得下几个」时用哪家的规格。
+    ///
+    /// 点了 `/命令` 就按那家；**没点名也不该退化成纯附件** ——
+    /// 素材一律先进参考区，装满了才落到附件区，跟点没点名无关。
+    /// 没点名时按内置默认顺序里第一家图片模型的规格算，
+    /// 真到生成那一步走的也是这套顺序和换家兜底
+    private var referenceProvider: AIVideoService.Provider {
+        if let named = namedModel { return named }
+        let p = service.selectedProvider
+        if p.category != .text { return p }
+        return AIVideoService.defaultOrder(for: .image).first ?? p
     }
 
     /// 下拉里只剩 Agent 模型了，旧配置可能还存着图片/视频模型 —— 那样发消息会
@@ -731,7 +755,16 @@ struct AIChatPanel: View {
                 // 上下排，不并排 —— 两块都要按自己那行的宽度换行，
                 // 并排时它们互相挤宽度，谁也算不准一行放几个
                 VStack(alignment: .leading, spacing: 6) {
-                    if uiProvider.maxReferenceImages > 0 {
+                    // 按 referenceProvider 判断，不是 uiProvider ——
+                    // 没打 `/命令` 时 uiProvider 是文字模型，它的参考图上限是 0，
+                    // 整块参考区就不显示了：用户从素材库加东西，东西收进了参考区，
+                    // 界面上却什么都没出现，看着就是「加不上」。
+                    //
+                    // 但**没打命令又什么都没加时不出现** —— 那个「参考图」空槽
+                    // 是点了命令之后引导上传用的，平时挂在输入框上方纯属碍眼
+                    if referenceProvider.maxReferenceImages > 0,
+                       namedModel != nil || !referenceContents.isEmpty
+                        || firstFrameImage != nil || lastFrameImage != nil {
                         imagePreviewArea
                     }
                     if !agentAttachments.isEmpty {
@@ -1090,7 +1123,7 @@ HStack(spacing: 2) {
 
     private var imagePreviewArea: some View {
         HStack(spacing: 2) {
-            if imageMode == .reference || uiProvider.category != .video {
+            if imageMode == .reference || referenceProvider.category != .video {
                 refContentSlot
             } else {
                 frameSlot(image: firstFrameImage, label: "首帧") {
@@ -1137,7 +1170,7 @@ HStack(spacing: 2) {
     /// 视频模型跟「首尾帧」二选一，那一档叫「智能参考」；
     /// 其余只收图片的叫「参考图」，能收视频/音频的叫「参考内容」
     private var refSlotLabel: String {
-        let p = uiProvider
+        let p = referenceProvider
         if p.category == .video { return "智能参考" }
         return (p.maxReferenceVideos == 0 && p.maxReferenceAudios == 0) ? "参考图" : "参考内容"
     }
@@ -1151,7 +1184,10 @@ HStack(spacing: 2) {
             // 满了（比如 10 张收齐）才收起来。间距照画布卡片那排来
             HStack(spacing: 6) {
                 if !referenceContents.isEmpty { pickedFan }
-                if referenceContents.count < uiProvider.maxReferenceTotal {
+                // 空槽只在点了命令时给 —— 没命令时用户是靠 ＋ 或拖进来加东西的，
+                // 不需要这个占位按钮
+                if namedModel != nil,
+                   referenceContents.count < referenceProvider.maxReferenceTotal {
                     placeholderSlot(label: refSlotLabel, icon: "photo.badge.plus",
                                     onUpload: { pickRefContents() },
                                     onLibrary: { libraryPick = .reference })
@@ -1241,6 +1277,13 @@ HStack(spacing: 2) {
                 .padding(1)
                 .zIndex(1)
             }
+            // 48 点见方的缩略图分不清哪张是哪张，点一下放大看。
+            // 用会话里生成结果那套现成的全屏层，不另起炉灶
+            .onTapGesture {
+                project.mediaPreview = MediaPreviewItem(url: item.url,
+                                                        isVideo: item.type != .image)
+            }
+            .help("点击放大预览")
     }
 
     /// 已经选好的那几个，叠成一小摞
@@ -1397,42 +1440,10 @@ HStack(spacing: 2) {
                                 onTargetChange: { isDropTargeted = $0 })
     }
 
-    /// 收下这些文件。
-    ///
-    /// **参考内容和附件是同一个入口**：当前这条命令点名的模型能收参考素材时，
-    /// 拖进来的媒体先按它的上限当参考内容（首尾帧模式下按上传顺序进首帧、尾帧），
-    /// 装不下的、或者这家压根不收的，才落回附件。
-    ///
-    /// 落回附件的只认图片和能读成文字的 —— 视频音频塞给模型没意义。
-    /// 但**不能静默丢掉**：拖进来什么都不发生，用户只会以为功能坏了
-    /// 点名生成模型之后，把之前当附件收着的图挪进参考区。
-    ///
-    /// 加图那会儿当前还是文字模型（`maxReferenceTotal` 为 0），参考区收不了，
-    /// 只能先躺在附件里 —— 用户的顺序常常是「先拖图、再打 /命令」，
-    /// 不补这一下，图就一直是附件，生成时也带不上
-    /// 命令被删掉之后，参考区里的东西转成普通附件。
-    ///
-    /// 没有生成模型点名，参考区整块就不显示了 —— 直接丢的话，
-    /// 用户挑了半天的图一声不响就没了
-    private func demoteReferencesToAttachments() {
-        var urls = referenceContents.map(\.url)
-        if let f = firstFrameImage { urls.append(f.url) }
-        if let l = lastFrameImage { urls.append(l.url) }
-        guard !urls.isEmpty else { return }
-        referenceContents.removeAll()
-        firstFrameImage = nil
-        lastFrameImage = nil
-        for u in urls {
-            guard AgentAttachmentIO.accepts(u),
-                  !agentAttachments.contains(where: { $0.url == u }),
-                  let a = AgentAttachmentIO.make(u) else { continue }
-            agentAttachments.append(a)
-        }
-    }
 
     private func promoteAttachmentsToReference() {
         guard !agentAttachments.isEmpty else { return }
-        let p = uiProvider
+        let p = referenceProvider
         guard p.maxReferenceTotal > 0
                 || (p.category == .video && imageMode == .frames && p.supportsFirstFrame) else { return }
         var kept: [AgentAttachment] = []
@@ -1446,7 +1457,7 @@ HStack(spacing: 2) {
     }
 
     private func addAgentAttachments(_ urls: [URL]) {
-        let p = uiProvider
+        let p = referenceProvider
         let takesReference = p.maxReferenceTotal > 0
             || (p.category == .video && imageMode == .frames && p.supportsFirstFrame)
 
@@ -1905,12 +1916,26 @@ HStack(spacing: 2) {
         // 附件：图片压成 JPEG 直接给模型看，文本读出来贴在提示词后面
         var images: [Data] = []
         var docs: [String] = []
+        // 附件里的图片/视频/音频**同时也当参考素材**交给生成模型 ——
+        // 点没点名 `/命令` 都一样。以前只有参考区那份算数，
+        // 普通对话里挂张图说「照这张画一版」，模型看得见图、生成时却一张参考都没带
+        var extraRefs: [AIVideoService.RefContent] = []
         for a in agentAttachments {
             if let img = a.thumb {
                 if let d = AgentAttachmentIO.jpegData(img) { images.append(d) }
             } else if AgentAttachmentIO.isTextDoc(a.url),
                       let text = AgentAttachmentIO.readText(a.url) {
                 docs.append("<文件 name=\"\(a.name)\">\n\(text)\n</文件>")
+            }
+            let ext = a.url.pathExtension.lowercased()
+            let refType: AIVideoService.RefContentType?
+            if AIVideoService.imageExts.contains(ext)      { refType = .image }
+            else if AIVideoService.videoExts.contains(ext) { refType = .video }
+            else if AIVideoService.audioExts.contains(ext) { refType = .audio }
+            else                                            { refType = nil }
+            if let refType {
+                extraRefs.append(.init(url: a.url, type: refType,
+                                       thumbnail: a.thumb ?? NSImage()))
             }
         }
         if !docs.isEmpty {
@@ -1929,14 +1954,16 @@ HStack(spacing: 2) {
         // 实测 1KB 的小图也要 58 秒、53KB 要 97 秒（不带图几秒就回，
         // 跟图大小几乎无关），撑过 180 秒超时就报「网络连接已中断」。
         // 要让模型看图，走 ＋ 上传附件那条，那才是给它看的
+        // 参考区那份在前（用户是特意挑的），附件里的接在后面，同一个文件不重复
         service.agentRoundReferences = referenceContents
+            + extraRefs.filter { e in !referenceContents.contains { $0.url == e.url } }
         service.agentRoundFirstFrame = firstFrameImage?.url
         service.agentRoundLastFrame = lastFrameImage?.url
         // 新一轮开工，生成名额重新算
         service.agentRoundGenerated = []
         // 从这轮原话里认张数，不等模型传 count
         service.agentRoundImageCount = AIVideoService.parseImageCount(from: prompt)
-        if !referenceContents.isEmpty || firstFrameImage != nil {
+        if !service.agentRoundReferences.isEmpty || firstFrameImage != nil {
             prompt += "\n\n[用户挂了参考素材，调生成工具时会自动带上，不用再问他要。]"
         }
         referenceContents.removeAll()
@@ -2238,7 +2265,23 @@ private struct MessageBubble: View {
 
             case .idle:
                 agentStepsSection
-                if !message.content.isEmpty {
+                if let kind = message.noteKind {
+                    // 后台任务的结果通报：图标用项目里那套 SVG，不使用 emoji
+                    HStack(alignment: .top, spacing: 5) {
+                        Image(nsImage: SidebarSVGIcon.load(
+                            kind == .taskDone ? "toastSuccess" : "toastWarn", size: 12))
+                            .renderingMode(.template)
+                            .foregroundColor(kind == .taskDone
+                                             ? Color(hex: "#3ECF8E") : .orange)
+                            .padding(.top, 1)
+                        Text(message.content)
+                            .font(.system(size: 11))
+                            .foregroundColor(kind == .taskDone
+                                             ? Color.labelPrimary : .orange)
+                            .textSelection(.enabled)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                } else if !message.content.isEmpty {
                     MarkdownContentView(text: message.content)
                 }
                 bubbleFooter
@@ -2319,6 +2362,7 @@ private struct MessageBubble: View {
 // MARK: - 消息附件缩略图
 
 private struct AttachmentThumb: View {
+    @EnvironmentObject private var project: ProjectState
     let attachment: AIVideoService.Attachment
     var onTap: () -> Void
 
@@ -2337,14 +2381,21 @@ private struct AttachmentThumb: View {
 
     private var tip: String {
         switch attachment.kind {
-        case .video: return "视频 · 点击添加"
-        case .audio: return "音频 · 点击添加"
-        case .image, .firstFrame, .lastFrame: return "图片 · 点击添加"
+        case .video: return "视频 · 点击放大，右键重新加入"
+        case .audio: return "音频 · 点击放大，右键重新加入"
+        case .image, .firstFrame, .lastFrame: return "图片 · 点击放大，右键重新加入"
         }
     }
 
     var body: some View {
-        Button(action: onTap) {
+        // 单击放大看 —— 32 点的缩略图只够认出「有这么个东西」。
+        // 「重新加回输入框」挪到右键：那是偶尔才用一次的操作，
+        // 而想看清自己发过什么是随时会有的念头
+        Button {
+            project.mediaPreview = MediaPreviewItem(
+                url: attachment.url,
+                isVideo: attachment.kind == .video || attachment.kind == .audio)
+        } label: {
             ZStack {
                 if let thumb = thumbnail {
                     Image(nsImage: thumb)
@@ -2386,6 +2437,9 @@ private struct AttachmentThumb: View {
         }
         .buttonStyle(.plain)
         .help(missing ? "文件已不存在" : tip)
+        .contextMenu {
+            Button("重新加回输入框") { onTap() }
+        }
         .onHover { hovering = $0 }
         .task { await load() }
     }
@@ -3973,7 +4027,10 @@ struct HistoryStatusDot: View {
         switch state {
         case .done:   return .green
         case .failed: return .red
-        case .idle, .running: return Color.labelSecondary
+        // 在跑的用主色（黄），跟「正在思考」那个呼吸点一个颜色 ——
+        // 灰的那版呼吸起来看不出来，跟静止的没区别
+        case .running: return Color.accent
+        case .idle:    return Color.labelSecondary
         }
     }
 

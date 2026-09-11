@@ -12,8 +12,16 @@ import Foundation
 struct AgentTurn {
     var text: String = ""
     var toolCalls: [AgentToolCall] = []
-    /// 这一次请求烧掉的 token（进+出）。拿不到就是 0
+    /// 这一次请求读进去 + 吐出来的 token 总量。拿不到就是 0。
+    /// **这不是花的钱** —— 命中缓存的部分只按一成计费，看 `billed`
     var tokens: Int = 0
+    /// 折算成「相当于多少个普通 token」的计费量。
+    ///
+    /// **折扣各家不同**，按各自公开的价目算：
+    /// Anthropic 写缓存 ×1.25、命中 ×0.1；OpenAI 命中半价。
+    /// 别家和中转站没有公开口径，一律按原样计，宁可报高不报低。
+    /// 所以这是个**估算**，不是账单
+    var billed: Int = 0
     /// 模型说它讲完了（没有再要调工具）
     var isFinal: Bool { toolCalls.isEmpty }
 }
@@ -31,7 +39,61 @@ enum AgentMessage {
     case toolResult(callID: String, name: String, text: String, imageData: Data?)
 }
 
+extension Array where Element == AgentMessage {
+
+    /// 把老的工具结果压成摘要再发出去。
+    ///
+    /// 历史是**每轮全量重发**的：第 20 步那次请求，前面 19 步的工具结果原样又发一遍。
+    /// 逐帧扫描、轨道清单这种一条就好几千字，压不住的话越跑越贵。
+    /// 最近几条留全文（模型正在用它们做事），更早的截成一段摘要；
+    /// 截图尤其贵，老的一律丢掉 —— 它早就看过了。
+    ///
+    /// **条目本身一条都不能删**：tool_result 必须跟前面的 tool_use 一一配对，
+    /// 少一条整个请求会被判非法
+    func compactedForSending(keepFull: Int = 4, briefLimit: Int = 240) -> [AgentMessage] {
+        var seenFromEnd = 0
+        var out = self
+        for i in stride(from: out.count - 1, through: 0, by: -1) {
+            guard case .toolResult(let id, let name, let text, let img) = out[i] else { continue }
+            seenFromEnd += 1
+            guard seenFromEnd > keepFull else { continue }
+            guard text.count > briefLimit || img != nil else { continue }
+            let brief = text.count > briefLimit
+                ? String(text.prefix(briefLimit)) + "……（这条结果早先已看过，略去 \(text.count - briefLimit) 字）"
+                : text
+            out[i] = .toolResult(callID: id, name: name, text: brief, imageData: nil)
+        }
+        return out
+    }
+}
+
 enum AgentLLM {
+
+    /// 缓存命中的那部分**相当于原价的几成**。各家自己的价目表，查于 2026-09：
+    ///
+    /// | 家 | 输入 | 命中 | 折算 |
+    /// |---|---|---|---|
+    /// | Claude | — | — | 0.1（写缓存另算 1.25 倍）|
+    /// | OpenAI | — | — | 0.5 |
+    /// | DeepSeek | 1 元 | 0.1 元 | 0.1 |
+    /// | Kimi K3 | 20 元 | 2 元 | 0.1 |
+    /// | Qwen | — | — | 0.2（隐式缓存）|
+    /// | GLM-5.3 | 8 元 | 2 元 | 0.25 |
+    /// | Grok 4.6 | $2.00 | $0.50 | 0.25 |
+    ///
+    /// 走中转站时价目可能另有一套，这里只能按官方口径估。
+    /// 价格会变，数字对不上了就照各家最新价目改这张表
+    static func cacheReadRate(_ p: AppSettings.LLMProvider) -> Double {
+        switch p {
+        case .claude:   return 0.1
+        case .openai:   return 0.5
+        case .deepseek: return 0.1
+        case .kimi:     return 0.1
+        case .qwen:     return 0.2
+        case .glm:      return 0.25
+        case .grok:     return 0.25
+        }
+    }
 
     /// 聊天框上选中的那家。它不是 Agent 模型（比如用户切到了图片生成）时，
     /// 退回设置里配的那个
@@ -170,7 +232,11 @@ enum AgentLLM {
             default: break
             }
         }
-        if !toolList.isEmpty { body["tools"] = toolList }
+        // 工具表末尾再标一个缓存点，把「系统提示词 + 整张工具表」一起圈进缓存前缀
+        if !toolList.isEmpty {
+            toolList[toolList.count - 1]["cache_control"] = ["type": "ephemeral"]
+            body["tools"] = toolList
+        }
         DiagLog.log("[Agent] → \(providerName) 模型=\(body["model"] as? String ?? "?")"
                   + " 工具 \(toolList.count) 个")
 
@@ -187,6 +253,11 @@ enum AgentLLM {
         if let u = root["usage"] as? [String: Any] {
             turn.tokens = (u["total_tokens"] as? Int)
                 ?? ((u["prompt_tokens"] as? Int ?? 0) + (u["completion_tokens"] as? Int ?? 0))
+            // 缓存命中记在 prompt_tokens_details.cached_tokens 里，已经含在 prompt_tokens 中，
+            // 折算时把省下来的那部分退回去。各家折扣见 cacheReadRate
+            let cached = ((u["prompt_tokens_details"] as? [String: Any])?["cached_tokens"] as? Int) ?? 0
+            let rate = Self.cacheReadRate(currentProvider())
+            turn.billed = turn.tokens - Int(Double(cached) * (1 - rate))
         }
         for c in (msg["tool_calls"] as? [[String: Any]]) ?? [] {
             guard let id = c["id"] as? String,
@@ -240,10 +311,15 @@ enum AgentLLM {
             }
         }
 
+        // 系统提示词和工具表**每一轮都原样重发**（一次任务最多 24 轮），
+        // 标上缓存点之后这两块命中缓存只按一成计费。位置必须是「稳定内容的末尾」——
+        // 缓存是前缀匹配，标在会变的东西后面等于永远不命中。
+        // 中转站不认这个字段的话会被忽略，行为跟以前一样
         var body: [String: Any] = [
             "model": currentModel(),
             "max_tokens": 4096,
-            "system": system,
+            "system": [["type": "text", "text": system,
+                        "cache_control": ["type": "ephemeral"]]],
             "messages": msgs
         ]
         var toolList: [[String: Any]] = tools.map { t in
@@ -271,7 +347,19 @@ enum AgentLLM {
         var turn = AgentTurn()
         // Claude 这边进出分开报，加起来才是这一轮的总量
         if let u = root["usage"] as? [String: Any] {
-            turn.tokens = (u["input_tokens"] as? Int ?? 0) + (u["output_tokens"] as? Int ?? 0)
+            // 缓存命中的那部分也是**读进去的**内容，算进总量，
+            // 不然界面上显示的数字会随缓存生效突然「变少」，看着像少花了其实没有
+            let cacheRead = u["cache_read_input_tokens"] as? Int ?? 0
+            let cacheWrite = u["cache_creation_input_tokens"] as? Int ?? 0
+            let input = u["input_tokens"] as? Int ?? 0
+            let output = u["output_tokens"] as? Int ?? 0
+            turn.tokens = input + output + cacheRead + cacheWrite
+            turn.billed = input + output
+                        + Int(Double(cacheWrite) * 1.25)
+                        + Int(Double(cacheRead) * 0.1)
+            if cacheRead > 0 || cacheWrite > 0 {
+                DiagLog.log("[Agent] 缓存：命中 \(cacheRead)，新建 \(cacheWrite)")
+            }
         }
         for block in content {
             switch block["type"] as? String {

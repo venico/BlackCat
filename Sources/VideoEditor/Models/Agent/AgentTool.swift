@@ -78,8 +78,12 @@ extension AgentToolbox {
     /// 以后新增工具组，只往这儿加一次
     @MainActor
     static var allSpecs: [AgentToolSpec] {
-        readTools + editTools + mediaTools + studioTools + studioTools2
+        readTools + editTools + mediaTools + studioTools + studioTools2 + canvasTools
         + generateTools + skillTools
         + shellTools + searchTools + mcpGateTool + mcpTools
+        // 「取工具」这个网关本身也得在册：它长在 AgentToolGate 上，不在上面任何一组里。
+        // 漏了它的后果就是上面那段注释说的原样重演 —— 模型看得见、调得动，
+        // 执行时回一句「没有叫 enable_tools 的工具」，于是它反复重试到步数耗尽（实测）
+        + [AgentToolGate.shared.gateTool]
     }
 }

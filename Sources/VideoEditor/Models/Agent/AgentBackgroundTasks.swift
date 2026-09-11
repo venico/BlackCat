@@ -27,6 +27,10 @@ final class AgentBackgroundTasks: ObservableObject {
         /// 等着用户点「换一家试试」时，点了要跑的那件事。
         /// 闭包放在 Item 上而不是 State 里 —— State 要能比较，闭包比不了
         var pendingRetry: (() -> Void)?
+        /// 这个任务该怎么取消。**画布卡片必须给** ——
+        /// 它登记时用的 id 是卡片 id，不是生成任务 id，
+        /// 拿卡片 id 去取消生成任务根本对不上号：任务照跑，卡片一直转圈（实测）
+        var cancelAction: (() -> Void)?
 
         enum State: Equatable {
             case running
@@ -67,7 +71,8 @@ final class AgentBackgroundTasks: ObservableObject {
         return item.isRunning
     }
 
-    func add(id: UUID, title: String, kind: AIVideoService.ProviderCategory) {
+    func add(id: UUID, title: String, kind: AIVideoService.ProviderCategory,
+             cancelAction: (() -> Void)? = nil) {
         let cid = AIVideoService.shared.currentConversationId
         // **新一轮开始时，把上一轮已经了结的清掉**。原来只增不减，全靠用户
         // 自己点「清除已完成」，跑几轮之后列表全是历史，正在跑的反而要翻半天。
@@ -81,21 +86,54 @@ final class AgentBackgroundTasks: ObservableObject {
         while items.count > 50, let old = items.lastIndex(where: { !isPending($0) }) {
             items.remove(at: old)
         }
-        items.insert(Item(id: id, title: title, kind: kind,
-                          conversationID: AIVideoService.shared.currentConversationId), at: 0)
+        var item = Item(id: id, title: title, kind: kind,
+                        conversationID: AIVideoService.shared.currentConversationId)
+        item.cancelAction = cancelAction
+        items.insert(item, at: 0)
     }
 
     func finish(id: UUID, url: URL) {
         guard let i = items.firstIndex(where: { $0.id == id }) else { return }
         items[i].state = .done
         items[i].url = url
-        unreadFinished.append(items[i])
+        report(items[i])
     }
 
     func fail(id: UUID, _ message: String) {
         guard let i = items.firstIndex(where: { $0.id == id }) else { return }
         items[i].state = .failed(message)
-        unreadFinished.append(items[i])
+        report(items[i])
+    }
+
+    /// 在会话里说一声。
+    ///
+    /// **必须在这儿报，不能让界面去监听** —— 聊天面板同时有两份实例活着
+    /// （侧栏一份、画布上那张卡片一份，共用同一个单例），各自监听就各报一遍，
+    /// 用户看到的是同一条完成消息出现两次（实测）。
+    /// 不是当前这条会话的先存着，等切回去再报
+    private func report(_ item: Item) {
+        guard item.conversationID == AIVideoService.shared.currentConversationId else {
+            unreadFinished.append(item)
+            return
+        }
+        switch item.state {
+        case .done:
+            let name = item.url?.lastPathComponent ?? ""
+            AIVideoService.shared.appendAgentNote(
+                item.title + "完成了" + (name.isEmpty ? "。" : "：" + name), kind: .taskDone)
+        case .failed(let why):
+            AIVideoService.shared.appendAgentNote(item.title + "没成：" + why, kind: .taskFailed)
+        default: break
+        }
+    }
+
+    /// 切回某条会话时，把攒着的那些补报出来
+    func flushUnread() {
+        let cid = AIVideoService.shared.currentConversationId
+        let mine = unreadFinished.filter { $0.conversationID == cid }
+        guard !mine.isEmpty else { return }
+        unreadFinished.removeAll { m in mine.contains { $0.id == m.id } }
+        for item in mine { report(item) }
     }
 
     /// 这家没成，把「要不要改用另一家」摆到卡片上等用户点。
@@ -121,7 +159,7 @@ final class AgentBackgroundTasks: ObservableObject {
             items[i].state = .failed(reason)
         }
         items[i].pendingRetry = nil
-        unreadFinished.append(items[i])
+        report(items[i])
     }
 
     /// 换了一家重新提交：**同一张卡片接着用**。
@@ -142,7 +180,13 @@ final class AgentBackgroundTasks: ObservableObject {
     }
 
     func cancel(id: UUID) {
-        AIVideoService.shared.cancel(taskID: id)
+        // 登记时给了取消办法的（画布卡片）走它自己那条，
+        // 否则按「id 就是生成任务 id」来取消
+        if let custom = items.first(where: { $0.id == id })?.cancelAction {
+            custom()
+        } else {
+            AIVideoService.shared.cancel(taskID: id)
+        }
         guard let i = items.firstIndex(where: { $0.id == id }) else { return }
         let (title, kind) = (items[i].title, items[i].kind)
         // 不直接从列表里抹掉，改成记成「已取消」：卡片上看得见，

@@ -177,6 +177,8 @@ final class AgentRunner: ObservableObject {
             await AgentMCP.shared.ensureConnected()
             // 用户这句话点到哪个外部服务，就挂哪个的工具
             AgentMCP.shared.activate(matching: prompt)
+            // 工具组同理：这句话点到哪组就挂哪组，没点到的留给 enable_tools
+            AgentToolGate.shared.activate(matching: prompt)
 
             // **提示词要等连上之后再拼**：外部服务清单来自刚才那次连接，
             // 在 Task 外面拼的话第一轮永远是空的，模型根本不知道有哪些服务可要
@@ -184,6 +186,7 @@ final class AgentRunner: ObservableObject {
                        + AgentMemory.shared.promptSection
                        + AgentSkills.shared.promptSection
                        + AgentMCP.shared.promptSection
+                       + AgentToolGate.shared.promptSection(inCanvas: project.showCanvas)
 
             // Skill 的列表进提示词，正文按需读 —— read_skill 是只读的，
             // 计划模式也给，不然它连方案都拟不出来。
@@ -191,13 +194,8 @@ final class AgentRunner: ObservableObject {
             // **每轮重算**：模型可能这一步刚 enable_service 要来一个外部服务，
             // 下一步就得能看见那些工具；算一次存着的话它要了也用不上
             @MainActor func buildTools() -> [AgentToolSpec] {
-                AgentToolbox.readTools
-                + AgentToolbox.skillTools.filter { mode != .plan || $0.risk == .readOnly }
-                + (mode == .plan ? [] : AgentToolbox.editTools + AgentToolbox.mediaTools
-                                       + AgentToolbox.studioTools + AgentToolbox.studioTools2
-                                       + AgentToolbox.generateTools
-                                       + AgentToolbox.shellTools
-                                       + AgentToolbox.mcpGateTool + AgentToolbox.mcpTools)
+                AgentToolGate.shared.tools(mode: mode, inCanvas: project.showCanvas)
+                + (mode == .plan ? [] : AgentToolbox.mcpGateTool + AgentToolbox.mcpTools)
                 // 这家有原生联网就用原生（搜索在服务端跑，模型自己决定搜什么词）；
                 // 没有、或者走了中转站发不过去，才挂这个外挂工具兜底
                 + (webSearch && !AgentLLM.canUseNativeSearch() ? AgentToolbox.searchTools : [])
@@ -210,9 +208,11 @@ final class AgentRunner: ObservableObject {
                 for _ in 0..<maxSteps {
                     if Task.isCancelled { break }
                     self.mutate(cid) { $0.phase = "正在思考" }
-                    let turn = try await AgentLLM.send(messages: msgs, tools: buildTools(),
+                    let turn = try await AgentLLM.send(messages: msgs.compactedForSending(),
+                                                       tools: buildTools(),
                                                        systemPrompt: system, webSearch: webSearch)
-                    self.mutate(cid) { $0.totalTokens += turn.tokens }
+                    // 显示用的是**计费量**：缓存命中只收一成，按原始总量报等于虚高一倍
+                    self.mutate(cid) { $0.totalTokens += (turn.billed > 0 ? turn.billed : turn.tokens) }
                     if !turn.text.isEmpty {
                         finalText = turn.text
                         self.mutate(cid) { $0.streamingText = turn.text }
@@ -222,7 +222,13 @@ final class AgentRunner: ObservableObject {
 
                     for call in turn.toolCalls {
                         if Task.isCancelled { break }
-                        self.mutate(cid) { $0.phase = AgentPhaseText.phase(for: call.name) }
+                        // 顶上那行要能一眼看出**这会儿在对什么动手**，
+                        // 光「正在裁剪片段」不够 —— 一轮里裁十条，看着像卡住了。
+                        // 参数带上一个最有信息量的，跟展开后每一步的写法对齐
+                        self.mutate(cid) {
+                            $0.phase = AgentPhaseText.phase(for: call.name)
+                                     + Self.phaseObject(call)
+                        }
                         let result = await self.execute(call, mode: mode, project: project,
                                                         convID: cid)
                         // 参数和完整结果都留着 —— 事后要复盘「它到底传了什么、
@@ -243,8 +249,16 @@ final class AgentRunner: ObservableObject {
                                                  // 模型这一轮动手前说的话，就是它的思路
                                                  thinking: turn.text))
                         }
+                        // 发给模型的结果也要有上限。轨道清单、逐帧扫描这类一条能有上万字，
+                        // 而且历史每轮重发 —— 一条超长结果会一路收费到任务结束。
+                        // 存档里那份是完整的（上面的 full），复盘不受影响
+                        let toModel = result.text.count > 3000
+                            ? String(result.text.prefix(3000))
+                              + "\n……（结果太长，这里截掉了 \(result.text.count - 3000) 字。"
+                              + "要看剩下的就缩小范围再查一次，别重复调同样的参数。）"
+                            : result.text
                         msgs.append(.toolResult(callID: call.id, name: call.name,
-                                                text: result.text, imageData: result.imageData))
+                                                text: toModel, imageData: result.imageData))
                     }
                 }
             } catch {
@@ -317,6 +331,13 @@ final class AgentRunner: ObservableObject {
         if let r = AgentToolbox.runStudioTool2(call.name, args: call.arguments, project: project) {
             return r
         }
+        if let r = AgentToolbox.runCanvasTool(call.name, args: call.arguments, project: project) {
+            return r
+        }
+        if call.name == "enable_tools" {
+            guard let g = call.arguments["group"] as? String else { return .fail("缺 group") }
+            return AgentToolGate.shared.enable(g)
+        }
         if let r = await AgentToolbox.runShellTool(call.name, args: call.arguments) {
             return r
         }
@@ -341,6 +362,22 @@ final class AgentRunner: ObservableObject {
     }
 
     /// 参数值压成一行。图片这类长 base64 只留个说明，别把存档撑爆
+    /// 从这次调用里挑一个最能说明「动的是什么」的参数，给顶上那行用。
+    /// 挑不出来就不写 —— 宁可短，也别把一长串 id 糊在标题上
+    static func phaseObject(_ call: AgentToolCall) -> String {
+        let keys = ["path", "prompt", "text", "name", "query", "command",
+                    "language", "kind", "group", "clip_id", "node_id", "asset_id"]
+        for k in keys {
+            guard let v = call.arguments[k] else { continue }
+            var s = "\(v)".replacingOccurrences(of: "\n", with: " ")
+                           .trimmingCharacters(in: .whitespaces)
+            guard !s.isEmpty else { continue }
+            if s.count > 18 { s = String(s.prefix(18)) + "…" }
+            return "（\(s)）"
+        }
+        return ""
+    }
+
     static func brief(_ v: Any) -> String {
         let s = "\(v)"
         return s.count > 200 ? String(s.prefix(200)) + "…（略）" : s
@@ -414,6 +451,19 @@ final class AgentRunner: ObservableObject {
               别跟用户说「放到时间轴上」「等好了叫我放进时间轴」——他现在不在那儿。
             · 时间轴那套工具（加片段、分割、加字幕这些）在画布上一般用不着，
               用户明确说要放进时间轴时才用。
+            · **画布上有什么，先调 read_canvas 看**，别猜。用户说「这几张图」「上面那张」
+              指的都是画布上的卡片，得先读出来才知道他指哪张。
+            · 卡片你也能动手：加卡片、改提示词、连线、让它开始生成、放到时间轴，
+              工具名都带 canvas。要看清楚某张卡片**画面里**是什么，
+              拿它的文件去调 capture_frame 或 read_frame_text，跟看时间轴素材一样。
+            · **「把这张图改成…」＝ 拿原图当参考重新生成**，不是改改提示词让它重跑。
+              后者出来的是一张毫不相干的新图，用户要的「改」变成了「换」。
+              做法：新建一张卡片写好提示词，generate_canvas_node 时把原图填进
+              reference（会自动连线）；原图那张留着别动，好坏可以对比。
+            · 用户说「画布上的图」而画布上**不止一张**时，先说清楚你打算动哪张，
+              或者直接问他 —— 别自己挑一张就改，改错了他得重新生成一次（花钱）。
+            · 画布卡片**能指定用哪家模型**（generate_canvas_node 的 model 参数）。
+              用户说「用 seedream 再来一版」就填上，别回他「画布不支持切换模型」。
 
             """
         }
@@ -507,7 +557,35 @@ enum AgentPhaseText {
         "split_at":              "正在分割片段",
         "move_clip":             "正在移动片段",
         "delete_clip":           "正在删除片段",
+        "get_project":           "正在看项目情况",
+        "list_tracks":           "正在看轨道",
+        "list_assets":           "正在看素材库",
+        "seek":                  "正在移动播放头",
+        "remember":              "正在记下来",
+        "forget":                "正在忘掉一条",
+        "set_subtitle_default_size": "正在调字幕字号",
+        "list_background_tasks": "正在看后台任务",
+        "read_skill":            "正在读 Skill",
+        "install_skill":         "正在装 Skill",
+        "enable_service":        "正在接入外部服务",
+        "enable_tools":          "正在取工具",
+        "read_canvas":           "正在看画布",
+        "add_canvas_node":       "正在往画布加卡片",
+        "update_canvas_node":    "正在改画布卡片",
+        "connect_canvas_nodes":  "正在连卡片",
+        "disconnect_canvas_nodes": "正在断开连线",
+        "generate_canvas_node":  "正在让卡片开跑",
+        "delete_canvas_node":    "正在删卡片",
+        "canvas_to_timeline":    "正在把卡片放进时间轴",
     ]
 
     static func phase(for tool: String) -> String { table[tool] ?? "正在执行" }
+
+    /// 步骤条上那行标题。跟 `phase` 同一张表，去掉「正在」——
+    /// 步骤是**已经做完**的事，写「正在导出成片」不对。
+    /// 表里没有的就直接用工具名，比笼统的「执行」有用
+    static func label(for tool: String) -> String {
+        guard let t = table[tool] else { return tool }
+        return t.hasPrefix("正在") ? String(t.dropFirst(2)) : t
+    }
 }

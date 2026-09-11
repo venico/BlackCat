@@ -54,7 +54,8 @@ struct AgentStepsView: View {
         return sec < 60 ? "\(sec)s" : "\(sec / 60)m\(sec % 60)s"
     }
 
-    /// 「832 tokens」/「5.6k tokens」
+    /// 「832 tokens」/「5.6k tokens」。这里的数是**折算后的计费量** ——
+    /// 命中缓存的部分只按一成算，报原始读入量会虚高一倍多
     private var tokenText: String {
         tokens < 1000 ? "\(tokens) tokens"
             : String(format: "%.1fk tokens", Double(tokens) / 1000)
@@ -63,16 +64,22 @@ struct AgentStepsView: View {
     /// 时间和用量，有哪个显示哪个
     private var meta: String {
         var parts: [String] = []
+        if isRunning && !steps.isEmpty { parts.append("\(steps.count) 步") }
         if elapsed >= 1 { parts.append(timeText) }
         if tokens > 0 { parts.append(tokenText) }
         return parts.isEmpty ? "" : " · " + parts.joined(separator: " · ")
     }
 
     private var headline: String {
+        // 跑着的时候，标题就是**此刻这一步**（跟展开后每行的写法一样：动作 + 对象），
+        // 一步步换过去，不展开也看得出它在干嘛。步数挪到后面那截统计里。
+        //
+        // 等模型回话的那段时间 phase 是「正在思考」，整轮下来大半时间都卡在这四个字上，
+        // 用户看不出它干到哪了 —— 这时候改显示**刚做完的那件事**
         if isRunning {
-            // 正在跑的时候，「在干什么」比「跑了几步」有用
-            let what = phase.isEmpty ? "正在执行" : phase
-            return steps.isEmpty ? what : "\(what)（\(steps.count) 步）"
+            if !phase.isEmpty && phase != "正在思考" { return phase }
+            if let last = steps.last { return AgentPhaseText.label(for: last.tool) }
+            return "正在思考"
         }
         return "执行了 \(steps.count) 步"
     }
@@ -105,6 +112,7 @@ struct AgentStepsView: View {
                         Text(headline + meta)
                             .font(.system(size: 10))
                             .monospacedDigit()
+                            .help(tokens > 0 ? "按各家公开的缓存折扣估算的计费量，不是账单" : "")
                         if steps.contains(where: \.isError) {
                             Text("有失败")
                                 .font(.system(size: 9))
@@ -128,45 +136,114 @@ struct AgentStepsView: View {
                     // maxHeight 只封顶。先前拿 GeometryReader 量内容再钉 height，
                     // 首帧量到 0、高度被钳成 1pt，展开等于没展开
                     ScrollView(showsIndicators: true) {
-                    VStack(alignment: .leading, spacing: 6) {
-                    ForEach(steps) { s in
-                        HStack(alignment: .top, spacing: 5) {
-                            Circle()
-                                .fill(s.isError ? Color(hex: "#FF6B6B") : Color.labelSecondary.opacity(0.5))
-                                .frame(width: 4, height: 4)
-                                .padding(.top, 5)
-                            VStack(alignment: .leading, spacing: 3) {
-                                // 动手前它说的那段话就是思路，摆在最前面
-                                if let think = s.thinking, !think.isEmpty {
-                                    Text(think)
-                                        .font(.system(size: 9.5))
-                                        .italic()
-                                        .lineSpacing(2)
-                                        .foregroundColor(Color.labelSecondary.opacity(0.5))
-                                        .fixedSize(horizontal: false, vertical: true)
-                                }
-                                Text(s.tool + (s.args.map { $0.isEmpty ? "" : "（\($0)）" } ?? ""))
-                                    .font(.system(size: 10, weight: .medium))
-                                    .foregroundColor(Color.labelSecondary)
-                                    .fixedSize(horizontal: false, vertical: true)
-                                // 有完整结果就显示完整的，没有才退回那 120 字的摘要
-                                Text((s.detail?.isEmpty == false ? s.detail! : s.summary))
-                                    .font(.system(size: 10))
-                                    .lineSpacing(2.5)
-                                    .foregroundColor(Color.labelSecondary.opacity(0.85))
-                                    .textSelection(.enabled)
-                                    .fixedSize(horizontal: false, vertical: true)
-                            }
+                        VStack(alignment: .leading, spacing: 1) {
+                            ForEach(steps) { AgentStepRow(step: $0) }
                         }
                     }
-                    }
-                    }
                     .frame(maxHeight: 600)
-                    .padding(.leading, 2)
+                    .padding(.top, 2)
                 }
             }
             .padding(.vertical, 8).padding(.horizontal, 12)
             .background(RoundedRectangle(cornerRadius: 6).fill(Color.white.opacity(0.04)))
+        }
+    }
+}
+
+/// 步骤列表里的一行。**自己也能再展开** ——
+/// 原先一展开就把每一步的思路、参数、完整结果全铺出来，十几步下来是一屏乱码，
+/// 想找「它到底把哪条片段改了」得在里面翻半天。
+/// 现在收起时一行一件事，要细节再点开那一行
+private struct AgentStepRow: View {
+    let step: AIVideoService.ConversationRecord.AgentStepRecord
+    @State private var open = false
+    @State private var hover = false
+
+    private var title: String { AgentPhaseText.label(for: step.tool) }
+
+    /// 收起时右边跟着的那句。优先显示参数——「它对什么动的手」比结果更能认出这一步
+    private var subtitle: String {
+        let raw = step.args?.isEmpty == false ? step.args! : step.summary
+        return raw.replacingOccurrences(of: "\n", with: " ")
+    }
+
+    private var hasDetail: Bool {
+        (step.detail?.isEmpty == false) || (step.thinking?.isEmpty == false)
+            || (step.args?.isEmpty == false)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Button { if hasDetail { open.toggle() } } label: {
+                HStack(alignment: .firstTextBaseline, spacing: 5) {
+                    Circle()
+                        .fill(step.isError ? Color(hex: "#FF6B6B") : Color.labelSecondary.opacity(0.45))
+                        .frame(width: 4, height: 4)
+                        .alignmentGuide(.firstTextBaseline) { _ in 3 }
+                    Text(title)
+                        .font(.system(size: 10.5, weight: .medium))
+                        .foregroundColor(step.isError ? Color(hex: "#FF9230") : Color.labelSecondary)
+                        .fixedSize()
+                    if !subtitle.isEmpty {
+                        Text(subtitle)
+                            .font(.system(size: 10))
+                            .foregroundColor(Color.labelSecondary.opacity(0.6))
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    }
+                    Spacer(minLength: 2)
+                    if hasDetail {
+                        Image(systemName: open ? "chevron.down" : "chevron.right")
+                            .font(.system(size: 7, weight: .semibold))
+                            .foregroundColor(Color.labelSecondary.opacity(hover ? 0.9 : 0.45))
+                    }
+                }
+                .padding(.vertical, 3)
+                .padding(.horizontal, 4)
+                .background(RoundedRectangle(cornerRadius: 4)
+                    .fill(hover && hasDetail ? Color.white.opacity(0.05) : Color.clear))
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .onHover { hover = $0 }
+
+            if open {
+                VStack(alignment: .leading, spacing: 4) {
+                    // 动手前它说的那段话就是思路，摆在最前面
+                    if let think = step.thinking, !think.isEmpty {
+                        Text(think)
+                            .font(.system(size: 9.5))
+                            .italic()
+                            .lineSpacing(2)
+                            .foregroundColor(Color.labelSecondary.opacity(0.5))
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    if let a = step.args, !a.isEmpty {
+                        Text(a)
+                            .font(.system(size: 9.5).monospaced())
+                            .foregroundColor(Color.labelSecondary.opacity(0.7))
+                            .textSelection(.enabled)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    // 有完整结果就显示完整的，没有才退回那 120 字的摘要
+                    Text(step.detail?.isEmpty == false ? step.detail! : step.summary)
+                        .font(.system(size: 10))
+                        .lineSpacing(2.5)
+                        .foregroundColor(Color.labelSecondary.opacity(0.85))
+                        .textSelection(.enabled)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .padding(.leading, 11)
+                .padding(.trailing, 4)
+                .padding(.vertical, 4)
+                // 左边那条竖线是「这是上一行的下级」的唯一提示，别去掉
+                .overlay(alignment: .leading) {
+                    Rectangle()
+                        .fill(Color.labelSecondary.opacity(0.18))
+                        .frame(width: 1)
+                        .padding(.leading, 5)
+                }
+            }
         }
     }
 }

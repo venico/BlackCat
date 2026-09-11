@@ -30,6 +30,9 @@ struct CanvasNodeView: View {
 
     @ObservedObject private var player = AIInlinePlayer.shared
     @State private var isHovering = false
+    /// 悬浮按钮上的下拉是不是开着。开着就别收按钮排 —— 菜单在卡片外面，
+    /// 鼠标挪过去时 isHovering 已经是 false 了
+    @State private var floatingMenuOpen = false
     /// 拖动中的临时位移。拖的时候只改这个本地值，松手才写回 model ——
     /// 每动一下就改 canvas.nodes 会让整层 ForEach 跟着重建，表现就是闪烁 + 不跟手
     @State private var dragOffset: CGSize = .zero
@@ -652,11 +655,13 @@ struct CanvasNodeView: View {
                 if node.kind == .text {
                     FloatingPlusButton(
                         items: [("添加到字幕", { NotificationCenter.default.post(name: .canvasNodeToSubtitle, object: node.id) }),
-                                ("添加到标题文字", { NotificationCenter.default.post(name: .canvasNodeToTitle, object: node.id) })])
+                                ("添加到标题文字", { NotificationCenter.default.post(name: .canvasNodeToTitle, object: node.id) })],
+                        onMenuOpenChange: { floatingMenuOpen = $0 })
                 } else {
                     FloatingPlusButton(
                         items: [("添加到 AI 参考", { NotificationCenter.default.post(name: .canvasNodeToReference, object: node.id) }),
-                                ("添加到时间轴", { NotificationCenter.default.post(name: .canvasNodeToTimeline, object: node.id) })])
+                                ("添加到时间轴", { NotificationCenter.default.post(name: .canvasNodeToTimeline, object: node.id) })],
+                        onMenuOpenChange: { floatingMenuOpen = $0 })
                 }
             }
             .padding(10)
@@ -664,7 +669,7 @@ struct CanvasNodeView: View {
     }
 
     private var showsFloatingActions: Bool {
-        guard isHovering || isDragging else { return false }
+        guard isHovering || isDragging || floatingMenuOpen else { return false }
         return node.kind == .text ? !node.text.isEmpty : node.hasContent
     }
 
@@ -1178,20 +1183,40 @@ private struct FloatingIconButton: View {
     }
 }
 
-/// 卡片左下角那个 +。
+/// 卡片上那两个下拉（@ 和 +）。
 ///
-/// 不用 `Menu`（macOS 上它会接管 label 绘制，自定义圆底画不出来），
-/// 也不用 `.popover`（带箭头的气泡，太重）—— 自绘一个贴着按钮的下拉
+/// 菜单走**系统原生 NSMenu**，不自绘。自绘那版有两个治不好的毛病：
+/// 菜单画在卡片外面，超出父视图的部分收不到鼠标（第二项永远点不动）；
+/// 而且两张卡片的菜单能同时开着，点空白也不关。
+/// 原生菜单是独立窗口，这些都由系统管
+private final class CardMenuTarget: NSObject, NSMenuDelegate {
+    var actions: [() -> Void] = []
+    var onClose: () -> Void = {}
+    @objc func pick(_ sender: NSMenuItem) {
+        guard actions.indices.contains(sender.tag) else { return }
+        actions[sender.tag]()
+    }
+    func menuDidClose(_ menu: NSMenu) { onClose() }
+}
+
+/// 菜单弹出期间要留住它，不然还没点就被回收了
+private var _cardMenuTarget: CardMenuTarget?
+
 private struct FloatingPlusButton: View {
     /// 下拉里的条目，标题 + 动作
     let items: [(String, () -> Void)]
+    /// 按钮上画什么。@ 那个也用这套下拉，只是换个图标
+    var systemIcon: String = "plus"
+    var help: String = "把这个内容用到别处"
+    /// 菜单开着的时候要让外面知道 —— 悬浮按钮那一排是「鼠标在卡片上」才显示的，
+    /// 菜单一弹出鼠标就离开卡片了，不说一声整排按钮会在菜单还开着时消失
+    var onMenuOpenChange: (Bool) -> Void = { _ in }
 
     @State private var hovering = false
-    @State private var showMenu = false
 
     var body: some View {
-        Button { showMenu.toggle() } label: {
-            Image(systemName: "plus")
+        Button { popUpMenu() } label: {
+            Image(systemName: systemIcon)
                 .font(.system(size: 11, weight: .medium))
                 .foregroundColor(.white)
                 .frame(width: 24, height: 24)
@@ -1200,26 +1225,28 @@ private struct FloatingPlusButton: View {
         }
         .buttonStyle(.plain)
         .onHover { hovering = $0 }
-        .help("把这个内容用到别处")
-        .overlay(alignment: .bottomLeading) {
-            if showMenu {
-                VStack(alignment: .leading, spacing: 0) {
-                    ForEach(Array(items.enumerated()), id: \.offset) { _, item in
-                        MenuItemRow(title: item.0) { showMenu = false; item.1() }
-                    }
-                }
-                .padding(.vertical, 4)
-                .frame(width: 140)
-                .background(RoundedRectangle(cornerRadius: 8)
-                    .fill(Color(red: 0.16, green: 0.16, blue: 0.17)))
-                .overlay(RoundedRectangle(cornerRadius: 8)
-                    .strokeBorder(Color.white.opacity(0.12)))
-                .shadow(color: .black.opacity(0.5), radius: 14, y: 5)
-                // 按钮在卡片底部，菜单往上弹才不会被卡片边缘切掉
-                .offset(y: -28)
-                .zIndex(10)
-            }
+        .help(help)
+    }
+
+    private func popUpMenu() {
+        let target = CardMenuTarget()
+        target.actions = items.map(\.1)
+        target.onClose = { onMenuOpenChange(false) }
+        _cardMenuTarget = target
+
+        let menu = NSMenu()
+        menu.delegate = target
+        for (i, item) in items.enumerated() {
+            let m = NSMenuItem(title: item.0, action: #selector(CardMenuTarget.pick(_:)),
+                               keyEquivalent: "")
+            m.target = target
+            m.tag = i
+            menu.addItem(m)
         }
+        guard let window = NSApp.keyWindow, let content = window.contentView else { return }
+        let winPoint = window.convertPoint(fromScreen: NSEvent.mouseLocation)
+        onMenuOpenChange(true)
+        menu.popUp(positioning: nil, at: content.convert(winPoint, from: nil), in: content)
     }
 }
 

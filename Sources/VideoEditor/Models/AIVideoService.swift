@@ -473,6 +473,11 @@ final class AIVideoService: ObservableObject {
         var agentTokens: Int?
         var status: TaskStatus
         let timestamp: Date
+        /// 这条是不是「后台任务有结果了」的通报。是的话前面挂个图标，
+        /// 跟模型自己说的话区分开
+        var noteKind: NoteKind?
+
+        enum NoteKind: String, Codable { case taskDone, taskFailed }
 
         enum Role { case user, assistant }
 
@@ -611,6 +616,9 @@ final class AIVideoService: ObservableObject {
             /// 失败/取消的原因。存下来重开才认得出这是失败态 ——
             /// 不存的话读回来一律当普通回复，图标和颜色都没了
             var failedError: String?
+            /// 这条是不是后台任务的结果通报。**同样得存** ——
+            /// 不存的话切走再回来，那个绿色对勾就没了，只剩一行光秃秃的文字
+            var noteKind: ChatMessage.NoteKind?
         }
 
         /// 一次工具调用的留痕
@@ -834,8 +842,20 @@ final class AIVideoService: ObservableObject {
     ///
     /// 不这么分的话，没打命令时只能按面板全局选的模型判 —— 它可能是个图片模型，
     /// 视频素材就被判成「不支持当前素材类型」，可附件区明明收得下
+    /// 收素材时按哪家的规格判断「收不收、还装得下几个」。
+    ///
+    /// **用户不关心什么参考区附件区，他只是往里放东西** ——
+    /// 所以不管打没打 `/命令`，一律先按「这次多半会用的那家」收进参考区，
+    /// 装不下或那家不收这类，才落到附件区
+    var intakeProvider: Provider {
+        if let p = activeUIProvider { return p }
+        if selectedProvider.category != .text { return selectedProvider }
+        return Self.defaultOrder(for: .image).first ?? selectedProvider
+    }
+
     func acceptLibraryAsset(url: URL) -> LibraryAcceptResult {
-        if let p = activeUIProvider {
+        do {
+            let p = intakeProvider
             let takesReference = p.maxReferenceTotal > 0
                 || (p.category == .video && imageMode == .frames && p.supportsFirstFrame)
             if takesReference {
@@ -1094,8 +1114,12 @@ final class AIVideoService: ObservableObject {
                            onFinish: @escaping (Result<URL, Error>) -> Void) -> UUID {
         let taskID = UUID()
         let category = provider.category
-        // convId/msgId 这里用不上，塞占位值 —— RunningGeneration 的字段是给聊天那条路用的
-        runningTasks[taskID] = RunningGeneration(id: taskID, convId: UUID(), msgId: UUID(),
+        // convId 要填**真的那条会话**：历史列表靠它判断「这条会话有活儿在跑」，
+        // 塞占位随机值的话永远对不上，画布生成时那个状态点一直是静的（实测）。
+        // msgId 这条路确实用不上，占位即可
+        runningTasks[taskID] = RunningGeneration(id: taskID,
+                                                 convId: currentConversationId ?? UUID(),
+                                                 msgId: UUID(),
                                                  source: .canvas, category: category, handle: nil)
 
         let handle = Task { @MainActor in
@@ -1286,6 +1310,23 @@ final class AIVideoService: ObservableObject {
         history.first { $0.id == id && $0.isCanvas }
     }
 
+    /// 改一张**不在眼前**的画布存档。
+    ///
+    /// 生成是后台跑的，用户完全可能中途切到别的画布去。结果回来时那张画布
+    /// 已经不在内存里了，直接改 CanvasState 是改到别人身上 —— 表现就是：
+    /// 图进了素材库，可那张卡片再打开还在转圈，历史列表也不显示已完成。
+    /// 所以结果要落到**它自己那条存档**里
+    @discardableResult
+    func editCanvasSnapshot(id: UUID,
+                            _ edit: (inout ConversationRecord.CanvasSnapshot) -> Void) -> Bool {
+        guard let i = history.firstIndex(where: { $0.id == id && $0.isCanvas }) else { return false }
+        var snap = history[i].canvas ?? ConversationRecord.CanvasSnapshot()
+        edit(&snap)
+        history[i].canvas = snap
+        saveHistoryToDisk()
+        return true
+    }
+
     /// 新建一条聊天会话。**立刻在历史里落一条** ——
     /// 原来是等发了第一条消息才建，用户点「新建」后历史列表没反应，
     /// 看着像没生效
@@ -1358,9 +1399,10 @@ final class AIVideoService: ObservableObject {
     /// 后台任务结束得让模型知道 —— 它只清楚自己提交过，之后是成了、砸了、
     /// 还是被用户取消了，一概看不到。不留痕的话用户再说一遍同样的需求，
     /// 它当没做过又提交一个，任务就这么一轮一轮累加上去
-    func appendAgentNote(_ text: String) {
+    func appendAgentNote(_ text: String, kind: ChatMessage.NoteKind? = nil) {
         if currentConversationId == nil { newConversation() }
-        let msg = ChatMessage(role: .assistant, content: text)
+        var msg = ChatMessage(role: .assistant, content: text)
+        msg.noteKind = kind
         messages.append(msg)
         persist(msg, isUser: false, steps: nil)
     }
@@ -1434,6 +1476,7 @@ final class AIVideoService: ObservableObject {
         entry.agentSteps = steps
         entry.agentElapsed = msg.agentElapsed
         entry.agentTokens = msg.agentTokens
+        entry.noteKind = msg.noteKind
         if case .failed(let e) = msg.status { entry.failedError = e }
         history[i].entries.append(entry)
         // 会话标题还是「新对话」时，拿用户第一句话当标题
@@ -1450,6 +1493,8 @@ final class AIVideoService: ObservableObject {
         guard let conv = history.first(where: { $0.id == id }) else { return }
         currentConversationId = conv.id
         restoreInputDraft(conv.id)
+        // 这条会话派出去的活儿在它没被打开的时候跑完了，现在补报
+        defer { Task { @MainActor in AgentBackgroundTasks.shared.flushUnread() } }
         messages = conv.entries.map { entry in
             if entry.isUser {
                 var msg = ChatMessage(id: entry.id, role: .user, content: entry.text)
@@ -1474,13 +1519,17 @@ final class AIVideoService: ObservableObject {
                     msg.agentSteps = entry.agentSteps
                     msg.agentElapsed = entry.agentElapsed
                     msg.agentTokens = entry.agentTokens
+                    msg.noteKind = entry.noteKind
                     return msg
                 }
             }
         }
         // 切回一个还在生成的会话时，把它那条占位消息补回来。
-        // 多任务之后同一个会话可能挂着好几条，逐个补
-        for task in runningTasks.values where task.convId == id {
+        // 多任务之后同一个会话可能挂着好几条，逐个补。
+        //
+        // **画布派的不补** —— 它的进度画布卡片上自己在转，后台任务面板也列着，
+        // 完成时还会在会话里报一声；再插一条「生成中，请等待…」纯属多余
+        for task in runningTasks.values where task.convId == id && task.source != .canvas {
             guard !messages.contains(where: { $0.id == task.msgId }) else { continue }
             let text: String
             switch task.category {
@@ -1554,6 +1603,7 @@ final class AIVideoService: ObservableObject {
             entry.agentSteps = msg.agentSteps
             entry.agentElapsed = msg.agentElapsed
             entry.agentTokens = msg.agentTokens
+            entry.noteKind = msg.noteKind
             if case .failed(let e) = msg.status { entry.failedError = e }
             return entry
         }
