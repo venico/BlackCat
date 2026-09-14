@@ -66,6 +66,9 @@ enum FileDropRouter {
         case asset(UUID)
         /// 素材库里拖动文件夹格子 —— 用来排序，不是往里放东西
         case folder(UUID)
+        /// 会话列表里拖会话 / 拖分组，都是排序用
+        case conversation(UUID)
+        case conversationGroup(UUID)
         case shape(ShapeType)
         case filter(FilterKind)
         case effect(EffectKind)
@@ -74,7 +77,7 @@ enum FileDropRouter {
 
     /// 接收区。素材区收文件，时间轴收素材 id —— 两边收的载荷类型不同，
     /// 所以匹配时既要看落点在不在区里，也要看这个区收不收这种载荷
-    enum Kind: Hashable { case mediaLibrary, timeline, aiChat, canvasChat, canvas }
+    enum Kind: Hashable { case mediaLibrary, timeline, aiChat, canvasChat, canvas, chatHistory }
 
     /// 匹配顺序。**必须固定**：AI 面板和素材库是同一块地方的两个标签页，
     /// 矩形几乎重合，而素材库那块登记后不会撤（切标签页只是不显示）。
@@ -84,7 +87,8 @@ enum FileDropRouter {
     // 画布开着的时候侧栏那份聊天面板**视图还在**，登记也还在，
     // 排前面的话拖到画布左半边会被底下的侧栏吃掉，变成 Agent 附件而不是落成卡片。
     // 卡片浮在画布之上，所以 `.canvasChat` 又要排在 `.canvas` 前面
-    private static let matchOrder: [Kind] = [.canvasChat, .canvas, .aiChat, .mediaLibrary, .timeline]
+    private static let matchOrder: [Kind] = [.chatHistory, .canvasChat, .canvas, .aiChat,
+                                             .mediaLibrary, .timeline]
 
     private struct Zone {
         /// SwiftUI `.global` 坐标系（原点左上）里的接收区
@@ -143,6 +147,15 @@ enum FileDropRouter {
     /// 落到别的文件夹上就成了「把素材归档」，而不是排序
     static let folderPrefix = "folder:"
     static func pasteboardString(forFolder id: UUID) -> String { folderPrefix + id.uuidString }
+    /// 会话列表拖排序的载荷。同样**不能拖裸 UUID** —— 那会被当成素材
+    static let conversationPrefix = "conv:"
+    static let conversationGroupPrefix = "cgroup:"
+    static func pasteboardString(forConversation id: UUID) -> String {
+        conversationPrefix + id.uuidString
+    }
+    static func pasteboardString(forConversationGroup id: UUID) -> String {
+        conversationGroupPrefix + id.uuidString
+    }
 
     private static func hit(at point: CGPoint, for payload: Payload,
                             in id: WindowID) -> (kind: Kind, zone: Zone)? {
@@ -163,6 +176,7 @@ enum FileDropRouter {
     static func setTargeted(_ targeted: Bool, at point: CGPoint,
                             payload: Payload, in id: WindowID) {
         guard let all = zones[id] else { return }
+        lastGlobalPoint = point
         let hitKind = targeted ? hit(at: point, for: payload, in: id)?.kind : nil
         for (k, z) in all {
             let on = k == hitKind
@@ -171,9 +185,14 @@ enum FileDropRouter {
         }
     }
 
+    /// 最后一次落点的**全局**坐标。会话列表那边每行报的是全局位置，
+    /// 而 onDrop 给的是区内相对坐标，混着用会差一个偏移，所以额外留一份
+    private(set) static var lastGlobalPoint: CGPoint = .zero
+
     /// 返回收下它的是哪个区，没人收就是 nil
     @discardableResult
     static func deliver(_ payload: Payload, at point: CGPoint, in id: WindowID) -> Kind? {
+        lastGlobalPoint = point
         guard let h = hit(at: point, for: payload, in: id) else { return nil }
         // 落点转成区内本地坐标：时间轴要用 x 算时间码
         h.zone.onDrop(payload, CGPoint(x: point.x - h.zone.rect.minX,
@@ -227,6 +246,14 @@ final class GatedHostingView<Content: View>: NSHostingView<Content> {
             if s.hasPrefix(FileDropRouter.folderPrefix),
                let id = UUID(uuidString: String(s.dropFirst(FileDropRouter.folderPrefix.count))) {
                 return .folder(id)
+            }
+            if s.hasPrefix(FileDropRouter.conversationGroupPrefix),
+               let id = UUID(uuidString: String(s.dropFirst(FileDropRouter.conversationGroupPrefix.count))) {
+                return .conversationGroup(id)
+            }
+            if s.hasPrefix(FileDropRouter.conversationPrefix),
+               let id = UUID(uuidString: String(s.dropFirst(FileDropRouter.conversationPrefix.count))) {
+                return .conversation(id)
             }
             if s.hasPrefix(FileDropRouter.shapePrefix),
                let t = ShapeType(rawValue: String(s.dropFirst(FileDropRouter.shapePrefix.count))) {
@@ -299,6 +326,8 @@ final class GatedHostingView<Content: View>: NSHostingView<Content> {
         case .effect(let k):   what = "特效=\(k.rawValue)"
         case .adjust:          what = "调节"
         case .folder(let id):  what = "文件夹=\(id.uuidString.prefix(8))"
+        case .conversation(let id):      what = "会话=\(id.uuidString.prefix(8))"
+        case .conversationGroup(let id): what = "会话分组=\(id.uuidString.prefix(8))"
         }
         DiagLog.log("[拖入] 落点=\(pt) \(what) 收下的区=\(landed.map(String.init(describing:)) ?? "没人收")")
         return landed != nil

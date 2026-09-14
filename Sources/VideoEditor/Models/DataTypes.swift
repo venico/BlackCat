@@ -161,7 +161,11 @@ struct SubtitleStyle: Equatable, Codable {
         let constraint = CGSize(width: maxW - padH * 2, height: .greatestFiniteMagnitude)
         let size = CTFramesetterSuggestFrameSizeWithConstraints(
             setter, CFRange(), nil, constraint, nil)
-        return CGSize(width: ceil(size.width) + padH * 2,
+        // 宽度**多留 1 点**。量出来的是浮点宽，框按 ceil 取整之后，真正画字时
+        // 可用宽度就是这个取整值 —— 碰上小数被抹掉的情形，文字比框宽零点几个点，
+        // 于是被迫折成两行，可框高还是按一行算的，直接压到上面那条字幕上。
+        // 现象是字号连着调：17 正常、16 重叠、15 又正常（卡在临界点上）
+        return CGSize(width: ceil(size.width) + 1 + padH * 2,
                       height: ceil(size.height) + padV * 2)
     }
 

@@ -38,6 +38,17 @@ struct AIChatPanel: View {
     /// 鼠标停在哪一条历史上。方法产出的行没法各自持 @State，只能记 id
     @State private var hoverHistoryID: UUID?
 
+    /// 正在重命名的分组，和它的草稿
+    @State private var renamingGroupID: UUID?
+    @State private var groupRenameDraft = ""
+    @FocusState private var groupRenameFocused: Bool
+    @State private var hoverGroupID: UUID?
+    /// 拖动排序时的落点提示画在哪一行
+    @State private var dropBeforeConvID: UUID?
+    @State private var dropOnGroupID: UUID?
+    @State private var dropToUngrouped = false
+    /// 会话列表每行的位置，拖放落点靠它对号入座
+    @State private var historyRowFrames: [UUID: CGRect] = [:]
     /// 正在重命名的历史会话
     @State private var renamingConversationID: UUID?
     @State private var renameDraft: String = ""
@@ -312,7 +323,16 @@ struct AIChatPanel: View {
                     // 间距走 VStack 的 spacing，不动每行自己的内边距 ——
                     // 那样 hover / 选中的底色块高度不会跟着变
                     VStack(spacing: 8) {
-                        ForEach(service.history) { conv in
+                        // 分组排在前面，没分组的排最后 —— 跟访达里文件夹在上一个道理
+                        ForEach(service.sortedGroups) { g in
+                            groupRow(g)
+                            if !g.collapsed {
+                                ForEach(service.conversations(inGroup: g.id)) { conv in
+                                    historyRow(conv).padding(.leading, 14)
+                                }
+                            }
+                        }
+                        ForEach(service.conversations(inGroup: nil)) { conv in
                             historyRow(conv)
                         }
                     }
@@ -323,6 +343,12 @@ struct AIChatPanel: View {
                 // 那边的 onChange），这里是兜底 —— 万一点到的空白区域接不住焦点转移
                 .contentShape(Rectangle())
                 .onTapGesture { commitRename() }
+                .onPreferenceChange(HistoryRowFramePref.self) { historyRowFrames = $0 }
+                .background(GeometryReader { g in
+                    Color.clear
+                        .onAppear { registerHistoryDropZone(g.frame(in: .global)) }
+                        .onChange(of: g.frame(in: .global)) { _, r in registerHistoryDropZone(r) }
+                })
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -395,12 +421,25 @@ struct AIChatPanel: View {
                     }
                 }
                 Spacer(minLength: 6)
-                // 时间挪到行尾，hover 才露出来 —— 平时那一行只留标题，干净些
-                Text(formatDate(conv.createdAt))
-                    .font(.system(size: 9))
-                    .foregroundColor(Color.labelSecondary)
-                    .lineLimit(1)
-                    .opacity(hoverHistoryID == conv.id ? 1 : 0)
+            }
+            // 时间和三个点**盖在行上**，不占位置 ——
+            // 原来它们是行内元素，不显示时照样占着右边一大块，标题早早就省略号了。
+            //
+            // **不给它们铺底色**：半透明的底叠在行 hover 色上会更亮，一眼看出是块补丁；
+            // 改成 hover 时标题自己收窄让位，底下本来就没东西，也就不用遮
+            .padding(.trailing, hoverHistoryID == conv.id ? 4 : 0)
+            .overlay(alignment: .trailing) {
+                if hoverHistoryID == conv.id {
+                    HStack(spacing: 2) {
+                        Text(formatDate(conv.createdAt))
+                            .font(.system(size: 9))
+                            .foregroundColor(Color.labelSecondary)
+                            .lineLimit(1)
+                        RowMoreButton(visible: true) {
+                            showChatNSMenu(conversationMenu(conv))
+                        }
+                    }
+                }
             }
             .padding(.leading, 6).padding(.trailing, 10)
             .padding(.vertical, 8)
@@ -415,16 +454,134 @@ struct AIChatPanel: View {
             if inside { hoverHistoryID = conv.id }
             else if hoverHistoryID == conv.id { hoverHistoryID = nil }
         }
-        .contextMenu {
-            Button { startRenaming(conv) } label: {
-                Image(nsImage: SidebarSVGIcon.load("rename", size: 14))
-                Text("重命名")
-            }
-            Button(role: .destructive) { service.deleteConversation(conv.id) } label: {
-                Image(nsImage: TimelineSVGIcon.load("delete", size: 14))
-                Text("删除")
+        .contextMenu { chatMenuContent(conversationMenu(conv)) }
+        .onDrag { NSItemProvider(object:
+            FileDropRouter.pasteboardString(forConversation: conv.id) as NSString) }
+        // 把这一行的位置报给宿主 —— 拖放由最外层统一收，它得按落点找到是哪一行
+        .background(GeometryReader { g in
+            Color.clear.preference(key: HistoryRowFramePref.self,
+                                   value: [conv.id: g.frame(in: .global)])
+        })
+        .overlay(alignment: .top) {
+            // 落点提示：一条细线插在这行上边
+            if dropBeforeConvID == conv.id {
+                Rectangle().fill(Color.accent).frame(height: 1).offset(y: -4)
             }
         }
+    }
+
+    /// 分组那一行：文件夹图标（悬停变箭头）+ 名字 + 条数 + 三个点
+    @ViewBuilder
+    private func groupRow(_ g: AIVideoService.ConversationGroup) -> some View {
+        let isRenaming = renamingGroupID == g.id
+        let count = service.conversations(inGroup: g.id).count
+        HStack(spacing: 6) {
+            Button { service.toggleGroupCollapsed(g.id) } label: {
+                Group {
+                    if hoverGroupID == g.id {
+                        Image(systemName: g.collapsed ? "chevron.right" : "chevron.down")
+                            .font(.system(size: 9, weight: .semibold))
+                    } else {
+                        // 展开收起都用线性那个，不换实心版 —— 换了反而像两种东西
+                        Image(nsImage: SidebarSVGIcon.load("folder", size: 13))
+                            .renderingMode(.template)
+                    }
+                }
+                .foregroundColor(Color.labelSecondary)
+                .frame(width: 16, height: 16)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            if isRenaming {
+                TextField("", text: $groupRenameDraft)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundColor(.white)
+                    .focused($groupRenameFocused)
+                    .onSubmit { commitGroupRename() }
+                    .onChange(of: groupRenameFocused) { _, f in if !f { commitGroupRename() } }
+                    .onExitCommand { renamingGroupID = nil }
+            } else {
+                Text(g.name)
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundColor(Color.labelPrimary)
+                    .lineLimit(1)
+                Text("\(count)")
+                    .font(.system(size: 9))
+                    .foregroundColor(Color.labelSecondary)
+            }
+            Spacer(minLength: 6)
+        }
+        .overlay(alignment: .trailing) {
+            if hoverGroupID == g.id {
+                RowMoreButton(visible: true) { showChatNSMenu(groupMenu(g)) }
+            }
+        }
+        .padding(.leading, 6).padding(.trailing, 10)
+        .padding(.vertical, 6)
+        .background(dropOnGroupID == g.id ? Color.accent.opacity(0.18)
+                    : (hoverGroupID == g.id ? Color.white.opacity(0.05) : Color.clear))
+        .cornerRadius(5)
+        .contentShape(Rectangle())
+        .onHover { inside in
+            if inside { hoverGroupID = g.id }
+            else if hoverGroupID == g.id { hoverGroupID = nil }
+        }
+        .onTapGesture { service.toggleGroupCollapsed(g.id) }
+        .contextMenu { chatMenuContent(groupMenu(g)) }
+        // 拖动排序的载荷走宿主那套（SwiftUI 的 onDrop 在这个 app 里收不到，
+        // 见 WindowDragGate.swift 顶部那段）
+        .onDrag { NSItemProvider(object:
+            FileDropRouter.pasteboardString(forConversationGroup: g.id) as NSString) }
+        .background(GeometryReader { geo in
+            Color.clear.preference(key: HistoryRowFramePref.self,
+                                   value: [g.id: geo.frame(in: .global)])
+        })
+    }
+
+    private func groupMenu(_ g: AIVideoService.ConversationGroup) -> [ChatMenuItem] {
+        [
+            .action("新建分组") { service.addGroup() },
+            .action("重命名") {
+                groupRenameDraft = g.name
+                renamingGroupID = g.id
+                DispatchQueue.main.async { groupRenameFocused = true }
+            },
+            .separator,
+            // 删组不删会话：里头的退回最下面那堆没分组的
+            .action("删除分组") { service.deleteGroup(g.id) }
+        ]
+    }
+
+    private func commitGroupRename() {
+        guard let id = renamingGroupID else { return }
+        service.renameGroup(id, to: groupRenameDraft)
+        renamingGroupID = nil
+    }
+
+    /// 会话的菜单：改名、移动到组、新建组、删除
+    private func conversationMenu(_ conv: AIVideoService.ConversationRecord) -> [ChatMenuItem] {
+        var moveItems: [ChatMenuItem] = service.sortedGroups.map { g in
+            .action(g.name, checked: conv.groupID == g.id) {
+                service.moveConversation(conv.id, toGroup: g.id)
+            }
+        }
+        if conv.groupID != nil {
+            moveItems.append(.separator)
+            moveItems.append(.action("移出分组") { service.moveConversation(conv.id, toGroup: nil) })
+        }
+        if moveItems.isEmpty { moveItems = [.action("（还没有分组）") {}] }
+        return [
+            .action("重命名") { startRenaming(conv) },
+            .submenu("移动到", moveItems),
+            .action("新建分组") {
+                let gid = service.addGroup()
+                service.moveConversation(conv.id, toGroup: gid)
+            },
+            .separator,
+            .action("删除") { service.deleteConversation(conv.id) }
+        ]
     }
 
     /// 这条记录的圆点该显示成什么状态。
@@ -433,6 +590,9 @@ struct AIChatPanel: View {
         if service.runningTasks.values.contains(where: { $0.convId == conv.id }) { return .running }
         guard let canvas = conv.canvas else { return .idle }
         if canvas.nodes.contains(where: { $0.failure != nil }) { return .failed }
+        // **进去看过就不再亮着**。绿点的意思是「有新出的东西你还没看」，
+        // 一直亮着的话列表里一排绿圈，等于什么都没提示
+        if conv.resultSeen == true { return .idle }
         // 「出过成品」＝ 有卡片写过提示词、而且已经有画面了。
         //
         // **不能用 producedAssets 判断** —— 那是老版本「产物只登记画布、
@@ -1427,6 +1587,73 @@ HStack(spacing: 2) {
             guard resp == .OK else { return }
             addAgentAttachments(panel.urls)
         }
+    }
+
+    /// 会话列表里每一行现在画在哪（全局坐标）。宿主按落点分发，靠它找是哪一行
+    private func registerHistoryDropZone(_ rect: CGRect) {
+        FileDropRouter.register(
+            windowID, kind: .chatHistory, rect: rect,
+            accepts: {
+                switch $0 {
+                case .conversation, .conversationGroup: return true
+                default: return false
+                }
+            },
+            onDrop: { payload, _ in
+                // 落点用全局坐标自己比对（onDrop 给的是区内相对坐标，
+                // 而每行报上来的是全局的，混着用会差一个偏移）
+                let pt = FileDropRouter.lastGlobalPoint
+                switch payload {
+                case .conversation(let moved):
+                    if let target = rowHit(pt) {
+                        if let g = service.conversationGroups.first(where: { $0.id == target }) {
+                            // 落在分组行上＝收进这个组
+                            service.moveConversation(moved, toGroup: g.id)
+                        } else if let conv = service.history.first(where: { $0.id == target }),
+                                  conv.id != moved {
+                            // 落在某条会话上＝插到它前面，并跟着它进同一个组
+                            var ids = service.conversations(inGroup: conv.groupID).map(\.id)
+                            ids.removeAll { $0 == moved }
+                            if let at = ids.firstIndex(of: conv.id) { ids.insert(moved, at: at) }
+                            else { ids.append(moved) }
+                            service.reorderConversations(ids, inGroup: conv.groupID)
+                        }
+                    } else {
+                        // 落在空白处＝移出分组，回到最下面那堆
+                        service.moveConversation(moved, toGroup: nil)
+                    }
+                case .conversationGroup(let moved):
+                    guard let target = rowHit(pt),
+                          service.conversationGroups.contains(where: { $0.id == target }),
+                          target != moved else { return }
+                    var ids = service.sortedGroups.map(\.id)
+                    ids.removeAll { $0 == moved }
+                    if let at = ids.firstIndex(of: target) { ids.insert(moved, at: at) }
+                    else { ids.append(moved) }
+                    service.reorderGroups(ids)
+                default: break
+                }
+                dropBeforeConvID = nil
+                dropOnGroupID = nil
+            },
+            onTargetChange: { on in
+                if !on { dropBeforeConvID = nil; dropOnGroupID = nil }
+            },
+            onHoverPoint: { _, _ in
+                // 悬停时把落点那一行点亮
+                let pt = FileDropRouter.lastGlobalPoint
+                let hit = rowHit(pt)
+                if let hit, service.conversationGroups.contains(where: { $0.id == hit }) {
+                    dropOnGroupID = hit; dropBeforeConvID = nil
+                } else {
+                    dropBeforeConvID = hit; dropOnGroupID = nil
+                }
+            })
+    }
+
+    /// 这个全局坐标落在哪一行上
+    private func rowHit(_ pt: CGPoint) -> UUID? {
+        historyRowFrames.first { $0.value.contains(pt) }?.key
     }
 
     /// 把聊天区登记成文件接收区。只收 Finder 文件 ——

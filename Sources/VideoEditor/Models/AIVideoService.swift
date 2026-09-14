@@ -524,6 +524,14 @@ final class AIVideoService: ObservableObject {
         /// 画布类会话带这一份；聊天会话是 nil。
         /// 一张画布 = 一条会话记录，历史列表里两种混排、各自打标
         var canvas: CanvasSnapshot?
+        /// 这一轮出的新东西，用户看过没。
+        /// **绿点只是个临时提示**：跑出成品时亮起来，进去看过就熄掉，
+        /// 不然列表里一排绿圈，等于什么都没提示。旧记录没这字段，当没看过处理
+        var resultSeen: Bool?
+        /// 归在哪个组里。nil = 没分组，列在最下面
+        var groupID: UUID?
+        /// 自定义排序里的位次。拖动排序时改它，跟素材库那套一个路子
+        var sortIndex: Int?
 
         var isCanvas: Bool { canvas != nil }
 
@@ -553,6 +561,9 @@ final class AIVideoService: ObservableObject {
             createdAt = try c.decodeIfPresent(Date.self, forKey: .createdAt) ?? Date()
             entries = try c.decodeIfPresent([Entry].self, forKey: .entries) ?? []
             canvas = try c.decodeIfPresent(CanvasSnapshot.self, forKey: .canvas)
+            resultSeen = try c.decodeIfPresent(Bool.self, forKey: .resultSeen)
+            groupID = try c.decodeIfPresent(UUID.self, forKey: .groupID)
+            sortIndex = try c.decodeIfPresent(Int.self, forKey: .sortIndex)
         }
 
         /// 画布存盘的样子。节点/连线/视口都在里面
@@ -997,6 +1008,8 @@ final class AIVideoService: ObservableObject {
     var isGenerating: Bool { runningTasks.values.contains { $0.source == .chat } }
     @Published var webSearchEnabled = false
     @Published var history: [ConversationRecord] = []
+    /// 会话列表的分组。单独存一个文件，不动 history 那份存档的格式
+    @Published var conversationGroups: [ConversationGroup] = []
     @Published var currentConversationId: UUID? = nil
     /// 当前是停在历史列表还是某条会话里。**不能放面板的 @State** ——
     /// 切到素材库再切回来，面板整个重建，状态一重置就弹回列表了
@@ -1297,6 +1310,128 @@ final class AIVideoService: ObservableObject {
         return id
     }
 
+    // MARK: - 会话分组
+
+    /// 会话列表里的分组。跟素材库的虚拟文件夹一个路子：只管归类，不动任何内容
+    struct ConversationGroup: Identifiable, Codable, Equatable {
+        var id = UUID()
+        var name: String
+        /// 拖动排序时改它
+        var sortIndex: Int = 0
+        /// 折起来了没
+        var collapsed: Bool = false
+    }
+
+    private var groupsFileURL: URL {
+        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+            .appendingPathComponent("BlackCat")
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir.appendingPathComponent("ai_conversation_groups.json")
+    }
+
+    func loadGroups() {
+        guard let data = try? Data(contentsOf: groupsFileURL),
+              let list = try? JSONDecoder().decode([ConversationGroup].self, from: data) else { return }
+        conversationGroups = list.sorted { $0.sortIndex < $1.sortIndex }
+    }
+
+    func saveGroups() {
+        guard let data = try? JSONEncoder().encode(conversationGroups) else { return }
+        try? data.write(to: groupsFileURL)
+    }
+
+    /// 组按自己的位次排；组内会话按位次排，没位次的排在后面（按原顺序）
+    var sortedGroups: [ConversationGroup] {
+        conversationGroups.sorted { $0.sortIndex < $1.sortIndex }
+    }
+
+    func conversations(inGroup id: UUID?) -> [ConversationRecord] {
+        let pool = history.filter { $0.groupID == id }
+        return pool.enumerated().sorted { a, b in
+            let x = a.element.sortIndex ?? Int.max, y = b.element.sortIndex ?? Int.max
+            return x == y ? a.offset < b.offset : x < y
+        }.map(\.element)
+    }
+
+    @discardableResult
+    func addGroup(name: String = "新建组") -> UUID {
+        // 同名的自动编号，免得一排「新建组」分不清
+        var final = name
+        if conversationGroups.contains(where: { $0.name == final }) {
+            var n = 2
+            while conversationGroups.contains(where: { $0.name == "\(name) \(n)" }) { n += 1 }
+            final = "\(name) \(n)"
+        }
+        let g = ConversationGroup(name: final,
+                                  sortIndex: (conversationGroups.map(\.sortIndex).max() ?? -1) + 1)
+        conversationGroups.append(g)
+        saveGroups()
+        return g.id
+    }
+
+    func renameGroup(_ id: UUID, to name: String) {
+        let t = name.trimmingCharacters(in: .whitespaces)
+        guard !t.isEmpty, let i = conversationGroups.firstIndex(where: { $0.id == id }) else { return }
+        conversationGroups[i].name = t
+        saveGroups()
+    }
+
+    /// 删组**不删会话** —— 里头的会话退回「没有分组」那一堆，
+    /// 顺手把组删掉就连着会话一起没了，那是最吓人的一种删除
+    func deleteGroup(_ id: UUID) {
+        conversationGroups.removeAll { $0.id == id }
+        for i in history.indices where history[i].groupID == id { history[i].groupID = nil }
+        saveGroups()
+        saveHistoryToDisk()
+    }
+
+    func toggleGroupCollapsed(_ id: UUID) {
+        guard let i = conversationGroups.firstIndex(where: { $0.id == id }) else { return }
+        conversationGroups[i].collapsed.toggle()
+        saveGroups()
+    }
+
+    func moveConversation(_ convID: UUID, toGroup groupID: UUID?) {
+        guard let i = history.firstIndex(where: { $0.id == convID }) else { return }
+        history[i].groupID = groupID
+        // 挪进去排最后
+        let siblings = history.filter { $0.groupID == groupID && $0.id != convID }
+        history[i].sortIndex = (siblings.compactMap(\.sortIndex).max() ?? -1) + 1
+        saveHistoryToDisk()
+    }
+
+    /// 拖动排序落定：按新顺序重写这一堆的位次
+    func reorderConversations(_ ids: [UUID], inGroup groupID: UUID?) {
+        for (n, cid) in ids.enumerated() {
+            guard let i = history.firstIndex(where: { $0.id == cid }) else { continue }
+            history[i].groupID = groupID
+            history[i].sortIndex = n
+        }
+        saveHistoryToDisk()
+    }
+
+    func reorderGroups(_ ids: [UUID]) {
+        for (n, gid) in ids.enumerated() {
+            guard let i = conversationGroups.firstIndex(where: { $0.id == gid }) else { continue }
+            conversationGroups[i].sortIndex = n
+        }
+        saveGroups()
+    }
+
+    /// 这条会话的新结果用户看过没。生成完成时置 false（列表亮绿点），
+    /// 进去看过就置 true（绿点熄掉）
+    func markConversationSeen(_ id: UUID) {
+        guard let i = history.firstIndex(where: { $0.id == id }), history[i].resultSeen != true else { return }
+        history[i].resultSeen = true
+        saveHistoryToDisk()
+    }
+
+    func markConversationUnseen(_ id: UUID) {
+        guard let i = history.firstIndex(where: { $0.id == id }) else { return }
+        history[i].resultSeen = false
+        saveHistoryToDisk()
+    }
+
     /// 保存一张画布的当前状态
     func saveCanvas(_ snapshot: ConversationRecord.CanvasSnapshot, id: UUID, title: String) {
         guard let i = history.firstIndex(where: { $0.id == id }) else { return }
@@ -1493,6 +1628,7 @@ final class AIVideoService: ObservableObject {
         guard let conv = history.first(where: { $0.id == id }) else { return }
         currentConversationId = conv.id
         restoreInputDraft(conv.id)
+        markConversationSeen(conv.id)
         // 这条会话派出去的活儿在它没被打开的时候跑完了，现在补报
         defer { Task { @MainActor in AgentBackgroundTasks.shared.flushUnread() } }
         messages = conv.entries.map { entry in
@@ -1651,6 +1787,7 @@ final class AIVideoService: ObservableObject {
     private(set) var historyLoadFailed = false
 
     private func loadHistory() {
+        loadGroups()
         guard let data = try? Data(contentsOf: historyFileURL) else { return }
         do {
             history = try JSONDecoder().decode([ConversationRecord].self, from: data)

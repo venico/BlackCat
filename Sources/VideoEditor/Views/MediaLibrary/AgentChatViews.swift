@@ -391,3 +391,128 @@ struct ThumbCloseButton: View {
         .buttonStyle(.plain)
     }
 }
+
+// MARK: - 列表行尾那个「更多」按钮 + 原生菜单
+
+/// 竖着的三个点。**点它跟右键弹的是同一份菜单** ——
+/// 两套菜单迟早会对不上，用户还得记「哪个入口有哪几项」
+struct RowMoreButton: View {
+    let visible: Bool
+    let action: () -> Void
+    @State private var hovering = false
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: "ellipsis")
+                .font(.system(size: 10, weight: .semibold))
+                .rotationEffect(.degrees(90))
+                .foregroundColor(Color.labelSecondary.opacity(hovering ? 1 : 0.7))
+                .frame(width: 18, height: 18)
+                .background(RoundedRectangle(cornerRadius: 4)
+                    .fill(hovering ? Color.white.opacity(0.12) : Color.clear))
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering = $0 }
+        .opacity(visible || hovering ? 1 : 0)
+    }
+}
+
+/// 菜单里的一项。支持二级菜单（「移动到分组」底下挂着所有组）
+enum ChatMenuItem {
+    /// 标题、打不打勾、点了做什么
+    case item(String, Bool, () -> Void)
+    case submenu(String, [ChatMenuItem])
+    case separator
+
+    /// 普通一项
+    static func action(_ title: String, _ run: @escaping () -> Void) -> ChatMenuItem {
+        .item(title, false, run)
+    }
+    /// 带勾的一项（「移动到分组」里标出当前在哪个组）
+    static func action(_ title: String, checked: Bool, _ run: @escaping () -> Void) -> ChatMenuItem {
+        .item(title, checked, run)
+    }
+}
+
+/// 菜单弹出期间要留住它，不然还没点就被回收了
+private final class ChatMenuTarget: NSObject {
+    var actions: [() -> Void] = []
+    @objc func pick(_ sender: NSMenuItem) {
+        guard actions.indices.contains(sender.tag) else { return }
+        actions[sender.tag]()
+    }
+}
+private var _chatMenuTarget: ChatMenuTarget?
+
+/// 在鼠标位置弹一份原生菜单。
+/// 用系统菜单不自绘：二级菜单、键盘操作、点别处自动关，都是现成的
+@MainActor
+func showChatNSMenu(_ items: [ChatMenuItem]) {
+    let target = ChatMenuTarget()
+    _chatMenuTarget = target
+
+    func build(_ items: [ChatMenuItem]) -> NSMenu {
+        let menu = NSMenu()
+        for item in items {
+            switch item {
+            case .separator:
+                menu.addItem(.separator())
+            case .item(let title, let checked, let run):
+                let m = NSMenuItem(title: title, action: #selector(ChatMenuTarget.pick(_:)),
+                                   keyEquivalent: "")
+                m.target = target
+                m.tag = target.actions.count
+                if checked { m.state = .on }
+                target.actions.append(run)
+                menu.addItem(m)
+            case .submenu(let title, let sub):
+                let m = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+                m.submenu = build(sub)
+                menu.addItem(m)
+            }
+        }
+        return menu
+    }
+
+    let menu = build(items)
+    guard let window = NSApp.keyWindow, let content = window.contentView else { return }
+    let winPoint = window.convertPoint(fromScreen: NSEvent.mouseLocation)
+    menu.popUp(positioning: nil, at: content.convert(winPoint, from: nil), in: content)
+}
+
+/// 把同一份菜单渲染成 SwiftUI 的右键菜单。
+/// **右键和三个点必须是同一份** —— 两套迟早对不上，
+/// 用户还得记「哪个入口有哪几项」。子菜单只做一层，够用
+@ViewBuilder
+func chatMenuContent(_ items: [ChatMenuItem]) -> some View {
+    ForEach(Array(items.enumerated()), id: \.offset) { _, item in
+        switch item {
+        case .separator:
+            Divider()
+        case .item(let title, let checked, let run):
+            Button(checked ? "✓ " + title : title, action: run)
+        case .submenu(let title, let sub):
+            Menu(title) {
+                ForEach(Array(sub.enumerated()), id: \.offset) { _, s in
+                    switch s {
+                    case .separator: Divider()
+                    case .item(let t, let c, let r): Button(c ? "✓ " + t : t, action: r)
+                    // 二级里不再嵌三级：菜单套太深反而难点
+                    case .submenu(let t, _): Text(t)
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// 会话列表每一行画在哪（全局坐标）。
+/// 拖放由最外层宿主统一接（见 WindowDragGate.swift），它只有一个落点坐标，
+/// 得靠这张表反查「落在哪一行上」
+struct HistoryRowFramePref: PreferenceKey {
+    static var defaultValue: [UUID: CGRect] = [:]
+    static func reduce(value: inout [UUID: CGRect], nextValue: () -> [UUID: CGRect]) {
+        value.merge(nextValue()) { _, new in new }
+    }
+}

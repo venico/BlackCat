@@ -721,8 +721,16 @@ final class AppSettings: ObservableObject {
         if let p = ud.string(forKey: K.exportDir) { exportSaveDir = URL(fileURLWithPath: p) }
         else { exportSaveDir = nil }
 
-        let interval = ud.double(forKey: K.autoSaveInterval)
-        autoSaveInterval = interval > 0 ? interval : 3.0
+        // **必须分清「没设置过」和「设成了关闭」**。
+        // 原来是 `interval > 0 ? interval : 3`：用户点了「关闭」存的是 0，
+        // 读回来又被当成没设置过、回落成 3 秒 —— 关不掉，而且 3 秒这档
+        // 界面上根本没有，看着像一个都没选中。
+        // 没设置过的默认给 30 秒（选项里的第一档），跟界面对得上
+        if ud.object(forKey: K.autoSaveInterval) != nil {
+            autoSaveInterval = ud.double(forKey: K.autoSaveInterval)
+        } else {
+            autoSaveInterval = 30
+        }
 
         if let p = ud.string(forKey: K.whisperModelDir) { whisperModelDir = URL(fileURLWithPath: p) }
         else { whisperModelDir = nil }

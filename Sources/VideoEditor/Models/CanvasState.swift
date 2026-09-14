@@ -954,6 +954,15 @@ final class CanvasState: ObservableObject {
                     }
                 }
                 self.runningTaskIDs.removeValue(forKey: nodeID)
+                // 出了新东西就把列表那个绿点点亮，用户进去看过会自己熄
+                if case .success = result, let cid = self.conversationID {
+                    AIVideoService.shared.markConversationUnseen(cid)
+                }
+                // **结果必须当场落盘**。视图层那个防抖保存挂在 CanvasOverlay 上，
+                // 用户把画布关了它就不在树里，没人触发保存 ——
+                // 于是图进了素材库、内存里的卡片也更新了，可存档还是旧的，
+                // 下次打开画布从存档恢复，成品不见了（实测）
+                self.persist()
                 // 等着这个节点的下游可以开工了
                 self.resumeWaitingNodes(provider: provider, settings: settings)
             }
@@ -1203,7 +1212,10 @@ final class CanvasState: ObservableObject {
             }
         }
         // 产物照样进素材库，跟在画布上时一样
-        if case .success(let url) = result { project?.importFile(url) }
+        if case .success(let url) = result {
+            project?.importFile(url)
+            svc.markConversationUnseen(owner)
+        }
     }
 
     /// 取消某个节点的生成

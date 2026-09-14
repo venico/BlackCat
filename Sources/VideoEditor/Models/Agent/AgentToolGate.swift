@@ -119,14 +119,16 @@ final class AgentToolGate {
     /// 不管在哪都留在手上的那几个：素材库谁都要用，记忆两条很短但随时会用到
     /// （用户随口一句「记住我喜欢…」，挂不上就只能干看着）
     static let alwaysOnNames: Set<String> = [
-        "remember", "forget", "list_assets"
+        // 「亲眼看一眼画面」两边都要：画布上挑图、时间轴上判断穿帮，都离不开它。
+        // 以前划给时间轴那边，画布上聊天时它只能回「我这边没有截帧工具」（实测）
+        "remember", "forget", "list_assets", "capture_frame"
     ]
 
     /// 只在时间轴那边常驻的。**画布用不着** ——
     /// 在画布上聊天时挂着「看轨道」「截预览帧」纯属浪费，
     /// 真要放进时间轴，它自己调 enable_tools 要 edit 那组
     static let timelineOnlyNames: Set<String> = [
-        "get_project", "list_tracks", "capture_frame", "seek"
+        "get_project", "list_tracks", "seek"
     ]
 
     /// 网关工具本身。描述得短 —— 它是每轮都发的

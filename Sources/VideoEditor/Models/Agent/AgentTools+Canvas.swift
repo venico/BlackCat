@@ -24,8 +24,8 @@ extension AgentToolbox {
                 description: """
                 看 AI 画布上有什么：每张卡片的类型、内容、提示词、生成状态，
                 以及卡片之间的连线（上游卡片是下游的参考素材）和分组。
-                想知道某张图片/视频卡片**画面里**是什么，拿它的文件路径去调
-                capture_frame 或 read_frame_text，跟时间轴上的素材一个办法。
+                想知道某张卡片**画面里**是什么（什么颜色、谁在里面、构图如何），
+                拿它的 id 调 capture_frame 亲眼看一眼，别靠文件名猜。
                 """,
                 parameters: ["type": "object", "properties": [:] as [String: Any],
                              "required": [] as [String]],
@@ -392,7 +392,7 @@ extension AgentToolbox {
             }
         }
 
-        out += "\n卡片里的画面要看清楚的话，拿上面那个文件名对应的素材去调 capture_frame 或 read_frame_text。"
+        out += "\n要看清楚某张卡片画的是什么，拿它的 id 调 capture_frame（source 填 id）亲眼看。"
         return out
     }
 }

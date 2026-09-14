@@ -40,11 +40,20 @@ extension AgentToolbox {
 
             AgentToolSpec(
                 name: "capture_frame",
-                description: "截取某个时刻的预览画面看一眼。判断画面明暗、主体位置、有没有穿帮这类事情必须靠它，光看数据看不出来。",
+                description: """
+                **亲眼看一眼画面**。判断明暗、颜色、主体位置、有没有穿帮这类事，
+                光看文件名和数据是看不出来的，必须靠它。
+                不给参数就截时间轴当前播放头那一帧；
+                给 source 就看那个东西：画布卡片 id、素材 id、或者文件绝对路径都认
+                （图片直接看，视频抽一帧）。
+                """,
                 parameters: [
                     "type": "object",
                     "properties": [
-                        "time": ["type": "number", "description": "秒。不传就截当前播放头那一帧"]
+                        "time": ["type": "number", "description": "秒。不传就截播放头处；看视频文件时是抽第几秒"],
+                        "source": ["type": "string",
+                                   "description": "要看哪个：画布卡片 id / 素材 id（前 8 位）/ 文件绝对路径。"
+                                                + "不传就看时间轴预览"]
                     ] as [String: Any]
                 ],
                 risk: .readOnly),
@@ -57,7 +66,8 @@ extension AgentToolbox {
         case "get_project":   return .ok(projectOverview(project))
         case "list_tracks":   return .ok(trackDump(project))
         case "list_assets":   return .ok(assetDump(project, type: args["type"] as? String))
-        case "capture_frame": return await captureFrame(project, time: args["time"] as? Double)
+        case "capture_frame": return await captureFrame(project, time: args["time"] as? Double,
+                                                        source: args["source"] as? String)
         default: return nil
         }
     }
@@ -151,7 +161,14 @@ extension AgentToolbox {
     }
 
     @MainActor
-    private static func captureFrame(_ p: ProjectState, time: Double?) async -> AgentToolResult {
+    private static func captureFrame(_ p: ProjectState, time: Double?,
+                                     source: String? = nil) async -> AgentToolResult {
+        // 指名了就看那个文件 —— 画布上的卡片、素材库里的素材，都是普通文件。
+        // 只能截时间轴预览的话，在画布上聊天时它什么都看不见，
+        // 只能回一句「我这边没有截帧工具」（实测）
+        if let key = source?.trimmingCharacters(in: .whitespaces), !key.isEmpty {
+            return await captureFile(p, key: key, time: time)
+        }
         let t = time ?? p.currentTime
         guard let item = p.playerItem else {
             return .fail("现在没有可预览的内容，时间轴大概是空的。")
@@ -172,6 +189,56 @@ extension AgentToolbox {
             return AgentToolResult(text: "这是 \(fmt(t)) 处的画面。", imageData: data)
         } catch {
             return .fail("截不到 \(fmt(t)) 的画面：\(error.localizedDescription)")
+        }
+    }
+
+    /// 看一个具体文件：画布卡片 / 素材 / 路径都认
+    @MainActor
+    private static func captureFile(_ p: ProjectState, key: String, time: Double?) async -> AgentToolResult {
+        var url: URL?
+        var what = ""
+        if let n = p.canvas.nodes.first(where: { "\($0.id)".hasPrefix(key) }), let u = n.mediaURL {
+            url = u; what = "画布卡片"
+        } else if let a = p.mediaAssets.first(where: { "\($0.id)".hasPrefix(key) }) {
+            url = a.url; what = "素材"
+        } else if key.hasPrefix("/") || key.hasPrefix("~") {
+            url = URL(fileURLWithPath: (key as NSString).expandingTildeInPath)
+            what = "文件"
+        }
+        guard let url else {
+            return .fail("找不到「\(key)」。画布卡片 id 用 read_canvas 查，素材 id 用 list_assets 查，或者直接给文件绝对路径。")
+        }
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            return .fail("「\(url.lastPathComponent)」这个文件不在了。")
+        }
+        let ext = url.pathExtension.lowercased()
+        // 图片：直接读，压一下再给模型，省 token
+        if AIVideoService.imageExts.contains(ext) {
+            guard let img = NSImage(contentsOf: url),
+                  let tiff = img.tiffRepresentation,
+                  let rep = NSBitmapImageRep(data: tiff),
+                  let data = rep.representation(using: .jpeg, properties: [.compressionFactor: 0.7])
+            else { return .fail("「\(url.lastPathComponent)」读不出画面。") }
+            return AgentToolResult(text: "这是\(what)「\(url.lastPathComponent)」的画面。", imageData: data)
+        }
+        // 视频：抽一帧
+        let asset = AVURLAsset(url: url)
+        let gen = AVAssetImageGenerator(asset: asset)
+        gen.appliesPreferredTrackTransform = true
+        gen.requestedTimeToleranceBefore = .zero
+        gen.requestedTimeToleranceAfter = .zero
+        gen.maximumSize = CGSize(width: 1024, height: 1024)
+        let at = time ?? 0
+        do {
+            var actual = CMTime.zero
+            let cg = try gen.copyCGImage(at: CMTime(seconds: at, preferredTimescale: 600), actualTime: &actual)
+            guard let data = NSBitmapImageRep(cgImage: cg)
+                .representation(using: .jpeg, properties: [.compressionFactor: 0.7])
+            else { return .fail("画面截出来了但编码失败。") }
+            return AgentToolResult(text: "这是\(what)「\(url.lastPathComponent)」\(fmt(at)) 处的画面。",
+                                   imageData: data)
+        } catch {
+            return .fail("截不到「\(url.lastPathComponent)」的画面：\(error.localizedDescription)")
         }
     }
 

@@ -2242,6 +2242,8 @@ struct TimelineView: View {
                 case .asset, .shape, .filter, .adjust, .effect: return true
                 case .files:                                   return false   // Finder 拖的文件归素材区
                 case .folder:                                  return false   // 文件夹只在素材区内部排序
+                // 会话列表的排序拖拽跟时间轴无关
+                case .conversation, .conversationGroup:        return false
                 }
             },
             onDrop: { payload, local in
@@ -2261,7 +2263,7 @@ struct TimelineView: View {
                     project.addEffect(kind: kind, at: time)
                 case .adjust:
                     project.addAdjust(at: time)
-                case .files, .folder:
+                case .files, .folder, .conversation, .conversationGroup:
                     break
                 }
             },
