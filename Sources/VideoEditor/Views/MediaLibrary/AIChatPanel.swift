@@ -45,10 +45,16 @@ struct AIChatPanel: View {
     @State private var hoverGroupID: UUID?
     /// 拖动排序时的落点提示画在哪一行
     @State private var dropBeforeConvID: UUID?
+    /// 落点在某一行**下半**时，提示线画在它下边（＝插到它后面）
+    @State private var dropAfterConvID: UUID?
     @State private var dropOnGroupID: UUID?
     @State private var dropToUngrouped = false
     /// 会话列表每行的位置，拖放落点靠它对号入座
     @State private var historyRowFrames: [UUID: CGRect] = [:]
+    /// shift 点击选出来的那几条会话。**只管多选，不改「当前打开的是哪条」**
+    @State private var selectedConvIDs: Set<UUID> = []
+    /// shift 范围选的锚点：普通点击落在哪条，下次 shift 就从那条拉到目标
+    @State private var selectionAnchorID: UUID?
     /// 正在重命名的历史会话
     @State private var renamingConversationID: UUID?
     @State private var renameDraft: String = ""
@@ -273,9 +279,14 @@ struct AIChatPanel: View {
                 HoverIconButton(icon: "clock", svgName: "chatHistory", tip: "历史会话") {
                     withAnimation(.easeInOut(duration: 0.18)) { service.showChatHistory = true }
                 }
+            } else if !inCanvas {
+                // 列表页这格换成「新建分组」，位置和图标都跟素材库那栏的新建文件夹一致
+                HoverIconButton(icon: "folder.badge.plus", svgName: "newFolder", tip: "新建分组") {
+                    service.addGroup()
+                }
             }
         }
-        // **高度按图标那 24pt 定死**：历史列表页不画右侧图标，
+        // **高度按图标那 24pt 定死**：两页右侧都画了图标，
         // 不撑着的话这一行会矮一截，两页之间标题就上下跳
         .frame(height: 24)
         // 画布卡片右上角那颗最小化按钮压在这一行上，标题得让开
@@ -342,7 +353,10 @@ struct AIChatPanel: View {
                 // 点列表空白处：正在重命名就提交。失焦本身也会提交（见 TextField
                 // 那边的 onChange），这里是兜底 —— 万一点到的空白区域接不住焦点转移
                 .contentShape(Rectangle())
-                .onTapGesture { commitRename() }
+                .onTapGesture {
+                    commitRename()
+                    selectedConvIDs.removeAll()   // 点空白＝取消多选
+                }
                 .onPreferenceChange(HistoryRowFramePref.self) { historyRowFrames = $0 }
                 .background(GeometryReader { g in
                     Color.clear
@@ -352,6 +366,15 @@ struct AIChatPanel: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        // 空白处右键也能建组。挂在最外层，两种情况都兜得住：一条会话都没有时
+        // （上面那块空状态里没有任何行可点），以及列表底下那片没铺到的空白。
+        // 行自己的 contextMenu 在内层，会盖住这一份，点行还是弹行的菜单
+        .contextMenu { chatMenuContent(blankAreaMenu) }
+    }
+
+    /// 列表空白处的菜单。眼下就一项，跟素材库空白区右键「新建文件夹」对齐
+    private var blankAreaMenu: [ChatMenuItem] {
+        [.action("新建分组") { service.addGroup() }]
     }
 
     /// 提交重命名。标题为空就当取消，不写回
@@ -370,6 +393,15 @@ struct AIChatPanel: View {
         let isRenaming = renamingConversationID == conv.id
         Button {
             guard !isRenaming else { return }   // 重命名中点这一行不该跳转
+            // shift + 点击是**选**不是**开**：从锚点拉到这一行，当前打开的会话不动。
+            // 修饰键只能问 NSEvent —— SwiftUI 的 Button action 拿不到事件本身
+            if NSEvent.modifierFlags.contains(.shift) {
+                extendSelection(to: conv.id)
+                return
+            }
+            // 普通点击：多选作废，这一行成为下次 shift 的锚点
+            selectedConvIDs.removeAll()
+            selectionAnchorID = conv.id
             if conv.isCanvas {
                 // 画布类记录：还原到画布里打开，不当聊天加载。
                 // **不收起历史列表** —— 画布是全屏盖上去的，关掉它应该退回原来那个列表，
@@ -420,14 +452,20 @@ struct AIChatPanel: View {
                         }
                     }
                 }
-                Spacer(minLength: 6)
+                // minLength 给 0：标题右边留多少**完全由下面那个 padding 决定**。
+                // 留 6 的话侧栏一窄就是 6 + 4 = 10pt，说好的 4pt 对不上
+                Spacer(minLength: 0)
             }
             // 时间和三个点**盖在行上**，不占位置 ——
             // 原来它们是行内元素，不显示时照样占着右边一大块，标题早早就省略号了。
             //
             // **不给它们铺底色**：半透明的底叠在行 hover 色上会更亮，一眼看出是块补丁；
-            // 改成 hover 时标题自己收窄让位，底下本来就没东西，也就不用遮
-            .padding(.trailing, hoverHistoryID == conv.id ? 4 : 0)
+            // 改成 hover 时标题自己收窄让位，底下本来就没东西，也就不用遮。
+            //
+            // 让位的量必须**按时间文字实际有多宽算**：侧栏拖窄时标题会一直铺到行尾，
+            // 盖在上面的时间就压到标题上了。padding 让出「时间 + 三点 + 4pt」，
+            // 标题到时间之间恒定 4pt，跟侧栏多宽无关
+            .padding(.trailing, hoverHistoryID == conv.id ? historyTrailingInset(conv) : 0)
             .overlay(alignment: .trailing) {
                 if hoverHistoryID == conv.id {
                     HStack(spacing: 2) {
@@ -436,16 +474,21 @@ struct AIChatPanel: View {
                             .foregroundColor(Color.labelSecondary)
                             .lineLimit(1)
                         RowMoreButton(visible: true) {
-                            showChatNSMenu(conversationMenu(conv))
+                            showChatNSMenu(menuFor(conv))
                         }
                     }
+                    // 行窄时不许它自己被压缩 —— 一压缩实际宽度就比上面让出的少，
+                    // 间距又不是 4pt 了
+                    .fixedSize()
                 }
             }
             .padding(.leading, 6).padding(.trailing, 10)
             .padding(.vertical, 8)
-            .background(isActive ? Color.white.opacity(0.1)
-                                 : (hoverHistoryID == conv.id ? Color.white.opacity(0.06)
-                                                              : Color.clear))
+            // 多选中的行用主题色打底，跟「当前打开的那条」（白色半透明）区分开
+            .background(selectedConvIDs.contains(conv.id) ? Color.accent.opacity(0.22)
+                        : (isActive ? Color.white.opacity(0.1)
+                                    : (hoverHistoryID == conv.id ? Color.white.opacity(0.06)
+                                                                 : Color.clear)))
             .cornerRadius(5)
             .contentShape(Rectangle())
         }
@@ -454,7 +497,7 @@ struct AIChatPanel: View {
             if inside { hoverHistoryID = conv.id }
             else if hoverHistoryID == conv.id { hoverHistoryID = nil }
         }
-        .contextMenu { chatMenuContent(conversationMenu(conv)) }
+        .contextMenu { chatMenuContent(menuFor(conv)) }
         .onDrag { NSItemProvider(object:
             FileDropRouter.pasteboardString(forConversation: conv.id) as NSString) }
         // 把这一行的位置报给宿主 —— 拖放由最外层统一收，它得按落点找到是哪一行
@@ -466,6 +509,14 @@ struct AIChatPanel: View {
             // 落点提示：一条细线插在这行上边
             if dropBeforeConvID == conv.id {
                 Rectangle().fill(Color.accent).frame(height: 1).offset(y: -4)
+            }
+        }
+        .overlay(alignment: .bottom) {
+            // 落在这行下半＝插到它后面，线画在下边。
+            // **没有这条的话，分组里最后一条后面就没有落点了** ——
+            // 再往下是行间空隙，那儿会被当成「落在空白处」直接移出分组
+            if dropAfterConvID == conv.id {
+                Rectangle().fill(Color.accent).frame(height: 1).offset(y: 4)
             }
         }
     }
@@ -560,6 +611,72 @@ struct AIChatPanel: View {
         renamingGroupID = nil
     }
 
+    /// 列表上此刻能看见的会话，从上到下。折叠起来的分组里那些不算 ——
+    /// shift 范围选要按**看得见的顺序**拉，不是按数据里的顺序
+    private var visibleConversationIDs: [UUID] {
+        var ids: [UUID] = []
+        for g in service.sortedGroups where !g.collapsed {
+            ids += service.conversations(inGroup: g.id).map(\.id)
+        }
+        ids += service.conversations(inGroup: nil).map(\.id)
+        return ids
+    }
+
+    /// 选中的那几条，按列表顺序排好。顺手滤掉已经不存在的（删过的会话）
+    private var orderedSelection: [UUID] {
+        visibleConversationIDs.filter { selectedConvIDs.contains($0) }
+    }
+
+    /// shift + 点击：锚点到目标之间整段选中，**替换**原来的选择。
+    /// 已经选中的那条再 shift 点一下是**取消它**，不是重新拉一遍范围 ——
+    /// 多选了一片之后想踢掉其中一两条，不用从头再选
+    private func extendSelection(to id: UUID) {
+        if selectedConvIDs.contains(id) {
+            selectedConvIDs.remove(id)
+            selectionAnchorID = id      // 下次范围选从这条起算
+            return
+        }
+        let ids = visibleConversationIDs
+        let anchor = selectionAnchorID ?? service.currentConversationId ?? id
+        guard let a = ids.firstIndex(of: anchor), let b = ids.firstIndex(of: id) else {
+            selectedConvIDs = [id]
+            selectionAnchorID = id
+            return
+        }
+        selectedConvIDs = Set(ids[min(a, b)...max(a, b)])
+        // 锚点不动，接着 shift 能反复改范围
+    }
+
+    /// 右键这一行该弹哪份菜单：选中多条、且右键的正是其中一条 → 多选菜单；
+    /// 否则还是单条那份（右键选区外的行不动选择，免得手一抖把选好的清了）
+    private func menuFor(_ conv: AIVideoService.ConversationRecord) -> [ChatMenuItem] {
+        let picked = orderedSelection
+        if picked.count > 1, picked.contains(conv.id) { return multiSelectMenu(picked) }
+        return conversationMenu(conv)
+    }
+
+    /// 多选之后的菜单：移动到已有分组，或者拿这几条直接开一个新分组
+    private func multiSelectMenu(_ ids: [UUID]) -> [ChatMenuItem] {
+        var moveItems: [ChatMenuItem] = service.sortedGroups.map { g in
+            .action(g.name) {
+                // 按列表顺序一条条搬，进组之后的先后顺序才跟原来一致
+                for id in ids { service.moveConversation(id, toGroup: g.id) }
+                selectedConvIDs.removeAll()
+            }
+        }
+        if moveItems.isEmpty { moveItems = [.action("（还没有分组）") {}] }
+        return [
+            .action("已选 \(ids.count) 条") {},
+            .separator,
+            .submenu("移动到", moveItems),
+            .action("用所选会话新建分组") {
+                let gid = service.addGroup()
+                for id in ids { service.moveConversation(id, toGroup: gid) }
+                selectedConvIDs.removeAll()
+            }
+        ]
+    }
+
     /// 会话的菜单：改名、移动到组、新建组、删除
     private func conversationMenu(_ conv: AIVideoService.ConversationRecord) -> [ChatMenuItem] {
         var moveItems: [ChatMenuItem] = service.sortedGroups.map { g in
@@ -609,6 +726,17 @@ struct AIChatPanel: View {
         renamingConversationID = conv.id
         // 键盘焦点要等 TextField 真正出现在树上才能抢，同一帧抢不到
         DispatchQueue.main.async { renameFieldFocused = true }
+    }
+
+    /// hover 时右边那坨（时间 + 三点按钮）要占多宽，标题得让出这么多再加 4pt。
+    ///
+    /// **只能实测文字宽度**，写死一个值的话「今天 09:11」和「09/11 09:11」差着好几个点，
+    /// 短的那种会空出一截、长的那种照样压到标题上
+    private func historyTrailingInset(_ conv: AIVideoService.ConversationRecord) -> CGFloat {
+        let w = (formatDate(conv.createdAt) as NSString)
+            .size(withAttributes: [.font: NSFont.systemFont(ofSize: 9)]).width
+        // 向上取整：宁可多留半个点，也别让文字比让出的位置宽（少半个点就是压字）
+        return ceil(w) + 2 + 18 + 4   // 文字 + HStack 间距 2 + 三点按钮 18 + 标题间距 4
     }
 
     private func formatDate(_ date: Date) -> String {
@@ -1605,17 +1733,19 @@ HStack(spacing: 2) {
                 let pt = FileDropRouter.lastGlobalPoint
                 switch payload {
                 case .conversation(let moved):
-                    if let target = rowHit(pt) {
-                        if let g = service.conversationGroups.first(where: { $0.id == target }) {
+                    if let hit = rowHitEdge(pt) {
+                        if let g = service.conversationGroups.first(where: { $0.id == hit.id }) {
                             // 落在分组行上＝收进这个组
                             service.moveConversation(moved, toGroup: g.id)
-                        } else if let conv = service.history.first(where: { $0.id == target }),
+                        } else if let conv = service.history.first(where: { $0.id == hit.id }),
                                   conv.id != moved {
-                            // 落在某条会话上＝插到它前面，并跟着它进同一个组
+                            // 落在某条会话上：上半插它前面、**下半插它后面**，
+                            // 并跟着它进同一个组
                             var ids = service.conversations(inGroup: conv.groupID).map(\.id)
                             ids.removeAll { $0 == moved }
-                            if let at = ids.firstIndex(of: conv.id) { ids.insert(moved, at: at) }
-                            else { ids.append(moved) }
+                            if let at = ids.firstIndex(of: conv.id) {
+                                ids.insert(moved, at: hit.after ? at + 1 : at)
+                            } else { ids.append(moved) }
                             service.reorderConversations(ids, inGroup: conv.groupID)
                         }
                     } else {
@@ -1634,19 +1764,22 @@ HStack(spacing: 2) {
                 default: break
                 }
                 dropBeforeConvID = nil
+                dropAfterConvID = nil
                 dropOnGroupID = nil
             },
             onTargetChange: { on in
-                if !on { dropBeforeConvID = nil; dropOnGroupID = nil }
+                if !on { dropBeforeConvID = nil; dropAfterConvID = nil; dropOnGroupID = nil }
             },
             onHoverPoint: { _, _ in
                 // 悬停时把落点那一行点亮
                 let pt = FileDropRouter.lastGlobalPoint
-                let hit = rowHit(pt)
-                if let hit, service.conversationGroups.contains(where: { $0.id == hit }) {
-                    dropOnGroupID = hit; dropBeforeConvID = nil
+                let hit = rowHitEdge(pt)
+                if let hit, service.conversationGroups.contains(where: { $0.id == hit.id }) {
+                    dropOnGroupID = hit.id; dropBeforeConvID = nil; dropAfterConvID = nil
                 } else {
-                    dropBeforeConvID = hit; dropOnGroupID = nil
+                    dropOnGroupID = nil
+                    dropBeforeConvID = (hit?.after == false) ? hit?.id : nil
+                    dropAfterConvID  = (hit?.after == true)  ? hit?.id : nil
                 }
             })
     }
@@ -1654,6 +1787,13 @@ HStack(spacing: 2) {
     /// 这个全局坐标落在哪一行上
     private func rowHit(_ pt: CGPoint) -> UUID? {
         historyRowFrames.first { $0.value.contains(pt) }?.key
+    }
+
+    /// 落在哪一行、以及是这行的上半还是下半。
+    /// 只认「插到前面」的话，一组里最后一条后面永远放不进东西
+    private func rowHitEdge(_ pt: CGPoint) -> (id: UUID, after: Bool)? {
+        guard let hit = historyRowFrames.first(where: { $0.value.contains(pt) }) else { return nil }
+        return (hit.key, pt.y > hit.value.midY)
     }
 
     /// 把聊天区登记成文件接收区。只收 Finder 文件 ——

@@ -1363,6 +1363,12 @@ struct ProjectSnapshot {
     var subtitleLineSpacing: Double
     var duration: Double
     var mediaAssets: [MediaAsset]? = nil
+    /// 整份标签页。上面那些散字段只是**当前这条**时间线的内容，
+    /// 不存这个的话「删掉一条不在编辑的时间线」撤销不回来。
+    /// 可选是为了不动那些逐字段构造快照的老代码；nil = 老快照，撤销时不动标签页
+    var tabs: [TimelineTab]? = nil
+    /// 快照那一刻停在第几条。撤销跟着切回去，人才看得见改动发生在哪
+    var activeTab: Int? = nil
 }
 
 // MARK: - Color helper

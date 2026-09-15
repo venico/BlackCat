@@ -180,24 +180,39 @@ struct TimelineTabBar: View {
     }
 }
 
-/// 所有时间线都收起来时，轨道区显示这个。
+/// 轨道区空着时显示这个。两种情形，文案和按钮都不一样：
 ///
-/// 关闭 ≠ 删除：内容还在，从「…」菜单里能全部展开回来
+/// - **一条时间线都没有**（全删了）：只能新建，没有「展开」这回事
+/// - **有、但全收起来了**：关闭 ≠ 删除，内容还在，从「…」菜单或这个按钮全部展开
 struct ClosedTimelinePlaceholder: View {
     @EnvironmentObject private var project: ProjectState
+    @Environment(\.windowID) private var windowID
+    /// ⌘Z / ⌘⇧Z 的监听。**空状态下必须自己装一个** ——
+    /// 平时管撤销的是 TimelineView 里那个 monitor，而这会儿轨道区显示的是本视图，
+    /// TimelineView 根本不在视图树上，它那个 monitor 早随 onDisappear 拆了。
+    /// 表现是：工具栏的撤销图标点了有效，⌘Z 没反应
+    @State private var undoMonitor: Any? = nil
+
+    /// 一条都不剩，跟「收起来了」是两码事
+    private var noTimelines: Bool { project.tabs.isEmpty }
 
     var body: some View {
         VStack(spacing: 10) {
             Image(systemName: "rectangle.stack")
                 .font(.system(size: 26, weight: .light))
                 .foregroundColor(Color.labelSecondary.opacity(0.4))
-            Text("时间线都收起来了")
+            Text(noTimelines ? "还没有任何时间线" : "时间线都收起来了")
                 .font(.system(size: 12))
                 .foregroundColor(Color.labelSecondary)
-            Text("内容还在，没有删掉")
-                .font(.system(size: 10))
-                .foregroundColor(Color.labelSecondary.opacity(0.6))
-            Button("全部展开") { project.showAllTabs() }
+            // 「内容还在」只对收起来的情形成立，删光了说这句是骗人
+            if !noTimelines {
+                Text("内容还在，没有删掉")
+                    .font(.system(size: 10))
+                    .foregroundColor(Color.labelSecondary.opacity(0.6))
+            }
+            Button(noTimelines ? "新建时间线" : "全部展开") {
+                if noTimelines { project.addTimelineTab() } else { project.showAllTabs() }
+            }
                 .buttonStyle(.plain)
                 .font(.system(size: 11, weight: .medium))
                 .foregroundColor(.black)
@@ -206,5 +221,28 @@ struct ClosedTimelinePlaceholder: View {
                 .padding(.top, 2)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .onAppear { setupUndoMonitor() }
+        .onDisappear { teardownUndoMonitor() }
+    }
+
+    /// 守卫照抄 TimelineView 那份：**local monitor 是进程级的**，
+    /// 不按当前窗口过滤，一次 ⌘Z 会把所有开着的项目一起撤销。
+    /// 另外弹窗、文本编辑、画布开着时键盘都不归这儿管
+    private func setupUndoMonitor() {
+        teardownUndoMonitor()
+        undoMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            guard WindowManager.shared.window(for: windowID)?.isKeyWindow == true else { return event }
+            if project.showCoverDesigner || project.showExportSheet { return event }
+            if NSApp.keyWindow?.firstResponder is NSTextView { return event }
+            if project.showCanvas { return event }
+            guard event.modifierFlags.contains(.command),
+                  event.charactersIgnoringModifiers?.lowercased() == "z" else { return event }
+            if event.modifierFlags.contains(.shift) { project.redo() } else { project.undo() }
+            return nil
+        }
+    }
+
+    private func teardownUndoMonitor() {
+        if let m = undoMonitor { NSEvent.removeMonitor(m); undoMonitor = nil }
     }
 }

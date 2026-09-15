@@ -129,11 +129,18 @@ extension ProjectState {
 
         // 新文件带整组标签页，直接用；老文件没有这一层，
         // 上面刚读进来的那套轨道就是它唯一的时间线，收成一个标签页
-        if let saved = doc.tabs, !saved.isEmpty {
-            tabs = saved
-            activeTab = min(max(doc.activeTab ?? 0, 0), saved.count - 1)
-            // 全关着的话至少把当前这个打开，否则轨道区空着还找不回来
-            if !tabs.contains(where: { $0.isTabOpen }) { tabs[activeTab].isTabOpen = true }
+        if let saved = doc.tabs {
+            // **空数组不是「老文件」**：是用户把时间线全删了，存的就是一条都没有。
+            // 当成老文件走下面那条分支的话，打开又会冒出一条「时间线 1」
+            if saved.isEmpty {
+                tabs = []
+                activeTab = 0
+            } else {
+                tabs = saved
+                activeTab = min(max(doc.activeTab ?? 0, 0), saved.count - 1)
+                // 全关着的话至少把当前这个打开，否则轨道区空着还找不回来
+                if !tabs.contains(where: { $0.isTabOpen }) { tabs[activeTab].isTabOpen = true }
+            }
         } else if tabs.count == 1 {
             tabs[0].name = "时间线 1"
         }

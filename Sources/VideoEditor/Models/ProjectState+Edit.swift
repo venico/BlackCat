@@ -80,7 +80,7 @@ extension ProjectState {
         // 带上素材：否则重做时还原不了素材名，磁盘文件也校准不回来
         redoStack.append(currentSnapshot(includeAssets: true))
         let before = mediaAssets
-        applySnapshot(s)
+        applySnapshot(s, restoreTabs: true)
         reconcileAssetFiles(from: before)
         // 这一步撤回来的素材，画布上那些卡片也跟着回来 ——
         // 一次 ⌘Z 素材、片段、卡片一起恢复
@@ -99,7 +99,7 @@ extension ProjectState {
         guard let s = redoStack.popLast() else { return }
         undoStack.append(currentSnapshot(includeAssets: true))
         let before = mediaAssets
-        applySnapshot(s)
+        applySnapshot(s, restoreTabs: true)
         reconcileAssetFiles(from: before)
         undoCount = undoStack.count
         redoCount = redoStack.count
@@ -123,10 +123,31 @@ extension ProjectState {
                         subtitleBottomMargin: subtitleBottomMargin,
                         subtitleLineSpacing: subtitleLineSpacing,
                         duration: duration,
-                        mediaAssets: includeAssets ? mediaAssets : nil)
+                        mediaAssets: includeAssets ? mediaAssets : nil,
+                        tabs: tabs,
+                        activeTab: activeTab)
     }
 
-    func applySnapshot(_ s: ProjectSnapshot) {
+    /// - Parameter restoreTabs: 连**整份标签页**一起恢复。撤销/重做要传 true ——
+    ///   快照的散字段只是当前那条时间线的内容，删掉别的时间线光靠它找不回来。
+    ///   **复合片段进出那条路必须是 false**：它拿的是进入复合前的快照，
+    ///   一起恢复的话，在复合片段里新建/改名/关掉标签页的操作会被连带抹掉。
+    ///   跨窗口素材恢复那条路同理，只该动片段、不该动标签页
+    func applySnapshot(_ s: ProjectSnapshot, restoreTabs: Bool = false) {
+        if restoreTabs, let saved = s.tabs {
+            tabs = saved
+            // 快照里一条时间线都没有是**合法状态**（用户全删了），这时不要补
+            activeTab = saved.isEmpty ? 0 : min(max(s.activeTab ?? activeTab, 0), saved.count - 1)
+        }
+        // 老快照（没带标签页）碰上现在一条时间线都没有：轨道数据没地方可写
+        // —— 那些属性都是代理到 tabs[activeTab] 的，空数组时写入直接丢弃。
+        // 补一条装它，名字回不来，用默认名
+        if tabs.isEmpty && s.tabs == nil {
+            var t = TimelineTab(name: "时间线 1")
+            t.isTabOpen = true
+            tabs = [t]
+            activeTab = 0
+        }
         filterTracks   = s.filterTracks
         adjustTracks   = s.adjustTracks
         effectTracks   = s.effectTracks

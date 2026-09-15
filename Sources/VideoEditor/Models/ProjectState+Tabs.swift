@@ -79,18 +79,29 @@ extension ProjectState {
     }
 
     /// 删除时间线：连数据一起丢掉。
-    /// 最后一条也能删 —— 删完补一条全新的空时间线，
-    /// 轨道区不该出现「一个时间线都没有」的状态
+    /// 最后一条也能删，**删光了就真的是空的** —— 不再自动补一条新的。
+    /// 轨道区改显示「还没有任何时间线」，由用户点「新建时间线」再建
+    /// （自动补一条的话，删完看见「时间线 1」还在，像是没删掉）
     func deleteTab(id: UUID) {
         guard let i = tabs.firstIndex(where: { $0.id == id }) else { return }
         pushUndo()
         // 数据都要丢了，栈直接清掉，别走 exitCompound —— 那条路会把复合片段的
-        // 内容写回轨道，写进删完新补的那条空时间线里
+        // 内容写回轨道，而它要写回的那条时间线马上就不存在了
         if i == activeTab { compositionStack.removeAll() }
         tabs.remove(at: i)
-        if tabs.isEmpty { tabs = [TimelineTab(name: "时间线 1")] }
-        activeTab = min(max(activeTab, 0), tabs.count - 1)
         isSaved = false
+        guard !tabs.isEmpty else {
+            // 一条不剩：选中态、复合片段栈、预览都得收干净。
+            // **走不了 activateTab** —— 它按下标找标签页，空数组直接 return，
+            // 不自己清的话预览里还挂着刚删掉的那条时间线的画面
+            activeTab = 0
+            compositionStack.removeAll()
+            clearClipSelections()
+            selectedClipIDs.removeAll()
+            rebuildTimelinePreview()
+            return
+        }
+        activeTab = min(max(activeTab, 0), tabs.count - 1)
         activateTab(activeTab)
     }
 
