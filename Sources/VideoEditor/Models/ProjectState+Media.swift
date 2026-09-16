@@ -71,6 +71,90 @@ extension ProjectState {
         rebuildTimelinePreview()
     }
 
+    /// shift + 点击素材：锚点到目标之间整段选中，**替换**原来的选择。
+    /// 跟历史会话列表一个脾气；顺序按 `visibleAssetOrder`（人眼看到的那份）算
+    func selectAssetRange(to id: UUID) {
+        let ids = visibleAssetOrder
+        let anchor = assetSelectionAnchor ?? id
+        guard let a = ids.firstIndex(of: anchor), let b = ids.firstIndex(of: id) else {
+            selectedAssetIDs = [id]
+            assetSelectionAnchor = id
+            return
+        }
+        selectedAssetIDs = Set(ids[min(a, b)...max(a, b)])
+        selectedFolderIDs = []   // 范围选只管素材，文件夹不掺和
+        // 锚点不动，接着 shift 能反复改范围
+    }
+
+    /// 一次移除多个素材。**确认框只弹一次，撤销也只回退一步** ——
+    /// 挨个调 `removeAsset` 的话，选了十个就得点十次「移除」，
+    /// 撤销还要按十次才回得来
+    func removeAssets(ids: [UUID]) {
+        let ids = Array(Set(ids))
+        guard !ids.isEmpty else { return }
+        guard ids.count > 1 else { removeAsset(id: ids[0]); return }
+        let idSet = Set(ids)
+
+        var clipCount = 0
+        for t in videoTracks    { clipCount += t.clips.filter { idSet.contains($0.assetID) }.count }
+        for t in audioTracks    { clipCount += t.clips.filter { idSet.contains($0.assetID) }.count }
+        for t in imageTracks    { clipCount += t.clips.filter { idSet.contains($0.assetID) }.count }
+        // 字幕片段的 assetID 是可选的（有的字幕不来自素材）
+        for t in subtitleTracks { clipCount += t.clips.filter { $0.assetID.map(idSet.contains) == true }.count }
+
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "确定移除这 \(ids.count) 个素材？"
+        var info = "素材库是所有项目共用的，移除后别的项目里引用它们的片段会变成「文件丢失」。"
+        if clipCount > 0 {
+            info += "\n当前项目时间轴上有 \(clipCount) 个片段使用了这些素材，将一并移除。"
+        }
+        alert.informativeText = info
+        alert.addButton(withTitle: "移除")
+        alert.addButton(withTitle: "取消")
+
+        // 跟单个那条一样：测试环境按「取消」处理，免得 runModal 卡死主线程
+        guard !DiagLog.isUnitTesting else {
+            DiagLog.log("[移除素材] 测试环境跳过确认框，未执行批量移除")
+            return
+        }
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        // 一个快照 = 一次撤销。带上素材，撤销时素材本身也回来
+        let snapshot = currentSnapshot(includeAssets: true)
+        undoStack.append(snapshot)
+        if undoStack.count > 30 { undoStack.removeFirst() }
+        redoStack.removeAll()
+        undoCount = undoStack.count
+        redoCount = 0
+        lastUndoPushTime = Date()
+        isSaved = false
+        scheduleAutoSave()
+
+        // 轨道**整份改完再赋值回去**：逐条改 @Published 会一条一次重绘
+        var v = videoTracks, a = audioTracks, im = imageTracks, sub = subtitleTracks
+        for i in v.indices    { v[i].clips.removeAll    { idSet.contains($0.assetID) } }
+        for i in a.indices    { a[i].clips.removeAll    { idSet.contains($0.assetID) } }
+        for i in im.indices   { im[i].clips.removeAll   { idSet.contains($0.assetID) } }
+        for i in sub.indices  { sub[i].clips.removeAll  { $0.assetID.map(idSet.contains) == true } }
+        videoTracks = v; audioTracks = a; imageTracks = im; subtitleTracks = sub
+
+        for id in idSet {
+            mediaThumbnails.removeValue(forKey: id)
+            assetThumbnails.removeValue(forKey: id)
+            waveformCache.removeValue(forKey: id)
+            imageVideoCache.removeValue(forKey: id)
+        }
+        mediaAssets.removeAll { idSet.contains($0.id) }
+
+        selectedVideoClipID = nil
+        selectedAudioClipID = nil
+        selectedImageClipID = nil
+        selectedSubtitleClipID = nil
+        selectedClipIDs.removeAll()
+        rebuildTimelinePreview()
+    }
+
     /// 把片段上的 `assetID` 按映射换成全局库里的 id。
     ///
     /// 打开项目时才用得上：项目文件里那份素材的 id 可能跟全局库对不上（同一个文件、

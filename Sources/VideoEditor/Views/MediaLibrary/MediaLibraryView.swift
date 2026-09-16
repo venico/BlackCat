@@ -76,6 +76,7 @@ struct MediaLibraryView: View {
         return f.contains(.shift) || f.contains(.command)
     }
 
+
     private var marqueeRect: CGRect? {
         guard let a = marqueeStart, let b = marqueeEnd else { return nil }
         return CGRect(x: min(a.x, b.x), y: min(a.y, b.y),
@@ -294,7 +295,14 @@ struct MediaLibraryView: View {
                 }
 
             // Asset list + drag-drop target
+            // 把**当前看到的顺序**（筛过、排过的那一份）报给 project ——
+            // shift 范围选要按人眼看到的先后算，不是素材库里的原始顺序
             ZStack {
+                Color.clear.frame(width: 0, height: 0)
+                    .onAppear { project.visibleAssetOrder = filteredAssets.map(\.id) }
+                    .onChange(of: filteredAssets.map(\.id)) { _, v in
+                        project.visibleAssetOrder = v
+                    }
                 if isShapeTab {
                     ShapePanel()
                 } else if isTextTab {
@@ -1269,15 +1277,21 @@ private struct AssetRow: View {
             if asset.fileExists { project.addToTimeline(asset) } else { relinkAsset() }
         }
         .onTapGesture(count: 1) {
-            if MediaLibraryView.additiveClick {
-                // 已选中的再点一下是**取消**，不是重复加
+            let flags = NSEvent.modifierFlags
+            if flags.contains(.shift) {
+                // shift = 从锚点连选到这里（跟历史会话列表一个脾气）
+                project.selectAssetRange(to: assetID)
+            } else if flags.contains(.command) {
+                // ⌘ = 挨个加减选。已选中的再点一下是**取消**，不是重复加
                 if project.selectedAssetIDs.contains(assetID) {
                     project.selectedAssetIDs.remove(assetID)
                 } else {
                     project.selectedAssetIDs.insert(assetID)
                 }
+                project.assetSelectionAnchor = assetID
             } else {
                 project.selectedAssetIDs = [assetID]
+                project.assetSelectionAnchor = assetID
             }
         }
         .contextMenu {
@@ -1313,12 +1327,7 @@ private struct AssetRow: View {
             }
             Divider()
             Button(batch ? "移除这 \(targets.count) 个" : "移除", role: .destructive) {
-                if batch {
-                    for id in targets { project.removeAsset(id: id) }
-                    project.selectedAssetIDs = []
-                } else {
-                    confirmDeleteAsset()
-                }
+                removeChosen(targets, batch: batch)
             }
         }
     }
@@ -1592,6 +1601,19 @@ private struct AssetRow: View {
         // leading 7 = 原来的「外层 4 + 自身 3」，观感不变
         .padding(.leading, 7).padding(.trailing, 10)
         .padding(.vertical, 7)
+    }
+
+    /// 右键「移除」。选了一批就走 `removeAssets` —— 它**只弹一次确认、只记一次撤销**，
+    /// 挨个调的话选十个要点十次「移除」。
+    /// **这段不能写在 contextMenu 的 ViewBuilder 里**：那里表达式稍微一复杂，
+    /// 编译器就报「无法在合理时间内完成类型检查」
+    private func removeChosen(_ targets: Set<UUID>, batch: Bool) {
+        if batch {
+            project.removeAssets(ids: Array(targets))
+            project.selectedAssetIDs = []
+        } else {
+            confirmDeleteAsset()
+        }
     }
 
     private func confirmDeleteAsset() {
@@ -2825,15 +2847,9 @@ private struct TransitionPanel: View {
                             isSelected: hasSelection && selectedClipTransition?.type == type,
                             onSelect: {
                                 guard let clipID = project.selectedTransitionClipID else { return }
-                                project.pushUndo()
-                                project.updateVideoClip(id: clipID) {
-                                    if $0.inTransition == nil {
-                                        $0.inTransition = Transition(type: type)
-                                    } else {
-                                        $0.inTransition?.type = type
-                                    }
-                                }
-                                project.rebuildTimelinePreviewDebounced()
+                                // 走这条：素材没余量时会自动腾出重叠区，
+                                // 不然转场挂上了画面却没变化
+                                project.applyTransition(type, toClipID: clipID)
                             }
                         )
                     }

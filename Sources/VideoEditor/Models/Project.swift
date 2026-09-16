@@ -623,6 +623,12 @@ final class ProjectState: ObservableObject {
         scheduleAutoSave()
     }
 
+    /// 素材库 shift 范围选的锚点：上一次普通点击 / ⌘ 点击落在哪个素材
+    @Published var assetSelectionAnchor: UUID?
+    /// 素材库当前**看得到**的顺序（筛过、排过的那一份）。范围选按它算。
+    /// 不用 @Published —— 它只在范围选那一下读，发布出去等于每次筛选都重绘一遍列表
+    var visibleAssetOrder: [UUID] = []
+
     /// 素材库里正在重命名的素材
     @Published var renamingAssetID: UUID? = nil
     /// 轨道区正在重命名的视频/图片/音频片段
@@ -1059,7 +1065,10 @@ final class ProjectState: ObservableObject {
     /// 原来这六类各占一个侧边栏图标，v5.3.0 合并进素材库，改成里面的标签页
     @Published var libraryCategory: String = "video"
     /// 「效果」栏下的分类：转场 / 滤镜 / 特效 / 调节
-    @Published var effectCategory: String = "transition"
+    /// 效果标签页里的子标签。取值必须是 MediaLibraryView.effectCategories 里的那几个 ——
+    /// 以前默认写的是 "transition"，跟子标签的取值 "effTransition" 对不上，
+    /// 于是第一次打开效果页落到 default 分支显示的是特效面板
+    @Published var effectCategory: String = "effTransition"
     /// 素材库用缩略图还是列表看。侧边栏和画布素材库**共用这一份**，
     /// 一边切了另一边跟着变（跟排序设置一个待遇）
     /// 缩略图 / 列表，**每个分类各记各的**。

@@ -737,6 +737,63 @@ extension ProjectState {
         }
     }
 
+    /// 给片段挂转场，**必要时自动腾出重叠区**。
+    ///
+    /// 转场是两段画面叠着过渡：A 要往后多播半个转场时长、B 要往前多播半个。
+    /// 这两段「多播」的内容来自素材没被用到的部分 —— A 尾部的余量、B 头部的余量
+    /// （也就是 `trimStart`）。整段素材直接拖进时间轴时两边余量都是 0，
+    /// 渲染那边算出重叠长度为 0 就**静默跳过**，表现是菱形点成了实心、画面上却什么都没发生。
+    ///
+    /// 所以余量不够时这里自己腾：A 尾巴缩一点、B 头部裁一点，B 跟着贴上去，
+    /// 后面的片段整体前移，整条轨道因此短一截（跟剪映加转场的行为一致）。
+    /// 每段最多让出自己时长的四成，免得把短片段吃没了。
+    func applyTransition(_ type: TransitionType, toClipID clipID: UUID) {
+        guard let ti = videoTracks.firstIndex(where: { $0.clips.contains { $0.id == clipID } })
+        else { return }
+        pushUndo()
+        var clips = videoTracks[ti].clips.sorted { $0.startTime < $1.startTime }
+        guard let bi = clips.firstIndex(where: { $0.id == clipID }) else { return }
+
+        if clips[bi].inTransition == nil { clips[bi].inTransition = Transition(type: type) }
+        else { clips[bi].inTransition?.type = type }
+
+        // fadeToBlack 各自淡进淡出，不需要重叠素材；也没有前一段就更不用腾
+        if type != .fadeToBlack, bi > 0 {
+            let wantHalf = (clips[bi].inTransition?.duration ?? 0.5) / 2
+            let a = clips[bi - 1], b = clips[bi]
+            // 紧挨着才算一对，跟渲染那边的判据一致
+            if abs(a.endTime - b.startTime) < 0.05 {
+                let aSrcDur = mediaAssets.first(where: { $0.id == a.assetID })?.duration ?? 0
+                let availA = max(0, aSrcDur - (a.trimStart + a.duration * max(0.01, a.speed)))
+                let availB = b.trimStart
+                var needA = max(0, wantHalf - availA)
+                var needB = max(0, wantHalf - availB)
+                needA = min(needA, max(0, a.duration * 0.4))
+                needB = min(needB, max(0, b.duration * 0.4))
+                if needA > 0.005 || needB > 0.005 {
+                    clips[bi - 1].endTime -= needA          // A 尾巴缩
+                    clips[bi].startTime   -= needA          // B 贴上来，中间不能有缝
+                    clips[bi].endTime     -= needA
+                    // B 头部裁掉：trimStart 是**源素材**上的秒数，要乘变速
+                    clips[bi].trimStart   += needB * max(0.01, b.speed)
+                    clips[bi].endTime     -= needB
+                    let shift = needA + needB
+                    if shift > 0, bi + 1 < clips.count {
+                        for i in (bi + 1)..<clips.count {
+                            clips[i].startTime -= shift
+                            clips[i].endTime   -= shift
+                        }
+                    }
+                }
+            }
+        }
+
+        videoTracks[ti].clips = clips
+        isSaved = false
+        scheduleAutoSave()
+        rebuildTimelinePreviewDebounced()
+    }
+
     func updateVideoClip(id: UUID, _ modify: (inout VideoClip) -> Void) {
         pushUndoThrottled()
         for i in videoTracks.indices {

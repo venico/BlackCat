@@ -214,9 +214,8 @@ struct CanvasChatCard: View {
                     .padding(.top, Self.grip)
                     .padding(.trailing, 34)
                     .claimsDragFromWindow()
-                    .onHover { inside in
-                        if inside { NSCursor.openHand.set() } else { NSCursor.arrow.set() }
-                    }
+                    // 标题行**不换手掌光标**：这块只是顺手能拖，不是非拖不可的把手，
+                    // 鼠标扫过去就变手掌反而像整块卡片都在等着被拖走
                     .gesture(moveGesture(CGSize(width: w, height: h)))
             }
     }

@@ -271,6 +271,14 @@ final class WindowManager: NSObject {
         canvasRightClickMonitors[id] = monitor
     }
 
+    /// 画布平移模式（按住空格）的兜底监听：鼠标一动就核对空格到底还按着没有
+    private var canvasCursorMonitors: [WindowID: Any] = [:]
+
+    func setCanvasCursorMonitor(_ monitor: Any?, for id: WindowID) {
+        if let old = canvasCursorMonitors[id] { NSEvent.removeMonitor(old) }
+        canvasCursorMonitors[id] = monitor
+    }
+
     func setEscMonitor(_ monitor: Any?, for id: WindowID) {
         // 同一个窗口重复注册时先撤掉旧的，避免一个窗口挂两个
         if let old = escMonitors[id] { NSEvent.removeMonitor(old) }
@@ -305,6 +313,11 @@ extension WindowManager: NSWindowDelegate {
         if let m = escMonitors[id] { NSEvent.removeMonitor(m); escMonitors[id] = nil }
         if let m = canvasSpaceMonitors[id] { NSEvent.removeMonitor(m); canvasSpaceMonitors[id] = nil }
         if let m = canvasScrollMonitors[id] { NSEvent.removeMonitor(m); canvasScrollMonitors[id] = nil }
+        // 这三个原来漏拆了 —— local monitor 挂在进程上，闭包攥着那个窗口的
+        // ProjectState 不放，关一个窗口残留一个
+        if let m = canvasFocusMonitors[id] { NSEvent.removeMonitor(m); canvasFocusMonitors[id] = nil }
+        if let m = canvasRightClickMonitors[id] { NSEvent.removeMonitor(m); canvasRightClickMonitors[id] = nil }
+        if let m = canvasCursorMonitors[id] { NSEvent.removeMonitor(m); canvasCursorMonitors[id] = nil }
         ExportManager.shared.unregisterHandlers(for: id)
         windows[id] = nil
         order.removeAll { $0 == id }

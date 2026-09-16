@@ -176,7 +176,15 @@ final class CanvasState: ObservableObject {
     /// （`makeFirstResponder(nil)` 常常当场被还回去）
     var chatCardFocused = false
     /// 画布标题，历史列表里显示
-    @Published var title: String = "未命名画布"
+    /// 新画布的默认名：**创建时的日期时间**。
+    /// 以前一律叫「未命名画布」，开几张就分不清谁是谁
+    static func defaultTitle(_ date: Date = Date()) -> String {
+        let f = DateFormatter()
+        f.dateFormat = "yyyy-MM-dd HH:mm"
+        return f.string(from: date)
+    }
+
+    @Published var title: String = CanvasState.defaultTitle()
 
     /// 这张画布产出过的素材（AI 生成的 + 操作栏处理出来的）。
     /// 节点删了产物还在，所以单独记一份 —— 左侧栏的「资产库」列的就是它
@@ -298,9 +306,10 @@ final class CanvasState: ObservableObject {
         AIVideoService.shared.saveCanvas(snapshot(), id: id, title: derivedTitle)
     }
 
-    /// 画布标题：取第一个有内容的节点。全空就留「未命名画布」——
-    /// 历史列表里一排「未命名」认不出谁是谁
-    var derivedTitle: String {
+    /// 画布标题：取第一个有内容的节点。
+    /// **一张卡片都没有时返回 nil** —— 那就别动标题，留着新建时那个日期时间名，
+    /// 不然每存一次盘就把名字冲回固定的「未命名画布」
+    var derivedTitle: String? {
         nodes.compactMap { n -> String? in
             if n.kind == .text {
                 let t = n.text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -309,7 +318,7 @@ final class CanvasState: ObservableObject {
             let p = n.prompt.trimmingCharacters(in: .whitespacesAndNewlines)
             if !p.isEmpty { return String(p.prefix(20)) }
             return n.mediaURL?.lastPathComponent
-        }.first ?? "未命名画布"
+        }.first
     }
 
     /// 打开画布时跟素材库对一次账：有 assetID 的卡片，**名字和文件路径**都取素材当前的值。
@@ -1407,7 +1416,7 @@ extension CanvasState {
         selectedGroupID = nil
         editingTextNodeID = nil
         self.conversationID = conversationID
-        title = "未命名画布"
+        title = CanvasState.defaultTitle()
         clearUndoHistory()
     }
 }

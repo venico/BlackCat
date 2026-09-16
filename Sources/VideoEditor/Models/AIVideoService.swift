@@ -1300,7 +1300,9 @@ final class AIVideoService: ObservableObject {
         saveCurrentConversation()
         stashInputDraft()
         let id = UUID()
-        history.insert(ConversationRecord(id: id, title: "未命名画布", createdAt: Date(),
+        let now = Date()
+        history.insert(ConversationRecord(id: id, title: CanvasState.defaultTitle(now),
+                                          createdAt: now,
                                           entries: [], canvas: .init()), at: 0)
         // 画布跟聊天一样算「当前会话」，否则历史列表的高亮会一直停在上次那条对话上
         currentConversationId = id
@@ -1433,11 +1435,13 @@ final class AIVideoService: ObservableObject {
     }
 
     /// 保存一张画布的当前状态
-    func saveCanvas(_ snapshot: ConversationRecord.CanvasSnapshot, id: UUID, title: String) {
+    /// - Parameter title: 按画布内容算出来的标题。**nil = 画布还是空的**，
+    ///   这时不动标题，留着新建时那个日期时间名
+    func saveCanvas(_ snapshot: ConversationRecord.CanvasSnapshot, id: UUID, title: String?) {
         guard let i = history.firstIndex(where: { $0.id == id }) else { return }
         history[i].canvas = snapshot
         // 用户自己起过名字就别再按内容改回去
-        if !history[i].titleIsCustom { history[i].title = title }
+        if let title, !history[i].titleIsCustom { history[i].title = title }
         saveHistoryToDisk()
     }
 

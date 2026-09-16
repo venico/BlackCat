@@ -332,7 +332,7 @@ struct CanvasOverlay: View {
     }
 
     /// 把画布存回它那条会话记录。标题取第一个有内容的节点，
-    /// 全空就留「未命名画布」—— 历史列表里一排「未命名」认不出谁是谁
+    /// 空画布不动标题 —— 留着新建时那个日期时间名
     private func saveCanvas() { canvas.persist() }
 }
 
@@ -1298,6 +1298,7 @@ struct CanvasKeyMonitor: ViewModifier {
             // 只认当前窗口的按键，否则别的窗口按空格这边也会跟着进拖拽模式
             guard let w = event.window,
                   WindowManager.shared.id(of: w) == windowID else { return event }
+            syncSpaceHeld(in: w)
             // 正在输入文字时这些键都归输入框。
             //
             // **判据是我们自己维护的两个状态，不是 NSWindow.firstResponder** ——
@@ -1335,31 +1336,21 @@ struct CanvasKeyMonitor: ViewModifier {
             // ⌘C / ⌘V。正在输入文字时不拦 —— 那时候归输入框自己复制粘贴
             if event.type == .keyDown, !editing,
                event.modifierFlags.contains(.command) {
-                // 焦点在**聊天卡片的输入框**里才让给它。
+                // 只把按键让给**真正在编辑**的输入框，判据是 field editor：
+                // NSTextField（组名、重命名这类）只有被点进去时，AppKit 才把
+                // field editor 装上来 —— 它在，就说明用户确实在打字。
                 //
-                // 原来只判断「是不是可编辑文本框」，而那个 NSTextView 会长期
-                // 占着 firstResponder（卡片收起了也占着）—— 结果画布再也粘不了东西。
-                // 现在还要求它确实落在卡片那块地方上，卡片收起时 rect 是 zero，
-                // 一律归画布
-                // 焦点在能编辑的文本框里就让给它，但**会话卡片要单独判断**：
-                // 它那个 NSTextView 会长期霸着 firstResponder，点了画布空白
-                // 也不放手，只认焦点的话画布就再也粘不了东西。
-                // 节点的提示词栏、文本卡片没这毛病，焦点在就是在
-                if let tv = w.firstResponder as? NSTextView, tv.isEditable,
-                   let content = w.contentView {
-                    let inWindow = tv.convert(tv.bounds, to: nil)
-                    let inContent = content.convert(inWindow, from: nil)
-                    let r = content.isFlipped
-                        ? inContent
-                        : CGRect(x: inContent.minX,
-                                 y: content.bounds.height - inContent.maxY,
-                                 width: inContent.width, height: inContent.height)
-                    let isChatCard = !canvas.chatCardRect.isEmpty
-                                  && canvas.chatCardRect.intersects(r)
-                    if isChatCard ? canvas.chatCardFocused : true {
-                        DiagLog.log("[画布] 按键让给文本框 isChatCard=\(isChatCard) tvRect=\(r)")
-                        return event
-                    }
+                // **不能拿「firstResponder 是不是可编辑 NSTextView」当判据** ——
+                // 提示词栏、聊天输入框这些独立 NSTextView 一挂上视图层级就自动占着
+                // firstResponder（用户根本没点过它），画布上只要有一张带输入框的卡片，
+                // ⌘C / ⌘V 就再也落不到画布上。日志里那条
+                // 「按键让给文本框 isChatCard=false tvRect=(173, 598, 692, 56)」就是它。
+                //
+                // 画布自己那三种输入态（提示词栏 / 文字卡片 / 聊天卡片），
+                // 上面的 editing 已经拿自维护状态判过了，这里不用再管
+                if let tv = w.firstResponder as? NSTextView, tv.isEditable, tv.isFieldEditor {
+                    DiagLog.log("[画布] 按键让给 field editor")
+                    return event
                 }
                 switch event.charactersIgnoringModifiers?.lowercased() {
                 case "c":
@@ -1371,7 +1362,11 @@ struct CanvasKeyMonitor: ViewModifier {
                 case "v":
                     // 画布自己复制过卡片就粘卡片；没有的话看系统剪贴板 ——
                     // 截图、访达里复制的文件、一段文字，都能直接落成卡片
-                    return canvas.pasteHere() ? nil : event
+                    let pasted = canvas.pasteHere()
+                    DiagLog.log("[画布] ⌘V "
+                                + (pasted ? "粘上了" : "剪贴板里没有能落成卡片的东西")
+                                + " 类型=\(NSPasteboard.general.types?.map(\.rawValue) ?? [])")
+                    return pasted ? nil : event
                 default: break
                 }
             }
@@ -1404,27 +1399,7 @@ struct CanvasKeyMonitor: ViewModifier {
                 canvas.isSpaceHeld = false
                 return nil
             }
-            let held = (event.type == .keyDown)
-            if held != canvas.isSpaceHeld {
-                canvas.isSpaceHeld = held
-                // **必须禁掉窗口的 cursor rect**，光靠自己反复 set 抢不过系统：
-                // 每个 AppKit/SwiftUI 控件都在自己的区域注册了光标（按钮的箭头、
-                // 文本的 I 形…），鼠标一移动系统就按 cursor rect 重设一次，
-                // 我们再设回手 —— 一来一回就是「手和箭头之间闪」。
-                // 禁用之后这套自动重设整个停掉，光标才真正听我们的
-                if held {
-                    w.disableCursorRects()
-                    NSCursor.openHand.set()
-                    // 在键盘事件的处理周期里 set 光标，屏幕上往往要等到下一次
-                    // 鼠标事件才反映出来 —— 表现就是「按下空格没反应，
-                    // 鼠标动一下才变手」。补一次异步的，当场就变
-                    DispatchQueue.main.async { NSCursor.openHand.set() }
-                } else {
-                    w.enableCursorRects()
-                    NSCursor.arrow.set()
-                    DispatchQueue.main.async { NSCursor.arrow.set() }
-                }
-            }
+            setSpaceHeld(event.type == .keyDown, in: w)
             return nil   // 吞掉，免得底下的时间轴拿去播放/暂停
         }
 
@@ -1538,10 +1513,60 @@ struct CanvasKeyMonitor: ViewModifier {
             return nil
         }
 
+        // 鼠标一动就核对一次「空格到底还按着没有」。
+        //
+        // **keyUp 是会丢的**：按住空格平移时如果按下 ⌘（系统在 ⌘ 按住期间不投递
+        // 其它键的 keyUp）、或中途切到别的 app 再回来，松开的那一下这里根本收不到。
+        // 状态就此卡在「按住」：光标一直是手掌、点击全被画布拿去平移 ——
+        // 表现是「输入框点不出光标、按钮点不动」，而且怎么按空格都好不了
+        // （因为 keyDown 时状态已经是 true，不会再切换）
+        let cursorMonitor = NSEvent.addLocalMonitorForEvents(
+            matching: [.mouseMoved, .leftMouseDragged, .flagsChanged]) { event in
+            if let w = event.window, WindowManager.shared.id(of: w) == windowID {
+                syncSpaceHeld(in: w)
+            }
+            return event
+        }
+
+        WindowManager.shared.setCanvasCursorMonitor(cursorMonitor, for: windowID)
         WindowManager.shared.setCanvasSpaceMonitor(keyMonitor, for: windowID)
         WindowManager.shared.setCanvasScrollMonitor(scrollMonitor, for: windowID)
         WindowManager.shared.setCanvasFocusMonitor(focusMonitor, for: windowID)
         WindowManager.shared.setCanvasRightClickMonitor(rightMonitor, for: windowID)
+    }
+
+    /// 空格这会儿是不是**真的**按着。问的是键盘的物理状态，不靠我们自己数
+    /// keyDown / keyUp —— 那两个事件会丢（见 cursorMonitor 那段注释）。49 = 空格
+    private var spaceIsPhysicallyDown: Bool {
+        CGEventSource.keyState(.combinedSessionState, key: 49)
+    }
+
+    /// 状态跟物理键对不上就掰回来。鼠标一动、按任意键时都核对一次
+    private func syncSpaceHeld(in w: NSWindow) {
+        if canvas.isSpaceHeld, !spaceIsPhysicallyDown { setSpaceHeld(false, in: w) }
+    }
+
+    /// 进/出画布平移模式：状态 + 光标一起切。
+    ///
+    /// **必须禁掉窗口的 cursor rect**，光靠自己反复 set 抢不过系统：
+    /// 每个 AppKit/SwiftUI 控件都在自己的区域注册了光标（按钮的箭头、文本的 I 形…），
+    /// 鼠标一移动系统就按 cursor rect 重设一次，我们再设回手 —— 一来一回就是
+    /// 「手和箭头之间闪」。禁用之后这套自动重设整个停掉，光标才真正听我们的
+    private func setSpaceHeld(_ held: Bool, in w: NSWindow) {
+        guard held != canvas.isSpaceHeld else { return }
+        canvas.isSpaceHeld = held
+        if held {
+            w.disableCursorRects()
+            NSCursor.openHand.set()
+            // 在键盘事件的处理周期里 set 光标，屏幕上往往要等到下一次鼠标事件
+            // 才反映出来 —— 表现就是「按下空格没反应，鼠标动一下才变手」。
+            // 补一次异步的，当场就变
+            DispatchQueue.main.async { NSCursor.openHand.set() }
+        } else {
+            w.enableCursorRects()
+            NSCursor.arrow.set()
+            DispatchQueue.main.async { NSCursor.arrow.set() }
+        }
     }
 
     private func remove() {
@@ -1556,6 +1581,7 @@ struct CanvasKeyMonitor: ViewModifier {
         WindowManager.shared.setCanvasScrollMonitor(nil, for: windowID)
         WindowManager.shared.setCanvasFocusMonitor(nil, for: windowID)
         WindowManager.shared.setCanvasRightClickMonitor(nil, for: windowID)
+        WindowManager.shared.setCanvasCursorMonitor(nil, for: windowID)
     }
 }
 

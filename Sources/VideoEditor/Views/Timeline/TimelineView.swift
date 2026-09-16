@@ -1358,6 +1358,7 @@ struct TimelineView: View {
                     if let transClipID = hitTestTransitionIcon(at: v.startLocation) {
                         project.selectedTransitionClipID = transClipID
                         project.mediaLibraryTab = "transition"
+                        project.effectCategory = "effTransition"   // 连子标签一起切，否则停在特效那页
                         project.selectedVideoClipID    = nil
                         project.selectedImageClipID    = nil
                         project.selectedAudioClipID    = nil
@@ -1618,6 +1619,7 @@ struct TimelineView: View {
         if let transClipID = hitTestTransitionIcon(at: pt) {
             project.selectedTransitionClipID = transClipID
             project.mediaLibraryTab = "transition"
+                        project.effectCategory = "effTransition"   // 连子标签一起切，否则停在特效那页
             // 清除片段选中
             project.selectedVideoClipID = nil
             project.selectedImageClipID = nil
@@ -3244,6 +3246,7 @@ struct TimelineView: View {
                 .onTapGesture {
                     project.selectedTransitionClipID = pair.clipID
                     project.mediaLibraryTab = "transition"
+                        project.effectCategory = "effTransition"   // 连子标签一起切，否则停在特效那页
                     project.selectedVideoClipID    = nil
                     project.selectedImageClipID    = nil
                     project.selectedAudioClipID    = nil
