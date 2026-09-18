@@ -3188,7 +3188,11 @@ struct AdjustInspector: View {
 
     @State private var adjust = ColorAdjust.identity
     @State private var startTime: Double = 0
+    @State private var endTime: Double = 0
     @State private var duration: Double = 3
+    /// 回填中。**没有这道闸门滑块就拖不动** —— 拖一下写进片段，片段一变又回填，
+    /// 正在拖的值被按回去，手感就是「怎么拖都没反应」。滤镜那边一直是这么挡的
+    @State private var syncing = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -3199,31 +3203,42 @@ struct AdjustInspector: View {
             }
 
             ISection(title: "时间") {
-                let span = max(project.contentEndTime, 1)
+                // 上限要盖住当前值 —— 片段比内容还长时（调节轨常有），
+                // 值落在 range 外，滑块会被钳在边上
+                let span = max(project.contentEndTime, clip.startTime + clip.duration, 1)
                 ISlider(label: "开始", value: $startTime, range: 0...span, unit: "秒", decimals: 2)
                     .onChange(of: startTime) { _ in
-                        let s = max(0, startTime)
-                        project.updateAdjustClip(id: clip.id) { $0.startTime = s; $0.endTime = s + duration }
+                        // 起点不能越过终点，至少留 0.1 秒
+                        let s = max(0, min(startTime, endTime - 0.1))
+                        write { $0.startTime = s }
                     }
                 ISlider(label: "持续", value: $duration, range: 0.1...span, unit: "秒", decimals: 2)
                     .onChange(of: duration) { _ in
-                        let d = max(0.1, duration)
-                        project.updateAdjustClip(id: clip.id) { $0.endTime = $0.startTime + d }
+                        endTime = startTime + max(duration, 0.1)
+                        write { $0.endTime = endTime }
                     }
             }
         }
         .onAppear { sync() }
         .onChange(of: clip.id) { _ in sync() }
-        .onChange(of: clip.startTime) { v in if abs(v - startTime) > 0.001 { startTime = v } }
-        .onChange(of: clip.endTime) { _ in
-            if abs(clip.duration - duration) > 0.001 { duration = clip.duration }
-        }
+        .onChange(of: clip.startTime) { _ in sync() }
+        .onChange(of: clip.endTime) { _ in sync() }
+    }
+
+    /// 回填期间挡住写入，否则「写→回填→再写」会把拖动中的值冲掉
+    private func write(_ mutate: @escaping (inout AdjustClip) -> Void) {
+        guard !syncing else { return }
+        project.pushUndoThrottled()
+        project.updateAdjustClip(id: clip.id, mutate)
     }
 
     private func sync() {
+        syncing = true
         adjust = clip.adjust
         startTime = clip.startTime
-        duration = clip.duration
+        endTime = clip.endTime
+        duration = max(clip.duration, 0.1)
+        DispatchQueue.main.async { syncing = false }
     }
 }
 

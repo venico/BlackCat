@@ -265,8 +265,10 @@ struct MediaLibraryView: View {
                     // 音频和字幕没有画面，不给这个按钮
                     if canSwitchViewMode {
                         MediaToolBtn(svgName: project.mediaViewMode.svgName,
-                                     help: project.mediaViewMode.help) {
-                            project.mediaViewMode = project.mediaViewMode.next
+                                     help: project.mediaViewMode.help(
+                                        allowOriginal: project.supportsOriginalViewMode(project.libraryCategory))) {
+                            project.mediaViewMode = project.mediaViewMode.next(
+                                allowOriginal: project.supportsOriginalViewMode(project.libraryCategory))
                         }
                     }
                     MediaToolBtn(svgName: "sort", help: "排序") {

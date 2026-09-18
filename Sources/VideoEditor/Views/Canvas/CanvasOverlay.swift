@@ -510,6 +510,14 @@ private struct CanvasSurface: View {
 
     /// 输入框自己的宽度（`CanvasPromptBar` 里写死 720），钳位置要用
     static let promptBarWidth: CGFloat = 720
+
+    /// 提示词栏占的地方，报给按键监听用。**位置只能拿算出来的那套** ——
+    /// 它是靠 `.offset` 摆的，`frame(in: .global)` 报的是挪动前的位置。
+    /// y 补上 topGap，跟监听那边的窗口内容坐标对齐
+    private func reportPromptBarRect(x: CGFloat, y: CGFloat, h: CGFloat) {
+        canvas.promptBarRect = CGRect(x: x, y: y + canvas.topGap,
+                                      width: Self.promptBarWidth, height: max(1, h))
+    }
     /// 给输入框留的最小高度，贴到画布底边时按这个钳住
     static let promptBarMinRoom: CGFloat = 150
 
@@ -1017,14 +1025,28 @@ private struct CanvasSurface: View {
                     y: n.position.y + n.renderSize.height
                        - CanvasNodeView.labelHeight / 2
                        + (n.kind == .text ? CanvasNodeView.edgeStraddle / 2 : 0)))
+                let barX = min(max(12, anchor.x - Self.promptBarWidth / 2),
+                               max(12, containerSize.width - Self.promptBarWidth - 12))
+                let barY = min(anchor.y + 20,
+                               max(12, containerSize.height - Self.promptBarMinRoom))
                 CanvasPromptBar(canvas: canvas, node: n)
                     .environmentObject(project)
                     .fixedSize()
+                    // 位置是算出来的（.offset 不改布局，量不出真实位置），
+                    // 直接拿这套数报给监听层：点击落在这块里就算「在输入框里打字」
+                    .background(GeometryReader { g in
+                        Color.clear
+                            .onAppear { reportPromptBarRect(x: barX, y: barY, h: g.size.height) }
+                            .onChange(of: g.size.height) { _, h in
+                                reportPromptBarRect(x: barX, y: barY, h: h)
+                            }
+                            .onChange(of: barY) { _, y in
+                                reportPromptBarRect(x: barX, y: y, h: g.size.height)
+                            }
+                            .onDisappear { canvas.promptBarRect = .zero }
+                    })
                     // 卡片贴边时输入框会被画布的圆角裁掉，钳回可视区里
-                    .offset(x: min(max(12, anchor.x - Self.promptBarWidth / 2),
-                                   max(12, containerSize.width - Self.promptBarWidth - 12)),
-                            y: min(anchor.y + 20,
-                                   max(12, containerSize.height - Self.promptBarMinRoom)))
+                    .offset(x: barX, y: barY)
                     .transition(.opacity)
                     // 动画只归输入框自己。挂在整层上的话，新建卡片会设选中，
                     // 卡片跟着一起做位移动画 —— 那就是「加卡片时有多余动画」的来源
@@ -1310,8 +1332,13 @@ struct CanvasKeyMonitor: ViewModifier {
             // 都该归输入框，画布不能抢（实测在里头按 ⌘Z，撤销的是画布上的操作）。
             // 它不能只看 firstResponder —— 那个 NSTextView 一挂上视图层级就自动
             // 成了第一响应者，得再要求「用户确实点进了卡片那块地方」
-            let editing = canvas.promptBarFocused || canvas.editingTextNodeID != nil
-                       || typingInChatCard(w)
+            // 状态说「在输入」还不够，**第一响应者也得真的是个可编辑文本视图**。
+            // 这两个状态是靠点击/焦点回调维护的，会粘住 —— 日志里见过
+            // `delete editing=true promptFocus=true 选中=1`：用户早就在画布上点了卡片，
+            // promptBarFocused 还留着 true，delete 于是一直被让给输入框
+            let responderIsEditableText = (w.firstResponder as? NSTextView)?.isEditable == true
+            let editing = (canvas.promptBarFocused || canvas.editingTextNodeID != nil
+                           || typingInChatCard(w)) && responderIsEditableText
             if event.type == .keyDown, event.keyCode == 51 || event.keyCode == 117 {
                 let a = "editing=\(editing) promptFocus=\(canvas.promptBarFocused)"
                 let b = "editingText=\(canvas.editingTextNodeID != nil)"
@@ -1365,6 +1392,11 @@ struct CanvasKeyMonitor: ViewModifier {
                     let pasted = canvas.pasteHere()
                     DiagLog.log("[画布] ⌘V "
                                 + (pasted ? "粘上了" : "剪贴板里没有能落成卡片的东西")
+                                + " promptFocus=\(canvas.promptBarFocused)"
+                                + " editingText=\(canvas.editingTextNodeID != nil)"
+                                + " chatFocus=\(canvas.chatCardFocused)"
+                                + " chatRect空=\(canvas.chatCardRect.isEmpty)"
+                                + " 响应者=\(type(of: w.firstResponder as Any))"
                                 + " 类型=\(NSPasteboard.general.types?.map(\.rawValue) ?? [])")
                     return pasted ? nil : event
                 default: break
@@ -1416,6 +1448,10 @@ struct CanvasKeyMonitor: ViewModifier {
                 : CGPoint(x: inContent.x, y: content.bounds.height - inContent.y)
             canvas.chatCardFocused = !canvas.chatCardRect.isEmpty
                                    && canvas.chatCardRect.contains(pt)
+            // 提示词栏同理：**点击落点说了算**，不指望 SwiftUI 的焦点回调 ——
+            // 那个只在选区变化时来，点一下出光标但没敲字就不触发
+            let inPromptBar = !canvas.promptBarRect.isEmpty && canvas.promptBarRect.contains(pt)
+            if canvas.promptBarFocused != inPromptBar { canvas.promptBarFocused = inPromptBar }
             return event
         }
 

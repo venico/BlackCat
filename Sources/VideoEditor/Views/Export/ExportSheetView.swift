@@ -168,9 +168,19 @@ private struct ExportJobBubble: View {
                 Circle()
                     .fill(iconBgColor)
                     .frame(width: 28, height: 28)
-                Image(systemName: iconName)
-                    .font(.system(size: 12, weight: .semibold))
-                    .foregroundColor(iconFgColor)
+                // 导出中 / 导出完成都用素材库那个导出图标；失败还是警告三角
+                if job.state == .failed {
+                    Image(systemName: iconName)
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundColor(iconFgColor)
+                } else {
+                    Image(nsImage: SidebarSVGIcon.load("exportFile", size: 15))
+                        .renderingMode(.template)
+                        .resizable()
+                        .aspectRatio(contentMode: .fit)
+                        .frame(width: 15, height: 15)
+                        .foregroundColor(iconFgColor)
+                }
             }
 
             VStack(alignment: .leading, spacing: 3) {

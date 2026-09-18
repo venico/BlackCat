@@ -1083,9 +1083,11 @@ final class ProjectState: ObservableObject {
         case original
         case list
 
-        var next: MediaViewMode {
+        /// - Parameter allowOriginal: 这个分类认不认「原始比例」。
+        ///   音频和字幕没有画面，按原始比例摆没有意义，它们只在宫格 / 列表之间转
+        func next(allowOriginal: Bool) -> MediaViewMode {
             switch self {
-            case .grid: return .original
+            case .grid: return allowOriginal ? .original : .list
             case .original: return .list
             case .list: return .grid
             }
@@ -1101,9 +1103,10 @@ final class ProjectState: ObservableObject {
             }
         }
 
-        var help: String {
+        /// 提示里要说清「下一下会切到哪」，所以也得看这个分类认不认原始比例
+        func help(allowOriginal: Bool) -> String {
             switch self {
-            case .grid: return "等比宫格（点击切原始比例）"
+            case .grid: return allowOriginal ? "等比宫格（点击切原始比例）" : "等比宫格（点击切列表）"
             case .original: return "原始比例（点击切列表）"
             case .list: return "列表（点击切等比宫格）"
             }
@@ -1118,8 +1121,20 @@ final class ProjectState: ObservableObject {
         set { setViewMode(newValue, for: libraryCategory) }
     }
 
+    /// 这个分类支不支持「原始比例」。只有视频和图片有画面，
+    /// 音频、字幕（以及文字、图形那两页）都没有，给它们这个选项没意义
+    func supportsOriginalViewMode(_ key: String) -> Bool {
+        // 画布素材浏览器的 key 带前缀（canvas.video），只看最后一段
+        let kind = key.split(separator: ".").last.map(String.init) ?? key
+        return kind == "video" || kind == "image"
+    }
+
     func viewMode(for key: String) -> MediaViewMode {
-        if let raw = mediaViewModeByKey[key], let m = MediaViewMode(rawValue: raw) { return m }
+        if let raw = mediaViewModeByKey[key], let m = MediaViewMode(rawValue: raw) {
+            // 早先存过「原始比例」的分类，现在不认了就退回宫格
+            if m == .original, !supportsOriginalViewMode(key) { return .grid }
+            return m
+        }
         // 还没切过的：沿用旧的那个布尔开关，老项目打开不会突然换个样子
         return (mediaGridModeByKey[key] ?? true) ? .grid : .list
     }

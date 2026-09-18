@@ -547,7 +547,7 @@ struct ContentView: View {
             exportManager.registerHandlers(
                 for: windowID,
                 onSuccess: { [weak project] filename, url in
-                    project?.showSuccessToast(icon: "checkmark",
+                    project?.showSuccessToast(icon: "exportDone",
                                               title: filename.truncatedFileName(maxVisualWidth: 24),
                                               subtitle: "导出完成", revealURL: url)
                 },
@@ -795,6 +795,8 @@ private struct SuccessToastBubble: View {
         "exclamationmark.triangle.fill": ("toastWarn",    Color(hex: "#FF9230")),
         "exclamationmark.circle.fill":   ("toastWarn",    Color(hex: "#FF9230")),
         "stop.fill":                     ("toastStop",    Color(hex: "#FF9230")),
+        // 导出完成：用素材库那个导出图标，比通用的对勾一眼认得出是导出
+        "exportDone":                    ("exportFile",   Color(hex: "#30D158")),
         // AI 生成完的插入提示：用素材库侧边栏那套图标，颜色跟其他通知一样走主题黄
         "video":                         ("video",        Color.accent),
         "image":                         ("image",        Color.accent),

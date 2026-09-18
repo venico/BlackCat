@@ -71,12 +71,16 @@ struct CanvasSideBar: View {
 
     /// 抽屉跟弹窗共用 `CanvasAssetBrowser` —— 标题、标签、搜索、格子样式一套，
     /// 差别只有外壳尺寸和它挂在哪
+    /// 素材库抽屉正待在哪个文件夹里。放这一层是因为**路径跟标题合成了一行**
+    @State private var libraryFolderID: UUID?
+
     private func drawer(for panel: Panel) -> some View {
         VStack(spacing: 0) {
             HStack {
-                Text("素材库")
-                    .font(.system(size: 13, weight: .semibold))
-                    .foregroundColor(Color.labelSecondary)
+                // 标题就是路径的第一级：素材库 / A / B，上一级可点
+                CanvasLibraryCrumb(chain: canvasFolderChain(libraryFolderID,
+                                                            in: MediaLibrary.shared.folders),
+                                   size: 13) { libraryFolderID = $0 }
                 Spacer()
                 Button { self.panel = nil } label: {
                     Image(systemName: "xmark")
@@ -95,6 +99,7 @@ struct CanvasSideBar: View {
             CanvasAssetBrowser(
                 canvas: canvas,
                 cellWidth: 92,
+                currentFolderID: $libraryFolderID,
                 onPick: onPickAsset)
                 .environmentObject(project)
         }

@@ -23,13 +23,14 @@ struct CanvasAssetBrowser: View {
     var onMarquee: ([URL]) -> Void = { _ in }
     /// 每行几列由外壳定：弹窗宽、抽屉窄
     var cellWidth: CGFloat = 96
+    /// 正待在哪个文件夹里。nil = 最外层。跟侧栏素材库是同一份数据，那边建的这儿立刻就有。
+    /// **由外壳持有** —— 路径跟标题合成了一行（「素材库 / 新建文件夹」，上一级可点），
+    /// 那行画在外壳上，所以这个 id 得让外面也能改
+    @Binding var currentFolderID: UUID?
     var onPick: (URL, CanvasNode.Kind) -> Void
 
     @State private var keyword = ""
     @State private var tab: Tab = .all
-    /// 正待在哪个文件夹里。nil = 最外层。跟侧栏素材库是同一份数据，
-    /// 那边建的文件夹这儿立刻就有
-    @State private var currentFolderID: UUID?
     /// 鼠标停在哪个文件夹上（前盖跟着张开）
     @State private var hoveredFolder: UUID?
     @ObservedObject private var library = MediaLibrary.shared
@@ -153,35 +154,6 @@ struct CanvasAssetBrowser: View {
     /// 四类都能切宫格。音频没有封面，格子里拿分类图标顶上
     private var canSwitchViewMode: Bool { true }
 
-    /// 路径栏：素材库 / A / B，点哪一级回哪一级
-    private var folderCrumb: some View {
-        HStack(spacing: 3) {
-            Button { currentFolderID = nil } label: {
-                Text("素材库")
-                    .font(.system(size: 11))
-                    .foregroundColor(Color.labelSecondary)
-                    .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            ForEach(Array(folderChain.enumerated()), id: \.element.id) { i, f in
-                Text("/").font(.system(size: 10)).foregroundColor(Color.labelSecondary.opacity(0.45))
-                Button { currentFolderID = f.id } label: {
-                    Text(f.name)
-                        .font(.system(size: 11,
-                                      weight: i == folderChain.count - 1 ? .medium : .regular))
-                        .foregroundColor(i == folderChain.count - 1
-                                         ? Color.labelPrimary : Color.labelSecondary)
-                        .lineLimit(1)
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-            }
-            Spacer(minLength: 0)
-        }
-        .padding(.horizontal, 20)
-        .padding(.bottom, 6)
-    }
-
     /// 宫格里的文件夹格子。皮相跟侧栏素材库共用同一个组件，双击进去
     private func folderCell(_ f: LibraryFolder) -> some View {
         VStack(spacing: 0) {
@@ -281,8 +253,6 @@ struct CanvasAssetBrowser: View {
         VStack(spacing: 0) {
             tabBar
             searchRow
-
-            if !folderChain.isEmpty { folderCrumb }
 
             if items.isEmpty && visibleFolders.isEmpty {
                 Spacer()
@@ -549,7 +519,11 @@ struct CanvasAssetBrowser: View {
             searchField
             // 缩略图 / 列表切换，跟侧边栏那个同一个开关
             if canSwitchViewMode {
-            Button { project.setViewMode(viewMode.next, for: viewModeKey) } label: {
+            Button {
+                project.setViewMode(
+                    viewMode.next(allowOriginal: project.supportsOriginalViewMode(viewModeKey)),
+                    for: viewModeKey)
+            } label: {
                 Image(nsImage: SidebarSVGIcon.load(viewMode.svgName, size: 13))
                     .renderingMode(.template)
                     .resizable()
@@ -561,7 +535,7 @@ struct CanvasAssetBrowser: View {
                     .contentShape(RoundedRectangle(cornerRadius: 8))
             }
             .buttonStyle(.plain)
-            .help(viewMode.help)
+            .help(viewMode.help(allowOriginal: project.supportsOriginalViewMode(viewModeKey)))
             }
 
             Button { showSortNSMenu(project: project) } label: {
@@ -765,6 +739,67 @@ private struct AssetCell<Menu: View>: View {
 
 // MARK: - 弹窗外壳
 
+/// 标题那一行：「素材库 / 文件夹 A / 文件夹 B」。
+/// 上一级可点，点了就跳回那一层 —— 路径不再单独占一行，跟标题合在一起
+struct CanvasLibraryCrumb: View {
+    let chain: [LibraryFolder]
+    /// 字号跟着外壳走：抽屉 13、弹窗 15
+    var size: CGFloat = 13
+    let onPick: (UUID?) -> Void
+
+    @State private var hovering: UUID?
+    /// 根那一级没有 id，单独记
+    @State private var rootHover = false
+
+    var body: some View {
+        HStack(spacing: 4) {
+            crumb("素材库", isLast: chain.isEmpty, hover: rootHover,
+                  onHover: { rootHover = $0 }) { onPick(nil) }
+            ForEach(Array(chain.enumerated()), id: \.element.id) { i, f in
+                Text("/")
+                    .font(.system(size: size - 2, weight: .semibold))
+                    .foregroundColor(Color.labelSecondary.opacity(0.45))
+                crumb(f.name, isLast: i == chain.count - 1, hover: hovering == f.id,
+                      onHover: { on in hovering = on ? f.id : (hovering == f.id ? nil : hovering) }) {
+                    onPick(f.id)
+                }
+            }
+        }
+    }
+
+    /// 当前这一级不是按钮（点了也没地方去），上级才可点、hover 才变亮
+    @ViewBuilder
+    private func crumb(_ text: String, isLast: Bool, hover: Bool,
+                       onHover: @escaping (Bool) -> Void,
+                       action: @escaping () -> Void) -> some View {
+        if isLast {
+            Text(text)
+                .font(.system(size: size, weight: .semibold))
+                .foregroundColor(Color.labelPrimary)
+                .lineLimit(1)
+        } else {
+            Text(text)
+                .font(.system(size: size, weight: .semibold))
+                .foregroundColor(hover ? Color.labelPrimary : Color.labelSecondary)
+                .lineLimit(1)
+                .contentShape(Rectangle())
+                .onHover(perform: onHover)
+                .onTapGesture(perform: action)
+        }
+    }
+}
+
+/// 从最外层到某个文件夹的那条路径。抽屉和弹窗都靠它铺面包屑
+func canvasFolderChain(_ id: UUID?, in folders: [LibraryFolder]) -> [LibraryFolder] {
+    var chain: [LibraryFolder] = []
+    var cur = id
+    while let c = cur, chain.count < 32, let f = folders.first(where: { $0.id == c }) {
+        chain.insert(f, at: 0)
+        cur = f.parentID
+    }
+    return chain
+}
+
 /// 从素材库挑（弹窗版）。标题、边距、关闭按钮都按「设置」那套来。
 /// `multiSelect` 打开时点格子是勾选/取消，底下多一排取消+确定
 struct CanvasAssetPicker: View {
@@ -809,22 +844,16 @@ struct CanvasAssetPicker: View {
         .padding(.vertical, 16)
     }
 
-    /// 标题跟着能选的类型走。图片视频音频**三样全收时就不必一一列出来**了 ——
-    /// 「选择图片 / 视频 / 音频素材」又长又没信息量，不如就叫「选择素材」
-    private var title: String {
-        guard let ks = limitKinds, !ks.isEmpty else { return "从素材库选择" }
-        let media: Set<CanvasNode.Kind> = [.image, .video, .audio]
-        if media.isSubset(of: ks) { return "选择素材" }
-        let names = CanvasNode.Kind.allCases.filter { ks.contains($0) }.map(\.label)
-        return "选择" + names.joined(separator: " / ") + "素材"
-    }
+    /// 正待在哪个文件夹里。放在这一层是因为**路径要跟标题合成一行**画在上面
+    @State private var currentFolderID: UUID?
+    @ObservedObject private var library = MediaLibrary.shared
 
     var body: some View {
         VStack(spacing: 0) {
             HStack {
-                Text(title)
-                    .font(.system(size: 15, weight: .semibold))
-                    .foregroundColor(Color.labelSecondary)
+                // 标题就是路径的第一级：素材库 / A / B，上一级可点
+                CanvasLibraryCrumb(chain: canvasFolderChain(currentFolderID, in: library.folders),
+                                   size: 15) { currentFolderID = $0 }
                 Spacer()
                 Button { onPick([]) } label: {
                     Image(systemName: "xmark")
@@ -846,7 +875,8 @@ struct CanvasAssetPicker: View {
                                onMarquee: { urls in
                                    for u in urls where !picked.contains(u) { picked.append(u) }
                                },
-                               cellWidth: 110) { url, _ in
+                               cellWidth: 110,
+                               currentFolderID: $currentFolderID) { url, _ in
                 guard multiSelect else {
                     onPick([project.mediaAssets.first { $0.url == url }].compactMap { $0 })
                     return

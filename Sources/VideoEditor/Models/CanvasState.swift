@@ -552,6 +552,11 @@ final class CanvasState: ObservableObject {
     /// 误判成「归输入框」而全部失效（实测日志：editing=true 但用户只是选中了卡片）。
     /// 改成由用户的实际动作来置位：点进输入框才算在输入，点卡片/空白就收回
     @Published var promptBarFocused = false
+    /// 选中卡片后出现在卡片下方那个输入框占的地方（SwiftUI `.global` 坐标）。
+    /// **靠点击落点判断「用户是不是在这儿打字」** —— SwiftUI 的焦点回调只在选区
+    /// 变化时才来，点一下光标出来了但没敲字，回调根本不触发，
+    /// 状态会一直是 false（日志实测：光标在框里按 ⌘V，promptFocus 还是 false）
+    var promptBarRect: CGRect = .zero
 
     /// 待插入聊天框的提及文字（「@图1」这样）。
     ///
