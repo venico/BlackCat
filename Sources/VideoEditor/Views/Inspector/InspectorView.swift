@@ -608,7 +608,8 @@ enum Translator {
     ///
     /// - Parameter sourceHint: 整批算出来的源语言。只有 Apple 用得上（它要求显式指定
     ///   源语言），批量翻译时由 `translateBatch` 投票产生，见 `dominantLanguage(of:)`
-    static func translate(_ text: String, to lang: String, sourceHint: String? = nil) async -> String {
+    static func translate(_ text: String, to lang: String, sourceHint: String? = nil,
+                          engine: AppSettings.TranslateProvider? = nil) async -> String {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return text }
 
@@ -633,7 +634,7 @@ enum Translator {
 
         var delay: UInt64 = 400_000_000   // 0.4s 起步，每次翻倍
         for attempt in 1...3 {
-            let result = await translateOnce(text, to: engineLang, sourceHint: sourceHint)
+            let result = await translateOnce(text, to: engineLang, sourceHint: sourceHint, engine: engine)
             if result != text {
                 // 校验译文**确实是目标语言**：有的引擎会静默降级，
                 // 既没报错也没翻对，用户拿到一条"翻译过却还是原文语言的轨"。
@@ -662,8 +663,11 @@ enum Translator {
     }
 
     private static func translateOnce(_ text: String, to lang: String,
-                                      sourceHint: String? = nil) async -> String {
-        switch AppSettings.shared.translateProvider {
+                                      sourceHint: String? = nil,
+                                      engine: AppSettings.TranslateProvider? = nil) async -> String {
+        // engine 传了就用它，没传才跟设置走 —— 语音识别弹窗里可以临时换引擎，
+        // 那儿选的不回写设置
+        switch engine ?? AppSettings.shared.translateProvider {
         case .google:   return await translateGoogle(text, to: lang)
         case .deepL:    return await translateDeepL(text, to: lang)
         // 只有 Apple 要显式源语言，其余几家都是 auto
@@ -1035,7 +1039,8 @@ enum Translator {
     /// 批量翻译。先把「本地就能出结果」的挑走（已是目标语言、或只差简繁），
     /// 剩下真需要引擎的才发请求 —— 一整轨中文转繁体因此是零请求。
     static func translateBatch(_ texts: [String], to lang: String,
-                               sourceHint: String? = nil) async -> [String] {
+                               sourceHint: String? = nil,
+                               engine: AppSettings.TranslateProvider? = nil) async -> [String] {
         guard !texts.isEmpty else { return texts }
 
         var output = Array(repeating: "", count: texts.count)
@@ -1055,7 +1060,7 @@ enum Translator {
         // 只拿真要送引擎的那些投票：已是目标语言的条目留在里面会带偏结果
         let hint = sourceHint ?? dominantLanguage(of: pending)
         let engineLang = engineLanguage(for: lang)
-        var translated = await translateEngineBatch(pending, to: engineLang, sourceHint: hint)
+        var translated = await translateEngineBatch(pending, to: engineLang, engine: engine, sourceHint: hint)
         if engineLang != lang {
             translated = translated.map { OpenCC.toTraditional($0) }
         }
@@ -1068,12 +1073,13 @@ enum Translator {
     /// 真正送去翻译引擎的那部分：多条文本用 \n 拼接成一次请求，翻译后按行还原。
     /// 如果行数不匹配则回退到逐条翻译。
     private static func translateEngineBatch(_ texts: [String], to lang: String,
+                                             engine: AppSettings.TranslateProvider? = nil,
                                              sourceHint: String? = nil) async -> [String] {
         guard !texts.isEmpty else { return texts }
 
         // DeepL 有真批量接口：一次请求带走整批，请求数少一个数量级，
         // 是躲开它那个很严的频率限制的正路（串行降并发只会让整轨翻译慢好几倍）
-        if AppSettings.shared.translateProvider == .deepL,
+        if (engine ?? AppSettings.shared.translateProvider) == .deepL,
            let batched = await translateDeepLBatch(texts, to: lang) {
             // 逐条过一遍语言校验：引擎收下了目标语言却回原文语言时要当失败
             return zip(texts, batched).map { src, out in
@@ -1084,11 +1090,11 @@ enum Translator {
             }
         }
 
-        if texts.count == 1 { return [await translate(texts[0], to: lang, sourceHint: sourceHint)] }
+        if texts.count == 1 { return [await translate(texts[0], to: lang, sourceHint: sourceHint, engine: engine)] }
 
         let lineCounts = texts.map { $0.components(separatedBy: "\n").count }
         let combined = texts.joined(separator: "\n")
-        let result = await translate(combined, to: lang, sourceHint: sourceHint)
+        let result = await translate(combined, to: lang, sourceHint: sourceHint, engine: engine)
         let allLines = result.components(separatedBy: "\n")
 
         let expectedTotal = lineCounts.reduce(0, +)
@@ -1105,7 +1111,7 @@ enum Translator {
 
         var results: [String] = []
         for text in texts {
-            results.append(await translate(text, to: lang, sourceHint: sourceHint))
+            results.append(await translate(text, to: lang, sourceHint: sourceHint, engine: engine))
         }
         return results
     }
@@ -1116,6 +1122,7 @@ enum Translator {
     ///   调用方据此逐批回填界面，不用等全部翻完
     static func translateConcurrent(
         _ texts: [String], to lang: String,
+        engine: AppSettings.TranslateProvider? = nil,
         batchSize: Int = 15, concurrency: Int = 6,
         onProgress: (@Sendable (Int) async -> Void)? = nil,
         onBatch: (@Sendable (Int, [String]) async -> Void)? = nil
@@ -1139,7 +1146,7 @@ enum Translator {
             var launched = 0
             for batch in batches.prefix(concurrency) {
                 let b = batch
-                group.addTask { (b.offset, await translateBatch(b.texts, to: lang, sourceHint: hint)) }
+                group.addTask { (b.offset, await translateBatch(b.texts, to: lang, sourceHint: hint, engine: engine)) }
                 launched += 1
             }
             for await (offset, translated) in group {
@@ -1152,7 +1159,7 @@ enum Translator {
 
                 if launched < batches.count {
                     let b = batches[launched]
-                    group.addTask { (b.offset, await translateBatch(b.texts, to: lang, sourceHint: hint)) }
+                    group.addTask { (b.offset, await translateBatch(b.texts, to: lang, sourceHint: hint, engine: engine)) }
                     launched += 1
                 }
             }

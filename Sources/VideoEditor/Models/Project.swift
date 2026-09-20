@@ -827,6 +827,9 @@ final class ProjectState: ObservableObject {
         case failed(String)       // 失败原因
     }
     @Published var transcribeState: TranscribeState = .idle
+    /// 进度卡片上显示的阶段名：先「语音识别」，进到 AI 校对就换成「AI 校对」。
+    /// 校对那段原来挤在 96%~99% 里，卡片看着像卡住了
+    @Published var transcribeStage: String = "语音识别"
     @Published var showWhisperModelPicker = false
     /// 识别前问「直接识别 / 识别+AI校对」的弹窗
     @Published var showTranscribeOptions = false
@@ -840,7 +843,12 @@ final class ProjectState: ObservableObject {
     @Published var translateTrackTick = 0
     /// 校对用哪个文字模型（AIVideoService.Provider 的 rawValue）。
     /// 跟「AI 生成」共用配置，不再单独一套 Key
+    /// 识别后用哪个 AI 模型（校对或 AI 翻译）。空串 = 不用 AI
     @Published var transcribeAIModel = "deepseek-ai"
+    /// 语音识别弹窗里选的翻译方式：
+    /// `""` = 不翻译，`"ai"` = 用大模型翻，其余是 `AppSettings.TranslateProvider` 的取值。
+    /// 默认跟设置里的引擎走，弹窗里改了**不回写设置**
+    @Published var transcribeTranslateEngine = "ai"
     @Published var selectedWhisperModel: WhisperTranscriber.ModelSize = .small
     var transcribeTask: Task<Void, Never>? = nil
     var isTranscribing: Bool {

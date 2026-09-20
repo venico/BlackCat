@@ -1802,7 +1802,9 @@ struct TranscribeOverlay: View {
     var body: some View {
         VStack(alignment: .trailing, spacing: 8) {
             if project.isTranscribing {
-                TranscribeBubble(state: project.transcribeState, onCancel: { project.cancelTranscribe() })
+                TranscribeBubble(state: project.transcribeState,
+                                 stage: project.transcribeStage,
+                                 onCancel: { project.cancelTranscribe() })
                 .transition(.asymmetric(
                     insertion: .move(edge: .trailing).combined(with: .opacity),
                     removal: .opacity))
@@ -2228,6 +2230,8 @@ private struct TranscribeBubble: View {
     /// 卡片出现即开始计时，用于估算剩余时间
     @State private var startedAt = Date()
     let state: ProjectState.TranscribeState
+    /// 现在走到哪一步了：语音识别 / AI 校对
+    let stage: String
     let onCancel: () -> Void
     @State private var xHovering = false
 
@@ -2253,7 +2257,7 @@ private struct TranscribeBubble: View {
 
             VStack(alignment: .leading, spacing: 3) {
                 HStack(spacing: 6) {
-                    Text("语音识别")
+                    Text(stage)
                         .font(.system(size: 11, weight: .medium))
                         .foregroundColor(Color.labelPrimary)
                         .lineLimit(1)

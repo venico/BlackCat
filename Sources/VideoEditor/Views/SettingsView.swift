@@ -661,8 +661,8 @@ struct SettingsView: View {
                         infoText: model.infoText,
                         folder: displayDir,
                         state: modelStates[model] ?? .notDownloaded,
-                        selection: (isSelected: settings.selectedWhisperModel == model,
-                                    onSelect: { settings.selectedWhisperModel = model }),
+                        // 不给复选框了 —— **用哪个模型在「语音识别字幕」弹窗里选**，
+                        // 这里只管下载和卸载
                         onDownload: { downloadModel(model) },
                         onUninstall: { deleteWhisperModel(model) }
                     )

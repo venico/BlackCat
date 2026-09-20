@@ -240,7 +240,9 @@ extension AgentToolbox {
             }
             guard hit else { return .fail("找不到 id 以 \(key) 开头的视频或音频片段，先 list_tracks 看看。") }
         }
-        p.autoTranscribeSelectedClip(useAI: proofread)
+        // proofread=false 就是纯识别：不校对也不让大模型翻
+        p.autoTranscribeSelectedClip(engine: proofread ? nil : "",
+                                     aiModel: proofread ? nil : "")
         return .ok("""
             开始识别了\(proofread ? "（识别完还会让大模型校对一遍）" : "")。
             后台跑，进度在右下角；完事会自己生成一条字幕轨。

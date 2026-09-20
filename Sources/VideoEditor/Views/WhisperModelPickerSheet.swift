@@ -162,10 +162,29 @@ struct TranscribeOptionsSheet: View {
         AIVideoService.Provider(rawValue: project.transcribeAIModel)
     }
 
+    /// 选的是「AI 翻译」——那第二个下拉就是翻译模型，不再单独跑校对
+    private var isAITranslate: Bool { project.transcribeTranslateEngine == "ai" }
+
+    /// 翻译方式：不翻译 / AI 翻译 / 各家引擎
+    private var engineOptions: [(String, String)] {
+        [("", "不翻译"), ("ai", "AI 翻译")]
+        + AppSettings.TranslateProvider.allCases.map { ($0.rawValue, $0.displayName) }
+    }
+
+    /// AI 模型。**校对是可选的**，所以非 AI 翻译时第一项是「不校对」；
+    /// 选了 AI 翻译就必须挑一个模型，那项不给
+    private var modelOptions: [(String, String)] {
+        (isAITranslate ? [] : [("", "不校对")])
+        + readyModels.map { ($0.rawValue, $0.displayName) }
+    }
+
+    /// AI 翻译得先有模型才能开跑
+    private var canStart: Bool { !isAITranslate || !project.transcribeAIModel.isEmpty }
+
     var body: some View {
         VStack(spacing: 0) {
             HStack {
-                Text("语音识别")
+                Text("语音识别字幕")
                     .font(.system(size: 15, weight: .semibold))
                     .foregroundColor(Color.labelPrimary)
                 Spacer()
@@ -179,28 +198,60 @@ struct TranscribeOptionsSheet: View {
                 }
                 .buttonStyle(.plain)
             }
-            .padding(.horizontal, 24)
+            .padding(.horizontal, 20)
             .padding(.top, 20)
             .padding(.bottom, 4)
 
             VStack(alignment: .leading, spacing: 16) {
+                // ① 识别模型：whisper 的几个档位，跟设置里是同一份选择
                 VStack(alignment: .leading, spacing: 8) {
-                    Text("识别方式")
+                    Text("识别模型")
                         .font(.system(size: 13, weight: .semibold))
                         .foregroundColor(Color.labelPrimary)
-                    optionCard(title: "直接识别",
-                           detail: "本地识别，不联网",
-                           enabled: true) { start(useAI: false) }
+                    IPicker(selection: Binding(
+                        get: { settings.selectedWhisperModel.rawValue },
+                        set: { raw in
+                            if let m = WhisperTranscriber.ModelSize(rawValue: raw) {
+                                settings.selectedWhisperModel = m
+                            }
+                        }
+                    // 下拉里只放标题 —— 标题加描述一条要一百多点宽，菜单会把后半截切掉。
+                    // 描述另起一行小字，跟下面「翻译引擎」那块一个样式
+                    ), options: WhisperTranscriber.ModelSize.allCases.map {
+                        ($0.rawValue, $0.featureName)
+                    }, height: 32)
+                    Text(settings.selectedWhisperModel.featureDetail)
+                        .font(.system(size: 10))
+                        .foregroundColor(Color.labelSecondary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
 
+                // ② 翻译方式：不翻译 / AI 翻译 / 各家翻译引擎。
+                // 默认跟设置里那个引擎走，这儿改了**不回写设置**
                 VStack(alignment: .leading, spacing: 8) {
-                    // 跟设置页的 sectionTitle 一致：13pt semibold 白字
-                    Text("校对模型")
+                    Text("翻译引擎")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundColor(Color.labelPrimary)
+                    IPicker(selection: Binding(
+                        get: { project.transcribeTranslateEngine },
+                        set: { project.transcribeTranslateEngine = $0 }
+                    ), options: engineOptions, height: 32)
+                    Text(isAITranslate
+                         ? "整批交给大模型翻，能结合上下文，顺带合并被切碎的句子"
+                         : (project.transcribeTranslateEngine.isEmpty
+                            ? "识别出什么就是什么，不翻译"
+                            : "逐句送翻译引擎，速度快"))
+                        .font(.system(size: 10))
+                        .foregroundColor(Color.labelSecondary)
+                }
+
+                // ③ AI 模型：选了 AI 翻译就是拿它翻，否则是拿它校对
+                VStack(alignment: .leading, spacing: 8) {
+                    Text(isAITranslate ? "翻译模型" : "AI 校对模型")
                         .font(.system(size: 13, weight: .semibold))
                         .foregroundColor(Color.labelPrimary)
 
                     if readyModels.isEmpty {
-                        // 一个都没配：下拉换成一条跳转，点了直接开「AI 生成」
                         Button {
                             dismiss()
                             NotificationCenter.default.post(name: .showSettings,
@@ -226,13 +277,32 @@ struct TranscribeOptionsSheet: View {
                         IPicker(selection: Binding(
                             get: { project.transcribeAIModel },
                             set: { project.transcribeAIModel = $0 }
-                        ), options: readyModels.map { ($0.rawValue, $0.displayName) }, height: 32)
-                    }
+                        ), options: modelOptions, height: 32)
 
-                    optionCard(title: "识别 + AI 校对",
-                               detail: "修正错别字，合并被切碎的句子。不改时间轴",
-                               enabled: !readyModels.isEmpty) { start(useAI: true) }
+                        // ④ 子模型。跟「AI 生成」那边共用一份选择
+                        if let m = selectedModel, !m.subModels.isEmpty {
+                            IPicker(selection: Binding(
+                                get: {
+                                    let saved = settings.providerModel(for: m.rawValue)
+                                    return m.subModels.contains(where: { $0.id == saved })
+                                        ? saved : (m.subModels.first?.id ?? "")
+                                },
+                                set: { settings.setProviderModel($0, for: m.rawValue) }
+                            ), options: m.subModels.map { ($0.id, $0.label) }, height: 32)
+                        }
+                    }
                 }
+
+                Button { start() } label: {
+                    Text("开始识别")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundColor(.black)
+                        .frame(maxWidth: .infinity, minHeight: 34)
+                        .background(Color.accent.opacity(canStart ? 1 : 0.4))
+                        .cornerRadius(8)
+                }
+                .buttonStyle(.plain)
+                .disabled(!canStart)
             }
             .padding(20)
         }
@@ -242,17 +312,25 @@ struct TranscribeOptionsSheet: View {
         .floatingPanelMaterial()
         .onAppear {
             // 选中的模型没配 Key 就换成第一个配好的，免得点了才报错
+            // 第一次进来：翻译方式默认跟设置里那个引擎走
+            if project.transcribeTranslateEngine == "ai", readyModels.isEmpty,
+               !AppSettings.shared.translateProvider.rawValue.isEmpty {
+                project.transcribeTranslateEngine = AppSettings.shared.translateProvider.rawValue
+            }
+            // 选中的模型没配 Key 就换成第一个配好的，免得点了才报错。
+            // 空串是「不校对」，那是用户自己选的，别动
+            if project.transcribeAIModel.isEmpty, !isAITranslate { return }
             if let m = selectedModel, hasKey(m) { return }
-            if let first = readyModels.first { project.transcribeAIModel = first.rawValue }
+            project.transcribeAIModel = readyModels.first?.rawValue ?? ""
         }
         .onExitCommand { dismiss() }
     }
 
-    private func start(useAI: Bool) {
+    private func start() {
         dismiss()
         // 等 sheet 收完再开跑，否则识别进度提示会被关闭动画盖住
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-            project.autoTranscribeSelectedClip(useAI: useAI)
+            project.autoTranscribeSelectedClip()
         }
     }
 

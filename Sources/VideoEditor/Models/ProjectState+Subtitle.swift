@@ -213,7 +213,15 @@ extension ProjectState {
     /// 未选中片段时，识别时间轴上第一个视频片段。
     /// - Parameter useAI: 识别完再让大模型校对一遍（修错别字、合并被切碎的句子）。
     ///   模型不碰时间戳——合并后的起止由代码取首尾，见 LLMAnalyzer.proofreadSubtitles
-    func autoTranscribeSelectedClip(useAI: Bool = false) {
+    /// - Parameters:
+    ///   - engine: 翻译方式。nil = 用弹窗里存的；`""` 不翻译；`"ai"` 大模型翻；
+    ///     其余是翻译引擎（`AppSettings.TranslateProvider` 的取值）
+    ///   - aiModel: 识别后用哪个 AI 模型。nil = 用弹窗里存的；`""` = 不用 AI
+    func autoTranscribeSelectedClip(engine: String? = nil, aiModel: String? = nil) {
+        let transEngine = engine ?? transcribeTranslateEngine
+        let modelID = aiModel ?? transcribeAIModel
+        let useAI = !modelID.isEmpty
+        let useAITranslate = transEngine == "ai" && useAI
         guard !isTranscribing else { return }
 
         // 解析识别目标：选中视频 > 选中音频 > 第一个视频片段
@@ -246,6 +254,7 @@ extension ProjectState {
             return
         }
 
+        transcribeStage = "语音识别"
         transcribeState = .running(0)
 
         // 识别用自动检测原声，再按需翻译到「翻译目标语言」
@@ -261,11 +270,13 @@ extension ProjectState {
                     mediaURL: mediaURL, trimStart: trimStart,
                     duration: srcDur, language: "auto", prompt: nil
                 ) { pct in
-                    DispatchQueue.main.async { self.transcribeState = .running(pct) }
+                    // **两段共用一条进度**：要校对的话识别只占前 70%，剩下 30% 留给校对
+                    let scaled = useAI ? pct * 0.7 : pct
+                    DispatchQueue.main.async { self.transcribeState = .running(scaled) }
                 }
                 try Task.checkCancellation()
 
-                await MainActor.run { self.transcribeState = .running(0.95) }
+                await MainActor.run { self.transcribeState = .running(useAI ? 0.7 : 0.95) }
                 let sample = segs.prefix(12).map(\.text).joined(separator: " ")
                 let recog = NLLanguageRecognizer()
                 recog.processString(sample)
@@ -275,18 +286,51 @@ extension ProjectState {
                     || (detectedBase.hasPrefix("zh") && targetBase == "zh")
 
                 var finalSegs: [(start: Double, end: Double, text: String)] = []
+                // AI 翻译那一步的失败原因，最后跟校对的错误一起报给用户
+                var aiTranslateError: String?
                 if sameLang {
                     for s in segs {
                         try Task.checkCancellation()
                         let text = isTargetSimplified ? OpenCC.toSimplified(s.text) : s.text
                         finalSegs.append((s.start, s.end, text))
                     }
+                } else if transEngine.isEmpty {
+                    // 选了「不翻译」：识别出什么就是什么
+                    for s in segs {
+                        try Task.checkCancellation()
+                        finalSegs.append((s.start, s.end, s.text))
+                    }
+                } else if useAITranslate {
+                    // 大模型翻译：整批带上下文翻，顺带把切碎的句子并起来。
+                    // 这一步已经包含润色，后面不再单独跑校对
+                    await MainActor.run { self.transcribeStage = "AI 翻译" }
+                    let raw = segs.map { (start: $0.start, end: $0.end, text: $0.text) }
+                    let r = await LLMAnalyzer.translateSubtitles(
+                        raw, to: displayName,
+                        send: { prompt in
+                            guard let m = AIVideoService.Provider(rawValue: modelID) else {
+                                throw AIVideoService.AIError.apiError("没选 AI 模型")
+                            }
+                            return try await AIVideoService.shared.generateText(provider: m, prompt: prompt)
+                        },
+                        progress: { pct in
+                            DispatchQueue.main.async { self.transcribeState = .running(0.7 + pct * 0.3) }
+                        })
+                    finalSegs = r.segs
+                    aiTranslateError = r.error
                 } else {
                     let texts = segs.map(\.text)
+                    await MainActor.run { self.transcribeStage = "字幕翻译" }
                     let translated = await Translator.translateConcurrent(
-                        texts, to: displayName, batchSize: 15, concurrency: 6
+                        texts, to: displayName,
+                        engine: AppSettings.TranslateProvider(rawValue: transEngine),
+                        batchSize: 15, concurrency: 6
                     ) { done in
-                        let p = 0.95 + 0.04 * Double(min(done, segs.count)) / Double(max(segs.count, 1))
+                        let frac = Double(min(done, segs.count)) / Double(max(segs.count, 1))
+                        // **整条进度只往前走**：要校对时翻译占 70%~75%，剩下的留给校对；
+                        // 不校对就还是收尾的 95%~99%。
+                        // 原来翻译一律跑到 99%，紧接着校对又从 70% 开始，看着像倒退
+                        let p = useAI ? 0.70 + 0.05 * frac : 0.95 + 0.04 * frac
                         await MainActor.run { self.transcribeState = .running(p) }
                     }
                     for (i, s) in segs.enumerated() {
@@ -298,14 +342,19 @@ extension ProjectState {
                 // AI 校对（可选）。失败不影响出字幕，原样用识别结果
                 var proofed = finalSegs
                 var proofChanged = 0
-                var proofError: String?
-                if useAI, let model = AIVideoService.Provider(rawValue: self.transcribeAIModel) {
-                    await MainActor.run { self.transcribeState = .running(0.96) }
+                var proofError: String? = aiTranslateError
+                if useAI, !useAITranslate, let model = AIVideoService.Provider(rawValue: modelID) {
+                    // 只换标题，进度接着走 —— 校对占最后 30%。
+                    // 原来挤在 96%~99%，看着就是卡在 96% 不动
+                    await MainActor.run {
+                        self.transcribeStage = "AI 校对"
+                        self.transcribeState = .running(0.75)
+                    }
                     let r = await LLMAnalyzer.proofreadSubtitles(finalSegs, send: { prompt in
                         try await AIVideoService.shared.generateText(provider: model, prompt: prompt)
                     }, progress: { pct in
                         DispatchQueue.main.async {
-                            self.transcribeState = .running(0.96 + pct * 0.03)
+                            self.transcribeState = .running(0.75 + pct * 0.25)
                         }
                     })
                     proofed = r.segs; proofChanged = r.changed; proofError = r.error
@@ -316,7 +365,9 @@ extension ProjectState {
                 try Task.checkCancellation()
                 await MainActor.run {
                     self.pushUndo()
-                    var track = Track<SubtitleClip>(label: useAI ? "识别字幕·已校对" : "识别字幕")
+                    var track = Track<SubtitleClip>(
+                        label: useAITranslate ? "识别字幕·已翻译"
+                             : (useAI ? "识别字幕·已校对" : "识别字幕"))
                     track.subtitleStyle = self.newSubtitleStyle(for: outSegs.map(\.text))
                     for s in outSegs {
                         let st = capOffset + s.start / capSpeed
@@ -328,7 +379,19 @@ extension ProjectState {
                     self.syncOverlayOrder()
                     self.transcribeState = .idle
                     self.transcribeTask = nil
-                    if useAI {
+                    if useAITranslate {
+                        // AI 翻译：说翻完了就行。「改动几处」是校对的口径，
+                        // 翻译本来就每条都变，报数字没有意义
+                        if let err = capError {
+                            self.showSuccessToast(icon: "exclamationmark.triangle", iconColor: .orange,
+                                                  title: "AI 翻译未完成",
+                                                  subtitle: "已出字幕 \(outSegs.count) 条。\(err.prefix(60))",
+                                                  autoCountdown: false)
+                        } else {
+                            self.showSuccessToast(icon: "checkmark", title: "语音识别",
+                                                  subtitle: "翻译完成，生成 \(outSegs.count) 条字幕")
+                        }
+                    } else if useAI {
                         // 校对结果必须如实说。之前失败是静默返回原文，
                         // 用户只看到"完成"，根本分不清模型到底跑没跑
                         if let err = capError {

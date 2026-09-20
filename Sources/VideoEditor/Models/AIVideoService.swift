@@ -3421,7 +3421,9 @@ final class AIVideoService: ObservableObject {
         var body: [String: Any] = [
             "model": model,
             "messages": [["role": "user", "content": prompt]],
-            "max_tokens": 4096
+            // 8192：批量任务（字幕校对一次几十条）4096 不够，
+            // 思考型模型光思考就能把它耗光，content 回来是空的
+            "max_tokens": 8192
         ]
         if !searchTools.isEmpty { body["tools"] = searchTools }
         if webSearch {
@@ -3445,7 +3447,27 @@ final class AIVideoService: ObservableObject {
 
         await MainActor.run { updateAssistantStatus(.generating(progress: "生成回复中…")) }
 
-        let (data, resp) = try await URLSession.shared.data(for: request)
+        // **断了要重试**：思考型模型（GLM / Kimi 开 reasoning_effort=high）一批几十条字幕
+        // 要想很久，中途服务端或中转网关常把连接掐掉，报「网络连接已中断」(-1005)。
+        // 实测这类断连重试一次多半就过了
+        var data = Data()
+        var resp: URLResponse?
+        var lastErr: Error?
+        for attempt in 1...3 {
+            do {
+                (data, resp) = try await URLSession.shared.data(for: request)
+                lastErr = nil
+                break
+            } catch let e as URLError where [.networkConnectionLost, .timedOut,
+                                             .cannotConnectToHost, .networkConnectionLost]
+                                            .contains(e.code) {
+                lastErr = e
+                DiagLog.log("[对话] \(model) 第 \(attempt) 次请求失败（\(e.code.rawValue)），\(attempt < 3 ? "重试" : "放弃")")
+                if attempt < 3 { try? await Task.sleep(nanoseconds: UInt64(attempt) * 1_500_000_000) }
+            }
+        }
+        if let e = lastErr { throw e }
+
         guard let http = resp as? HTTPURLResponse, http.statusCode == 200 else {
             let errJson = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
             let errMsg = (errJson?["error"] as? [String: Any])?["message"] as? String
@@ -3454,11 +3476,27 @@ final class AIVideoService: ObservableObject {
 
         let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
         guard let choices = json?["choices"] as? [[String: Any]],
-              let msg = choices.first?["message"] as? [String: Any],
-              let text = msg["content"] as? String else {
+              let msg = choices.first?["message"] as? [String: Any] else {
             throw AIError.apiError("\(model) 返回格式错误")
         }
-        return text
+        let text = (msg["content"] as? String) ?? ""
+        guard text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return text }
+
+        // content 是空的。两种情况：
+        // ① **推理型模型把正文放进了 `reasoning_content`**，content 留空 —— 取它
+        // ② 真的什么都没回（多半是思考阶段就把 max_tokens 耗光了，finish_reason=length）
+        let reasoning = (msg["reasoning_content"] as? String)
+            ?? (msg["reasoning"] as? String) ?? ""
+        if !reasoning.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return reasoning }
+
+        let finish = (choices.first?["finish_reason"] as? String) ?? ""
+        DiagLog.log("[对话] \(model) 返回空内容 finish_reason=\(finish)")
+        // **不能静默返回空串** —— 上层（字幕校对）会把空回复当成「模型说不用改」，
+        // 界面提示「未改动任何内容」，用户根本不知道这次请求其实失败了
+        throw AIError.apiError("\(model) 返回了空内容"
+            + (finish == "length"
+               ? "（回复长度超出上限，换个模型或分批少一点再试）"
+               : finish.isEmpty ? "" : "（finish_reason=\(finish)）"))
     }
 
     // MARK: - 联网搜索
