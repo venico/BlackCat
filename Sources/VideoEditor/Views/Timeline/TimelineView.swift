@@ -882,7 +882,8 @@ struct TimelineView: View {
                        isMuted: false, isVis: project.imageTracks[i].isVisible,
                        onMute: nil,
                        onVis:  { project.pushUndo(); project.imageTracks[i].isVisible.toggle(); project.refreshOverlayComposite(); project.rebuildTimelinePreview() },
-                       onDel:  { project.pushUndo(); project.imageTracks.remove(at:i); project.syncOverlayOrder(); project.rebuildTimelinePreview() },
+                       onDel:  { project.pushUndo(); project.imageTracks.remove(at:i); project.syncOverlayOrder()
+                                 project.refreshOverlayComposite(); project.rebuildTimelinePreview() },
                        onDragChanged: { handleDragChanged(type: .overlay, index: ovIdx, offsetY: $0) },
                        onDragEnded:   { handleDragEnded(type: .overlay, index: ovIdx, offsetY: $0) })
         case .subtitle:
@@ -893,7 +894,10 @@ struct TimelineView: View {
                        onVis:  { project.pushUndo(); project.subtitleTracks[i].isVisible.toggle()
                                  // 内容归合成器画时，光改标志位画面不会动
                                  project.refreshOverlayComposite() },
-                       onDel:  { project.pushUndo(); project.subtitleTracks.remove(at:i); project.syncOverlayOrder(); project.rebuildTimelinePreview() },
+                       onDel:  { project.pushUndo(); project.subtitleTracks.remove(at:i); project.syncOverlayOrder()
+                                 // 内容归合成器画，删了轨道也得推一次新数据，
+                                 // 不然合成器手上还是旧图层，画面上那条字幕不会消失
+                                 project.refreshOverlayComposite(); project.rebuildTimelinePreview() },
                        onDragChanged: { handleDragChanged(type: .overlay, index: ovIdx, offsetY: $0) },
                        onDragEnded:   { handleDragEnded(type: .overlay, index: ovIdx, offsetY: $0) })
         case .text:
@@ -903,7 +907,8 @@ struct TimelineView: View {
                        onVis:  { project.pushUndo(); project.textTracks[i].isVisible.toggle()
                                  // 内容归合成器画时，光改标志位画面不会动
                                  project.refreshOverlayComposite() },
-                       onDel:  { project.pushUndo(); project.textTracks.remove(at:i); project.syncOverlayOrder() },
+                       onDel:  { project.pushUndo(); project.textTracks.remove(at:i); project.syncOverlayOrder()
+                                 project.refreshOverlayComposite(); project.rebuildTimelinePreview() },
                        onDragChanged: { handleDragChanged(type: .overlay, index: ovIdx, offsetY: $0) },
                        onDragEnded:   { handleDragEnded(type: .overlay, index: ovIdx, offsetY: $0) })
         case .shape:
@@ -914,7 +919,8 @@ struct TimelineView: View {
                        onVis:  { project.pushUndo(); project.shapeTracks[i].isVisible.toggle()
                                  // 内容归合成器画时，光改标志位画面不会动
                                  project.refreshOverlayComposite() },
-                       onDel:  { project.pushUndo(); project.shapeTracks.remove(at:i); project.syncOverlayOrder() },
+                       onDel:  { project.pushUndo(); project.shapeTracks.remove(at:i); project.syncOverlayOrder()
+                                 project.refreshOverlayComposite(); project.rebuildTimelinePreview() },
                        onDragChanged: { handleDragChanged(type: .overlay, index: ovIdx, offsetY: $0) },
                        onDragEnded:   { handleDragEnded(type: .overlay, index: ovIdx, offsetY: $0) })
         case .filter:
@@ -1822,11 +1828,9 @@ struct TimelineView: View {
             dragOp = .box
             boxStart = pt
             project.selectedClipIDs.removeAll()
-            project.selectedVideoClipID    = nil
-            project.selectedImageClipID    = nil
-            project.selectedAudioClipID    = nil
-            project.selectedSubtitleClipID = nil
-            project.selectedTextClipID     = nil
+            // 一把清干净。原来这儿只点名清五种片段，转场 / 滤镜 / 调节 / 特效 / 复合
+            // 都漏了 —— 选中转场后点轨道空白，属性区还停在「转场」那页
+            project.clearClipSelections()
         }
     }
 

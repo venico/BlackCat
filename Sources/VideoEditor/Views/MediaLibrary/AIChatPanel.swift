@@ -48,6 +48,10 @@ struct AIChatPanel: View {
     /// 落点在某一行**下半**时，提示线画在它下边（＝插到它后面）
     @State private var dropAfterConvID: UUID?
     @State private var dropOnGroupID: UUID?
+    /// 拖**分组**时的落点提示：插到这个分组前面 / 后面。
+    /// 跟会话那两个分开存 —— 同一时刻只可能有一种载荷在拖，但状态混用容易留脏值
+    @State private var dropBeforeGroupID: UUID?
+    @State private var dropAfterGroupID: UUID?
     @State private var dropToUngrouped = false
     /// 会话列表每行的位置，拖放落点靠它对号入座
     @State private var historyRowFrames: [UUID: CGRect] = [:]
@@ -515,7 +519,10 @@ struct AIChatPanel: View {
             // 落在这行下半＝插到它后面，线画在下边。
             // **没有这条的话，分组里最后一条后面就没有落点了** ——
             // 再往下是行间空隙，那儿会被当成「落在空白处」直接移出分组
-            if dropAfterConvID == conv.id {
+            // 拖分组时「插到某组后面」的线也可能落在这一行下边
+            // （那个组展开着，这条是它的最后一条会话）
+            if dropAfterConvID == conv.id
+                || (dropAfterGroupID.map { groupTailRowID($0) == conv.id } ?? false) {
                 Rectangle().fill(Color.accent).frame(height: 1).offset(y: 4)
             }
         }
@@ -589,6 +596,18 @@ struct AIChatPanel: View {
             Color.clear.preference(key: HistoryRowFramePref.self,
                                    value: [g.id: geo.frame(in: .global)])
         })
+        .overlay(alignment: .top) {
+            if dropBeforeGroupID == g.id {
+                Rectangle().fill(Color.accent).frame(height: 1).offset(y: -4)
+            }
+        }
+        .overlay(alignment: .bottom) {
+            // 组收起来了或里头是空的，线就画在组标题下边；
+            // 展开且有会话时线归最后那条会话（见 groupTailRowID）
+            if dropAfterGroupID == g.id, groupTailRowID(g.id) == g.id {
+                Rectangle().fill(Color.accent).frame(height: 1).offset(y: 4)
+            }
+        }
     }
 
     private func groupMenu(_ g: AIVideoService.ConversationGroup) -> [ChatMenuItem] {
@@ -1753,26 +1772,32 @@ HStack(spacing: 2) {
                         service.moveConversation(moved, toGroup: nil)
                     }
                 case .conversationGroup(let moved):
-                    guard let target = rowHit(pt),
-                          service.conversationGroups.contains(where: { $0.id == target }),
-                          target != moved else { return }
+                    guard let target = groupDropTarget(pt, moved: moved) else { return }
                     var ids = service.sortedGroups.map(\.id)
                     ids.removeAll { $0 == moved }
-                    if let at = ids.firstIndex(of: target) { ids.insert(moved, at: at) }
-                    else { ids.append(moved) }
+                    if let at = ids.firstIndex(of: target.id) {
+                        ids.insert(moved, at: target.after ? at + 1 : at)
+                    } else { ids.append(moved) }
                     service.reorderGroups(ids)
                 default: break
                 }
-                dropBeforeConvID = nil
-                dropAfterConvID = nil
-                dropOnGroupID = nil
+                clearHistoryDropHints()
             },
             onTargetChange: { on in
-                if !on { dropBeforeConvID = nil; dropAfterConvID = nil; dropOnGroupID = nil }
+                if !on { clearHistoryDropHints() }
             },
-            onHoverPoint: { _, _ in
+            onHoverPoint: { _, payload in
                 // 悬停时把落点那一行点亮
                 let pt = FileDropRouter.lastGlobalPoint
+                if case .conversationGroup(let moved) = payload {
+                    // 拖的是分组：只画前后插入线，不点亮任何一行
+                    dropOnGroupID = nil; dropBeforeConvID = nil; dropAfterConvID = nil
+                    let t = groupDropTarget(pt, moved: moved)
+                    dropBeforeGroupID = (t?.after == false) ? t?.id : nil
+                    dropAfterGroupID  = (t?.after == true)  ? t?.id : nil
+                    return
+                }
+                dropBeforeGroupID = nil; dropAfterGroupID = nil
                 let hit = rowHitEdge(pt)
                 if let hit, service.conversationGroups.contains(where: { $0.id == hit.id }) {
                     dropOnGroupID = hit.id; dropBeforeConvID = nil; dropAfterConvID = nil
@@ -1782,6 +1807,15 @@ HStack(spacing: 2) {
                     dropAfterConvID  = (hit?.after == true)  ? hit?.id : nil
                 }
             })
+    }
+
+    /// 拖放结束/离开落点区，把所有落点提示收干净
+    private func clearHistoryDropHints() {
+        dropBeforeConvID = nil
+        dropAfterConvID = nil
+        dropOnGroupID = nil
+        dropBeforeGroupID = nil
+        dropAfterGroupID = nil
     }
 
     /// 这个全局坐标落在哪一行上
@@ -1794,6 +1828,38 @@ HStack(spacing: 2) {
     private func rowHitEdge(_ pt: CGPoint) -> (id: UUID, after: Bool)? {
         guard let hit = historyRowFrames.first(where: { $0.value.contains(pt) }) else { return nil }
         return (hit.key, pt.y > hit.value.midY)
+    }
+
+    /// 拖一个分组时，这个落点该把它插到哪个分组的前面/后面。
+    /// 分组永远排在会话上面，所以落在**会话行或空白处**一律理解成「放到最后」，
+    /// 这样列表最底下也能放得进去；落在分组行上则按上半/下半分前后
+    private func groupDropTarget(_ pt: CGPoint, moved: UUID) -> (id: UUID, after: Bool)? {
+        let groups = service.sortedGroups
+        guard !groups.isEmpty else { return nil }
+        var target: (id: UUID, after: Bool)
+        if let hit = rowHitEdge(pt) {
+            if groups.contains(where: { $0.id == hit.id }) {
+                target = (hit.id, hit.after)
+            } else if let conv = service.history.first(where: { $0.id == hit.id }) {
+                // 落在组里的会话上＝放到那个组后面；落在没分组的会话上＝放到最后
+                target = (conv.groupID ?? groups[groups.count - 1].id, true)
+            } else {
+                target = (groups[groups.count - 1].id, true)
+            }
+        } else {
+            target = (groups[groups.count - 1].id, true)
+        }
+        guard target.id != moved else { return nil }
+        return target
+    }
+
+    /// 「插到这个分组后面」那条线画在哪一行下边：
+    /// 组是展开的且里头有会话，就挂到最后一条会话下面，不然挂在分组行自己下面。
+    /// 不这么算的话，线会画在展开的组标题底下，看着像是插进组里了
+    private func groupTailRowID(_ gid: UUID) -> UUID {
+        guard let g = service.conversationGroups.first(where: { $0.id == gid }), !g.collapsed,
+              let last = service.conversations(inGroup: gid).last else { return gid }
+        return last.id
     }
 
     /// 把聊天区登记成文件接收区。只收 Finder 文件 ——

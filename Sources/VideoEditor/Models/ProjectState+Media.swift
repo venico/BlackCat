@@ -468,6 +468,8 @@ extension ProjectState {
         var firstError: String? = nil
         var abandoned = false
         var remaining: Int
+        /// 下一次往外吐部分结果的帧数门槛（见 avFrameStripSync 的 onPartial）
+        var nextPartialAt = 24
         init(remaining: Int) { self.remaining = remaining }
         func snapshot() -> [ThumbnailFrame] {
             lock.lock(); defer { lock.unlock() }
@@ -477,8 +479,11 @@ extension ProjectState {
 
     /// 带超时的 AVFoundation 批量抽帧（同步版，须在专属 pthread 上调用）。
     /// 线程模型同 avSingleFrameSync；信号量超时兜"同步挂死"和"回调不齐"两种情况
+    /// - Parameter onPartial: 抽到一批就先吐出来（每多 24 帧一次），调用方可以边抽边贴。
+    ///   不传的话行为跟以前一样：全抽完才返回。**回调在解码线程上**，里面别做重活
     nonisolated static func avFrameStripSync(url: URL, times: [NSValue], maxSize: CGSize,
-                                             tolerance: CMTime, timeout: Double) -> AVStripOutcome {
+                                             tolerance: CMTime, timeout: Double,
+                                             onPartial: (@Sendable ([ThumbnailFrame]) -> Void)? = nil) -> AVStripOutcome {
         let sem = DispatchSemaphore(value: 0)
         let state = StripState(remaining: times.count)
         var genRef: AVAssetImageGenerator? = nil
@@ -492,9 +497,10 @@ extension ProjectState {
             gen.requestedTimeToleranceAfter  = tolerance
             genLock.lock(); genRef = gen; genLock.unlock()
             gen.generateCGImagesAsynchronously(forTimes: times) { requested, cgImage, _, result, error in
+                var partial: [ThumbnailFrame]? = nil
+                var done = false
                 state.lock.lock()
-                defer { state.lock.unlock() }
-                guard !state.abandoned else { return }
+                if state.abandoned { state.lock.unlock(); return }
                 if result == .succeeded, let cg = cgImage {
                     let img = NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
                     state.frames.append(ThumbnailFrame(time: requested.seconds, image: img))
@@ -502,7 +508,16 @@ extension ProjectState {
                     state.firstError = error?.localizedDescription ?? "result=\(result.rawValue)"
                 }
                 state.remaining -= 1
-                if state.remaining == 0 { sem.signal() }
+                done = state.remaining == 0
+                // 攒够一批先吐一次，让片段上的缩略图一段段铺出来，
+                // 而不是 200 张全抽完才一次性出现
+                if !done, onPartial != nil, state.frames.count >= state.nextPartialAt {
+                    state.nextPartialAt = state.frames.count + 24
+                    partial = state.frames.sorted(by: { $0.time < $1.time })
+                }
+                state.lock.unlock()
+                if let p = partial { onPartial?(p) }
+                if done { sem.signal() }
             }
         }
         if sem.wait(timeout: .now() + timeout) == .timedOut {
@@ -742,10 +757,12 @@ extension ProjectState {
                 if previewCount > 0 {
                     let step = max(1, times.count / previewCount)
                     let coarse = stride(from: 0, to: times.count, by: step).map { times[$0] }
+                    // 容差给无限大 = 直接拿最近的关键帧，不为了对准时间点去解一整段 GOP。
+                    // 这批只是打底，时间点偏一点看不出来，但出图快好几倍
                     if case .frames(let fs, _) = Self.avFrameStripSync(
                         url: url, times: coarse,
                         maxSize: CGSize(width: 160, height: 104),
-                        tolerance: CMTime(seconds: 0.5, preferredTimescale: 600),
+                        tolerance: .positiveInfinity,
                         timeout: 8), !fs.isEmpty {
                         let quick = fs.sorted(by: { $0.time < $1.time })
                         DispatchQueue.main.async {
@@ -759,7 +776,16 @@ extension ProjectState {
                 let tol = CMTime(seconds: 0.3, preferredTimescale: 600)
                 switch Self.avFrameStripSync(url: url, times: times,
                                              maxSize: CGSize(width: 160, height: 104),
-                                             tolerance: tol, timeout: 20) {
+                                             tolerance: tol, timeout: 20,
+                                             onPartial: { [weak self] partial in
+                                                 DispatchQueue.main.async {
+                                                     guard let self else { return }
+                                                     // 只在比现有的更全时才盖，别把已完成的批冲掉
+                                                     if (self.assetThumbnails[id]?.count ?? 0) < partial.count {
+                                                         self.assetThumbnails[id] = partial
+                                                     }
+                                                 }
+                                             }) {
                 case .frames(let fs, let firstError):
                     sorted = fs.sorted(by: { $0.time < $1.time })
                     if sorted.isEmpty {

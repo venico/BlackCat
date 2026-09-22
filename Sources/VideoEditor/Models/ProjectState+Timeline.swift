@@ -456,6 +456,7 @@ extension ProjectState {
 
     func addToTimeline(_ asset: MediaAsset) {
         pushUndo()
+        ensureTimelineTab()   // 空状态下先补一条，否则轨道写入会被静默丢掉
         switch asset.type {
         case .video:
             let trackIdx: Int
@@ -600,6 +601,7 @@ extension ProjectState {
     /// Add asset to timeline at a specific time position (used for drag-drop from media library)
     func addToTimelineAt(_ asset: MediaAsset, time: Double, skipUndo: Bool = false) {
         if !skipUndo { pushUndo() }
+        ensureTimelineTab()   // 空状态下先补一条，否则轨道写入会被静默丢掉
         let insertTime = max(0, time)
         switch asset.type {
         case .video:
@@ -1583,6 +1585,9 @@ extension ProjectState {
         selectedAdjustClipID = nil
         selectedEffectClipID = nil
         selectedCompoundClipID = nil
+        // 转场也算一种选中。漏掉它的话，选中转场后点轨道空白、点别的片段、
+        // 切标签页都取消不掉，属性区一直停在「转场」那页
+        selectedTransitionClipID = nil
     }
 
     // MARK: - 特效

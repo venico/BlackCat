@@ -66,6 +66,7 @@ final class AppSettings: ObservableObject {
         static let subtitleFontSizeCJK = "settings.subtitle.fontSizeCJK"
         static let subtitleFontSizeLatin = "settings.subtitle.fontSizeLatin"
         static let chatFontSize = "settings.agent.chatFontSize"
+        static let agentMaxSteps = "settings.agent.maxSteps"
     }
 
     // MARK: - Fish Audio 音色模型
@@ -580,6 +581,12 @@ final class AppSettings: ObservableObject {
         didSet { ud.set(chatFontSize, forKey: K.chatFontSize) }
     }
 
+    /// Agent 一轮最多调多少次工具。到顶就停下来，免得它绕圈子一直烧 token。
+    /// 读一遍时间线、改几处、再复查一遍，十几步就没了，所以默认给到 100
+    @Published var agentMaxSteps: Double {
+        didSet { ud.set(agentMaxSteps, forKey: K.agentMaxSteps) }
+    }
+
     /// 新字幕的默认字号，中英各一档（中文笔画密，同样字号看着比英文小）
     @Published var subtitleFontSizeCJK: Double {
         didSet { ud.set(subtitleFontSizeCJK, forKey: K.subtitleFontSizeCJK) }
@@ -775,6 +782,7 @@ final class AppSettings: ObservableObject {
         subtitleFontSizeCJK = ud.object(forKey: K.subtitleFontSizeCJK) as? Double ?? 48
         subtitleFontSizeLatin = ud.object(forKey: K.subtitleFontSizeLatin) as? Double ?? 32
         chatFontSize = ud.object(forKey: K.chatFontSize) as? Double ?? 13
+        agentMaxSteps = ud.object(forKey: K.agentMaxSteps) as? Double ?? 100
         biRefNetModel = BiRefNetModel(rawValue: ud.string(forKey: K.biRefNetModel) ?? "") ?? .lite
 
         deeplAPIKey = ud.string(forKey: K.deeplAPIKey) ?? ""

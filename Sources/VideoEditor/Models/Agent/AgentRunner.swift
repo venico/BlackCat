@@ -104,8 +104,9 @@ final class AgentRunner: ObservableObject {
         let onAnswer: (Bool) -> Void
     }
 
-    /// 一轮最多让它调多少次工具。绕圈子的话到这就停
-    private let maxSteps = 24
+    /// 一轮最多让它调多少次工具。绕圈子的话到这就停。
+    /// 走设置（AI → 通用 → 步数上限），每轮开跑时读一次
+    private var maxSteps: Int { max(1, Int(AppSettings.shared.agentMaxSteps)) }
 
     /// 停的是**当前看着那条**的活儿
     func cancel() {

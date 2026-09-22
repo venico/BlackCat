@@ -1399,6 +1399,15 @@ struct SettingsView: View {
                     .font(.system(size: 10))
                     .foregroundColor(Color.labelSecondary.opacity(0.6))
 
+                sectionTitle("执行")
+                ICapsuleSlider(label: "步数上限", value: Binding(
+                    get: { settings.agentMaxSteps },
+                    set: { settings.agentMaxSteps = $0.rounded() }
+                ), range: 10...300, unit: "步", labelWidth: 48)
+                Text("一轮里最多让它调多少次工具，到顶就停下来报「步数用完了」。调大能干更长的活，代价是绕起圈来也更费 token。")
+                    .font(.system(size: 10))
+                    .foregroundColor(Color.labelSecondary.opacity(0.6))
+
                 sectionTitle("记忆")
                 // 跟 Skill / MCP 一个长相的卡片
                 HStack(spacing: 10) {

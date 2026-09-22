@@ -16,6 +16,21 @@ extension ProjectState {
     @discardableResult
     func addTimelineTab() -> UUID {
         pushUndo()
+        return appendTab()
+    }
+
+    /// 一条时间线都没有时补一条。
+    /// **tabs 空的时候轨道写入会被 withTab 静默丢掉**（它按 activeTab 找下标，空数组直接
+    /// return），所以往时间线里放东西的入口都得先过这里，否则素材加了却什么也看不见。
+    /// **不 pushUndo** —— 调用方自己压过一次了，这里再压会把一次添加拆成两步撤销
+    func ensureTimelineTab() {
+        guard tabs.isEmpty else { return }
+        appendTab()
+    }
+
+    /// 建标签页本体，不碰撤销栈
+    @discardableResult
+    private func appendTab() -> UUID {
         // 名字取没被占用的最小编号，关掉再开也不会撞名
         var n = tabs.count + 1
         let used = Set(tabs.map(\.name))
