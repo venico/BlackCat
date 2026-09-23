@@ -598,7 +598,8 @@ final class AppSettings: ObservableObject {
     /// 可选的语音模型
     /// 跟「AI 设置」里声音生成那栏用同一份清单 —— 那边隐藏掉的，这里也不该还能选
     static var ttsProviders: [AIVideoService.Provider] {
-        AIVideoService.Provider.providers(for: .audio)
+        // 本地配乐生成的是音乐，念不了字幕
+        AIVideoService.Provider.providers(for: .audio).filter { $0 != .aceStep }
     }
 
     /// 图片去背使用的模型

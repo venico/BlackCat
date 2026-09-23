@@ -17,6 +17,11 @@ struct MediaLibraryView: View {
     /// 素材库里的分类（六个标签页）
     private var isTextTab: Bool { project.mediaLibraryTab == "library" && project.libraryCategory == "text" }
     private var isShapeTab: Bool { project.mediaLibraryTab == "library" && project.libraryCategory == "shape" }
+    private var isAudioTab: Bool { project.mediaLibraryTab == "library" && project.libraryCategory == "audio" }
+    /// 音频页左边那列导航选中的是哪块。选「本地音频」时右边照旧是素材列表，
+    /// 其余（收藏 / 音乐库 / 音效库）换成在线面板
+    @ObservedObject private var audioStore = OnlineAudioStore.shared
+    private var showOnlineAudio: Bool { isAudioTab && audioStore.section != .local }
 
     /// 只有视频和图片有缩略图可看，能在两种视图之间切
     /// 四个素材标签页都能在宫格 / 列表之间切。
@@ -179,7 +184,12 @@ struct MediaLibraryView: View {
     /// 拖宽拉窄都是加减列数，格子和缩略图一动不动。
     ///
     private var gridColumns: [GridItem] {
-        sidebarGridColumns(sidebarWidth: sidebarWidth, minGap: 4)
+        // 音频页左边多了一列导航，宫格能用的宽度得扣掉它 ——
+        // 不扣的话列数按整宽算，格子撑出去，整块往两边溢，导航被挤到图标栏上
+        // 还要扣掉导航和内容之间多出来的那点间距（contentGap 比原来的 3 宽）
+        sidebarGridColumns(sidebarWidth: sidebarWidth
+                               - (isAudioTab ? AudioLibraryNav.totalWidth + AudioLibraryNav.contentGap - 3 : 0),
+                           minGap: 4)
     }
 
     private func countFor(_ type: AssetType) -> Int {
@@ -233,8 +243,16 @@ struct MediaLibraryView: View {
                 libraryTabBar
             }
 
+            // 音频页：左边竖排导航（我的 / 音乐库 / 音效库），右边是内容。
+            // 其他页 isAudioTab 为假，外面这层 HStack 只包着原来那一列，布局不变
+            HStack(alignment: .top, spacing: 0) {
+            if isAudioTab {
+                AudioLibraryNav()
+                    .padding(.leading, 3)
+            }
+            VStack(spacing: 0) {
             // Search + Sort bar
-            if !isTransitionTab && !isTextTab && !isShapeTab && !isAITab {
+            if !isTransitionTab && !isTextTab && !isShapeTab && !isAITab && !showOnlineAudio {
                 HStack(spacing: 4) {
                     HStack(spacing: 4) {
                         Image(nsImage: SidebarSVGIcon.load("search"))
@@ -257,7 +275,8 @@ struct MediaLibraryView: View {
                         }
                     }
                     .padding(.horizontal, 6)
-                    .padding(.vertical, 4)
+                    // 各页统一 22 高，跟音频页左边导航、收藏页搜索框一致
+                    .frame(height: AudioLibraryNav.rowHeight)
                     .background(Color.white.opacity(0.06))
                     .clipShape(RoundedRectangle(cornerRadius: 6))
 
@@ -275,7 +294,11 @@ struct MediaLibraryView: View {
                         showSortNSMenu(project: project)
                     }
                 }
-                .padding(.leading, 3).padding(.trailing, 10)
+                // 整行钉成搜索框那么高。右边两个工具按钮是 24 高，不钉的话整行被撑到 24，
+                // 22 高的搜索框居中后比收藏页那个（行里只有搜索框）低 1pt，切页时会跳一下。
+                // 按钮照旧 24，只是上下各多出 1pt 在行外，看不出来
+                .frame(height: AudioLibraryNav.rowHeight)
+                .padding(.leading, isAudioTab ? AudioLibraryNav.contentGap : 3).padding(.trailing, 10)
                 .padding(.bottom, 6)
             }
 
@@ -305,7 +328,9 @@ struct MediaLibraryView: View {
                     .onChange(of: filteredAssets.map(\.id)) { _, v in
                         project.visibleAssetOrder = v
                     }
-                if isShapeTab {
+                if showOnlineAudio {
+                    OnlineAudioPanel()
+                } else if isShapeTab {
                     ShapePanel()
                 } else if isTextTab {
                     TextLayerPanel()
@@ -331,7 +356,7 @@ struct MediaLibraryView: View {
                                 }
                             }
                             .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(.leading, 3).padding(.trailing, 10)
+                            .padding(.leading, isAudioTab ? AudioLibraryNav.contentGap : 3).padding(.trailing, 10)
                             .padding(.bottom, 8)
                         } else {
                             VStack(spacing: 2) {
@@ -340,7 +365,7 @@ struct MediaLibraryView: View {
                                     AssetRow(assetID: asset.id, currentFolder: currentFolderID)
                                 }
                             }
-                            .padding(.leading, 3).padding(.trailing, 10)
+                            .padding(.leading, isAudioTab ? AudioLibraryNav.contentGap : 3).padding(.trailing, 10)
                             .padding(.bottom, 8)
                         }
                         // 列表底下垫一段，短列表也有地方右键（菜单挂在整片上，见下）
@@ -430,6 +455,8 @@ struct MediaLibraryView: View {
                     // 侧栏能拖宽、窗口能缩放、切 tab 也会变，位置得跟着更新
                     .onChange(of: g.frame(in: .global)) { _, r in registerDropZone(r) }
             })
+            }   // VStack（右边内容）
+            }   // HStack（音频页导航 + 内容）
 
             Spacer()
 
@@ -1004,6 +1031,7 @@ struct MediaLibraryView: View {
         tabBar(Self.libraryCategories, selection: $project.libraryCategory)
     }
 
+
     /// 「效果」栏的分类标签
     private var effectTabBar: some View {
         tabBar(Self.effectCategories, selection: $project.effectCategory)
@@ -1309,6 +1337,13 @@ private struct AssetRow: View {
             if asset.fileExists, !batch {
                 Button("添加到时间轴") { project.addToTimeline(asset) }
                 Button("添加到 AI 参考") { addToAIReference() }
+            }
+            // 在线下载的 CC BY 素材要署名，这里一键复制那段文字
+            if !batch, let credit = asset.attribution, !credit.isEmpty {
+                Button("复制署名") {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(credit, forType: .string)
+                }
             }
             // 移动到文件夹。跟拖进去是一回事 —— 只改归属，磁盘文件不动
             if library.folders.contains(where: { $0.type == asset.type }) {

@@ -71,6 +71,8 @@ struct MediaAsset: Identifiable, Equatable, Codable {
     var fileSize: Int64?
     /// 归在哪个虚拟文件夹下。nil = 放在根一层
     var folderID: UUID?
+    /// 署名文字。在线下载的 CC BY 素材才有，按协议成片里要带上
+    var attribution: String?
     var fileExists: Bool { FileManager.default.fileExists(atPath: url.path) }
     static func == (lhs: MediaAsset, rhs: MediaAsset) -> Bool { lhs.id == rhs.id }
 }

@@ -48,6 +48,8 @@ final class MediaLibrary: ObservableObject {
         var fileSize: Int64?
         var bookmark: Data?
         var folderID: UUID?
+        /// 在线下载的 CC BY 素材的署名。老存档没这个键，可选型自动解成 nil
+        var attribution: String?
     }
 
     /// 盘上的整份。老版本存的是**裸数组**，解不出这个结构时按老格式再试一次
@@ -87,7 +89,8 @@ final class MediaLibrary: ObservableObject {
                         bookmark: try? a.url.bookmarkData(options: .withSecurityScope,
                                                           includingResourceValuesForKeys: nil,
                                                           relativeTo: nil),
-                        folderID: a.folderID)
+                        folderID: a.folderID,
+                        attribution: a.attribution)
         }
         guard let data = try? JSONEncoder().encode(StoredLibrary(assets: stored,
                                                                  folders: folders)) else {
@@ -141,7 +144,8 @@ final class MediaLibrary: ObservableObject {
             // 每次重启所有素材都退回根一层，看着就像「文件夹被清空了」
             restored.append(MediaAsset(id: s.id, url: url, name: s.name, type: s.type,
                                        duration: s.duration, importDate: s.importDate,
-                                       fileSize: s.fileSize, folderID: s.folderID))
+                                       fileSize: s.fileSize, folderID: s.folderID,
+                                       attribution: s.attribution))
         }
         assets = restored
         saveWorkItem?.cancel()   // load 触发的 didSet 不必回写

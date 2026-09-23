@@ -3920,6 +3920,14 @@ class ChatTextView: NSTextView, NSMenuDelegate {
         if item.action == #selector(addToSubtitle) || item.action == #selector(addToTitle) {
             return selectedRange().length > 0
         }
+        // 纯文本输入框（isRichText = false）遇到剪贴板里只有位图时，系统判定「粘不了」，
+        // 把粘贴置灰 —— ⌘V 连 paste(_:) 都进不来。截图（⌘⇧⌃4）放进剪贴板的
+        // 正是 PNG/TIFF 位图、没有文件路径，所以截图粘不进来，复制图片文件却可以。
+        // 这里放行：有图就算能粘，真正的处理在 paste(_:) 里落盘成附件
+        if item.action == #selector(paste(_:)),
+           NSImage.canInit(with: NSPasteboard.general) {
+            return true
+        }
         return super.validateUserInterfaceItem(item)
     }
 

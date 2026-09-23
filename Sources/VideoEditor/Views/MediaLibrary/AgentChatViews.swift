@@ -139,11 +139,18 @@ struct AgentStepsView: View {
                         VStack(alignment: .leading, spacing: 1) {
                             ForEach(steps) { AgentStepRow(step: $0) }
                         }
+                        // 行宽跟着卡片走，不许按内容撑：参数那截（clip_id、长路径）
+                        // 理想宽度是整串文字，不钉住的话整块比气泡还宽
+                        .frame(maxWidth: .infinity, alignment: .leading)
                     }
                     .frame(maxHeight: 600)
                     .padding(.top, 2)
                 }
             }
+            // **展开时钉成气泡宽、靠左**。不钉的话里面那排步骤按内容撑宽，
+            // 比气泡还宽的那截会以中心为准往两边溢出 —— 左边的圆点和卡片边
+            // 被切掉半截。收起时不钉，卡片还是跟标题一样宽
+            .frame(maxWidth: expanded ? .infinity : nil, alignment: .leading)
             .padding(.vertical, 8).padding(.horizontal, 12)
             .background(RoundedRectangle(cornerRadius: 6).fill(Color.white.opacity(0.04)))
         }
@@ -180,10 +187,16 @@ private struct AgentStepRow: View {
                         .fill(step.isError ? Color(hex: "#FF6B6B") : Color.labelSecondary.opacity(0.45))
                         .frame(width: 4, height: 4)
                         .alignmentGuide(.firstTextBaseline) { _ in 3 }
+                    // 标题优先占位（比参数那截先拿宽度），但**不能 fixedSize** ——
+                    // 没中文名的工具（MCP 那些）显示原名，最长四十几个字符，
+                    // fixedSize 让它成了整排步骤的最小宽度，侧栏一窄就把气泡撑出列表，
+                    // 超出的那截居中溢出，左边被切（实测列表 276 时气泡被撑到 274）
                     Text(title)
                         .font(.system(size: 10.5, weight: .medium))
                         .foregroundColor(step.isError ? Color(hex: "#FF9230") : Color.labelSecondary)
-                        .fixedSize()
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                        .layoutPriority(1)
                     if !subtitle.isEmpty {
                         Text(subtitle)
                             .font(.system(size: 10))

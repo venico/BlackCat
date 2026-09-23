@@ -1070,6 +1070,15 @@ enum Translator {
         return output
     }
 
+    /// 不做「是否已是目标语言」的预判，全部送引擎。
+    /// 给**短标题**用（在线音效名 Rain / Door 这种）：translateBatch 会把 4 字以下的
+    /// 一律当成「已是目标语言」原样放过，短标题就一个都翻不到
+    static func translateBatchRaw(_ texts: [String], to lang: String) async -> [String] {
+        let engineLang = engineLanguage(for: lang)
+        let out = await translateEngineBatch(texts, to: engineLang)
+        return engineLang == lang ? out : out.map { OpenCC.toTraditional($0) }
+    }
+
     /// 真正送去翻译引擎的那部分：多条文本用 \n 拼接成一次请求，翻译后按行还原。
     /// 如果行数不匹配则回退到逐条翻译。
     private static func translateEngineBatch(_ texts: [String], to lang: String,

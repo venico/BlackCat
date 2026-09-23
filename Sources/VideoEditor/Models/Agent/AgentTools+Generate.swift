@@ -18,7 +18,10 @@ extension AgentToolbox {
         let names = AIVideoService.Provider.allCases
             .filter { !$0.isHidden && $0.category == cat }
             .map { p -> String in
-                AIVideoService.apiKey(for: p).isEmpty
+                if p.isLocal {
+                    return p.rawValue + (AIVideoService.apiKey(for: p).isEmpty ? "（本地，模型未下载）" : "（本地）")
+                }
+                return AIVideoService.apiKey(for: p).isEmpty
                     ? p.rawValue + "（未配 Key）" : p.rawValue
             }
         return names.isEmpty ? "（没有可用的）" : names.joined(separator: "、")
@@ -95,11 +98,25 @@ extension AgentToolbox {
 
             AgentToolSpec(
                 name: "generate_audio",
-                description: "用 AI 生成音频（音乐、音效）。提交后立刻返回。",
+                description: """
+                用 AI 生成音频。提交后立刻返回。
+                **要配乐 / 背景音乐 / 一首歌时用 ace-step**（本地运行，不花钱）：\
+                prompt 写风格、情绪、乐器、速度，中英文都行；duration 传秒数；\
+                默认纯音乐，用户要人声才传 vocals=true（歌词可以自己写好放 lyrics，不写它会自己编）。
+                其余几家是语音合成（把文字念出来），prompt 就是要念的那段话。
+                """,
                 parameters: [
                     "type": "object",
                     "properties": [
                         "prompt": ["type": "string"],
+                        "duration": ["type": "string",
+                                     "description": "只对 ace-step 有效：配乐多长（秒，10～600）。"
+                                         + "给视频配乐就按视频长度传；不传默认 30 秒"],
+                        "vocals": ["type": "boolean",
+                                   "description": "只对 ace-step 有效：要不要人声。默认 false（纯音乐）"],
+                        "lyrics": ["type": "string",
+                                   "description": "只对 ace-step 有效，且 vocals=true 时才用：歌词。"
+                                       + "可以用 [Verse] [Chorus] 这类段落标记。不传就让它自己写"],
                         // 图片/视频都能点名模型，音频原来漏了这个参数，
                         // 用户说「用 elevenlabs 生成」根本传不下来
                         "model": ["type": "string",
@@ -135,8 +152,9 @@ extension AgentToolbox {
             .filter { !$0.isHidden && $0.category == category }
         let rest = AIVideoService.Provider.allCases
             .filter { !$0.isHidden && $0.category == category && !ordered.contains($0) }
+        // 本地配乐跟其余几家（语音合成）干的不是一回事，失败了不能互相顶
         return (ordered + rest).first {
-            !tried.contains($0) && !AIVideoService.apiKey(for: $0).isEmpty
+            !$0.isLocal && !tried.contains($0) && !AIVideoService.apiKey(for: $0).isEmpty
         }
     }
 
@@ -165,11 +183,20 @@ extension AgentToolbox {
         let refVideos = refs.filter { $0.type == .video }.map(\.url)
         let refAudios = refs.filter { $0.type == .audio }.map(\.url)
 
+        // 歌词三态，给本地配乐用：nil 纯音乐 / "" 让它自己写 / 其余照这段唱
+        let wantsVocals = (args["vocals"] as? Bool) ?? ((args["vocals"] as? String) == "true")
+        let lyricsArg: String? = wantsVocals ? ((args["lyrics"] as? String) ?? "") : nil
+        // 模型有时把秒数传成数字
+        let durationArg = (args["duration"] as? String)
+            ?? (args["duration"] as? Int).map(String.init)
+            ?? (args["duration"] as? Double).map { String(Int($0)) }
+
         let box = TaskIDBox()
         let id = svc.generateForCanvas(
             prompt: prompt,
             provider: provider,
-            duration: args["duration"] as? String ?? "5",
+            // 视频默认 5 秒；音频（配乐）默认 30 秒
+            duration: durationArg ?? (category == .audio ? "30" : "5"),
             aspectRatio: args["ratio"] as? String ?? "16:9",
             imageRatio: args["ratio"] as? String ?? "1:1",
             referenceImages: refImages,
@@ -177,7 +204,8 @@ extension AgentToolbox {
             referenceAudios: refAudios,
             firstFrame: svc.agentRoundFirstFrame,
             lastFrame: svc.agentRoundLastFrame,
-            modelOverride: modelOverride
+            modelOverride: modelOverride,
+            lyrics: lyricsArg
         ) { result in
             Task { @MainActor in
                 guard let tid = box.id else { return }
@@ -311,6 +339,10 @@ extension AgentToolbox {
                 provider = AIVideoService.provider(for: category)
             }
             guard !AIVideoService.apiKey(for: provider).isEmpty else {
+                if provider.isLocal {
+                    return .fail("「\(provider.displayName)」的模型还没下载，"
+                                 + "请用户去 设置 → 音频 → 生成配乐 里下载（约 4.4 GB）再试。")
+                }
                 return .fail("「\(provider.displayName)」还没配 API Key，去设置 → AI 设置里填上再试。")
             }
 
@@ -321,7 +353,8 @@ extension AgentToolbox {
             // 之后在聊天里生图被版权拦下时死活不问换家，而他压根不记得自己指定过什么
             // （日志实据：允许换家=false 换了有意义=true 下一家=Image2）。
             // 换家本来就还要他点头，放宽是安全的
-            let allowFallback = namedProvider == nil
+            // 本地配乐失败也不换 —— 能换的全是语音合成，拿去「配乐」只会念出一段描述
+            let allowFallback = namedProvider == nil && !provider.isLocal
 
             let cap = AIVideoService.maxImages(for: provider, model: modelOverride)
             let count = max(1, min(asked, cap))

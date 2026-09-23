@@ -51,6 +51,10 @@ final class AIVideoService: ObservableObject {
         switch provider {
         case .seedance, .seedance15, .seedream:
             return settings.seedanceApiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        case .aceStep:
+            // 本地模型没有 Key。拿「模型装好了没」顶替 ——
+            // 各处「有没有 Key」的判断（能不能用、失败换家时挑谁）就都不用改
+            return MusicGenerator.isReady ? "local" : ""
         default:
             return settings.providerAPIKey(for: provider.rawValue)
                 .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -169,6 +173,8 @@ final class AIVideoService: ObservableObject {
         case fishAudio = "fish-audio"
         case suno = "suno"
         case minimaxTTS = "minimax-tts"
+        /// 本地配乐（ACE-Step 1.5）。不走网络、不要 Key，模型在 设置 → 音频 里下载
+        case aceStep = "ace-step"
         // 文字生成（与「视频分析」那套 LLM 保持同一组五家）
         case claude = "claude"
         case gpt56 = "gpt-5.6"
@@ -191,10 +197,14 @@ final class AIVideoService: ObservableObject {
         var subModels: [(label: String, id: String)] {
             switch self {
             case .claude:
-                return [("Fable5", "claude-fable-5"), ("Opus5", "claude-opus-5"),
+                // Opus5.5 插第二位，**别放第一** —— 第一个是没选过时的默认值
+                return [("Fable5", "claude-fable-5"), ("Opus5.5", "claude-opus-5-5"),
+                        ("Opus5", "claude-opus-5"),
                         ("Sonnet5", "claude-sonnet-5"), ("Opus4.6", "claude-opus-4-6")]
             case .gpt56:
+                // 新的插在 Astra 后面，第一个是默认值不动
                 return [("GPT-6-Astra", "gpt-6-astra"),
+                        ("GPT-6-Sol", "gpt-6-sol"), ("GPT-6-Luna", "gpt-6-luna"),
                         ("GPT-5.6-Sol", "gpt-5.6-sol"), ("GPT-5.6-Terra", "gpt-5.6-terra"),
                         ("GPT-5.5", "gpt-5.5")]
             case .deepseek_ai:
@@ -286,7 +296,7 @@ final class AIVideoService: ObservableObject {
             switch self {
             case .kling, .seedance, .seedance15, .runway, .minimax, .vidu, .veo3, .grokVideo: return .video
             case .seedream, .nanobanana2, .gptImage2, .flux, .sd3, .wanxiang, .grokImage: return .image
-            case .elevenlabs, .openaiTTS, .fishAudio, .suno, .minimaxTTS: return .audio
+            case .elevenlabs, .openaiTTS, .fishAudio, .suno, .minimaxTTS, .aceStep: return .audio
             case .claude, .gpt56, .deepseek_ai, .qwen, .glm, .grok, .kimi: return .text
             }
         }
@@ -311,6 +321,7 @@ final class AIVideoService: ObservableObject {
             case .fishAudio: return "Fish Audio"
             case .suno: return "Suno"
             case .minimaxTTS: return "MiniMax"
+            case .aceStep: return "ACE-Step（本地配乐）"
             case .claude: return "Claude"
             case .gpt56: return "Chatgpt"
             case .deepseek_ai: return "DeepSeek"
@@ -337,9 +348,12 @@ final class AIVideoService: ObservableObject {
             allCases.filter { $0.category == category && !$0.isHidden }
         }
 
+        /// 在本机跑的，不连任何接口、没有 Key 这回事
+        var isLocal: Bool { self == .aceStep }
+
         var needsAccessKey: Bool {
             switch self {
-            case .seedance, .seedance15, .seedream: return false
+            case .seedance, .seedance15, .seedream, .aceStep: return false
             default: return true
             }
         }
@@ -1124,6 +1138,7 @@ final class AIVideoService: ObservableObject {
                            firstFrame: URL? = nil,
                            lastFrame: URL? = nil,
                            modelOverride: String? = nil,
+                           lyrics: String? = nil,
                            onFinish: @escaping (Result<URL, Error>) -> Void) -> UUID {
         let taskID = UUID()
         let category = provider.category
@@ -1153,7 +1168,8 @@ final class AIVideoService: ObservableObject {
                                                       referenceImages: referenceImages, ratio: imageRatio,
                                                       modelOverride: modelOverride)
                     case .audio:
-                        url = try await generateAudio(provider: provider, prompt: prompt)
+                        url = try await generateAudio(provider: provider, prompt: prompt,
+                                                      duration: duration, lyrics: lyrics)
                     case .text:
                         // 文本节点不走生成，它就是个提示词输入框
                         throw AIError.apiError("文本节点不需要生成")
@@ -2778,7 +2794,14 @@ final class AIVideoService: ObservableObject {
         return try await generateAudio(provider: provider, prompt: trimmed)
     }
 
-    private func generateAudio(provider: Provider, prompt: String) async throws -> URL {
+    /// - Parameters:
+    ///   - duration: 只有本地配乐用得上（秒）。其他几家是 TTS，长短由文本定
+    ///   - lyrics: 只有本地配乐用得上。nil = 纯音乐，"" = 让它自己写词，其余 = 用这段词
+    private func generateAudio(provider: Provider, prompt: String,
+                               duration: String? = nil, lyrics: String? = nil) async throws -> URL {
+        if provider == .aceStep {
+            return try await generateWithAceStep(prompt: prompt, duration: duration, lyrics: lyrics)
+        }
         let apiKey = settings.providerAPIKey(for: provider.rawValue)
         guard !apiKey.isEmpty else {
             throw AIError.missingAPIKey("请先在设置中填写 \(provider.displayName) 的 API Key")
@@ -2796,6 +2819,26 @@ final class AIVideoService: ObservableObject {
             return try await generateWithMiniMaxTTS(apiKey: apiKey, prompt: prompt)
         default:
             throw AIError.missingAPIKey("\(provider.displayName) 不支持音频生成")
+        }
+    }
+
+    // MARK: - ACE-Step 本地配乐
+
+    private func generateWithAceStep(prompt: String, duration: String?, lyrics: String?) async throws -> URL {
+        guard MusicGenerator.binariesReady else { throw AIError.apiError(MusicGenerator.GenError.binaryMissing.localizedDescription) }
+        guard MusicGenerator.modelReady else { throw AIError.apiError(MusicGenerator.GenError.notInstalled.localizedDescription) }
+        // 没给时长默认 30 秒；给了也夹到它支持的 10～600 秒
+        let secs = duration.flatMap { Double($0.trimmingCharacters(in: .whitespaces)) } ?? 30
+        await MainActor.run { updateAssistantStatus(.generating(progress: "生成配乐中…")) }
+        // 取消：外层 Task 被 cancel 只是竖个标志，底下是子进程，得亲手杀掉
+        return try await withTaskCancellationHandler {
+            try await MusicGenerator.generate(caption: prompt, lyrics: lyrics, duration: secs) { pct, stage in
+                Task { @MainActor [weak self] in
+                    self?.updateAssistantStatus(.generating(progress: "\(stage) \(Int(pct * 100))%"))
+                }
+            }
+        } onCancel: {
+            MusicGenerator.cancel()
         }
     }
 

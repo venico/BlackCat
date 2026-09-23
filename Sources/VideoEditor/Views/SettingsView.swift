@@ -28,6 +28,7 @@ struct SettingsView: View {
 
     @State private var sceneDetectState: ModelState = .notDownloaded
     @State private var demucsState: ModelState = .notDownloaded
+    @State private var aceStepState: ModelState = .notDownloaded
     @State private var biRefNetStates: [BiRefNetModel: ModelState] = [:]
     @State private var clarityModelStates: [ClarityModel: ModelState] = [:]
     @State private var clarityProStates: [ClarityProModel: ModelState] = [:]
@@ -108,7 +109,7 @@ struct SettingsView: View {
         .frame(width: 720, height: 540)
         .background(Color.black.opacity(0.30))
         .floatingPanelMaterial()
-        .onAppear { refreshModelStates(); refreshSceneDetectState(); refreshDemucsState(); refreshSeparated(); refreshBiRefNetStates(); refreshClarityModelStates(); refreshClarityProStates() }
+        .onAppear { refreshModelStates(); refreshSceneDetectState(); refreshDemucsState(); refreshAceStepState(); refreshSeparated(); refreshBiRefNetStates(); refreshClarityModelStates(); refreshClarityProStates() }
     }
 
     /// 标签图标。有几个只长在时间轴那套注册表里，两边都找一下
@@ -393,6 +394,27 @@ struct SettingsView: View {
 
     private var audioTab: some View {
         VStack(alignment: .leading, spacing: 12) {
+            sectionTitle("生成配乐")
+
+            componentCard(
+                title: "配乐生成组件",
+                detail: "按一句描述生成配乐，可以是纯音乐，也可以带人声歌词",
+                infoText: "使用 ACE-Step 1.5（本地运行），约 4.4 GB",
+                folder: MusicGenerator.supportDir,
+                state: aceStepState,
+                onDownload: { downloadAceStepModel() },
+                onUninstall: {
+                    try? MusicGenerator.uninstallModel()
+                    refreshAceStepState()
+                }
+            )
+
+            if !MusicGenerator.binariesReady {
+                Text("未检测到配乐生成程序 ace-lm / ace-synth，功能暂不可用。")
+                    .font(.system(size: 10))
+                    .foregroundColor(.orange.opacity(0.8))
+            }
+
             sectionTitle("分离音轨")
 
             componentCard(
@@ -569,6 +591,25 @@ struct SettingsView: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+    }
+
+    private func refreshAceStepState() {
+        if case .downloading = aceStepState { return }
+        aceStepState = MusicGenerator.modelReady ? .downloaded : .notDownloaded
+    }
+
+    private func downloadAceStepModel() {
+        aceStepState = .downloading(0)
+        Task {
+            do {
+                try await MusicGenerator.downloadModel { pct in
+                    DispatchQueue.main.async { aceStepState = .downloading(pct) }
+                }
+                await MainActor.run { aceStepState = .downloaded }
+            } catch {
+                await MainActor.run { aceStepState = .failed(error.localizedDescription) }
+            }
+        }
     }
 
     private func refreshDemucsState() {
@@ -1506,7 +1547,15 @@ struct SettingsView: View {
             }
 
             if let provider = AIVideoService.Provider(rawValue: settings.aiProvider) {
-                if provider == .minimaxTTS {
+                if provider == .aceStep {
+                    // 本地模型没有 Key 可填，只说清楚去哪下载、现在装没装
+                    Text(MusicGenerator.isReady
+                         ? "在本机运行，不需要 API Key。模型已安装，可以直接生成配乐。"
+                         : "在本机运行，不需要 API Key。需要先到 设置 → 音频 → 生成配乐 下载模型（约 4.4 GB）。")
+                        .font(.system(size: 11))
+                        .foregroundColor(MusicGenerator.isReady ? Color.labelSecondary : .orange.opacity(0.85))
+                        .fixedSize(horizontal: false, vertical: true)
+                } else if provider == .minimaxTTS {
                     apiKeyField(
                         label: "API Key",
                         placeholder: "输入 MiniMax API Key",
