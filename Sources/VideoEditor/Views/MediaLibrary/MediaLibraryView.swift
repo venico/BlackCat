@@ -1226,6 +1226,8 @@ private class ImportExportMenuHandler: NSObject {
 // MARK: - Asset Row
 
 private struct AssetRow: View {
+    /// 音频行的试听跟在线库共用一个播放器，同一时间只响一条
+    @ObservedObject private var audioStore = OnlineAudioStore.shared
     /// 文件夹列表在这儿读，不观察的话改完名右键菜单还是老名字
     @ObservedObject private var library = MediaLibrary.shared
     @EnvironmentObject private var project: ProjectState
@@ -1432,9 +1434,30 @@ private struct AssetRow: View {
                                 .aspectRatio(contentMode: .fill)
                         )
                         .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
+                } else if asset.type == .audio {
+                    // 音频的缺省图是个**圆**（像张唱片），跟视频 / 图片的方块区分开。
+                    // 外面仍占 4:3 的格子，宫格里各行才对得齐；圆取格子的高
+                    Color.clear
+                        .frame(maxWidth: .infinity)
+                        .aspectRatio(4.0/3.0, contentMode: .fit)
+                        .overlay(
+                            Circle()
+                                .fill(Color.white.opacity(0.06))
+                                .aspectRatio(1, contentMode: .fit)
+                                .overlay(
+                                    Image(nsImage: SidebarSVGIcon.load(asset.type.svgIcon))
+                                        .renderingMode(.template)
+                                        .resizable()
+                                        .aspectRatio(contentMode: .fit)
+                                        .frame(width: 24, height: 24)
+                                        .foregroundColor(Color.labelSecondary.opacity(0.32))
+                                )
+                                // 上下各留一点，圆比格子高度小一圈，不顶满
+                                .padding(.vertical, 7)
+                        )
                 } else {
                     // 分类图标 —— 跟素材区空状态那张是同一套 SVG。
-                    // 音频和字幕没有封面可抽，永远走这条
+                    // 字幕没有封面可抽，永远走这条
                     RoundedRectangle(cornerRadius: 9, style: .continuous)
                         .fill(Color.white.opacity(0.06))
                         .aspectRatio(4.0/3.0, contentMode: .fit)
@@ -1503,7 +1526,9 @@ private struct AssetRow: View {
                         .help(asset.name)
                 }
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
+            // 音频、字幕的图是居中的图标，名字跟着居中；视频 / 图片是画面，名字左对齐
+            .frame(maxWidth: .infinity,
+                   alignment: (asset.type == .audio || asset.type == .subtitle) ? .center : .leading)
             .padding(.top, 5)
         }
         // 四周 16pt 的留白。图和名字都收在这圈里，左边缘自然对齐 ——
@@ -1561,7 +1586,77 @@ private struct AssetRow: View {
         return out
     }
 
+    /// 音频、字幕在列表视图里跟音乐库 / 音效库长一个样：左边一个圆，名字一行，
+    /// 下面格式标签 + 时长；右边两个按钮照旧 hover 才出来。
+    /// 音频的圆是试听钮；字幕没得听，圆里放字幕图标，不能点
+    private var audioListRow: some View {
+        let playID = asset.id.uuidString
+        let playing = audioStore.playingID == playID
+        return HStack(spacing: 8) {
+            if asset.type == .audio {
+                AudioPlayCircle(playing: playing) {
+                    audioStore.togglePreview(url: asset.url, id: playID)
+                }
+            } else {
+                Image(nsImage: SidebarSVGIcon.load(asset.type.svgIcon))
+                    .renderingMode(.template)
+                    .resizable().aspectRatio(contentMode: .fit)
+                    .frame(width: 11, height: 11)
+                    .foregroundColor(Color.labelSecondary)
+                    .frame(width: 24, height: 24)
+                    .background(Circle().fill(Color.white.opacity(0.08)))
+            }
+            VStack(alignment: .leading, spacing: 2) {
+                if isRenaming {
+                    nameEditor(fontSize: 12)
+                } else {
+                    Text(asset.name)
+                        .font(.system(size: 11.5))
+                        .foregroundColor(Color.labelPrimary)
+                        .lineLimit(1).truncationMode(.middle)
+                        .help(asset.name)
+                }
+                HStack(spacing: 5) {
+                    if let tag = formatTag {
+                        Text(tag.text)
+                            .font(.system(size: 9, weight: .medium))
+                            .foregroundColor(tag.color)
+                            .padding(.horizontal, 4).padding(.vertical, 1)
+                            .background(RoundedRectangle(cornerRadius: 3).fill(Color.white.opacity(0.08)))
+                    }
+                    if asset.duration > 0 {
+                        Text(fmtDur(asset.duration))
+                            .font(.system(size: 10).monospacedDigit())
+                            .foregroundColor(Color.labelSecondary.opacity(0.7))
+                    }
+                }
+            }
+            Spacer(minLength: 4)
+            if hovered {
+                HStack(spacing: 2) {
+                    miniBtn(icon: "plus.circle") { project.addToTimeline(asset) }
+                    miniBtn(icon: "trash") { confirmDeleteAsset() }
+                }
+            }
+        }
+        // 按钮不出来时也占着高度，hover 时行不跳
+        .frame(minHeight: 34)
+        .padding(.horizontal, 4).padding(.vertical, 3)
+        .background(RoundedRectangle(cornerRadius: 5)
+            .fill(playing ? Color.white.opacity(0.06) : Color.clear))
+    }
+
+    @ViewBuilder
     private var normalAssetRow: some View {
+        // 丢失的还走下面那套：要显示「素材丢失」和重新关联按钮
+        if (asset.type == .audio || asset.type == .subtitle) && asset.fileExists {
+            audioListRow
+        } else {
+            classicAssetRow
+        }
+    }
+
+    private var classicAssetRow: some View {
         // spacing 0：名字长到撑满时 Spacer 压到 0，行内不再有任何死间距，
         // 名字能一直排到按钮跟前（按钮自己的 padding 就是视觉间隔）
         HStack(spacing: 0) {

@@ -371,6 +371,12 @@ final class OnlineAudioStore: ObservableObject {
         play(url, id: item.id)
     }
 
+    /// 本地音频列表用：直接给文件试听。跟在线库共用一个播放器，点别的会把这条停掉
+    func togglePreview(url: URL, id: String) {
+        if playingID == id { stopPreview(); return }
+        play(url, id: id)
+    }
+
     private func play(_ url: URL, id: String) {
         stopPreview()
         let p = AVPlayer(url: url)
@@ -500,7 +506,6 @@ struct AudioLibraryNav: View {
                         .foregroundColor(Color.labelSecondary)
                 }
                 .padding(.horizontal, 6).frame(height: Self.rowHeight)
-                .background(RoundedRectangle(cornerRadius: 6).fill(Color.white.opacity(0.07)))
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
@@ -578,7 +583,23 @@ struct OnlineAudioPanel: View {
     private var content: some View {
         if isFavorites {
             if store.visibleFavorites.isEmpty {
-                hint(store.favorites.isEmpty ? "还没有收藏。在音乐库、音效库里点卡片上的 ♡ 收藏" : "没有匹配的收藏")
+                if store.favorites.isEmpty {
+                    // 跟本地音频的空状态同一个样子：分类图标 + 一行字，摆在三分之一高度
+                    VStack(spacing: 10) {
+                        Image(nsImage: SidebarSVGIcon.load("audio"))
+                            .renderingMode(.template)
+                            .resizable().aspectRatio(contentMode: .fit)
+                            .frame(width: 44, height: 44)
+                            .foregroundColor(Color.labelSecondary.opacity(0.30))
+                        Text("你还没有任何收藏")
+                            .font(.system(size: 11))
+                            .foregroundColor(Color.labelSecondary.opacity(0.45))
+                    }
+                    .modifier(PositionedAtOneThird())
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else {
+                    hint("没有匹配的收藏")
+                }
             } else {
                 list(store.visibleFavorites, paged: false)
             }
@@ -628,31 +649,74 @@ struct OnlineAudioPanel: View {
     }
 
     private func row(_ item: OnlineAudioItem) -> some View {
-        let playing = store.playingID == item.id
-        return HStack(spacing: 8) {
-            Button { store.togglePreview(item) } label: {
-                // 跟预览区传输控件同一套图标。有封面就拿封面当底（压暗一层让图标看得清），
-                // 没有就是原来那个浅色圆底
-                let cover = store.cover(for: item)
-                Image(nsImage: TimelineSVGIcon.load(playing ? "pause" : "play"))
-                    .renderingMode(.template)
-                    .resizable().aspectRatio(contentMode: .fit)
-                    .frame(width: 10, height: 10)
-                    .foregroundColor(playing ? Color.accent : (cover == nil ? Color.labelPrimary : .white))
-                    .frame(width: 24, height: 24)
-                    .background {
-                        if let cover {
-                            Image(nsImage: cover).resizable().aspectRatio(contentMode: .fill)
-                                .overlay(Color.black.opacity(0.35))
-                                .clipShape(Circle())
-                        } else {
-                            Circle().fill(Color.white.opacity(0.08))
-                        }
+        OnlineAudioRow(item: item)
+    }
+}
+
+// MARK: - 一行（在线库 / 收藏共用）
+
+/// 左边播放圆钮：跟预览区传输控件同一套图标。有封面就拿封面当底（压暗一层让图标看得清），
+/// 没有就是浅色圆底。本地音频列表也用它，两边长得一样
+struct AudioPlayCircle: View {
+    let playing: Bool
+    var cover: NSImage? = nil
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Image(nsImage: TimelineSVGIcon.load(playing ? "pause" : "play"))
+                .renderingMode(.template)
+                .resizable().aspectRatio(contentMode: .fit)
+                .frame(width: 10, height: 10)
+                .foregroundColor(playing ? Color.accent : (cover == nil ? Color.labelPrimary : .white))
+                .frame(width: 24, height: 24)
+                .background {
+                    if let cover {
+                        Image(nsImage: cover).resizable().aspectRatio(contentMode: .fill)
+                            .overlay(Color.black.opacity(0.35))
+                            .clipShape(Circle())
+                    } else {
+                        Circle().fill(Color.white.opacity(0.08))
                     }
-                    .contentShape(Circle())
-            }
-            .buttonStyle(.plain)
-            .help(playing ? "停止" : "试听")
+                }
+                .contentShape(Circle())
+        }
+        .buttonStyle(.plain)
+        .help(playing ? "停止" : "试听")
+    }
+}
+
+/// 行尾的小图标按钮
+struct AudioRowIconButton: View {
+    let symbol: String
+    let color: Color
+    let help: String
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: symbol)
+                .font(.system(size: 11, weight: .medium))
+                .foregroundColor(color)
+                .frame(width: 24, height: 24)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(help)
+    }
+}
+
+private struct OnlineAudioRow: View {
+    let item: OnlineAudioItem
+    @EnvironmentObject var project: ProjectState
+    @ObservedObject private var store = OnlineAudioStore.shared
+    @State private var hover = false
+
+    var body: some View {
+        let playing = store.playingID == item.id
+        let downloading = store.downloading[item.id]
+        HStack(spacing: 8) {
+            AudioPlayCircle(playing: playing, cover: store.cover(for: item)) { store.togglePreview(item) }
 
             VStack(alignment: .leading, spacing: 2) {
                 Text(store.title(for: item))
@@ -675,42 +739,31 @@ struct OnlineAudioPanel: View {
             }
             Spacer(minLength: 4)
 
-            let fav = store.isFavorite(item)
-            iconButton(fav ? "heart.fill" : "heart",
-                       color: fav ? Color(hex: "#FF6B8A") : Color.labelSecondary,
-                       help: fav ? "取消收藏" : "收藏") { store.toggleFavorite(item) }
-            downloadButton(item)
+            // 收藏 / 下载两个按钮 hover 才出来；下载进行中的进度条一直显示，不然看不出在下
+            if let pct = downloading {
+                ProgressView(value: pct).frame(width: 24).tint(Color.accent)
+            } else if hover {
+                let fav = store.isFavorite(item)
+                AudioRowIconButton(symbol: fav ? "heart.fill" : "heart",
+                                   color: fav ? Color(hex: "#FF6B8A") : Color.labelSecondary,
+                                   help: fav ? "取消收藏" : "收藏") { store.toggleFavorite(item) }
+                if store.isDownloaded(item) {
+                    AudioRowIconButton(symbol: "plus.circle.fill", color: Color.accent,
+                                       help: "添加到时间轴（播放头处）") {
+                        store.addToTimeline(item, project: project)
+                    }
+                } else {
+                    AudioRowIconButton(symbol: "arrow.down.circle", color: Color.labelSecondary,
+                                       help: "下载") { store.download(item, project: project) }
+                }
+            }
         }
-        .padding(.horizontal, 4).padding(.vertical, 5)
+        // 按钮不出来时也占着高度，行不会因为 hover 跳一下
+        .frame(minHeight: 34)
+        .padding(.horizontal, 4).padding(.vertical, 3)
         .background(RoundedRectangle(cornerRadius: 5)
-            .fill(playing ? Color.white.opacity(0.06) : Color.clear))
-    }
-
-    private func iconButton(_ symbol: String, color: Color, help: String,
-                            action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            Image(systemName: symbol)
-                .font(.system(size: 11, weight: .medium))
-                .foregroundColor(color)
-                .frame(width: 24, height: 24)
-                .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .help(help)
-    }
-
-    @ViewBuilder
-    private func downloadButton(_ item: OnlineAudioItem) -> some View {
-        if let pct = store.downloading[item.id] {
-            ProgressView(value: pct).frame(width: 24).tint(Color.accent)
-        } else if store.isDownloaded(item) {
-            iconButton("plus.circle.fill", color: Color.accent, help: "添加到时间轴（播放头处）") {
-                store.addToTimeline(item, project: project)
-            }
-        } else {
-            iconButton("arrow.down.circle", color: Color.labelSecondary, help: "下载") {
-                store.download(item, project: project)
-            }
-        }
+            .fill(playing ? Color.white.opacity(0.06) : (hover ? Color.white.opacity(0.04) : Color.clear)))
+        .contentShape(Rectangle())
+        .onHover { hover = $0 }
     }
 }

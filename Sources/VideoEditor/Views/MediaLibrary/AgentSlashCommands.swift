@@ -115,7 +115,9 @@ struct SlashCommandPopup: View {
     let onPick: (SlashCommand) -> Void
 
     var body: some View {
-        // 命令一多就滚，别把整个面板顶穿
+        // 命令一多就滚，别把整个面板顶穿。
+        // 上下键移动选中项时要跟着滚：不跟的话选中的那条跑到可视区外面，看不见选到哪了
+        ScrollViewReader { proxy in
         ScrollView(showsIndicators: false) {
             VStack(alignment: .leading, spacing: 0) {
                 ForEach(Array(commands.enumerated()), id: \.element.id) { i, cmd in
@@ -148,8 +150,15 @@ struct SlashCommandPopup: View {
                         .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
+                    .id(i)
                 }
             }
+        }
+        // 只在选中项出了可视区时才滚，而且只滚到刚好露出来（anchor 为 nil），
+        // 列表不会每按一下就整体跳一截
+        .onChange(of: selectedIndex) { _, i in
+            proxy.scrollTo(i)
+        }
         }
         // 必须给确定高度：overlay 里 ScrollView 会去取被覆盖那个视图的提案，
         // 只写 maxHeight 的话它塌成输入框那么高，菜单等于不见了

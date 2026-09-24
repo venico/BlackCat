@@ -191,6 +191,8 @@ extension AgentToolbox {
             ?? (args["duration"] as? Int).map(String.init)
             ?? (args["duration"] as? Double).map { String(Int($0)) }
 
+        // 记下是哪条会话发起的：做完时人可能已经切走了，结果要回到这条会话里
+        let ownerConversation = svc.currentConversationId
         let box = TaskIDBox()
         let id = svc.generateForCanvas(
             prompt: prompt,
@@ -219,7 +221,7 @@ extension AgentToolbox {
                         // 生成完直接进素材库，用户不用再手动导一次
                         project.importFile(url)
                     }
-                    svc.appendAgentMedia(url: url, category: category)
+                    svc.appendAgentMedia(url: url, category: category, conversationID: ownerConversation)
                     AgentBackgroundTasks.shared.finish(id: tid, url: url)
                 case .failure(let err):
                     // 三个条件缺一个就不问换家，而三个都不在界面上露脸 ——

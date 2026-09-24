@@ -1143,8 +1143,11 @@ final class ProjectState: ObservableObject {
             if m == .original, !supportsOriginalViewMode(key) { return .grid }
             return m
         }
-        // 还没切过的：沿用旧的那个布尔开关，老项目打开不会突然换个样子
-        return (mediaGridModeByKey[key] ?? true) ? .grid : .list
+        // 还没切过的：沿用旧的那个布尔开关。
+        // 素材库的音频、字幕两页默认列表 —— 没有画面，宫格里只是一排排同样的图标，
+        // 列表能直接看到文件名和时长
+        let defaultGrid = !(key == "audio" || key == "subtitle")
+        return (mediaGridModeByKey[key] ?? defaultGrid) ? .grid : .list
     }
 
     func setViewMode(_ m: MediaViewMode, for key: String) {
