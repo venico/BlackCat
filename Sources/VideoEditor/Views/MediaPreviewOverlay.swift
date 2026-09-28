@@ -52,10 +52,11 @@ struct MediaPreviewOverlay: View {
                     .shadow(color: .black.opacity(0.5), radius: 24, y: 8)
             }
         } else if let img = image {
+            // 图片显示原图：不加圆角，也不放大到超过原始尺寸
             Image(nsImage: img)
                 .resizable()
                 .aspectRatio(contentMode: .fit)
-                .clipShape(RoundedRectangle(cornerRadius: 10))
+                .frame(maxWidth: img.size.width, maxHeight: img.size.height)
                 .shadow(color: .black.opacity(0.5), radius: 24, y: 8)
                 // 图片本身不接点击，让给底下的遮罩去关
                 .allowsHitTesting(false)

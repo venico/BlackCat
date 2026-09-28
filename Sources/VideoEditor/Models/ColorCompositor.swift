@@ -317,8 +317,11 @@ final class ColorCompositor: NSObject, AVVideoCompositing {
     }
 
     /// 把叠加层画到帧上。顺序跟导出一致：从底到顶
-    static func drawOverlays(_ image: CIImage, at t: Double, renderSize: CGSize) -> CIImage {
-        let input = getOverlayInput()
+    /// - Parameter explicit: 不走合成器手上那份、直接用给定的数据画（Agent 截帧用：
+    ///   没有效果轨时合成器手上那份是空的，叠加层归 SwiftUI 画，截帧里就没有字幕）
+    static func drawOverlays(_ image: CIImage, at t: Double, renderSize: CGSize,
+                             input explicit: OverlayInput? = nil) -> CIImage {
+        let input = explicit ?? getOverlayInput()
         guard !input.order.isEmpty else { return image }
         var out = image
         var subtitleDone = false

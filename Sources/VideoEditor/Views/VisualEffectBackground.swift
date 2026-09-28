@@ -125,6 +125,13 @@ extension View {
         modifier(PanelBorder(cornerRadius: cornerRadius))
     }
 
+    /// 贴边侧栏（主界面素材栏、欢迎页侧栏）的底：只压一层半透明黑，
+    /// 下面的窗口材质照样透出来，玻璃感还在，只是比右边内容区暗一档。
+    /// 两处共用这一个值，调深浅改这里
+    func sidebarTint() -> some View {
+        background(Color.black.opacity(0.15))
+    }
+
     /// 侧边栏材质（系统设置左栏、访达边栏用的就是这个）
     func sidebarMaterial() -> some View {
         background(VisualEffectBackground(material: .sidebar))

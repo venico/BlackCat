@@ -1,4 +1,5 @@
 import SwiftUI
+import CryptoKit
 import AVFoundation
 import UniformTypeIdentifiers
 
@@ -2413,7 +2414,8 @@ HStack(spacing: 2) {
                                                isError: $0.isError,
                                                args: $0.args.isEmpty ? nil : $0.args,
                                                detail: $0.detail.isEmpty ? nil : $0.detail,
-                                               thinking: $0.thinking.isEmpty ? nil : $0.thinking)
+                                               thinking: $0.thinking.isEmpty ? nil : $0.thinking,
+                                               imagePath: $0.imagePath.isEmpty ? nil : $0.imagePath)
                                      },
                                      elapsed: agent.elapsed, tokens: agent.totalTokens)
             agent.setRunningMessage(nil, in: service.currentConversationId)
@@ -2738,7 +2740,8 @@ private struct MessageBubble: View {
             ? agent.steps.map { .init(id: $0.id, tool: $0.toolName, summary: $0.summary, isError: $0.isError,
                                       args: $0.args.isEmpty ? nil : $0.args,
                                       detail: $0.detail.isEmpty ? nil : $0.detail,
-                                      thinking: $0.thinking.isEmpty ? nil : $0.thinking) }
+                                      thinking: $0.thinking.isEmpty ? nil : $0.thinking,
+                                      imagePath: $0.imagePath.isEmpty ? nil : $0.imagePath) }
             : (message.agentSteps ?? [])
         if !steps.isEmpty || isLiveAgentReply {
             AgentStepsView(steps: steps,
@@ -3305,6 +3308,8 @@ private struct MarkdownContentView: View {
                 case .table(let header, let rows):
                     MarkdownTableView(header: header, rows: rows)
                         .frame(maxWidth: textWidth, alignment: .leading)
+                case .image(let alt, let src):
+                    MarkdownImageView(alt: alt, src: src, maxWidth: textWidth)
                 }
             }
         }
@@ -3314,6 +3319,7 @@ private struct MarkdownContentView: View {
     enum BlockGroup {
         case text([Block])
         case table([String], [[String]])
+        case image(String, String)
     }
 
     static func groupBlocks(_ blocks: [Block]) -> [BlockGroup] {
@@ -3323,6 +3329,10 @@ private struct MarkdownContentView: View {
             if case .table(let h, let r) = b {
                 if !buf.isEmpty { out.append(.text(buf)); buf = [] }
                 out.append(.table(h, r))
+            } else if case .image(let alt, let src) = b {
+                // 图跟表格一样画不进 NSTextView，单独成一组
+                if !buf.isEmpty { out.append(.text(buf)); buf = [] }
+                out.append(.image(alt, src))
             } else {
                 buf.append(b)
             }
@@ -3416,6 +3426,9 @@ private struct MarkdownContentView: View {
                 } else {
                     appendInline(Self.tableAsList(header, rows))
                 }
+            case .image(let alt, _):
+                // 这条路径是纯文字排版，放不了真图，留个占位
+                appendInline("［图片" + (alt.isEmpty ? "" : "：\(alt)") + "］")
             }
         }
         return out
@@ -3458,6 +3471,8 @@ private struct MarkdownContentView: View {
                 } else {
                     out += inlineAttr(Self.tableAsList(header, rows))
                 }
+            case .image(let alt, _):
+                out += inlineAttr("［图片" + (alt.isEmpty ? "" : "：\(alt)") + "］")
             }
         }
         return out
@@ -3486,6 +3501,42 @@ private struct MarkdownContentView: View {
         case paragraph(String)
         /// markdown 表格。第一行是表头，后面是数据行
         case table([String], [[String]])
+        /// 单独占一行的插图 `![说明](本机路径或网址)`
+        case image(String, String)
+    }
+
+    /// 单独一行的 `![说明](地址)` → (说明, 地址)。地址可以带 <> 或后面跟 "标题"
+    private static let imageLineRegex = try! NSRegularExpression(
+        pattern: #"^!\[([^\]]*)\]\(\s*<?(.+?)>?(?:\s+"[^"]*")?\s*\)$"#)
+
+    /// 去掉行首的列表符号（- * • 1.），列表项里单放一张图也要认得出来
+    static func stripListMarker(_ line: String) -> String {
+        var t = line
+        for m in ["- ", "* ", "• ", "+ "] where t.hasPrefix(m) { t = String(t.dropFirst(m.count)); break }
+        if let r = t.range(of: #"^\d+[.)、]\s+"#, options: .regularExpression) { t.removeSubrange(r) }
+        return t.trimmingCharacters(in: .whitespaces)
+    }
+
+    /// 整行只有一个图片网址（模型常这么贴，而不是写成 ![](…)）→ 当图显示。
+    /// 只认 http(s) 且路径以常见图片后缀结尾的，免得把普通链接也变成图
+    static func bareImageURL(_ line: String) -> String? {
+        var t = line
+        // 可能被包成 <…> 或 markdown 链接 [文字](地址)
+        if t.hasPrefix("<"), t.hasSuffix(">") { t = String(t.dropFirst().dropLast()) }
+        if t.hasPrefix("["), let open = t.range(of: "]("), t.hasSuffix(")") {
+            t = String(t[open.upperBound..<t.index(before: t.endIndex)])
+        }
+        guard t.hasPrefix("http://") || t.hasPrefix("https://"), !t.contains(" "),
+              let u = URL(string: t) else { return nil }
+        let exts: Set<String> = ["jpg", "jpeg", "png", "gif", "webp", "heic", "bmp"]
+        return exts.contains(u.pathExtension.lowercased()) ? t : nil
+    }
+
+    static func imageLine(_ line: String) -> (String, String)? {
+        let ns = line as NSString
+        guard let m = imageLineRegex.firstMatch(in: line, range: NSRange(location: 0, length: ns.length)),
+              m.numberOfRanges == 3 else { return nil }
+        return (ns.substring(with: m.range(at: 1)), ns.substring(with: m.range(at: 2)))
     }
 
     /// `|---|:--:|---:|` 这种分隔行
@@ -3561,6 +3612,14 @@ private struct MarkdownContentView: View {
                     i += 1
                 }
                 blocks.append(.code(codeLines.joined(separator: "\n"), lang.isEmpty ? nil : lang))
+                i += 1
+                continue
+            }
+
+            // 单独一行的插图：![说明](地址)。行内夹在文字中间的不认，照原样当文字
+            if let (alt, src) = Self.imageLine(Self.stripListMarker(trimmed))
+                ?? Self.bareImageURL(Self.stripListMarker(trimmed)).map({ ("", $0) }) {
+                blocks.append(.image(alt, src))
                 i += 1
                 continue
             }
@@ -3667,6 +3726,8 @@ private struct MarkdownContentView: View {
                     .lineSpacing(AIChatPanel.bodyLineSpacing)
                     .foregroundColor(Color.white.opacity(0.7))
             }
+        case .image(let alt, let src):
+            MarkdownImageView(alt: alt, src: src, maxWidth: 300)
         }
     }
 
@@ -4532,5 +4593,94 @@ struct MarkdownTableView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.horizontal, 7)
             .padding(.vertical, 5)
+    }
+}
+
+
+/// 回复里的插图。本机路径和网址都认；网上的先下到本机缓存再显示，
+/// 点开放大走会话里那套现成的全屏预览（它只收本机文件）
+struct MarkdownImageView: View {
+    /// 导入素材库（已导入过就复用），放到播放头位置的图片轨道
+    private func addToImageTrack(_ url: URL) {
+        if !project.mediaAssets.contains(where: { $0.url == url }) { project.importFile(url) }
+        guard let asset = project.mediaAssets.first(where: { $0.url == url }) else { return }
+        project.addToTimelineAt(asset, time: project.currentTime)
+    }
+
+    static func fitSize(_ s: CGSize, maxW: CGFloat, maxH: CGFloat) -> CGSize {
+        guard s.width > 0, s.height > 0 else { return CGSize(width: min(maxW, 200), height: 120) }
+        let k = min(1, maxW / s.width, maxH / s.height)
+        return CGSize(width: s.width * k, height: s.height * k)
+    }
+    let alt: String
+    let src: String
+    let maxWidth: CGFloat
+    @EnvironmentObject var project: ProjectState
+    @State private var localURL: URL?
+    @State private var image: NSImage?
+    @State private var failed = false
+
+    var body: some View {
+        Group {
+            if let image, let localURL {
+                // 按宽高上限算出实际显示尺寸，frame 贴合图片，圆角才能四角都落在图上
+                let sz = Self.fitSize(image.size, maxW: maxWidth, maxH: 320)
+                Image(nsImage: image)
+                    .resizable()
+                    .frame(width: sz.width, height: sz.height)
+                    .clipShape(RoundedRectangle(cornerRadius: 8))
+                    .contentShape(Rectangle())
+                    .onTapGesture { project.mediaPreview = MediaPreviewItem(url: localURL, isVideo: false) }
+                    .contextMenu {
+                        Button("添加到图片轨道") { addToImageTrack(localURL) }
+                    }
+                    .help(alt.isEmpty ? "点击放大" : alt)
+            } else if failed {
+                Text("［图片加载失败" + (alt.isEmpty ? "" : "：\(alt)") + "］")
+                    .font(.system(size: 11))
+                    .foregroundColor(Color.labelSecondary)
+            } else {
+                RoundedRectangle(cornerRadius: 8)
+                    .fill(Color.white.opacity(0.06))
+                    .frame(width: min(maxWidth, 200), height: 120)
+                    .overlay(ProgressView().controlSize(.small))
+            }
+        }
+        .task(id: src) { await load() }
+    }
+
+    private func load() async {
+        failed = false
+        guard let url = await Self.resolve(src), let img = NSImage(contentsOf: url) else {
+            failed = true; return
+        }
+        localURL = url
+        image = img
+    }
+
+    /// 本机路径（/、~、file://）直接用；http(s) 下到缓存，同一地址只下一次
+    static func resolve(_ src: String) async -> URL? {
+        let s = src.trimmingCharacters(in: .whitespaces)
+        if s.hasPrefix("http://") || s.hasPrefix("https://") {
+            guard let remote = URL(string: s) else { return nil }
+            let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            let dir = base.appendingPathComponent("黑猫剪辑/agent-images", isDirectory: true)
+            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            // 文件名取地址的摘要，同一张图下过就直接用
+            let digest = SHA256.hash(data: Data(s.utf8)).prefix(8).map { String(format: "%02x", $0) }.joined()
+            let ext = remote.pathExtension.isEmpty ? "img" : remote.pathExtension
+            let dest = dir.appendingPathComponent("\(digest).\(ext)")
+            if FileManager.default.fileExists(atPath: dest.path) { return dest }
+            guard let (data, resp) = try? await URLSession.shared.data(from: remote),
+                  (resp as? HTTPURLResponse).map({ (200...299).contains($0.statusCode) }) ?? false,
+                  NSImage(data: data) != nil else { return nil }
+            try? data.write(to: dest)
+            return dest
+        }
+        let path: String
+        if s.hasPrefix("file://") { path = URL(string: s)?.path ?? "" }
+        else { path = (s as NSString).expandingTildeInPath }
+        guard path.hasPrefix("/"), FileManager.default.fileExists(atPath: path) else { return nil }
+        return URL(fileURLWithPath: path)
     }
 }

@@ -75,7 +75,7 @@ extension AgentToolbox {
 
             AgentToolSpec(
                 name: "add_filter",
-                description: "加一段滤镜。滤镜只作用于排在它下面的图层。可选的种类见参数说明。",
+                description: "加一段滤镜。滤镜只作用于排在它下面的图层。可选的种类见参数说明。用户给了 .cube LUT 文件就传 lut_path，kind 不用给。",
                 parameters: [
                     "type": "object",
                     "properties": [
@@ -84,9 +84,10 @@ extension AgentToolbox {
                                  "description": FilterKind.builtins.map { "\($0.rawValue)=\($0.label)" }.joined(separator: "，")],
                         "start": ["type": "number"],
                         "end": ["type": "number"],
-                        "intensity": ["type": "number", "description": "0~1，默认 1"]
+                        "intensity": ["type": "number", "description": "0~1，默认 1"],
+                        "lut_path": ["type": "string", "description": ".cube 格式 LUT 文件的绝对路径（导入外部 LUT）"]
                     ] as [String: Any],
-                    "required": ["kind"]
+                    "required": [] as [String]
                 ],
                 risk: .mutating),
 
@@ -127,23 +128,52 @@ extension AgentToolbox {
 
             AgentToolSpec(
                 name: "move_clip",
-                description: "把一条片段挪到别的时间位置。",
+                description: """
+                把一条片段挪到别的时间位置，或者挪到**同类型的另一条轨道**上（视频到视频、字幕到字幕……）。
+                start 和 track_id 至少给一个；只给 track_id 就保持原来的时间。
+                目标轨道上那段时间已经有片段的话会失败，换个时间或换条轨道。
+                """,
                 parameters: [
                     "type": "object",
                     "properties": [
-                        "clip_id": ["type": "string", "description": "list_tracks 给的 id"],
-                        "start": ["type": "number", "description": "新的起始秒数"]
+                        "clip_id": ["type": "string", "description": "list_tracks 给的片段 id"],
+                        "start": ["type": "number", "description": "新的起始秒数。不传就不改时间"],
+                        "track_id": ["type": "string",
+                                     "description": "挪到哪条轨道（list_tracks 里轨道标题后面的 id）。不传就留在原轨道"]
                     ] as [String: Any],
-                    "required": ["clip_id", "start"]
+                    "required": ["clip_id"]
+                ],
+                risk: .mutating),
+
+            AgentToolSpec(
+                name: "move_track",
+                description: """
+                调整轨道的上下顺序。时间轴从上到下分三块：叠加层（图片、字幕、文字、图形、滤镜、调节、特效）、\
+                视频、音频，**每块里各排各的**，不能把字幕轨挪进视频那块。
+                同一块里**上面的轨道盖在下面的上面**：想让文字压在图片上，就把文字轨挪到图片轨上面。
+                position：top＝本块最上，bottom＝本块最下，above / below＝挪到 relative_to 那条的上面 / 下面。
+                """,
+                parameters: [
+                    "type": "object",
+                    "properties": [
+                        "track_id": ["type": "string", "description": "要挪的轨道（list_tracks 里轨道标题后面的 id）"],
+                        "position": ["type": "string", "enum": ["top", "bottom", "above", "below"]],
+                        "relative_to": ["type": "string",
+                                        "description": "position 是 above / below 时必填：参照的那条轨道 id，须在同一块里"]
+                    ] as [String: Any],
+                    "required": ["track_id", "position"]
                 ],
                 risk: .mutating),
 
             AgentToolSpec(
                 name: "split_at",
-                description: "在某个时刻把片段切开。不传 clip_id 就切播放头处所有轨道上的片段。",
+                description: "在某个时刻把片段切开，跟界面上一样**只切选中的片段**。给 clip_id 就先选中那条再切；不给就切用户当前选中的；都没有就不切。",
                 parameters: [
                     "type": "object",
-                    "properties": ["time": ["type": "number", "description": "秒"]] as [String: Any],
+                    "properties": [
+                        "time": ["type": "number", "description": "秒"],
+                        "clip_id": ["type": "string", "description": "要切的片段，会先选中它（id 前 8 位就行）。不给就切当前选中的"]
+                    ] as [String: Any],
                     "required": ["time"]
                 ],
                 risk: .mutating),
@@ -269,10 +299,19 @@ extension AgentToolbox {
             return .ok("文字已加：\(text)")
 
         case "add_filter":
-            guard let raw = args["kind"] as? String, let kind = FilterKind(rawValue: raw)
+            var lut: String?
+            if let lp = (args["lut_path"] as? String)?.trimmingCharacters(in: .whitespaces), !lp.isEmpty {
+                let path = (lp as NSString).expandingTildeInPath
+                guard LUTCache.shared.cube(at: path) != nil else { return .fail("「\(lp)」不是有效的 .cube LUT 文件。") }
+                if !AppSettings.shared.customLUTs.contains(path) { AppSettings.shared.customLUTs.append(path) }
+                lut = path
+            }
+            let kind: FilterKind
+            if lut != nil { kind = .lut }
+            else if let raw = args["kind"] as? String, let k = FilterKind(rawValue: raw) { kind = k }
             else { return .fail("没有叫 \(args["kind"] ?? "") 的滤镜。") }
             let start = args["start"] as? Double ?? p.currentTime
-            let id = p.addFilter(kind: kind, at: start)
+            let id = p.addFilter(kind: kind, at: start, lutPath: lut)
             p.updateFilterClip(id: id) {
                 if let e = args["end"] as? Double { $0.endTime = max(start + 0.3, e) }
                 if let i = args["intensity"] as? Double { $0.intensity = min(max(i, 0), 1) }
@@ -311,16 +350,50 @@ extension AgentToolbox {
             return .ok("已加一段调节。")
 
         case "move_clip":
-            guard let key = args["clip_id"] as? String, let start = args["start"] as? Double
-            else { return .fail("缺 clip_id 或 start") }
-            return moveClip(p, idPrefix: key, to: start)
+            guard let key = args["clip_id"] as? String else { return .fail("缺 clip_id") }
+            let start = (args["start"] as? Double) ?? (args["start"] as? Int).map(Double.init)
+            let track = (args["track_id"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+            guard start != nil || track != nil else { return .fail("start 和 track_id 至少给一个") }
+            if let track { return moveClipToTrack(p, idPrefix: key, trackPrefix: track, start: start) }
+            return moveClip(p, idPrefix: key, to: start!)
+
+        case "move_track":
+            guard let key = args["track_id"] as? String, !key.isEmpty,
+                  let pos = args["position"] as? String else { return .fail("缺 track_id 或 position") }
+            return moveTrack(p, trackPrefix: key, position: pos, relativeTo: args["relative_to"] as? String)
 
         case "split_at":
-            guard let t = args["time"] as? Double else { return .fail("缺 time") }
+            let t: Double
+            if let d = args["time"] as? Double { t = d }
+            else if let i = args["time"] as? Int { t = Double(i) }
+            else { return .fail("缺 time") }
             p.currentTime = t
             p.clock.currentTime = t
-            p.splitAtPlayhead()
-            return .ok("已在 \(fmt(t)) 处分割。")
+            // 跟界面一样只切「选中的」：点名了就先选中那条；没点名就切用户当前选中的。
+            // splitAtPlayhead 只认「主选中」—— 多选（selectedClipIDs）里的要逐条设成主选中再切，
+            // 以前直接调它，选中落在多选里时一刀没切却回了「已分割」
+            var targets: [UUID] = []
+            if let key = (args["clip_id"] as? String), !key.isEmpty {
+                guard let id = resolveClipIDs(p, [key]).first else { return .fail("找不到 id 以 \(key) 开头的片段。") }
+                targets = [id]
+            } else {
+                let primaries = [p.selectedVideoClipID, p.selectedAudioClipID, p.selectedImageClipID,
+                                 p.selectedSubtitleClipID, p.selectedTextClipID, p.selectedShapeClipID,
+                                 p.selectedCompoundClipID].compactMap { $0 }
+                for id in primaries + Array(p.selectedClipIDs) where !targets.contains(id) { targets.append(id) }
+            }
+            guard !targets.isEmpty else {
+                return .fail("现在没有选中的片段，不知道切哪条。用 clip_id 指定要切的片段（list_tracks 查 id）。")
+            }
+            let before = Self.clipCount(p)
+            for id in targets where selectPrimary(p, id) { p.splitAtPlayhead() }
+            // 切完还选中原来那条（左半段），跟界面上手动分割后的状态一样
+            if let first = targets.first { selectPrimary(p, first) }
+            let made = Self.clipCount(p) - before
+            guard made > 0 else {
+                return .fail("\(fmt(t)) 不在选中片段的中间（正好在头尾或者在片段外面），没切。先 list_tracks 看看时间对不对。")
+            }
+            return .ok("已在 \(fmt(t)) 处把选中的 \(made) 条片段切开。")
 
         case "delete_clip":
             guard let key = args["clip_id"] as? String else { return .fail("缺 clip_id") }
@@ -382,6 +455,124 @@ extension AgentToolbox {
             p.updateTextClip(id: c.id) { $0.endTime = s + ($0.endTime - $0.startTime); $0.startTime = s }
             return .ok("文字已挪到 \(fmt(s))。") } }
         return .fail("找不到 id 以 \(idPrefix) 开头的片段，先调 list_tracks 确认。")
+    }
+
+    // MARK: 换轨 / 调轨道顺序
+
+    /// 把片段挪到同类型的另一条轨道。每类轨道各试一遍，片段不在这一类就跳过
+    @MainActor
+    private static func moveClipToTrack(_ p: ProjectState, idPrefix: String,
+                                        trackPrefix: String, start: Double?) -> AgentToolResult {
+        p.pushUndo()
+        var out: AgentToolResult?
+        func attempt<C: AgentMovableClip>(_ tracks: inout [Track<C>], _ kind: String) {
+            guard out == nil else { return }
+            out = relocate(&tracks, kind: kind, clipPrefix: idPrefix, trackPrefix: trackPrefix, start: start)
+        }
+        attempt(&p.videoTracks, "视频"); attempt(&p.audioTracks, "音频")
+        attempt(&p.imageTracks, "图片"); attempt(&p.subtitleTracks, "字幕")
+        attempt(&p.textTracks, "文字"); attempt(&p.shapeTracks, "图形")
+        attempt(&p.filterTracks, "滤镜"); attempt(&p.adjustTracks, "调节")
+        attempt(&p.effectTracks, "特效")
+        guard let out else { return .fail("找不到 id 以 \(idPrefix) 开头的片段，先调 list_tracks 确认。") }
+        if !out.isError {
+            p.refreshOverlayComposite()
+            p.rebuildTimelinePreview()
+        }
+        return out
+    }
+
+    /// 在同一类轨道里把片段从原轨道搬到目标轨道。
+    /// 片段不在这一类 → nil（让下一类去试）；在这一类但办不成 → failure
+    private static func relocate<C: AgentMovableClip>(
+        _ tracks: inout [Track<C>], kind: String,
+        clipPrefix: String, trackPrefix: String, start: Double?
+    ) -> AgentToolResult? {
+        guard let si = tracks.firstIndex(where: { $0.clips.contains { "\($0.id)".hasPrefix(clipPrefix) } }),
+              let ci = tracks[si].clips.firstIndex(where: { "\($0.id)".hasPrefix(clipPrefix) })
+        else { return nil }
+        guard let di = tracks.firstIndex(where: { "\($0.id)".hasPrefix(trackPrefix) }) else {
+            return .fail("片段在\(kind)轨上，但没有 id 以 \(trackPrefix) 开头的\(kind)轨。"
+                            + "片段只能挪到同类型的轨道，先调 list_tracks 看看有哪些\(kind)轨。")
+        }
+        var clip = tracks[si].clips[ci]
+        let len = clip.endTime - clip.startTime
+        let s = max(0, start ?? clip.startTime)
+        // 目标轨道那段时间被占了就不挪，不替它挤开别人
+        let clash = tracks[di].clips.contains { c in
+            "\(c.id)" != "\(clip.id)" && c.startTime < s + len - 0.001 && c.endTime > s + 0.001
+        }
+        if clash {
+            return .fail("目标\(kind)轨在 \(fmt(s))–\(fmt(s + len)) 已经有片段了，换个时间或换条轨道。")
+        }
+        tracks[si].clips.remove(at: ci)
+        clip.startTime = s
+        clip.endTime = s + len
+        tracks[di].clips.append(clip)
+        tracks[di].clips.sort { $0.startTime < $1.startTime }
+        let where_ = si == di ? "" : "挪到「\(tracks[di].label)」轨"
+        return .ok("已把这段\(kind)\(where_)，时间 \(fmt(s))–\(fmt(s + len))。")
+    }
+
+    /// 调轨道顺序。三块（叠加层 / 视频 / 音频）各有一张顺序表，表里第一个就是最上面那条，
+    /// 画面叠放也是上面的盖住下面的
+    @MainActor
+    private static func moveTrack(_ p: ProjectState, trackPrefix: String,
+                                  position: String, relativeTo: String?) -> AgentToolResult {
+        func reorder<R>(_ list: inout [R], id: (R) -> UUID, block: String) -> AgentToolResult? {
+            guard let from = list.firstIndex(where: { "\(id($0))".hasPrefix(trackPrefix) }) else { return nil }
+            let item = list.remove(at: from)
+            var to: Int
+            switch position {
+            case "top": to = 0
+            case "bottom": to = list.count
+            case "above", "below":
+                guard let ref = relativeTo, !ref.isEmpty else {
+                    list.insert(item, at: from)
+                    return .fail("position 是 \(position) 时要给 relative_to")
+                }
+                guard let ri = list.firstIndex(where: { "\(id($0))".hasPrefix(ref) }) else {
+                    list.insert(item, at: from)
+                    return .fail("relative_to 那条轨道不在\(block)这一块里。轨道只能在自己那块里调顺序"
+                                 + "（叠加层 / 视频 / 音频各排各的）。")
+                }
+                to = position == "above" ? ri : ri + 1
+            default:
+                list.insert(item, at: from)
+                return .fail("position 只能是 top / bottom / above / below")
+            }
+            list.insert(item, at: min(max(0, to), list.count))
+            return .ok("已调整\(block)轨道的顺序，现在是第 \(min(max(0, to), list.count - 1) + 1) 条（从上往下数）。"
+                       + (block == "叠加层" ? "上面的盖在下面的上面。" : ""))
+        }
+        p.pushUndo()
+        var ov = p.overlayTrackOrder
+        if let r = reorder(&ov, id: { $0.trackID }, block: "叠加层") {
+            if !r.isError { p.overlayTrackOrder = ov }
+            p.refreshOverlayComposite(); p.rebuildTimelinePreview()
+            return r
+        }
+        var vs = p.videoSectionOrder
+        if let r = reorder(&vs, id: { $0.trackID }, block: "视频") {
+            if !r.isError { p.videoSectionOrder = vs }
+            p.rebuildTimelinePreview()
+            return r
+        }
+        var au = p.audioSectionOrder
+        if let r = reorder(&au, id: { $0.trackID }, block: "音频") {
+            if !r.isError { p.audioSectionOrder = au }
+            p.rebuildTimelinePreview()
+            return r
+        }
+        return .fail("找不到 id 以 \(trackPrefix) 开头的轨道，先调 list_tracks 看轨道 id。")
+    }
+
+    @MainActor
+    static func clipCount(_ p: ProjectState) -> Int {
+        p.videoTracks.flatMap(\.clips).count + p.audioTracks.flatMap(\.clips).count
+            + p.imageTracks.flatMap(\.clips).count + p.subtitleTracks.flatMap(\.clips).count
+            + p.textTracks.flatMap(\.clips).count + p.shapeTracks.flatMap(\.clips).count
+            + p.compoundTracks.flatMap(\.clips).count
     }
 
     @MainActor

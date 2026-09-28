@@ -738,7 +738,17 @@ extension ProjectState {
                             let fOp: Float = isA ? 1.0 : 0.0
                             let tOp: Float = isA ? 0.0 : 1.0
                             switch trans.type {
-                            case .dissolve, .fadeToBlack:
+                            case .dissolve:
+                                // 淡入淡出：前一段保持不透明，只让后一段从 0 渐显盖上去。
+                                // 原来两段各自反向渐变、都叠在黑底上，正中间那帧是
+                                // 0.5×后段 + 0.25×前段，整体暗了四分之一 —— 看着就是「黑一下」、
+                                // 过渡不明显。后一段在同一条轨上排在前一段之后画，天然在上面
+                                if isB {
+                                    te.opacityRamp = (from: 0, to: 1,
+                                                      start: effStart.seconds, end: effEnd.seconds)
+                                }
+                                hasTween = true
+                            case .fadeToBlack:
                                 te.opacityRamp = (from: fOp, to: tOp,
                                                   start: effStart.seconds, end: effEnd.seconds)
                                 hasTween = true

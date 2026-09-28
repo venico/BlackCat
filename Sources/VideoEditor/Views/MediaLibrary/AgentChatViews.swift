@@ -176,7 +176,13 @@ private struct AgentStepRow: View {
 
     private var hasDetail: Bool {
         (step.detail?.isEmpty == false) || (step.thinking?.isEmpty == false)
-            || (step.args?.isEmpty == false)
+            || (step.args?.isEmpty == false) || stepImageURL != nil
+    }
+
+    /// 这一步工具返回的图（截帧那类），文件还在才算
+    private var stepImageURL: URL? {
+        guard let p = step.imagePath, !p.isEmpty, FileManager.default.fileExists(atPath: p) else { return nil }
+        return URL(fileURLWithPath: p)
     }
 
     var body: some View {
@@ -222,6 +228,10 @@ private struct AgentStepRow: View {
 
             if open {
                 VStack(alignment: .leading, spacing: 4) {
+                    // 它这一步「看到」的画面。截帧只发给模型的话，用户没法核对它看对了没有
+                    if let url = stepImageURL {
+                        StepImageThumb(url: url)
+                    }
                     // 动手前它说的那段话就是思路，摆在最前面
                     if let think = step.thinking, !think.isEmpty {
                         Text(think)
@@ -527,5 +537,25 @@ struct HistoryRowFramePref: PreferenceKey {
     static var defaultValue: [UUID: CGRect] = [:]
     static func reduce(value: inout [UUID: CGRect], nextValue: () -> [UUID: CGRect]) {
         value.merge(nextValue()) { _, new in new }
+    }
+}
+
+
+/// 步骤里那张图：限高显示，点一下全屏看（用会话里生成结果那套现成的预览层）
+private struct StepImageThumb: View {
+    let url: URL
+    @EnvironmentObject var project: ProjectState
+
+    var body: some View {
+        if let img = NSImage(contentsOf: url) {
+            Image(nsImage: img)
+                .resizable().aspectRatio(contentMode: .fit)
+                .frame(maxWidth: 220, maxHeight: 140, alignment: .leading)
+                .clipShape(RoundedRectangle(cornerRadius: 5))
+                .overlay(RoundedRectangle(cornerRadius: 5).stroke(Color.white.opacity(0.12), lineWidth: 0.5))
+                .contentShape(Rectangle())
+                .onTapGesture { project.mediaPreview = MediaPreviewItem(url: url, isVideo: false) }
+                .help("点击放大")
+        }
     }
 }

@@ -154,6 +154,12 @@ struct CanvasOverlay: View {
                     Color.clear
                         .onAppear { registerCanvasDropZone(g.frame(in: .global)) }
                         .onChange(of: g.frame(in: .global)) { _, r in registerCanvasDropZone(r) }
+                        // **画布从界面上消失就撤掉拖入区**。原来只在点 × 关画布那条路上撤，
+                        // 从会话列表打开普通会话、Agent 放上时间轴这些路径关掉画布时，
+                        // 那块铺满整个窗口的区域还留着，而它的优先级比素材库高 ——
+                        // 之后从 Finder 拖进侧栏的文件全被隐形的画布收走：侧栏不高亮、
+                        // 文件没进素材库、拖文件夹毫无反应
+                        .onDisappear { FileDropRouter.unregister(windowID, kind: .canvas) }
                 })
 
             // 左上角关闭，右上角撤销/重做/缩放

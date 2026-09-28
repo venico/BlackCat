@@ -51,7 +51,7 @@ extension AgentToolbox {
                 name: "translate_subtitles",
                 description: """
                 把一条字幕轨整轨翻译成另一种语言，**结果放进一条新字幕轨**，原文那条不动。
-                用的是设置里选的翻译引擎。
+                只想翻其中几条就传 clip_ids（新轨上只有这几条的译文）。用的是设置里选的翻译引擎。
                 """,
                 parameters: [
                     "type": "object",
@@ -59,7 +59,9 @@ extension AgentToolbox {
                         "track_index": ["type": "integer",
                                         "description": "第几条字幕轨（list_tracks 里的顺序，从 0 起）。不传就翻第一条"],
                         "language": ["type": "string",
-                                     "description": "目标语言，比如「英语」「日语」「中文（简体）」。不传用设置里的"]
+                                     "description": "目标语言，比如「英语」「日语」「中文（简体）」。不传用设置里的"],
+                        "clip_ids": ["type": "array", "items": ["type": "string"],
+                                     "description": "只翻这几条字幕（id 前 8 位就行）。给了就不用 track_index，按它们所在的轨"]
                     ] as [String: Any],
                     "required": [] as [String]
                 ],
@@ -220,7 +222,9 @@ extension AgentToolbox {
         let dur = max(0.1, min(3, (args["duration"] as? Double) ?? 0.5))
         for t in p.videoTracks {
             guard let c = t.clips.first(where: { "\($0.id)".hasPrefix(key) }) else { continue }
+            // 走界面同一条路：素材余量不够时它会自动腾出重叠区，不然转场静默不生效
             p.updateVideoClip(id: c.id) { $0.inTransition = Transition(type: type, duration: dur) }
+            p.applyTransition(type, toClipID: c.id)
             p.rebuildTimelinePreview(); p.scheduleAutoSave()
             return .ok("「\(c.name)」的开头加了 \(type.rawValue) 转场，\(dur) 秒。")
         }
@@ -238,11 +242,21 @@ extension AgentToolbox {
 
     @MainActor
     private static func translateSubtitles(_ p: ProjectState, args: [String: Any]) -> AgentToolResult {
-        let idx = (args["track_index"] as? Int) ?? 0
+        let keys = (args["clip_ids"] as? [Any])?.compactMap { $0 as? String }.filter { !$0.isEmpty } ?? []
+        var idx = (args["track_index"] as? Int) ?? 0
+        if let k = keys.first,
+           let ti = p.subtitleTracks.firstIndex(where: { $0.clips.contains { "\($0.id)".hasPrefix(k) } }) {
+            idx = ti
+        }
         guard p.subtitleTracks.indices.contains(idx) else {
             return .fail("没有第 \(idx) 条字幕轨，现在一共 \(p.subtitleTracks.count) 条。")
         }
-        let originals = p.subtitleTracks[idx].clips
+        var originals = p.subtitleTracks[idx].clips
+        if !keys.isEmpty {
+            originals = originals.filter { c in keys.contains { "\(c.id)".hasPrefix($0) } }
+                .sorted { $0.startTime < $1.startTime }
+            guard !originals.isEmpty else { return .fail("clip_ids 里一条字幕都没找到。") }
+        }
         guard !originals.isEmpty else { return .fail("那条字幕轨是空的。") }
         let lang = (args["language"] as? String) ?? p.translationTargetLang
 

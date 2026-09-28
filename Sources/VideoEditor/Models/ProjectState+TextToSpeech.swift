@@ -254,8 +254,11 @@ extension ProjectState {
     ) -> URL? {
         guard segments.count > 1, let ffmpeg = ProjectState.findFFmpeg() else { return nil }
 
-        let out = FileManager.default.temporaryDirectory
-            .appendingPathComponent("tts_lane_\(UUID().uuidString).m4a")
+        // **跟各段配音放在同一个文件夹**（项目目录下的「AI生成」），不能放系统临时目录 ——
+        // 那里会被系统定期清掉，项目里引用的配音过几天就成了「素材丢失」，
+        // 预览时读它还会卡住整条解码（2026-09-28 实际丢过一条）
+        let dir = segments[0].url.deletingLastPathComponent()
+        let out = dir.appendingPathComponent("配音_\(UUID().uuidString.prefix(8)).m4a")
         var args = ["-hide_banner", "-loglevel", "error", "-nostdin", "-y"]
         for seg in segments { args += ["-i", seg.url.path] }
 

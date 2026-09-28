@@ -32,6 +32,17 @@ final class AgentRunner: ObservableObject {
         var detail: String = ""
         /// 这一步之前模型说的话（它的思路）。有些轮次会先解释再动手
         var thinking: String = ""
+        /// 这一步工具返回的图存在哪（截帧那类）。空 = 没有图
+        var imagePath: String = ""
+    }
+
+    /// 工具返回的图落盘：步骤条展开时要显示，模型想在回复里给用户看也得有个路径
+    static func saveStepImage(_ data: Data) -> String? {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        let dir = base.appendingPathComponent("黑猫剪辑/agent-captures", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let url = dir.appendingPathComponent("\(UUID().uuidString.prefix(8)).jpg")
+        do { try data.write(to: url); return url.path } catch { return nil }
     }
 
     // 下面这几个 @Published 是**当前正看着那条会话**的镜像。
@@ -241,6 +252,7 @@ final class AgentRunner: ObservableObject {
                         let full = result.text.count > 4000
                             ? String(result.text.prefix(4000)) + "\n……（还有 \(result.text.count - 4000) 字）"
                             : result.text
+                        let imagePath = result.imageData.flatMap { Self.saveStepImage($0) } ?? ""
                         self.mutate(cid) {
                             $0.steps.append(Step(toolName: call.name,
                                                  summary: String(result.text.prefix(120)),
@@ -248,16 +260,24 @@ final class AgentRunner: ObservableObject {
                                                  args: args,
                                                  detail: full,
                                                  // 模型这一轮动手前说的话，就是它的思路
-                                                 thinking: turn.text))
+                                                 thinking: turn.text,
+                                                 imagePath: imagePath))
                         }
                         // 发给模型的结果也要有上限。轨道清单、逐帧扫描这类一条能有上万字，
                         // 而且历史每轮重发 —— 一条超长结果会一路收费到任务结束。
                         // 存档里那份是完整的（上面的 full），复盘不受影响
-                        let toModel = result.text.count > 3000
+                        var toModel = result.text.count > 3000
                             ? String(result.text.prefix(3000))
                               + "\n……（结果太长，这里截掉了 \(result.text.count - 3000) 字。"
                               + "要看剩下的就缩小范围再查一次，别重复调同样的参数。）"
                             : result.text
+                        // 图存了盘就告诉它路径：想让用户也看到这张图，回复里直接插进去就行
+                        if !imagePath.isEmpty {
+                            // 先说清「图已经附上了」：只提路径的话，模型会以为工具只给了个路径、
+                            // 没去看后面附着的图（实测它回「截图工具只返回了图片路径，我看不到」）
+                            toModel += "\n（画面已作为图片附在这条结果里，直接看图判断就行。"
+                                + "另外它存在 \(imagePath)，要给用户看，就在回复里单独一行写 ![说明](<\(imagePath)>)，路径有空格所以要带尖括号）"
+                        }
                         msgs.append(.toolResult(callID: call.id, name: call.name,
                                                 text: toModel, imageData: result.imageData))
                     }
@@ -333,6 +353,18 @@ final class AgentRunner: ObservableObject {
             return r
         }
         if let r = AgentToolbox.runCanvasTool(call.name, args: call.arguments, project: project) {
+            return r
+        }
+        if let r = await AgentToolbox.runCanvasEditTool(call.name, args: call.arguments, project: project) {
+            return r
+        }
+        if let r = AgentToolbox.runSettingsTool(call.name, args: call.arguments, project: project) {
+            return r
+        }
+        if let r = AgentToolbox.runProjectTool(call.name, args: call.arguments, project: project) {
+            return r
+        }
+        if let r = await AgentToolbox.runLibraryTool(call.name, args: call.arguments, project: project) {
             return r
         }
         if call.name == "enable_tools" {
@@ -436,6 +468,10 @@ final class AgentRunner: ObservableObject {
         **每格十来个字以内**、**最多三列**。聊天区就四百来点宽，四列必然挤烂。
         一两条信息、讲你做了什么、格子里是长句子的，一律用句子或短横线列表。
         `list_tracks`、`list_assets` 返回的本来就是表格，可以原样贴出来。
+
+        **要给用户看图就直接插进回复**：单独一行写 `![说明](图片地址)`，聊天框会把图显示出来，
+        网上的图片地址和本机路径都行（路径有空格就写成 `![说明](<路径>)`）。
+        别只贴一串图片链接让用户自己点开。
 
         说话风格：中文，简短，别用「好的」「我将为您」这类开场白。**不要用 emoji**，
         该标状态就用文字（成功 / 失败 / 已完成），面板里 emoji 跟界面图标混在一起很乱。
@@ -557,6 +593,31 @@ enum AgentPhaseText {
         "capture_frame":         "正在截取画面",
         "split_at":              "正在分割片段",
         "move_clip":             "正在移动片段",
+        "move_track":            "正在调整轨道顺序",
+        "add_track":             "正在新建轨道",
+        "delete_track":          "正在删除轨道",
+        "set_track":             "正在调整轨道",
+        "edit_timeline":         "正在调整时间线",
+        "delete_timeline":       "正在删除时间线",
+        "marker":                "正在处理标记",
+        "copy_clips":            "正在复制片段",
+        "align_clips":           "正在对齐图层",
+        "compound_edit":         "正在进出复合片段",
+        "text_template":         "正在处理文字模板",
+        "set_project":           "正在改项目设置",
+        "set_cover":             "正在设封面",
+        "new_project":           "正在新建项目",
+        "open_project":          "正在打开项目",
+        "save_frame":            "正在截帧存素材",
+        "library_folder":        "正在整理素材库",
+        "relink_asset":          "正在重新关联素材",
+        "add_to_ai_reference":   "正在加 AI 参考",
+        "online_audio":          "正在查在线音频库",
+        "canvas_edit":           "正在处理画布卡片",
+        "app_settings":          "正在改设置",
+        "get_clip":              "正在看片段属性",
+        "select_clips":          "正在选中片段",
+        "asset_attribution":     "正在查素材署名",
         "delete_clip":           "正在删除片段",
         "get_project":           "正在看项目情况",
         "list_tracks":           "正在看轨道",

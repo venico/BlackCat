@@ -659,6 +659,8 @@ final class AIVideoService: ObservableObject {
             var args: String?
             var detail: String?
             var thinking: String?
+            /// 这一步工具返回的图（截帧那类）存在本机哪儿。展开那一步时显示出来
+            var imagePath: String?
         }
     }
 
@@ -1527,7 +1529,6 @@ final class AIVideoService: ObservableObject {
     ///   带波形 / 画面的那条跑到别处或丢掉，重启后看着就是「波形没了」。
     ///   不是当前会话的，直接写进那条会话的存档，切回去时从存档读出来
     func appendAgentMedia(url: URL, category: ProviderCategory, conversationID: UUID? = nil) {
-        DiagLog.log("[会话诊断] 生成结果进会话 发起=\(conversationID?.uuidString.prefix(8) ?? "nil") 当前=\(currentConversationId?.uuidString.prefix(8) ?? "nil") \(url.lastPathComponent) 之前 \(diagCount(conversationID ?? currentConversationId))")  // TMPDIAG
         if let owner = conversationID, owner != currentConversationId,
            history.contains(where: { $0.id == owner }) {
             let status: TaskStatus
@@ -1540,7 +1541,6 @@ final class AIVideoService: ObservableObject {
             // 不是当前会话 → applyGenerationResult 走「写进那条存档」的分支
             applyGenerationResult(convId: owner, msgId: UUID(), content: text,
                                   mediaURL: url, status: status)
-            DiagLog.log("[会话诊断] 已写进发起会话的存档 → \(diagCount(owner))")  // TMPDIAG
             return
         }
         if currentConversationId == nil { newConversation() }
@@ -1654,7 +1654,6 @@ final class AIVideoService: ObservableObject {
         entry.noteKind = msg.noteKind
         if case .failed(let e) = msg.status { entry.failedError = e }
         history[i].entries.append(entry)
-        DiagLog.log("[会话诊断] 追加存 \(isUser ? "用户" : "助手") 「\(msg.content.prefix(12))」 → \(diagCount(cid))")  // TMPDIAG
         // 会话标题还是「新对话」时，拿用户第一句话当标题
         if isUser, !history[i].titleIsCustom,
            history[i].title == "新对话" || history[i].title.isEmpty {
@@ -1667,7 +1666,6 @@ final class AIVideoService: ObservableObject {
         saveCurrentConversation()
         stashInputDraft()
         guard let conv = history.first(where: { $0.id == id }) else { return }
-        DiagLog.log("[会话诊断] 打开会话 \(id.uuidString.prefix(8)) \(diagCount(id))")  // TMPDIAG
         currentConversationId = conv.id
         restoreInputDraft(conv.id)
         markConversationSeen(conv.id)
@@ -1739,14 +1737,7 @@ final class AIVideoService: ObservableObject {
         saveHistoryToDisk()
     }
 
-    /// TMPDIAG：某条会话在内存 history 里有几条、其中几条带音频
-    private func diagCount(_ cid: UUID?) -> String {
-        guard let cid, let h = history.first(where: { $0.id == cid }) else { return "无记录" }
-        return "条目\(h.entries.count) 音频\(h.entries.filter { $0.audioPath != nil }.count)"
-    }
-
-    func saveCurrentConversation(_ caller: String = #function) {
-        defer { DiagLog.log("[会话诊断] 全量存 来自=\(caller) cid=\(currentConversationId?.uuidString.prefix(8) ?? "nil") messages=\(messages.count) 音频消息=\(messages.filter { $0.audioURL != nil }.count) → \(diagCount(currentConversationId))") }  // TMPDIAG
+    func saveCurrentConversation() {
         let validMessages = messages.filter { msg in
             if msg.role == .user { return true }
             if case .generating = msg.status { return false }

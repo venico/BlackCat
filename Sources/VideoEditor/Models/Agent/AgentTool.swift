@@ -78,7 +78,7 @@ extension AgentToolbox {
     /// 以后新增工具组，只往这儿加一次
     @MainActor
     static var allSpecs: [AgentToolSpec] {
-        readTools + editTools + mediaTools + studioTools + studioTools2 + canvasTools
+        readTools + editTools + mediaTools + studioTools + studioTools2 + canvasTools + projectTools + libraryTools + canvasEditTools + settingsTools
         + generateTools + skillTools
         + shellTools + searchTools + mcpGateTool + mcpTools
         // 「取工具」这个网关本身也得在册：它长在 AgentToolGate 上，不在上面任何一组里。

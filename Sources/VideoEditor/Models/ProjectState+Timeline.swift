@@ -766,8 +766,17 @@ extension ProjectState {
             // 紧挨着才算一对，跟渲染那边的判据一致
             if abs(a.endTime - b.startTime) < 0.05 {
                 let aSrcDur = mediaAssets.first(where: { $0.id == a.assetID })?.duration ?? 0
-                let availA = max(0, aSrcDur - (a.trimStart + a.duration * max(0.01, a.speed)))
-                let availB = b.trimStart
+                var availA = max(0, aSrcDur - (a.trimStart + a.duration * max(0.01, a.speed)))
+                var availB = b.trimStart
+                // 同一段素材从中间切开的两半：A 往后多播的、B 往前多播的正好是**同一段画面**，
+                // 叠在一起等于同一帧叠同一帧，转场完全看不出来（实测淡入淡出「没效果」）。
+                // 这种情况当作没有余量，两边各让出半个转场时长，重叠区里前后差一个转场时长的画面
+                let aSrcEnd = a.trimStart + a.duration * max(0.01, a.speed)
+                if a.assetID == b.assetID, abs(a.speed - b.speed) < 0.001, !a.reversed, !b.reversed,
+                   abs(b.trimStart - aSrcEnd) < 0.05 {
+                    availA = 0
+                    availB = 0
+                }
                 var needA = max(0, wantHalf - availA)
                 var needB = max(0, wantHalf - availB)
                 needA = min(needA, max(0, a.duration * 0.4))

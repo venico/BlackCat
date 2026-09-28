@@ -9,6 +9,7 @@
 import AVFoundation
 import AppKit
 import Foundation
+import SwiftUI
 import Vision
 
 extension AgentToolbox {
@@ -22,13 +23,18 @@ extension AgentToolbox {
                 「输出成片」「保存成 mp4」的时候用它。
 
                 后台跑，提交完就返回；进度在右下角，不用在这儿等。
-                导出用的画质、帧率、格式沿用「导出设置」里配好的那套。
+                默认按项目设置里的分辨率、比例、帧率、码率导出；这里传了就只对这一次生效。
+                content：video 成片（默认）、audio 只导声音（m4a）、subtitle 只导字幕（srt）。
                 """,
                 parameters: [
                     "type": "object",
                     "properties": [
                         "filename": ["type": "string",
-                                     "description": "文件名，不用带后缀。不传就按项目名+时间"]
+                                     "description": "文件名，不用带后缀。不传就按项目名+时间"],
+                        "content": ["type": "string", "enum": ["video", "audio", "subtitle"]],
+                        "resolution": ["type": "string", "enum": ExportSettings.resolutions],
+                        "fps": ["type": "integer", "enum": ExportSettings.fpsOptions],
+                        "bitrate": ["type": "integer", "description": "码率 kbps。参考：2000 低、5000 标准、12000 高、30000 极高"]
                     ] as [String: Any],
                     "required": [] as [String]
                 ],
@@ -57,23 +63,112 @@ extension AgentToolbox {
             AgentToolSpec(
                 name: "update_clip",
                 description: """
-                改一条已有片段的属性：位置、缩放、旋转、透明度、音量、速度。
+                改一条已有片段的属性，属性区里能调的这里基本都能调。**只传要改的那几项**，没传的不动。
+                加完之后想调整就用它，别删了重加。各参数对哪类片段有效：
 
-                **加完之后想调整就用它**，别删了重加。只传要改的那几项，没传的不动。
+                · 位置 / 缩放 / 旋转 / 不透明度：视频、图片、文字
+                · 音量、速度：视频、音频；左右声道、淡入淡出：音频
+                · 调色（brightness 等十一项）：视频片段、调节片段
+                · 转场时长 transition_duration：视频片段（它开头那个转场）
+                · 文字内容 text：字幕、文字
+                · 文字样式（字号、字体、粗斜体、颜色、背景、对齐）：文字片段；
+                  **字幕的样式是整条字幕轨共用的**，改任意一条字幕等于改它那一整轨。
+                  中英双语是两条轨时，各拿一条的 id 分别改（比如中文 46、英文 23）
+                · 描边：文字、图片（图片还有 stroke_softness、corner_radius、调色）；行距、离底边距离、
+                  subtitle_width、merge_line_breaks：字幕
+                · 裁切 crop_*、镜像 mirror_*：视频、图片、文字、图形；倒放 reversed、选音轨 audio_track：视频
+                · transition：换掉或删掉视频片段开头的转场（none = 删掉）
+                · 文字还有：animation 入场动画、box_width / box_height 文本框、stroke_softness
+                · 图形：x / y / scale / rotation / opacity / width / height，填充 fill_*、描边 stroke_*、
+                  虚线、端点 cap_*、圆角（矩形）、投影 shadow_*、钢笔路径 pen_points / pen_closed
+                · 强度 intensity：滤镜、特效；amount / angle / center：特效
                 """,
                 parameters: [
                     "type": "object",
                     "properties": [
                         "clip_id": ["type": "string", "description": "list_tracks 给的 id，前 8 位就够"],
+                        "clip_ids": ["type": "array", "items": ["type": "string"],
+                                     "description": "多条一起改成同样的值（跟属性区多选「一起调整」一样），给了就不用 clip_id"],
                         "x": ["type": "number", "description": "水平位置，画面宽度的百分比，50 是居中"],
                         "y": ["type": "number", "description": "垂直位置，画面高度的百分比，50 是居中"],
                         "scale": ["type": "number", "description": "缩放，1 是原始大小"],
                         "rotation": ["type": "number", "description": "旋转角度"],
                         "opacity": ["type": "number", "description": "不透明度 0~1"],
-                        "volume": ["type": "number", "description": "音量 0~2，视频和音频片段才有"],
-                        "speed": ["type": "number", "description": "倍速 0.1~10，视频和音频片段才有"]
+                        "volume": ["type": "number", "description": "音量 0~4，1 是原始"],
+                        "speed": ["type": "number", "description": "倍速 0.1~10"],
+                        "left_channel": ["type": "number", "description": "左声道 0~1（音频）"],
+                        "right_channel": ["type": "number", "description": "右声道 0~1（音频）"],
+                        "fade_in": ["type": "number", "description": "淡入秒数，0 = 关掉淡入（音频）"],
+                        "fade_out": ["type": "number", "description": "淡出秒数，0 = 关掉淡出（音频）"],
+                        "brightness": ["type": "number", "description": "亮度 -1~1，0 不变"],
+                        "contrast": ["type": "number", "description": "对比度 -1~1"],
+                        "saturation": ["type": "number", "description": "饱和度 -1~1"],
+                        "vibrance": ["type": "number", "description": "自然饱和度 -1~1"],
+                        "exposure": ["type": "number", "description": "曝光 -2~2"],
+                        "gamma": ["type": "number", "description": "伽马 0.25~4，**1 是不变**"],
+                        "highlight": ["type": "number", "description": "高光 -1~1"],
+                        "shadow": ["type": "number", "description": "阴影 -1~1"],
+                        "temperature": ["type": "number", "description": "色温 -1~1，负冷正暖"],
+                        "tint": ["type": "number", "description": "色调 -1~1，负绿正品红"],
+                        "hue": ["type": "number", "description": "色相 -180~180 度"],
+                        "transition_duration": ["type": "number", "description": "转场时长（秒），视频片段开头有转场时才有用"],
+                        "text": ["type": "string", "description": "文字内容（字幕、文字）"],
+                        "font_size": ["type": "number", "description": "字号（px）"],
+                        "font_name": ["type": "string", "description": "字体名，比如 PingFang SC、Source Han Sans SC"],
+                        "bold": ["type": "boolean"],
+                        "italic": ["type": "boolean"],
+                        "color": ["type": "string", "description": "文字颜色，#RRGGBB"],
+                        "background_color": ["type": "string", "description": "背景颜色，#RRGGBB"],
+                        "background_opacity": ["type": "number", "description": "背景不透明度 0~1，0 = 没有背景"],
+                        "alignment": ["type": "string", "enum": ["left", "center", "right"]],
+                        "stroke_color": ["type": "string", "description": "描边颜色 #RRGGBB（文字）"],
+                        "stroke_width": ["type": "number", "description": "描边宽度 px，0 = 无描边（文字）"],
+                        "line_spacing": ["type": "number", "description": "双语两行之间的间距 px（字幕）"],
+                        "bottom_margin": ["type": "number", "description": "字幕离画面底边的距离，画面高度的百分比"],
+                        "crop_top": ["type": "number", "description": "从上边裁掉多少，百分比 0~90"],
+                        "crop_bottom": ["type": "number", "description": "从下边裁掉多少，百分比 0~90"],
+                        "crop_left": ["type": "number", "description": "从左边裁掉多少，百分比 0~90"],
+                        "crop_right": ["type": "number", "description": "从右边裁掉多少，百分比 0~90"],
+                        "mirror_h": ["type": "boolean", "description": "水平镜像"],
+                        "mirror_v": ["type": "boolean", "description": "垂直镜像"],
+                        "reversed": ["type": "boolean", "description": "倒放（视频）"],
+                        "audio_track": ["type": "integer", "description": "多音轨素材用第几条音轨，从 0 数（视频）"],
+                        "transition": ["type": "string",
+                                       "description": "换开头转场的种类，none = 删掉转场（视频）。种类：none、" + TransitionType.allCases.map(\.rawValue).joined(separator: "、")],
+                        "corner_radius": ["type": "number", "description": "圆角 px（图片、矩形图形）"],
+                        "stroke_softness": ["type": "number", "description": "描边柔和度 0~1（文字、图片）"],
+                        "animation": ["type": "string", "enum": TextAnimation.allCases.map(\.rawValue),
+                                      "description": "文字入场动画：" + TextAnimation.allCases.map { "\($0.rawValue)=\($0.label)" }.joined(separator: "，")],
+                        "box_width": ["type": "number", "description": "文本框宽 px，0 = 跟着文字自适应（文字）"],
+                        "box_height": ["type": "number", "description": "文本框高 px，0 = 自适应（文字）"],
+                        "subtitle_width": ["type": "number", "description": "字幕最大宽度，画面宽度百分比 20~100（字幕，整轨）"],
+                        "merge_line_breaks": ["type": "boolean", "description": "把字幕里的换行合成一行（字幕，整轨）"],
+                        "width": ["type": "number", "description": "图形宽 px"],
+                        "height": ["type": "number", "description": "图形高 px"],
+                        "fill_enabled": ["type": "boolean", "description": "图形填充开关"],
+                        "fill_color": ["type": "string", "description": "图形填充颜色 #RRGGBB"],
+                        "fill_opacity": ["type": "number", "description": "图形填充不透明度 0~1"],
+                        "stroke_enabled": ["type": "boolean", "description": "图形描边开关"],
+                        "stroke_opacity": ["type": "number", "description": "图形描边不透明度 0~1"],
+                        "stroke_dashed": ["type": "boolean", "description": "图形描边用虚线"],
+                        "cap_start": ["type": "string", "enum": LineCapStyle.allCases.map(\.rawValue), "description": "线段/箭头起点样式"],
+                        "cap_end": ["type": "string", "enum": LineCapStyle.allCases.map(\.rawValue), "description": "线段/箭头终点样式"],
+                        "shadow_enabled": ["type": "boolean", "description": "图形投影开关"],
+                        "shadow_color": ["type": "string", "description": "投影颜色 #RRGGBB"],
+                        "shadow_opacity": ["type": "number", "description": "投影不透明度 0~1"],
+                        "shadow_radius": ["type": "number", "description": "投影模糊半径 px"],
+                        "shadow_offset_x": ["type": "number", "description": "投影水平偏移 px"],
+                        "shadow_offset_y": ["type": "number", "description": "投影垂直偏移 px"],
+                        "pen_points": ["type": "array", "items": ["type": "array", "items": ["type": "number"]],
+                                       "description": "钢笔路径的锚点，[[x,y],…]，x/y 是图形框内的比例 0~1（钢笔图形）"],
+                        "pen_closed": ["type": "boolean", "description": "钢笔路径闭合（钢笔图形）"],
+                        "intensity": ["type": "number", "description": "强度 0~1（滤镜、特效）"],
+                        "amount": ["type": "number", "description": "特效的程度参数 0~1"],
+                        "angle": ["type": "number", "description": "特效的角度（度）"],
+                        "center_x": ["type": "number", "description": "特效中心，画面宽度百分比 0~100"],
+                        "center_y": ["type": "number", "description": "特效中心，画面高度百分比 0~100"]
                     ] as [String: Any],
-                    "required": ["clip_id"]
+                    "required": [] as [String]
                 ],
                 risk: .mutating),
 
@@ -149,14 +244,26 @@ extension AgentToolbox {
                              project p: ProjectState) async -> AgentToolResult? {
         switch name {
         case "export_video":
-            return exportVideo(p, filename: args["filename"] as? String)
+            return exportVideo(p, filename: args["filename"] as? String, args: args)
 
         case "transcribe":
             return transcribe(p, clipKey: args["clip_id"] as? String,
                               proofread: args["proofread"] as? Bool ?? false)
 
         case "update_clip":
-            return updateClip(p, args: args)
+            let many = (args["clip_ids"] as? [Any])?.compactMap { $0 as? String }.filter { !$0.isEmpty } ?? []
+            guard !many.isEmpty else { return updateClip(p, args: args) }
+            // 多条一起改：逐条套同一组参数，一条失败不影响别的
+            var base = args; base.removeValue(forKey: "clip_ids")
+            var okCount = 0
+            var fails: [String] = []
+            for k in many {
+                base["clip_id"] = k
+                let r = updateClip(p, args: base)
+                if r.isError { fails.append("\(k.prefix(8))：\(r.text)") } else { okCount += 1 }
+            }
+            let msg = "改好了 \(okCount)/\(many.count) 条。" + (fails.isEmpty ? "" : "\n" + fails.joined(separator: "\n"))
+            return okCount > 0 ? .ok(msg) : .fail(msg)
 
         case "trim_clip":
             return trimClip(p, args: args)
@@ -183,9 +290,26 @@ extension AgentToolbox {
     // MARK: - 导出
 
     @MainActor
-    private static func exportVideo(_ p: ProjectState, filename: String?) -> AgentToolResult {
+    private static func exportVideo(_ p: ProjectState, filename: String?, args: [String: Any]) -> AgentToolResult {
         guard p.contentEndTime > 0.01 else {
             return .fail("时间线上还什么都没有，没得导。")
+        }
+        // 跟导出面板打开时一样，先按项目设置反显一遍，再叠这次指定的
+        let res = p.previewResolution
+        for r in ExportSettings.resolutions where res.hasPrefix(r) { p.exportSettings.resolution = r }
+        if ExportSettings.aspectRatios.contains(p.previewAspectRatio) {
+            p.exportSettings.aspectRatio = p.previewAspectRatio
+        }
+        p.exportSettings.fps = p.projectFPS
+        p.exportSettings.bitrate = p.projectBitrate
+        func int(_ k: String) -> Int? { (args[k] as? Int) ?? (args[k] as? Double).map { Int($0) } }
+        if let r = args["resolution"] as? String, ExportSettings.resolutions.contains(r) { p.exportSettings.resolution = r }
+        if let f = int("fps"), ExportSettings.fpsOptions.contains(f) { p.exportSettings.fps = f }
+        if let b = int("bitrate") { p.exportSettings.bitrate = max(1000, min(50000, b)) }
+        switch args["content"] as? String {
+        case "audio": p.exportSettings.content = .audioOnly
+        case "subtitle": p.exportSettings.content = .subtitleOnly
+        default: p.exportSettings.content = .video
         }
         let ext: String
         switch p.exportSettings.content {
@@ -255,69 +379,312 @@ extension AgentToolbox {
     @MainActor
     private static func updateClip(_ p: ProjectState, args: [String: Any]) -> AgentToolResult {
         guard let key = (args["clip_id"] as? String), !key.isEmpty else { return .fail("缺 clip_id") }
-        func num(_ k: String) -> Double? { args[k] as? Double ?? (args[k] as? Int).map(Double.init) }
-        let x = num("x"), y = num("y"), scale = num("scale"), rot = num("rotation")
-        let opacity = num("opacity"), volume = num("volume"), speed = num("speed")
-        guard x != nil || y != nil || scale != nil || rot != nil
-                || opacity != nil || volume != nil || speed != nil else {
-            return .fail("一个要改的属性都没传。")
-        }
+        let a = ClipArgs(args)
+        guard a.hasAny else { return .fail("一个要改的属性都没传。") }
         var changed: [String] = []
         func note(_ s: String) { changed.append(s) }
+        /// 这类片段不认的参数也要说出来，不然模型以为改成了
+        func done(_ what: String, _ supported: Set<String>) -> AgentToolResult {
+            let ignored = a.given.subtracting(supported).subtracting(["clip_id"]).sorted()
+            p.refreshOverlayComposite()
+            p.rebuildTimelinePreview()
+            var msg = changed.isEmpty ? "\(what)：没有可改的项。" : "已经改了\(what)：\(changed.joined(separator: "、"))"
+            if !ignored.isEmpty { msg += "\n（这些参数对\(what)不适用，没改：\(ignored.joined(separator: "、"))）" }
+            return changed.isEmpty ? .fail(msg) : .ok(msg)
+        }
+        let transform: Set<String> = ["x", "y", "scale", "rotation", "opacity"]
+        let color: Set<String> = Set(ClipArgs.colorKeys)
 
         // 视频
         for t in p.videoTracks {
             guard let c = t.clips.first(where: { "\($0.id)".hasPrefix(key) }) else { continue }
             p.updateVideoClip(id: c.id) { v in
-                if let x { v.offsetX = x / 100 - 0.5; note("水平位置 \(Int(x))%") }
-                if let y { v.offsetY = y / 100 - 0.5; note("垂直位置 \(Int(y))%") }
-                if let s = scale { v.scaleX = s; v.scaleY = s; note("缩放 \(s)") }
+                if let x = a.num("x") { v.offsetX = x / 100 - 0.5; note("水平位置 \(Int(x))%") }
+                if let y = a.num("y") { v.offsetY = y / 100 - 0.5; note("垂直位置 \(Int(y))%") }
+                if let s = a.num("scale") { v.scaleX = s; v.scaleY = s; note("缩放 \(s)") }
                 // 视频这条的 rotation 是整数度、volume 是 Float
-                if let r = rot { v.rotation = Int(r.rounded()); note("旋转 \(Int(r))°") }
-                if let vol = volume { v.volume = Float(max(0, min(2, vol))); note("音量 \(vol)") }
-                if let sp = speed { v.speed = max(0.1, min(10, sp)); note("速度 \(sp)x") }
+                if let r = a.num("rotation") { v.rotation = Int(r.rounded()); note("旋转 \(Int(r))°") }
+                if let vol = a.num("volume") { v.volume = Float(max(0, min(4, vol))); note("音量 \(vol)") }
+                if let sp = a.num("speed") { v.speed = max(0.1, min(10, sp)); note("速度 \(sp)x") }
+                a.applyColor(&v.colorAdjust, note)
+                if let t = a.str("transition") {
+                    if t == "none" {
+                        if v.inTransition != nil { v.inTransition = nil; note("删掉开头转场") }
+                    } else if let k = TransitionType(rawValue: t) {
+                        if v.inTransition != nil { v.inTransition?.type = k; note("转场换成 \(k.rawValue)") }
+                        else { v.inTransition = Transition(type: k, duration: 0.5); note("加转场 \(k.rawValue)") }
+                    }
+                }
+                if let d = a.num("transition_duration") {
+                    if v.inTransition != nil { v.inTransition?.duration = max(0.1, d); note("转场时长 \(d) 秒") }
+                }
+                a.applyCrop(&v.cropTop, &v.cropBottom, &v.cropLeft, &v.cropRight, note)
+                a.applyMirror(&v.mirrorH, &v.mirrorV, note)
+                if let r = a.bool("reversed") { v.reversed = r; note(r ? "倒放" : "取消倒放") }
+                if let i = a.num("audio_track") { v.audioTrackIndex = max(0, Int(i)); note("用第 \(Int(i)) 条音轨") }
             }
-            p.rebuildTimelinePreview()
-            return .ok("已经改了视频片段「\(c.name)」：\(changed.joined(separator: "、"))")
+            return done("视频片段「\(c.name)」",
+                        transform.subtracting(["opacity"]).union(["volume", "speed", "transition_duration", "transition",
+                                                                  "reversed", "audio_track"]).union(color).union(ClipArgs.cropMirrorKeys))
         }
         // 图片
         for t in p.imageTracks {
             guard let c = t.clips.first(where: { "\($0.id)".hasPrefix(key) }) else { continue }
             p.updateImageClip(id: c.id) { v in
-                if let x { v.offsetX = x / 100 - 0.5; note("水平位置 \(Int(x))%") }
-                if let y { v.offsetY = y / 100 - 0.5; note("垂直位置 \(Int(y))%") }
-                if let s = scale { v.scaleX = s; v.scaleY = s; note("缩放 \(s)") }
-                if let r = rot { v.rotation = r; note("旋转 \(Int(r))°") }
-                if let o = opacity { v.opacity = max(0, min(1, o)); note("不透明度 \(o)") }
+                if let x = a.num("x") { v.offsetX = x / 100 - 0.5; note("水平位置 \(Int(x))%") }
+                if let y = a.num("y") { v.offsetY = y / 100 - 0.5; note("垂直位置 \(Int(y))%") }
+                if let s = a.num("scale") { v.scaleX = s; v.scaleY = s; note("缩放 \(s)") }
+                if let r = a.num("rotation") { v.rotation = r; note("旋转 \(Int(r))°") }
+                if let o = a.num("opacity") { v.opacity = max(0, min(1, o)); note("不透明度 \(o)") }
+                a.applyCrop(&v.cropTop, &v.cropBottom, &v.cropLeft, &v.cropRight, note)
+                a.applyMirror(&v.mirrorH, &v.mirrorV, note)
+                a.applyColor(&v.colorAdjust, note)
+                if let r = a.num("corner_radius") { v.cornerRadius = max(0, r); note("圆角 \(Int(r))") }
+                if let h = a.hex("stroke_color") { v.strokeColorHex = h; note("描边颜色") }
+                if let w = a.num("stroke_width") { v.strokeWidth = max(0, w); note("描边宽度 \(w)") }
+                if let s = a.num("stroke_softness") { v.strokeSoftness = max(0, min(1, s)); note("描边柔和 \(s)") }
             }
-            p.rebuildTimelinePreview()
-            return .ok("已经改了图片片段「\(c.name)」：\(changed.joined(separator: "、"))")
+            return done("图片片段「\(c.name)」", transform.union(color).union(ClipArgs.cropMirrorKeys)
+                .union(["corner_radius", "stroke_color", "stroke_width", "stroke_softness"]))
         }
         // 文字
         for t in p.textTracks {
             guard let c = t.clips.first(where: { "\($0.id)".hasPrefix(key) }) else { continue }
             p.updateTextClip(id: c.id) { v in
-                if let x { v.posX = x / 100; note("水平位置 \(Int(x))%") }
-                if let y { v.posY = y / 100; note("垂直位置 \(Int(y))%") }
-                if let r = rot { v.rotation = r; note("旋转 \(Int(r))°") }
-                if let o = opacity { v.opacity = max(0, min(1, o)); note("不透明度 \(o)") }
+                if let x = a.num("x") { v.posX = x / 100; note("水平位置 \(Int(x))%") }
+                if let y = a.num("y") { v.posY = y / 100; note("垂直位置 \(Int(y))%") }
+                if let r = a.num("rotation") { v.rotation = r; note("旋转 \(Int(r))°") }
+                if let o = a.num("opacity") { v.opacity = max(0, min(1, o)); note("不透明度 \(o)") }
+                if let s = a.str("text") { v.text = s; note("内容") }
+                if let f = a.num("font_size") { v.fontSize = CGFloat(max(4, f)); note("字号 \(Int(f))") }
+                if let f = a.str("font_name") { v.fontName = f; note("字体 \(f)") }
+                if let b = a.bool("bold") { v.bold = b; note(b ? "加粗" : "取消加粗") }
+                if let b = a.bool("italic") { v.italic = b; note(b ? "斜体" : "取消斜体") }
+                if let c = a.color("color") { v.textColor = c; note("文字颜色") }
+                if let c = a.color("background_color") { v.bgColor = c; note("背景颜色") }
+                if let o = a.num("background_opacity") { v.bgOpacity = max(0, min(1, o)); note("背景不透明度 \(o)") }
+                if let al = a.alignment { v.alignment = al; note("对齐 \(al)") }
+                if let c = a.color("stroke_color") { v.strokeColor = c; note("描边颜色") }
+                if let w = a.num("stroke_width") { v.strokeWidth = max(0, w); note("描边宽度 \(w)") }
+                if let s = a.num("stroke_softness") { v.strokeSoftness = max(0, min(1, s)); note("描边柔和 \(s)") }
+                if let an = a.str("animation"), let k = TextAnimation(rawValue: an) { v.animation = k; note("入场动画 \(k.label)") }
+                if let w = a.num("box_width") { v.boxWidth = w > 0 ? w : nil; note(w > 0 ? "文本框宽 \(Int(w))" : "文本框宽自适应") }
+                if let h = a.num("box_height") { v.boxHeight = h > 0 ? h : nil; note(h > 0 ? "文本框高 \(Int(h))" : "文本框高自适应") }
+                a.applyCrop(&v.cropTop, &v.cropBottom, &v.cropLeft, &v.cropRight, note)
+                a.applyMirror(&v.mirrorH, &v.mirrorV, note)
             }
-            p.rebuildTimelinePreview()
-            return .ok("已经改了文字「\(c.text.prefix(10))」：\(changed.joined(separator: "、"))")
+            return done("文字「\(c.text.prefix(10))」", transform.subtracting(["scale"]).union(
+                ["text", "font_size", "font_name", "bold", "italic", "color", "background_color",
+                 "background_opacity", "alignment", "stroke_color", "stroke_width", "stroke_softness",
+                 "animation", "box_width", "box_height"]).union(ClipArgs.cropMirrorKeys))
+        }
+        // 图形
+        for t in p.shapeTracks {
+            guard let c = t.clips.first(where: { "\($0.id)".hasPrefix(key) }) else { continue }
+            var bad: String?
+            p.updateShapeClip(id: c.id) { v in
+                if let x = a.num("x") { v.posX = x / 100; note("水平位置 \(Int(x))%") }
+                if let y = a.num("y") { v.posY = y / 100; note("垂直位置 \(Int(y))%") }
+                if let s = a.num("scale") { v.scaleX = s; v.scaleY = s; note("缩放 \(s)") }
+                if let r = a.num("rotation") { v.rotation = r; note("旋转 \(Int(r))°") }
+                if let o = a.num("opacity") { v.opacity = max(0, min(1, o)); note("不透明度 \(o)") }
+                if let w = a.num("width") { v.width = max(1, w); note("宽 \(Int(w))") }
+                if let h = a.num("height") { v.height = max(1, h); note("高 \(Int(h))") }
+                if let b = a.bool("fill_enabled") { v.fillEnabled = b; note(b ? "开填充" : "关填充") }
+                if let c = a.color("fill_color") { v.fillColor = c; v.fillEnabled = true; note("填充颜色") }
+                if let o = a.num("fill_opacity") { v.fillOpacity = max(0, min(1, o)); note("填充不透明度 \(o)") }
+                if let b = a.bool("stroke_enabled") { v.strokeEnabled = b; note(b ? "开描边" : "关描边") }
+                if let c = a.color("stroke_color") { v.strokeColor = c; v.strokeEnabled = true; note("描边颜色") }
+                if let w = a.num("stroke_width") { v.strokeWidth = max(0, w); v.strokeEnabled = w > 0; note("描边宽度 \(w)") }
+                if let o = a.num("stroke_opacity") { v.strokeOpacity = max(0, min(1, o)); note("描边不透明度 \(o)") }
+                if let b = a.bool("stroke_dashed") { v.strokeDashed = b; note(b ? "虚线" : "实线") }
+                if let s = a.str("cap_start"), let k = LineCapStyle(rawValue: s) { v.capStart = k; note("起点 \(k.label)") }
+                if let s = a.str("cap_end"), let k = LineCapStyle(rawValue: s) { v.capEnd = k; note("终点 \(k.label)") }
+                if let r = a.num("corner_radius") {
+                    if v.type == .rectangle { v.cornerRadius = max(0, r); note("圆角 \(Int(r))") }
+                    else { bad = "只有矩形有圆角" }
+                }
+                if let b = a.bool("shadow_enabled") { v.shadowEnabled = b; note(b ? "开投影" : "关投影") }
+                if let c = a.color("shadow_color") { v.shadowColor = c; v.shadowEnabled = true; note("投影颜色") }
+                if let o = a.num("shadow_opacity") { v.shadowOpacity = max(0, min(1, o)); note("投影不透明度 \(o)") }
+                if let r = a.num("shadow_radius") { v.shadowRadius = max(0, r); note("投影半径 \(r)") }
+                if let x = a.num("shadow_offset_x") { v.shadowOffsetX = x; note("投影水平偏移 \(x)") }
+                if let y = a.num("shadow_offset_y") { v.shadowOffsetY = y; note("投影垂直偏移 \(y)") }
+                if let pts = a.raw["pen_points"] as? [[Any]] {
+                    if v.type == .pen {
+                        let ps = pts.compactMap { pr -> PenPoint? in
+                            guard pr.count >= 2, let x = ClipArgs.anyNum(pr[0]), let y = ClipArgs.anyNum(pr[1]) else { return nil }
+                            return PenPoint(x: x, y: y, smooth: false)
+                        }
+                        if ps.count >= 2 { v.penPoints = ps; note("钢笔路径 \(ps.count) 个点") } else { bad = "钢笔路径至少要两个点" }
+                    } else { bad = "只有钢笔图形能改路径" }
+                }
+                if let b = a.bool("pen_closed") {
+                    if v.type == .pen { v.penClosed = b; note(b ? "闭合路径" : "断开路径") } else { bad = "只有钢笔图形能闭合路径" }
+                }
+                a.applyCrop(&v.cropTop, &v.cropBottom, &v.cropLeft, &v.cropRight, note)
+                a.applyMirror(&v.mirrorH, &v.mirrorV, note)
+            }
+            if let bad, changed.isEmpty { return .fail(bad) }
+            return done("图形（\(c.type.label)）", transform.union(ClipArgs.cropMirrorKeys).union(
+                ["width", "height", "fill_enabled", "fill_color", "fill_opacity", "stroke_enabled", "stroke_color",
+                 "stroke_width", "stroke_opacity", "stroke_dashed", "cap_start", "cap_end", "corner_radius",
+                 "shadow_enabled", "shadow_color", "shadow_opacity", "shadow_radius", "shadow_offset_x",
+                 "shadow_offset_y", "pen_points", "pen_closed"]))
+        }
+        // 字幕：内容改这一条，样式改整条轨
+        for ti in p.subtitleTracks.indices {
+            guard let c = p.subtitleTracks[ti].clips.first(where: { "\($0.id)".hasPrefix(key) }) else { continue }
+            if let s = a.str("text") { p.updateSubtitleText(id: c.id, text: s); note("这一条的内容") }
+            var st = p.subtitleTracks[ti].subtitleStyle ?? SubtitleStyle()
+            let before = st
+            if let f = a.num("font_size") { st.fontSize = CGFloat(max(4, f)); note("字号 \(Int(f))") }
+            if let f = a.str("font_name") { st.fontName = f; note("字体 \(f)") }
+            if let b = a.bool("bold") { st.bold = b; note(b ? "加粗" : "取消加粗") }
+            if let b = a.bool("italic") { st.italic = b; note(b ? "斜体" : "取消斜体") }
+            if let c = a.color("color") { st.textColor = c; note("文字颜色") }
+            if let c = a.color("background_color") { st.backgroundColor = c; note("背景颜色") }
+            if let o = a.num("background_opacity") { st.backgroundOpacity = max(0, min(1, o)); note("背景不透明度 \(o)") }
+            if let al = a.alignment { st.alignment = al; note("对齐 \(al)") }
+            if let l = a.num("line_spacing") { st.lineSpacing = max(0, l); note("行距 \(l)") }
+            if let m = a.num("bottom_margin") { st.bottomMargin = max(0, min(90, m)); note("离底边 \(m)%") }
+            if let w = a.num("subtitle_width") { st.widthPercent = max(20, min(100, w)); note("字幕宽度 \(Int(w))%") }
+            if let b = a.bool("merge_line_breaks") { st.mergeLineBreaks = b; note(b ? "合并换行" : "保留换行") }
+            if st != before { p.subtitleTracks[ti].subtitleStyle = st }
+            let label = p.subtitleTracks[ti].label
+            return done(st != before ? "字幕轨「\(label)」（样式对整轨生效）" : "字幕",
+                        ["text", "font_size", "font_name", "bold", "italic", "color", "background_color",
+                         "background_opacity", "alignment", "line_spacing", "bottom_margin",
+                         "subtitle_width", "merge_line_breaks"])
         }
         // 音频
         for ti in p.audioTracks.indices {
-            guard let ci = p.audioTracks[ti].clips.firstIndex(where: { "\($0.id)".hasPrefix(key) })
-            else { continue }
-            let name = p.audioTracks[ti].clips[ci].name
-            if let vol = volume {
-                p.audioTracks[ti].clips[ci].volume = Float(max(0, min(2, vol))); note("音量 \(vol)")
+            guard let c = p.audioTracks[ti].clips.first(where: { "\($0.id)".hasPrefix(key) }) else { continue }
+            p.updateAudioClip(id: c.id) { v in
+                if let vol = a.num("volume") { v.volume = Float(max(0, min(4, vol))); note("音量 \(vol)") }
+                if let sp = a.num("speed") { v.speed = max(0.1, min(10, sp)); note("速度 \(sp)x") }
+                if let l = a.num("left_channel") { v.leftChannel = Float(max(0, min(1, l))); note("左声道 \(l)") }
+                if let r = a.num("right_channel") { v.rightChannel = Float(max(0, min(1, r))); note("右声道 \(r)") }
+                if let f = a.num("fade_in") {
+                    v.fadeInEnabled = f > 0
+                    if f > 0 { v.fadeInDuration = min(f, v.duration) }
+                    note(f > 0 ? "淡入 \(f) 秒" : "关掉淡入")
+                }
+                if let f = a.num("fade_out") {
+                    v.fadeOutEnabled = f > 0
+                    if f > 0 { v.fadeOutDuration = min(f, v.duration) }
+                    note(f > 0 ? "淡出 \(f) 秒" : "关掉淡出")
+                }
             }
-            if let sp = speed { p.audioTracks[ti].clips[ci].speed = max(0.1, min(10, sp)); note("速度 \(sp)x") }
-            p.rebuildTimelinePreview()
-            return .ok("已经改了音频片段「\(name)」：\(changed.joined(separator: "、"))")
+            return done("音频片段「\(c.name)」",
+                        ["volume", "speed", "left_channel", "right_channel", "fade_in", "fade_out"])
+        }
+        // 调节片段
+        for t in p.adjustTracks {
+            guard let c = t.clips.first(where: { "\($0.id)".hasPrefix(key) }) else { continue }
+            p.updateAdjustClip(id: c.id) { v in a.applyColor(&v.adjust, note) }
+            return done("调节片段「\(c.name)」", color)
+        }
+        // 滤镜
+        for t in p.filterTracks {
+            guard let c = t.clips.first(where: { "\($0.id)".hasPrefix(key) }) else { continue }
+            p.updateFilterClip(id: c.id) { v in
+                if let i = a.num("intensity") { v.intensity = max(0, min(1, i)); note("强度 \(i)") }
+            }
+            return done("滤镜「\(c.name)」", ["intensity"])
+        }
+        // 特效
+        for t in p.effectTracks {
+            guard let c = t.clips.first(where: { "\($0.id)".hasPrefix(key) }) else { continue }
+            p.updateEffectClip(id: c.id) { v in
+                if let i = a.num("intensity") { v.intensity = max(0, min(1, i)); note("强度 \(i)") }
+                if let m = a.num("amount") { v.amount = max(0, min(1, m)); note("程度 \(m)") }
+                if let g = a.num("angle") { v.angle = g; note("角度 \(Int(g))°") }
+                if let x = a.num("center_x") { v.centerX = max(0, min(1, x / 100)); note("中心水平 \(Int(x))%") }
+                if let y = a.num("center_y") { v.centerY = max(0, min(1, y / 100)); note("中心垂直 \(Int(y))%") }
+            }
+            return done("特效「\(c.name)」", ["intensity", "amount", "angle", "center_x", "center_y"])
         }
         return .fail("找不到 id 以 \(key) 开头的片段，先 list_tracks 看看。")
+    }
+
+    /// update_clip 的参数。模型给数字有时是整数、有时是字符串，这里统一收
+    private struct ClipArgs {
+        let raw: [String: Any]
+        init(_ raw: [String: Any]) { self.raw = raw }
+
+        static let colorKeys = ["brightness", "contrast", "saturation", "vibrance", "exposure",
+                                "gamma", "highlight", "shadow", "temperature", "tint", "hue"]
+
+        /// 这一次实际传了哪些键
+        var given: Set<String> { Set(raw.keys) }
+        var hasAny: Bool { !given.subtracting(["clip_id"]).isEmpty }
+
+        func num(_ k: String) -> Double? {
+            if let d = raw[k] as? Double { return d }
+            if let i = raw[k] as? Int { return Double(i) }
+            if let s = raw[k] as? String { return Double(s.trimmingCharacters(in: .whitespaces)) }
+            return nil
+        }
+        func str(_ k: String) -> String? { raw[k] as? String }
+        static let cropMirrorKeys: Set<String> = ["crop_top", "crop_bottom", "crop_left", "crop_right", "mirror_h", "mirror_v"]
+        static func anyNum(_ v: Any) -> Double? {
+            if let d = v as? Double { return d }
+            if let i = v as? Int { return Double(i) }
+            if let s = v as? String { return Double(s) }
+            return nil
+        }
+        /// 裁切按百分比收，存成 0~1
+        func applyCrop(_ t: inout Double, _ b: inout Double, _ l: inout Double, _ r: inout Double,
+                       _ note: (String) -> Void) {
+            func pct(_ k: String) -> Double? { num(k).map { max(0, min(0.9, $0 / 100)) } }
+            if let v = pct("crop_top") { t = v; note("上裁 \(Int(v * 100))%") }
+            if let v = pct("crop_bottom") { b = v; note("下裁 \(Int(v * 100))%") }
+            if let v = pct("crop_left") { l = v; note("左裁 \(Int(v * 100))%") }
+            if let v = pct("crop_right") { r = v; note("右裁 \(Int(v * 100))%") }
+        }
+        func applyMirror(_ h: inout Bool, _ v: inout Bool, _ note: (String) -> Void) {
+            if let b = bool("mirror_h") { h = b; note(b ? "水平镜像" : "取消水平镜像") }
+            if let b = bool("mirror_v") { v = b; note(b ? "垂直镜像" : "取消垂直镜像") }
+        }
+        /// #RRGGBB 原样收成字符串（图片描边存的是 hex）
+        func hex(_ k: String) -> String? {
+            guard var h = str(k)?.trimmingCharacters(in: .whitespaces) else { return nil }
+            if !h.hasPrefix("#") { h = "#" + h }
+            guard h.count == 7, UInt64(h.dropFirst(), radix: 16) != nil else { return nil }
+            return h.uppercased()
+        }
+        func bool(_ k: String) -> Bool? {
+            if let b = raw[k] as? Bool { return b }
+            if let s = raw[k] as? String { return s == "true" ? true : (s == "false" ? false : nil) }
+            return nil
+        }
+        /// #RRGGBB → Color。格式不对就当没传
+        func color(_ k: String) -> Color? {
+            guard var h = str(k)?.trimmingCharacters(in: .whitespaces) else { return nil }
+            if !h.hasPrefix("#") { h = "#" + h }
+            guard h.count == 7, UInt64(h.dropFirst(), radix: 16) != nil else { return nil }
+            return Color(hex: h)
+        }
+        var alignment: String? {
+            guard let s = str("alignment")?.lowercased(), ["left", "center", "right"].contains(s) else { return nil }
+            return s
+        }
+        /// 调色参数写进 ColorAdjust，范围按属性区滑块夹住
+        func applyColor(_ c: inout ColorAdjust, _ note: (String) -> Void) {
+            func clamp(_ v: Double, _ lo: Double, _ hi: Double) -> Double { max(lo, min(hi, v)) }
+            if let v = num("brightness") { c.brightness = clamp(v, -1, 1); note("亮度 \(v)") }
+            if let v = num("contrast") { c.contrast = clamp(v, -1, 1); note("对比度 \(v)") }
+            if let v = num("saturation") { c.saturation = clamp(v, -1, 1); note("饱和度 \(v)") }
+            if let v = num("vibrance") { c.vibrance = clamp(v, -1, 1); note("自然饱和度 \(v)") }
+            if let v = num("exposure") { c.exposure = clamp(v, -2, 2); note("曝光 \(v)") }
+            if let v = num("gamma") { c.gamma = clamp(v, 0.25, 4); note("伽马 \(v)") }
+            if let v = num("highlight") { c.highlight = clamp(v, -1, 1); note("高光 \(v)") }
+            if let v = num("shadow") { c.shadow = clamp(v, -1, 1); note("阴影 \(v)") }
+            if let v = num("temperature") { c.temperature = clamp(v, -1, 1); note("色温 \(v)") }
+            if let v = num("tint") { c.tint = clamp(v, -1, 1); note("色调 \(v)") }
+            if let v = num("hue") { c.hue = clamp(v, -180, 180); note("色相 \(Int(v))°") }
+        }
     }
 
     // MARK: - 裁剪

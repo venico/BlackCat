@@ -2656,14 +2656,26 @@ private struct AudioInspector: View {
         }
     }
 
+    /// 音量 / 左右声道。**多选时对选中的每一条音频片段都生效** ——
+    /// 原来只改属性区正显示的这一条，全选一整轨调音量，结果只有第一段变了。
+    /// 各条设成同一个值（不是按比例加减）；撤销节流会把这一下合成一步
     private func dbl(_ kp: WritableKeyPath<AudioClip, Float>, scale: Double) -> Binding<Double> {
         Binding(
             get: { Double(clip[keyPath: kp]) * scale },
             set: { v in
-                project.updateAudioClip(id: clip.id) { $0[keyPath: kp] = Float(v/scale) }
+                for id in selectedAudioClipIDs {
+                    project.updateAudioClip(id: id) { $0[keyPath: kp] = Float(v/scale) }
+                }
                 project.rebuildTimelinePreview()
             }
         )
+    }
+
+    /// 这次要改哪些音频片段：当前这条在多选里就是选中的全部音频片段，否则只有它自己
+    private var selectedAudioClipIDs: [UUID] {
+        let sel = project.selectedClipIDs
+        guard sel.count > 1, sel.contains(clip.id) else { return [clip.id] }
+        return project.audioTracks.flatMap(\.clips).map(\.id).filter { sel.contains($0) }
     }
 }
 
@@ -2841,7 +2853,12 @@ struct ICapsuleSlider: View {
             // 数值区**固定宽度 + fixedSize**：滑轨那头是个 GeometryReader，
             // 在 HStack 里会一路撑开，不把这头钉死的话「344°」会被压到滑轨底下
             HStack(spacing: 1) {
-                TextField("", text: $editText)
+                // 没在输入时**直接显示当前值**，不经过 editText 中转。
+                // 原来靠 onChange(of: value) 把值抄进 editText，⌘Z 撤销时滑块回去了、
+                // 数字却停在旧值 —— 那一下的 onChange 没抄到。直接读值就不存在抄漏的问题；
+                // 只有点进去输入时才用 editText，进去那一刻先填上当前值
+                TextField("", text: Binding(get: { focused ? editText : fmt },
+                                            set: { editText = $0 }))
                     .font(.system(size: 10).monospacedDigit())
                     .foregroundColor(Color.labelPrimary)
                     .multilineTextAlignment(.trailing)
@@ -2849,9 +2866,11 @@ struct ICapsuleSlider: View {
                     .focused($focused)
                     .frame(width: 34)
                     .onAppear { editText = fmt }
-                    .onChange(of: value) { v in if !focused { editText = fmt }; if dragging { onChange?(v) } }
+                    .onChange(of: value) { v in if dragging { onChange?(v) } }
                     .onSubmit { commit() }
-                    .onChange(of: focused) { _ in if !focused { commit() } }
+                    .onChange(of: focused) { f in
+                        if f { editText = fmt } else { commit() }
+                    }
                 if !unit.isEmpty {
                     Text(unit)
                         .font(.system(size: 10))

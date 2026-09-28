@@ -82,18 +82,20 @@ struct WelcomeView: View {
 
     // MARK: - 左侧
 
-    /// 侧栏。样式跟主界面的素材栏一致：独立的圆角卡片浮在左边，
+    /// 侧栏。样式跟主界面的素材栏一致：贴着窗口左边、不铺底色，右边一条分割线，
     /// 顶部留出跟主界面同高的标题栏行放交通灯
     private var sidebar: some View {
         VStack(alignment: .leading, spacing: 0) {
             // 交通灯行。欢迎页现在铺满整个窗口，没有它就没法关/最小化窗口
             HStack {
+                // 侧栏不再浮起、少了外面那圈 8pt，交通灯补回左 8、上 8，窗口里位置不变
                 TrafficLightsView()
-                    .padding(.leading, 11)
+                    .padding(.leading, 19)
                 Spacer()
             }
             // 34 = 交通灯 12pt + 上下各 11pt，跟主界面侧边栏那行同一套数
             .frame(height: 34)
+            .padding(.top, 8)
 
             Spacer().frame(height: 18)
 
@@ -114,9 +116,13 @@ struct WelcomeView: View {
         }
         .frame(width: 220)
         .frame(maxHeight: .infinity)
-        .panelSurface(.sidebar, cornerRadius: 18)
-        .softPanelShadow()
-        .padding(8)
+        .sidebarTint()
+        // 跟主界面侧栏同一个做法：没有玻璃底、圆角、阴影，只靠右边缘一条线跟内容区分开
+        .overlay(alignment: .trailing) {
+            Rectangle()
+                .fill(Color.white.opacity(0.10))
+                .frame(width: 1)
+        }
     }
 
     /// 更新卡片。只在真有新版时出现，没有更新就完全不占位置

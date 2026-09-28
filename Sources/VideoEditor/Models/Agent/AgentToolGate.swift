@@ -22,7 +22,7 @@ final class AgentToolGate {
     static let shared = AgentToolGate()
 
     enum Group: String, CaseIterable {
-        case edit, canvas, generate, studio, media, script
+        case edit, canvas, generate, studio, media, project, library, script
 
         var label: String {
             switch self {
@@ -31,6 +31,8 @@ final class AgentToolGate {
             case .generate: return "生成"
             case .studio:   return "加工"
             case .media:    return "媒体"
+            case .project:  return "结构"
+            case .library:  return "素材库"
             case .script:   return "脚本"
             }
         }
@@ -38,11 +40,13 @@ final class AgentToolGate {
         /// 给模型看的一句话说明（进系统提示词，要短）
         var summary: String {
             switch self {
-            case .edit:     return "往时间轴加东西、分割、移动、删片段、加字幕文字滤镜特效"
-            case .canvas:   return "在 AI 画布上加卡片、连线、让卡片开始生成"
+            case .edit:     return "往时间轴加东西、分割、移动、换轨、调轨道顺序、删片段、加字幕文字滤镜特效"
+            case .canvas:   return "在 AI 画布上加卡片、连线、让卡片开始生成，成组、副本、裁剪镜像旋转、存素材库、卡片去背景超分分离音频"
             case .generate: return "生成图片、视频、音频"
             case .studio:   return "转场、翻译字幕、字幕配音、清晰度提升、抠图、去背景音乐、场景切分、挑精彩片段、保存撤销重命名"
             case .media:    return "导出成片、语音识别、逐帧识别画面文字、裁剪片段"
+            case .project:  return "新建删除轨道、轨道静音隐藏改名、时间线复制改名删除、标记、复制粘贴片段、选中、对齐、进出复合片段、文字模板、项目设置（比例分辨率帧率码率名称）、封面、新建打开项目、截帧存素材库、改软件设置（保存位置、各引擎、生成默认值）"
+            case .library:  return "素材库文件夹、重新关联丢失素材、素材署名、加进 AI 参考、在线音乐音效库（搜索试听收藏下载上时间轴）"
             case .script:   return "跑命令行、装和跑 Skill"
             }
         }
@@ -54,7 +58,8 @@ final class AgentToolGate {
             case .edit:
                 return ["时间轴", "时间线", "轨道", "片段", "字幕", "文字", "标题", "滤镜",
                         "特效", "调节", "分割", "切开", "删掉", "删除", "移动", "导入",
-                        "加进", "放到", "素材库", "剪"]
+                        "加进", "放到", "素材库", "剪",
+                        "顺序", "置顶", "盖住", "上层", "下层", "换轨"]
             case .canvas:
                 return ["画布", "卡片", "连线", "节点", "连到", "画板"]
             case .generate:
@@ -67,6 +72,13 @@ final class AgentToolGate {
             case .media:
                 return ["导出", "输出", "成片", "识别", "语音", "转写", "字幕生成",
                         "ocr", "认字", "识字", "扫描", "裁剪", "裁掉", "掐头"]
+            case .project:
+                return ["轨道", "静音", "隐藏", "显示", "时间线", "标记", "复制", "粘贴", "剪切",
+                        "选中", "全选", "对齐", "分布", "居中", "复合", "模板", "新建轨",
+                        "比例", "分辨率", "帧率", "码率", "封面", "项目名", "新建项目", "打开项目", "竖屏", "横屏", "设置", "引擎", "默认", "保存位置"]
+            case .library:
+                return ["文件夹", "分类", "整理", "丢失", "关联", "署名", "版权", "参考",
+                        "音乐库", "音效库", "音效", "配乐", "背景音乐", "bgm", "找首", "找个音", "收藏", "下载"]
             case .script:
                 return ["命令", "终端", "脚本", "shell", "skill", "技能", "安装", "插件"]
             }
@@ -108,10 +120,13 @@ final class AgentToolGate {
             return (AgentToolbox.readTools.filter { Self.timelineOnlyNames.contains($0.name) }
                     + AgentToolbox.editTools)
                 .filter { !Self.alwaysOnNames.contains($0.name) }
-        case .canvas:   return AgentToolbox.canvasTools.filter { !Self.alwaysOnNames.contains($0.name) }
+        case .canvas:   return (AgentToolbox.canvasTools + AgentToolbox.canvasEditTools)
+                .filter { !Self.alwaysOnNames.contains($0.name) }
         case .generate: return AgentToolbox.generateTools
         case .studio:   return AgentToolbox.studioTools + AgentToolbox.studioTools2
         case .media:    return AgentToolbox.mediaTools
+        case .project:  return AgentToolbox.projectTools + AgentToolbox.settingsTools
+        case .library:  return AgentToolbox.libraryTools
         case .script:   return AgentToolbox.shellTools + AgentToolbox.skillTools
         }
     }
@@ -128,7 +143,7 @@ final class AgentToolGate {
     /// 在画布上聊天时挂着「看轨道」「截预览帧」纯属浪费，
     /// 真要放进时间轴，它自己调 enable_tools 要 edit 那组
     static let timelineOnlyNames: Set<String> = [
-        "get_project", "list_tracks", "seek"
+        "get_project", "list_tracks", "get_clip", "seek"
     ]
 
     /// 网关工具本身。描述得短 —— 它是每轮都发的
@@ -161,7 +176,7 @@ final class AgentToolGate {
         var list: [AgentToolSpec] = shared + [gateTool]
         if inCanvas {
             // 画布上：画布那组直接给全，不用它开口要
-            list += AgentToolbox.canvasTools
+            list += AgentToolbox.canvasTools + AgentToolbox.canvasEditTools
         } else {
             list += AgentToolbox.readTools.filter { Self.timelineOnlyNames.contains($0.name) }
         }

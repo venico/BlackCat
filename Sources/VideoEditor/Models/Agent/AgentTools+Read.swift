@@ -22,9 +22,11 @@ extension AgentToolbox {
 
             AgentToolSpec(
                 name: "list_tracks",
-                description: "列出当前时间线的所有轨道和里面的片段（含 id、名字、起止时间）。要改某条片段必须先从这里拿到它的 id。",
+                description: "列出当前时间线的所有轨道和里面的片段（含 id、名字、起止时间，字幕轨带字号）。要改某条片段必须先从这里拿到它的 id；要看它的具体属性用 get_clip。",
                 parameters: ["type": "object", "properties": [:] as [String: Any]],
                 risk: .readOnly),
+
+            clipInfoSpec,
 
             AgentToolSpec(
                 name: "list_assets",
@@ -65,6 +67,7 @@ extension AgentToolbox {
         switch name {
         case "get_project":   return .ok(projectOverview(project))
         case "list_tracks":   return .ok(trackDump(project))
+        case "get_clip":      return clipInfo(project, args: args)
         case "list_assets":   return .ok(assetDump(project, type: args["type"] as? String))
         case "capture_frame": return await captureFrame(project, time: args["time"] as? Double,
                                                         source: args["source"] as? String)
@@ -89,13 +92,20 @@ extension AgentToolbox {
 
     @MainActor
     private static func trackDump(_ p: ProjectState) -> String {
-        var s = "当前时间线「\(p.tab.name)」的轨道，从上到下：\n"
+        var s = "当前时间线「\(p.tab.name)」的轨道，从上到下（分三块：叠加层 → 视频 → 音频，"
+            + "每块里上面的盖住下面的；调顺序用 move_track）：\n"
         for ref in p.overlayTrackOrder {
             switch ref {
             case .image(let id):
                 s += dumpTrack("图片", p.imageTracks.first { $0.id == id }) { "\($0.name)" }
             case .subtitle(let id):
-                s += dumpTrack("字幕", p.subtitleTracks.first { $0.id == id }) { $0.text.replacingOccurrences(of: "\n", with: " ") }
+                let t = p.subtitleTracks.first { $0.id == id }
+                s += dumpTrack("字幕", t) { $0.text.replacingOccurrences(of: "\n", with: " ") }
+                if let t, !t.clips.isEmpty {
+                    let st = t.subtitleStyle ?? SubtitleStyle()
+                    s += "（这条轨的样式：\(st.fontName) \(Int(st.fontSize)) 号\(st.bold ? " 粗体" : "")，"
+                        + "颜色 \(st.textColor.toHex())，离底边 \(Int(st.bottomMargin))%；详细用 get_clip）\n"
+                }
             case .text(let id):
                 s += dumpTrack("文字", p.textTracks.first { $0.id == id }) { $0.text }
             case .shape(let id):
@@ -110,8 +120,19 @@ extension AgentToolbox {
                 s += dumpTrack("复合", p.compoundTracks.first { $0.id == id }) { $0.name }
             }
         }
-        for t in p.videoTracks { s += dumpTrack("视频", t) { $0.name } }
-        for t in p.audioTracks { s += dumpTrack("音频", t) { $0.name } }
+        // 视频、音频两块也按界面上的顺序列（跟时间轴看到的一致，调顺序时才对得上号）
+        for ref in p.videoSectionOrder {
+            switch ref {
+            case .video(let id): s += dumpTrack("视频", p.videoTracks.first { $0.id == id }) { $0.name }
+            case .compound(let id): s += dumpTrack("复合", p.compoundTracks.first { $0.id == id }) { $0.name }
+            }
+        }
+        for ref in p.audioSectionOrder {
+            switch ref {
+            case .audio(let id): s += dumpTrack("音频", p.audioTracks.first { $0.id == id }) { $0.name }
+            case .compound(let id): s += dumpTrack("复合", p.compoundTracks.first { $0.id == id }) { $0.name }
+            }
+        }
         if s.hasSuffix("：\n") { s += "（还是空的）\n" }
         return s
     }
@@ -120,7 +141,9 @@ extension AgentToolbox {
         _ kind: String, _ track: Track<C>?, label: (C) -> String
     ) -> String where C: Equatable & Codable {
         guard let t = track else { return "" }
-        var s = "\n**\(kind)轨「\(t.label)」**\(t.isVisible ? "" : "（已隐藏）")　\(t.clips.count) 段\n"
+        // 轨道 id 要给出来：move_track / move_clip 换轨都得点名是哪条轨道
+        var s = "\n**\(kind)轨「\(t.label)」** id \(String("\(t.id)".prefix(8)))"
+            + "\(t.isVisible ? "" : "（已隐藏）")　\(t.clips.count) 段\n"
         guard !t.clips.isEmpty else { return s }
         // 片段列成表格，模型转述时可以直接用
         s += "\n| id | 时间 | 内容 |\n|---|---|---|\n"
@@ -170,18 +193,18 @@ extension AgentToolbox {
             return await captureFile(p, key: key, time: time)
         }
         let t = time ?? p.currentTime
-        guard let item = p.playerItem else {
+        guard p.playerItem != nil else {
             return .fail("现在没有可预览的内容，时间轴大概是空的。")
         }
-        let gen = AVAssetImageGenerator(asset: item.asset)
-        gen.appliesPreferredTrackTransform = true
-        gen.videoComposition = item.videoComposition
-        gen.requestedTimeToleranceBefore = CMTime.zero
-        gen.requestedTimeToleranceAfter = CMTime.zero
-        gen.maximumSize = CGSize(width: 1024, height: 1024)
         do {
-            var actual = CMTime.zero
-            let cg = try gen.copyCGImage(at: CMTime(seconds: t, preferredTimescale: 600), actualTime: &actual)
+            var cg = try renderTimelineFrame(p, at: t)
+            // 给模型的图长边压到 1024，省 token
+            let longSide = CGFloat(max(cg.width, cg.height))
+            if longSide > 1024 {
+                let k = 1024 / longSide
+                let small = CIImage(cgImage: cg).transformed(by: CGAffineTransform(scaleX: k, y: k))
+                if let out = CIContext().createCGImage(small, from: small.extent) { cg = out }
+            }
             let rep = NSBitmapImageRep(cgImage: cg)
             guard let data = rep.representation(using: .jpeg, properties: [.compressionFactor: 0.7]) else {
                 return .fail("画面截出来了但编码失败。")
@@ -190,6 +213,34 @@ extension AgentToolbox {
         } catch {
             return .fail("截不到 \(fmt(t)) 的画面：\(error.localizedDescription)")
         }
+    }
+
+    /// 时间轴某一刻的整帧，原始渲染尺寸，叠加层也画上，跟导出一致
+    @MainActor
+    static func renderTimelineFrame(_ p: ProjectState, at t: Double) throws -> CGImage {
+        guard let item = p.playerItem else {
+            throw NSError(domain: "Agent", code: 1, userInfo: [NSLocalizedDescriptionKey: "时间轴是空的"])
+        }
+        let gen = AVAssetImageGenerator(asset: item.asset)
+        gen.appliesPreferredTrackTransform = true
+        gen.videoComposition = item.videoComposition
+        gen.requestedTimeToleranceBefore = CMTime.zero
+        gen.requestedTimeToleranceAfter = CMTime.zero
+        // 按原始渲染尺寸抽，叠加层才能按跟导出同一套坐标画上去；最后再缩给模型
+        let renderSize = item.videoComposition?.renderSize ?? p.previewRenderSize
+        var actual = CMTime.zero
+        var cg = try gen.copyCGImage(at: CMTime(seconds: t, preferredTimescale: 600), actualTime: &actual)
+        // 字幕 / 文字 / 图形 / 图片这些叠加层**不在视频合成里**：没有效果轨时它们是
+        // 预览界面上另画的，抽出来的帧里没有。这种情况自己按导出那套画上去，
+        // 截到的才跟用户看到的、导出的成片一致。有效果轨时合成器已经画过了，不再画一遍
+        if !p.overlayDrawnByCompositor {
+            let base = CIImage(cgImage: cg)
+            let composed = ColorCompositor.drawOverlays(base, at: t, renderSize: renderSize,
+                                                        input: p.makeOverlayInput())
+                .cropped(to: CGRect(origin: .zero, size: renderSize))
+            if let out = CIContext().createCGImage(composed, from: composed.extent) { cg = out }
+        }
+        return cg
     }
 
     /// 看一个具体文件：画布卡片 / 素材 / 路径都认
@@ -264,6 +315,21 @@ extension FilterClip: AgentTimedClip {}
 extension AdjustClip: AgentTimedClip {}
 extension EffectClip: AgentTimedClip {}
 extension CompoundClip: AgentTimedClip {}
+
+/// 能改起止时间的片段：move_clip 换轨时要改它们的时间再放进目标轨
+protocol AgentMovableClip: Identifiable, Equatable, Codable {
+    var startTime: Double { get set }
+    var endTime: Double { get set }
+}
+extension VideoClip: AgentMovableClip {}
+extension AudioClip: AgentMovableClip {}
+extension ImageClip: AgentMovableClip {}
+extension SubtitleClip: AgentMovableClip {}
+extension TextClip: AgentMovableClip {}
+extension ShapeClip: AgentMovableClip {}
+extension FilterClip: AgentMovableClip {}
+extension AdjustClip: AgentMovableClip {}
+extension EffectClip: AgentMovableClip {}
 
 /// 工具的总入口
 enum AgentToolbox {}

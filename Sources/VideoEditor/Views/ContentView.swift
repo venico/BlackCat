@@ -64,13 +64,16 @@ struct ContentView: View {
                 VStack(spacing: 0) {
                     // 标题栏行：自定义交通灯（SwiftUI）+ toggle 按钮
                     HStack(spacing: 0) {
+                        // 侧栏贴边后少了外面那圈 8pt，交通灯左移 8、上移 8 补回来，
+                        // 在窗口里的位置跟以前一样
                         TrafficLightsView()
-                            .padding(.leading, 11)
+                            .padding(.leading, 19)
                         Spacer()
                         toggleButton
                             .padding(.trailing, 11)
                     }
                     .frame(height: toolbarH)
+                    .padding(.top, 8)
 
                     // Content
                     // 宽度传下去给宫格算列数。**必须从这儿给** ——
@@ -80,14 +83,18 @@ struct ContentView: View {
                 }
                 .frame(width: sidebarWidth)
                 .frame(maxHeight: .infinity)
-                .panelSurface(.sidebar, cornerRadius: 18)
-                .softPanelShadow()
+                .sidebarTint()
+                // 不再是浮起来的卡片（没有玻璃底、圆角、阴影、外边距）：贴着窗口左边，
+                // 跟预览 / 属性 / 轨道三块一样不铺底色，只靠右边一条分割线跟主区划界。
+                // 线画在侧栏右边缘上，上下顶头，跟预览区和属性区之间那条同一个样子
+                .overlay(alignment: .trailing) {
+                    Rectangle()
+                        .fill(Color.white.opacity(0.10))
+                        .frame(width: 1)
+                }
                 .simultaneousGesture(TapGesture().onEnded {
                     NSApp.keyWindow?.makeFirstResponder(nil)
                 })
-                .padding(.top, 8)
-                .padding(.leading, 8)
-                .padding(.bottom, 8)
                 .transition(.move(edge: .leading).combined(with: .opacity))
                 // 侧边栏右边缘的拖宽手柄。
                 //
