@@ -538,8 +538,8 @@ struct AIChatPanel: View {
             Button { service.toggleGroupCollapsed(g.id) } label: {
                 Group {
                     if hoverGroupID == g.id {
-                        Image(systemName: g.collapsed ? "chevron.right" : "chevron.down")
-                            .font(.system(size: 9, weight: .semibold))
+                        Image(nsImage: SidebarSVGIcon.load(g.collapsed ? "groupCollapsed" : "groupExpanded", size: 12))
+                            .renderingMode(.template)
                     } else {
                         // 展开收起都用线性那个，不换实心版 —— 换了反而像两种东西
                         Image(nsImage: SidebarSVGIcon.load("folder", size: 13))
@@ -3895,6 +3895,10 @@ struct SelectableMarkdownView: NSViewRepresentable {
 /// 只为了改右键菜单而存在的子类。
 /// 回复区（只读）和输入框（可编辑）共用同一套菜单规则，区别只在剪切要不要留
 class ChatTextView: NSTextView, NSMenuDelegate {
+    override func copy(_ sender: Any?) {  // TMPDIAG
+        DiagLog.log("[复制诊断] 气泡 copy 选中 \(selectedRange().length) 字 可编辑=\(isEditable)")
+        super.copy(sender)
+    }
     var onAddSubtitle: ((String) -> Void)?
     var onAddTitle: ((String) -> Void)?
     /// 输入框要留着剪切，只读的回复区不留

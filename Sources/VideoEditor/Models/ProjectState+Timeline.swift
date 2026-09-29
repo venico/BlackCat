@@ -749,10 +749,10 @@ extension ProjectState {
     /// 所以余量不够时这里自己腾：A 尾巴缩一点、B 头部裁一点，B 跟着贴上去，
     /// 后面的片段整体前移，整条轨道因此短一截（跟剪映加转场的行为一致）。
     /// 每段最多让出自己时长的四成，免得把短片段吃没了。
-    func applyTransition(_ type: TransitionType, toClipID clipID: UUID) {
+    func applyTransition(_ type: TransitionType, toClipID clipID: UUID, pushUndo doUndo: Bool = true) {
         guard let ti = videoTracks.firstIndex(where: { $0.clips.contains { $0.id == clipID } })
         else { return }
-        pushUndo()
+        if doUndo { pushUndo() }
         var clips = videoTracks[ti].clips.sorted { $0.startTime < $1.startTime }
         guard let bi = clips.firstIndex(where: { $0.id == clipID }) else { return }
 
@@ -760,7 +760,7 @@ extension ProjectState {
         else { clips[bi].inTransition?.type = type }
 
         // fadeToBlack 各自淡进淡出，不需要重叠素材；也没有前一段就更不用腾
-        if type != .fadeToBlack, bi > 0 {
+        if !type.isDip, bi > 0 {
             let wantHalf = (clips[bi].inTransition?.duration ?? 0.5) / 2
             let a = clips[bi - 1], b = clips[bi]
             // 紧挨着才算一对，跟渲染那边的判据一致

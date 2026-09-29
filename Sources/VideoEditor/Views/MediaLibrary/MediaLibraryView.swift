@@ -2965,6 +2965,8 @@ private struct TransitionPanel: View {
 
     private var hasSelection: Bool { project.selectedTransitionClipID != nil }
 
+    @AppStorage("transitions.collapsedGroups") private var collapsed = CollapsedGroups()
+
     var body: some View {
         ScrollView(showsIndicators: false) {
             VStack(alignment: .leading, spacing: 10) {
@@ -2976,21 +2978,34 @@ private struct TransitionPanel: View {
                         .padding(.top, 4)
                 }
 
-                LazyVGrid(columns: gridColumns, alignment: .leading, spacing: 6) {
-                    ForEach(TransitionType.allCases, id: \.self) { type in
-                        TransitionPreviewCard(
-                            type: type,
-                            isSelected: hasSelection && selectedClipTransition?.type == type,
-                            onSelect: {
-                                guard let clipID = project.selectedTransitionClipID else { return }
-                                // 走这条：素材没余量时会自动腾出重叠区，
-                                // 不然转场挂上了画面却没变化
-                                project.applyTransition(type, toClipID: clipID)
+                // 按类分组，每组标题点一下折叠 / 展开（跟会话列表的分组一个样子）
+                ForEach(TransitionType.groups, id: \.title) { group in
+                    let folded = collapsed.contains(group.title)
+                    LibraryGroupHeader(title: group.title, count: group.items.count, folded: folded) {
+                        collapsed.toggle(group.title)
+                    }
+
+                    if !folded {
+                        LazyVGrid(columns: gridColumns, alignment: .leading, spacing: 6) {
+                            ForEach(group.items, id: \.self) { type in
+                                TransitionPreviewCard(
+                                    type: type,
+                                    isSelected: hasSelection && selectedClipTransition?.type == type,
+                                    onSelect: {
+                                        // Shift 选了好几个就一起换，撤销一步全回去。
+                                        // 走 applyTransition：素材没余量时会自动腾出重叠区，
+                                        // 不然转场挂上了画面却没变化
+                                        let ids = project.allSelectedTransitionIDs
+                                        guard !ids.isEmpty else { return }
+                                        project.pushUndo()
+                                        for id in ids { project.applyTransition(type, toClipID: id, pushUndo: false) }
+                                    }
+                                )
                             }
-                        )
+                        }
+                        .padding(.leading, 3).padding(.trailing, 10)
                     }
                 }
-                .padding(.leading, 3).padding(.trailing, 10)
             }
             // 不留上边距：标题行自己的 8pt 就够了，加了这 6 转场这栏
             // 比素材库、AI 创作宽出一截
@@ -3018,8 +3033,12 @@ private struct TransitionPreviewCard: View {
                         Image(nsImage: TransitionPreviewFrames.before)
                             .resizable()
                             .aspectRatio(contentMode: .fill)
-                        // 叠加层：转场**后**的画面，按转场类型演示进场方式
-                        transitionOverlay(in: geo.size)
+                        // 叠加层：转场**后**的画面，按转场类型演示进场方式。
+                        // 包一层逐帧驱动：故障 / 抖动这些是「中间最强、两头为零」，
+                        // 只让系统在 0 和 1 两个端点之间插值的话，中间那一下根本演不出来
+                        PhaseDriven(phase: displayPhase) { p in
+                            transitionOverlay(in: geo.size, phase: p)
+                        }
                     }
                     .frame(width: geo.size.width, height: geo.size.height)
                 }
@@ -3071,9 +3090,17 @@ private struct TransitionPreviewCard: View {
             .aspectRatio(contentMode: .fill)
     }
 
+    /// 静止时显示哪一刻。「中间最强」的那几种停在正中间，不然静止画面跟没加转场一样
+    private var displayPhase: Double {
+        guard !hover else { return phase }
+        switch type {
+        case .glitch, .shake, .chromatic, .lightLeak: return 0.5
+        default: return phase
+        }
+    }
+
     @ViewBuilder
-    private func transitionOverlay(in size: CGSize) -> some View {
-        let p = phase
+    private func transitionOverlay(in size: CGSize, phase p: Double) -> some View {
         // 位移量按卡片尺寸的八成算：**静止时要露出两成的上层帧**，
         // 不然看不出这个转场是从哪个方向进来的（原来纵向写死 50，
         // 差不多等于整个卡片高度，上下那四种就全看不见了）
@@ -3124,6 +3151,130 @@ private struct TransitionPreviewCard: View {
             // 浅灰块从上滑入覆盖
             afterFrame
                 .offset(y: -(1 - p) * dy)
+        case .flashWhite:
+            // 白色遮罩淡入淡出
+            Color.white.opacity(p)
+        case .blur:
+            // 后一帧从糊到清楚、渐显
+            afterFrame
+                .blur(radius: (1 - p) * 8)
+                .opacity(p)
+        case .zoomOut:
+            // 后一帧从放大缩回 + 渐显（跟缩放方向相反的那一半是前一帧缩小，卡片里只演后一帧）
+            afterFrame
+                .scaleEffect(0.5 + 0.5 * p)
+                .opacity(p)
+        case .rotate:
+            // 后一帧转着进来
+            afterFrame
+                .rotationEffect(.degrees(-90 * (1 - p)))
+                .scaleEffect(0.5 + 0.5 * p)
+                .opacity(p)
+        case .wipeLeft:
+            // 一条边从右往左扫
+            afterFrame
+                .mask(alignment: .trailing) { Rectangle().frame(width: size.width * p) }
+        case .wipeRight:
+            afterFrame
+                .mask(alignment: .leading) { Rectangle().frame(width: size.width * p) }
+        case .wipeUp:
+            afterFrame
+                .mask(alignment: .bottom) { Rectangle().frame(height: size.height * p) }
+        case .wipeDown:
+            afterFrame
+                .mask(alignment: .top) { Rectangle().frame(height: size.height * p) }
+        case .circleOpen:
+            // 中间一个圆越开越大
+            afterFrame
+                .mask { Circle().frame(width: size.width * 1.5 * p, height: size.width * 1.5 * p) }
+        case .circleClose:
+            // 前一帧缩成中间一个圆，露出下面的后一帧：卡片里用后一帧四周往里收来演
+            afterFrame
+                .mask {
+                    Rectangle()
+                        .overlay(Circle().frame(width: size.width * 1.5 * (1 - p),
+                                                height: size.width * 1.5 * (1 - p))
+                                    .blendMode(.destinationOut))
+                        .compositingGroup()
+                }
+        case .blinds:
+            // 5 条横杠各自往下长
+            afterFrame
+                .mask {
+                    VStack(spacing: 0) {
+                        ForEach(0..<5, id: \.self) { _ in
+                            Rectangle().frame(height: size.height / 5 * p)
+                                .frame(height: size.height / 5, alignment: .top)
+                        }
+                    }
+                }
+        case .copyMachine:
+            // 一道亮带从左扫到右，扫过的地方是后一帧
+            ZStack(alignment: .leading) {
+                afterFrame
+                    .mask(alignment: .leading) { Rectangle().frame(width: size.width * p) }
+                Rectangle()
+                    .fill(Color(red: 0.6, green: 1, blue: 0.8).opacity(0.6))
+                    .frame(width: size.width * 0.12)
+                    .offset(x: size.width * p - size.width * 0.06)
+            }
+        case .ripple:
+            // 后一帧从中心一圈圈晕开
+            afterFrame
+                .scaleEffect(0.9 + 0.1 * p)
+                .opacity(p)
+                .mask { Circle().frame(width: size.width * 1.6 * p, height: size.width * 1.6 * p).blur(radius: 6) }
+        case .glitch:
+            // 中间一下横向错位 + 红蓝分离
+            let k = 1 - abs(2 * p - 1)
+            ZStack {
+                afterFrame.opacity(p > 0.5 ? 1 : 0)
+                afterFrame.colorMultiply(.red).offset(x: -6 * k).opacity(0.5 * k).blendMode(.screen)
+                afterFrame.colorMultiply(.cyan).offset(x: 6 * k).opacity(0.5 * k).blendMode(.screen)
+            }
+        case .shake:
+            let k = 1 - abs(2 * p - 1)
+            afterFrame
+                .scaleEffect(1 + 0.08 * k)
+                .offset(x: sin(p * 60) * 5 * k, y: cos(p * 47) * 4 * k)
+                .opacity(min(1, max(0, (p - 0.35) / 0.3)))
+        case .chromatic:
+            let k = 1 - abs(2 * p - 1)
+            ZStack {
+                afterFrame.opacity(p)
+                afterFrame.colorMultiply(.red).offset(x: -8 * k).opacity(0.45 * k).blendMode(.screen)
+                afterFrame.colorMultiply(.blue).offset(x: 8 * k).opacity(0.45 * k).blendMode(.screen)
+            }
+        case .lightLeak:
+            let k = 1 - abs(2 * p - 1)
+            ZStack {
+                afterFrame.opacity(min(1, max(0, (p - 0.3) / 0.4)))
+                RadialGradient(colors: [Color(red: 1, green: 0.62, blue: 0.3).opacity(0.9 * k), .clear],
+                               center: UnitPoint(x: -0.2 + 1.4 * p, y: 0.45),
+                               startRadius: 0, endRadius: size.width * 0.8)
+                    .blendMode(.screen)
+            }
+        case .splitScreen:
+            HStack(spacing: 0) {
+                ForEach(0..<3, id: \.self) { i in
+                    let q = min(1, max(0, (p - Double(i) * 0.15) / 0.7))
+                    let e = 1 - (1 - q) * (1 - q)
+                    afterFrame
+                        .frame(width: size.width / 3, height: size.height)
+                        .clipped()
+                        .offset(y: (i == 1 ? -1 : 1) * size.height * (1 - e))
+                }
+            }
+            .frame(width: size.width, height: size.height)
+            .clipped()
+        case .pageCurl:
+            // 前一帧像书页往左上翻走：卡片里用后一帧从右下角斜着露出来演
+            afterFrame
+                .mask(alignment: .bottomTrailing) {
+                    Rectangle()
+                        .frame(width: size.width * 1.6 * p, height: size.height * 1.6 * p)
+                        .rotationEffect(.degrees(-20), anchor: .bottomTrailing)
+                }
         }
     }
 }
@@ -3328,6 +3479,13 @@ enum SidebarSVGIcon {
     static var cache: [String: NSImage] = [:]
 
     static let svgs: [String: String] = [
+        // 分组折叠 / 展开（会话列表、转场、滤镜、特效的分组标题共用）
+        "groupCollapsed": """
+        <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path fill-rule="evenodd" d="M14.8571497,15.5202888 L13.1875756,16.9553751 C11.3260755,18.5554318 10.3953255,19.3554602 9.32730332,19.3829899 C8.39913139,19.4069147 7.51218658,18.999723 6.92530669,18.2802457 C6.25,17.4523629 6.25,16.225032 6.25,13.7703703 L6.25,10.148214 C6.25,7.69355227 6.25,6.46622143 6.92530669,5.63833856 C7.51218658,4.91886131 8.39913139,4.51166957 9.32730332,4.53559444 C10.3953255,4.56312413 11.3260755,5.36315249 13.1875756,6.96320921 L14.8571497,8.39829552 C16.2551308,9.59993345 16.9541214,10.2007524 17.2215951,10.9466417 C17.4563649,11.6013314 17.4563649,12.3172529 17.2215951,12.9719426 C16.9541214,13.7178319 16.2551308,14.3186508 14.8571497,15.5202888 Z"/></svg>
+        """,
+        "groupExpanded": """
+        <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path fill-rule="evenodd" d="M8.47971123,14.6071497 L7.04462492,12.9375756 C5.4445682,11.0760755 4.64453984,10.1453255 4.61701015,9.07730332 C4.59308528,8.14913139 5.00027702,7.26218658 5.71975428,6.67530669 C6.54763714,6 7.77496799,6 10.2296297,6 L13.851786,6 C16.3064477,6 17.5337786,6 18.3616614,6.67530669 C19.0811387,7.26218658 19.4883304,8.14913139 19.4644056,9.07730332 C19.4368759,10.1453255 18.6368475,11.0760755 17.0367908,12.9375756 L15.6017045,14.6071497 C14.4000666,16.0051308 13.7992476,16.7041214 13.0533583,16.9715951 C12.3986686,17.2063649 11.6827471,17.2063649 11.0280574,16.9715951 C10.2821681,16.7041214 9.68134916,16.0051308 8.47971123,14.6071497 Z"/></svg>
+        """,
         "relink": """
         <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path fill-rule="evenodd" d="M12.7716286,11.4720826 L12.7282337,11.3760569 C12.5585888,11.0390069 12.1795714,10.6685796 10.8709017,9.53097035 L10.5690179,9.26854674 C9.13571297,8.02259378 8.76892283,7.75287247 8.38226638,7.65646819 C7.97245372,7.55429042 7.54081339,7.58447365 7.1492094,7.74269194 C6.77973274,7.89197019 6.45405012,8.21011392 5.20809717,9.64341883 L4.94567356,9.94530266 C3.69972061,11.3786076 3.4299993,11.7453977 3.33359502,12.1320542 C3.15165093,12.861792 3.3944681,13.6319097 3.96206841,14.1253171 L5.62242949,15.568647 C7.0557344,16.8145999 7.42252455,17.0843213 7.809181,17.1807255 C8.21899365,17.2829033 8.65063399,17.2527201 9.04223798,17.0945018 C9.35104719,16.9697348 9.55713818,16.8344442 9.67123214,16.7031941 L11.1806513,18.0153121 C10.839671,18.4075651 10.3730305,18.7138962 9.79145116,18.9488695 C9.00824318,19.2653061 8.14496252,19.3256725 7.32533721,19.121317 C6.48901984,18.9127996 6.04708395,18.5878195 4.31031143,17.0780662 L2.64995035,15.6347363 C1.51474974,14.6479214 1.0291154,13.1076861 1.39300356,11.6482104 C1.6015209,10.811893 1.92650108,10.3699571 3.4362544,8.63318461 L3.69867801,8.33130077 C5.20843133,6.59452825 5.60083783,6.21120517 6.39999621,5.88832423 C7.18320419,5.57188766 8.04648486,5.5115212 8.86611017,5.71587674 C9.70242753,5.92439408 10.1443634,6.24937425 11.8811359,7.75912758 L12.1830198,8.02155119 C13.9197923,9.53130451 14.3031154,9.92371101 14.6259963,10.7228694 C15.1894629,12.1174981 14.9229141,13.7103313 13.9360992,14.8455319 L12.4266801,13.5334138 C12.9200875,12.9658135 13.0533619,12.169397 12.7716286,11.4720826 Z M19.2814936,7.56856006 L20.3983169,8.53939973 C21.7918124,9.76233653 22.1385748,10.1531138 22.4345489,10.8856757 C22.7509855,11.6688836 22.811352,12.5321643 22.6069964,13.3517896 C22.3984791,14.188107 22.0734989,14.6300429 20.5637456,16.3668154 L20.301322,16.6686992 C18.7915687,18.4054718 18.3991622,18.7887948 17.6000038,19.1116758 C16.8167958,19.4281123 15.9535151,19.4884788 15.1338898,19.2841233 C14.2975725,19.0756059 13.8556366,18.7506257 12.1188641,17.2408724 L11.8169802,16.9784488 C10.0802077,15.4686955 9.69688462,15.076289 9.37400368,14.2771306 C8.81053708,12.8825019 9.07708593,11.2896687 10.0639008,10.1544681 L11.5733199,11.4665862 C11.0799125,12.0341865 10.9466381,12.830603 11.2283714,13.5279174 C11.3776496,13.8973941 11.6957934,14.2230767 13.1290983,15.4690297 L13.4309821,15.7314533 C14.864287,16.9774062 15.2310772,17.2471275 15.6177336,17.3435318 C16.0275463,17.4457096 16.4591866,17.4155263 16.8507906,17.2573081 C17.2202673,17.1080298 17.5459499,16.7898861 18.7919028,15.3565812 L19.0543264,15.0546973 C20.3002794,13.6213924 20.5700007,13.2546023 20.666405,12.8679458 C20.7685828,12.4581332 20.7383995,12.0264928 20.5801812,11.6348888 C20.430903,11.2654122 20.1127593,10.9397296 18.6794543,9.69377662 L18.3775705,9.43135301 C16.9442656,8.18540006 16.5774755,7.91567875 16.190819,7.81927447 C15.4610811,7.63733038 14.6909635,7.88014755 14.1975561,8.44774786 L12.6881369,7.1356298 C13.6749517,6.00042919 15.2151871,5.51479485 16.6746628,5.87868301 C17.441287,6.06982391 17.8765213,6.35882593 19.2814936,7.56856006 Z" fill="black"/></svg>
         """,
@@ -3609,38 +3767,46 @@ struct FilterPanel: View {
     @EnvironmentObject private var project: ProjectState
     @ObservedObject private var settings = AppSettings.shared
     @State private var importHover = false
+    @AppStorage("filters.collapsedGroups") private var collapsed = CollapsedGroups()
 
     var body: some View {
         VStack(spacing: 0) {
             ScrollView(showsIndicators: false) {
-                LazyVGrid(columns: gridColumns, alignment: .leading, spacing: 6) {
-                    ForEach(FilterKind.builtins, id: \.self) { kind in
-                        FilterCard(kind: kind) { project.addFilter(kind: kind) }
+              VStack(alignment: .leading, spacing: 10) {
+                ForEach(FilterKind.groups, id: \.title) { group in
+                    let folded = collapsed.contains(group.title)
+                    LibraryGroupHeader(title: group.title, count: group.items.count, folded: folded) {
+                        collapsed.toggle(group.title)
+                    }
+                    if !folded {
+                        LazyVGrid(columns: gridColumns, alignment: .leading, spacing: 6) {
+                            ForEach(group.items, id: \.self) { kind in
+                                FilterCard(kind: kind) { project.addFilter(kind: kind) }
+                            }
+                        }
+                        .padding(.leading, 3).padding(.trailing, 10)
                     }
                 }
-                .padding(.leading, 3).padding(.trailing, 10)
 
                 // 导进来的 .cube 归到这一组。原来导入只往时间轴加一段，
                 // 库里根本不留，下次想再用还得重新翻文件
                 if !settings.customLUTs.isEmpty {
-                    HStack {
-                        Text("自定义")
-                            .font(.system(size: 10, weight: .medium))
-                            .foregroundColor(Color.labelSecondary)
-                        Spacer()
+                    let folded = collapsed.contains("自定义")
+                    LibraryGroupHeader(title: "自定义", count: settings.customLUTs.count, folded: folded) {
+                        collapsed.toggle("自定义")
                     }
-                    .padding(.leading, 9).padding(.trailing, 10)
-                    .padding(.top, 10).padding(.bottom, 4)
-
-                    LazyVGrid(columns: gridColumns, alignment: .leading, spacing: 6) {
-                        ForEach(settings.customLUTs, id: \.self) { path in
-                            FilterCard(kind: .lut, lutPath: path,
-                                       onAdd: { project.addFilter(kind: .lut, lutPath: path) },
-                                       onRemove: { settings.customLUTs.removeAll { $0 == path } })
+                    if !folded {
+                        LazyVGrid(columns: gridColumns, alignment: .leading, spacing: 6) {
+                            ForEach(settings.customLUTs, id: \.self) { path in
+                                FilterCard(kind: .lut, lutPath: path,
+                                           onAdd: { project.addFilter(kind: .lut, lutPath: path) },
+                                           onRemove: { settings.customLUTs.removeAll { $0 == path } })
+                            }
                         }
+                        .padding(.leading, 3).padding(.trailing, 10)
                     }
-                    .padding(.leading, 3).padding(.trailing, 10)
                 }
+              }
             }
             .padding(.bottom, 8)
             // 导入 LUT。吸在底部，列表滚多长都在
@@ -3859,6 +4025,8 @@ struct EffectPanel: View {
 
     @EnvironmentObject private var project: ProjectState
 
+    @AppStorage("effects.collapsedGroups") private var collapsed = CollapsedGroups()
+
     /// 按类别分组显示 —— 26 个平铺下来找不着东西
     private static let groups: [(String, [EffectKind])] = [
         ("模糊", [.gaussianBlur, .motionBlur, .zoomBlur, .bokeh]),
@@ -3873,18 +4041,20 @@ struct EffectPanel: View {
         ScrollView(showsIndicators: false) {
             VStack(alignment: .leading, spacing: 10) {
                 ForEach(Self.groups, id: \.0) { group in
-                    Text(group.0)
-                        .font(.system(size: 10, weight: .medium))
-                        .foregroundColor(Color.labelSecondary)
-                        .padding(.leading, 3)
-                    LazyVGrid(columns: gridColumns, alignment: .leading, spacing: 6) {
-                        ForEach(group.1, id: \.self) { kind in
-                            EffectCard(kind: kind) { project.addEffect(kind: kind) }
+                    let folded = collapsed.contains(group.0)
+                    LibraryGroupHeader(title: group.0, count: group.1.count, folded: folded) {
+                        collapsed.toggle(group.0)
+                    }
+                    if !folded {
+                        LazyVGrid(columns: gridColumns, alignment: .leading, spacing: 6) {
+                            ForEach(group.1, id: \.self) { kind in
+                                EffectCard(kind: kind) { project.addEffect(kind: kind) }
+                            }
                         }
+                        .padding(.leading, 3).padding(.trailing, 10)
                     }
                 }
             }
-            .padding(.leading, 3).padding(.trailing, 10)
             .padding(.bottom, 8)
         }
     }
@@ -4020,4 +4190,65 @@ extension View {
     func onRightClick(perform action: @escaping () -> Void) -> some View {
         overlay(RightClickCatcher(action: action))
     }
+}
+
+// MARK: - 可折叠分组（转场 / 滤镜 / 特效共用）
+
+/// 分组标题行：箭头 + 名字 + 个数，点一下折叠 / 展开。样子和悬停底色跟会话列表的分组行一致
+struct LibraryGroupHeader: View {
+    let title: String
+    let count: Int
+    let folded: Bool
+    let onToggle: () -> Void
+    @State private var hover = false
+
+    var body: some View {
+        Button(action: onToggle) {
+            HStack(spacing: 6) {
+                Image(nsImage: SidebarSVGIcon.load(folded ? "groupCollapsed" : "groupExpanded", size: 12))
+                    .renderingMode(.template)
+                    .foregroundColor(Color.labelSecondary)
+                    .frame(width: 12)
+                Text(title)
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundColor(Color.labelPrimary)
+                Text("\(count)")
+                    .font(.system(size: 10))
+                    .foregroundColor(Color.labelSecondary)
+                Spacer(minLength: 0)
+            }
+            .frame(height: 22)
+            .padding(.leading, 6).padding(.trailing, 10)
+            .padding(.vertical, 4)
+            .background(hover ? Color.white.opacity(0.05) : Color.clear)
+            .cornerRadius(5)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .onHover { hover = $0 }
+        .padding(.leading, 3).padding(.trailing, 10)
+    }
+}
+
+/// 折叠了哪几组，存成「标题|标题」一串放 AppStorage，下次打开保持用户上次的样子
+struct CollapsedGroups: RawRepresentable {
+    var titles: Set<String> = []
+    init() {}
+    init?(rawValue: String) { titles = Set(rawValue.split(separator: "|").map(String.init)) }
+    var rawValue: String { titles.sorted().joined(separator: "|") }
+    func contains(_ t: String) -> Bool { titles.contains(t) }
+    mutating func toggle(_ t: String) {
+        if titles.contains(t) { titles.remove(t) } else { titles.insert(t) }
+    }
+}
+
+/// 让动画每一帧都拿插值后的 phase 重新算一遍内容（而不是只在两个端点之间插位移、透明度）
+private struct PhaseDriven<Content: View>: View, Animatable {
+    var phase: Double
+    let content: (Double) -> Content
+    var animatableData: Double {
+        get { phase }
+        set { phase = newValue }
+    }
+    var body: some View { content(phase) }
 }

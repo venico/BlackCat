@@ -811,7 +811,7 @@ actor TimelineExporter {
                 guard let trans = cB.inTransition, abs(cA.endTime - cB.startTime) < 0.05 else { continue }
                 let wantedHalf = trans.duration / 2
                 let half: Double
-                if trans.type == .fadeToBlack {
+                if trans.type.isDip {
                     half = wantedHalf
                 } else {
                     let availA = max(0, (exportClipAssetDurSec[cA.id] ?? 0) - (cA.trimStart + cA.duration * cA.speed))
@@ -840,8 +840,8 @@ actor TimelineExporter {
                 guard useDur.seconds > 0.01 else { continue }
                 let srcContentDurSec = useDur.seconds * speed  // 源素材实际消耗量（秒）
 
-                let aExtend  = exportTransAdjusts.first(where: { $0.clipAID == clip.id && $0.type != .fadeToBlack })?.half ?? 0
-                let bAdvance = exportTransAdjusts.first(where: { $0.clipBID == clip.id && $0.type != .fadeToBlack })?.half ?? 0
+                let aExtend  = exportTransAdjusts.first(where: { $0.clipAID == clip.id && !$0.type.isDip })?.half ?? 0
+                let bAdvance = exportTransAdjusts.first(where: { $0.clipBID == clip.id && !$0.type.isDip })?.half ?? 0
 
                 let actualTrimSt  = CMTime(seconds: clip.trimStart - bAdvance, preferredTimescale: 600)
                 let actualSrcDur  = CMTime(seconds: srcContentDurSec + bAdvance + aExtend, preferredTimescale: 600)
@@ -1285,67 +1285,48 @@ actor TimelineExporter {
                 vc.renderSize = renderSize
                 vc.frameDuration = frameDuration
                 vc.sourceTrackIDForFrameTiming = kCMPersistentTrackID_Invalid
+                // 跟预览**同一个合成器**（ColorCompositor）、同一份图层参数（compositorVideoEntries）。
+                // 原来导出走系统合成器的图层指令，只能做透明度 / 变换 / 矩形裁剪：
+                // 模糊、圆形、百叶窗这些做不了，只能退到逐帧处理，整条视频都跟着变慢；
+                // 而且那边前片在上层、跟预览相反，同一种转场要写两遍。
+                // 现在转场、调色都在合成里做完，没有字幕等叠加层时照样走快速导出
+                vc.customVideoCompositorClass = ColorCompositor.self
 
                 let ts: CMTimeScale = 600
                 let videoClipCMRanges = videoCompTracks.map { entry -> (start: CMTime, end: CMTime) in
-                    let s = CMTime(seconds: entry.startTime, preferredTimescale: ts)
-                    let e = CMTime(seconds: entry.endTime, preferredTimescale: ts)
-                    return (s, e)
+                    (CMTime(seconds: entry.startTime, preferredTimescale: ts),
+                     CMTime(seconds: entry.endTime, preferredTimescale: ts))
                 }
-
                 var cmBoundaries: [CMTime] = [.zero, composition.duration]
                 for r in videoClipCMRanges { cmBoundaries.append(r.start); cmBoundaries.append(r.end) }
                 for ti in transitionInfos {
                     cmBoundaries.append(ti.overlapStart)
                     cmBoundaries.append(ti.overlapEnd)
-                    if ti.type == .fadeToBlack { cmBoundaries.append(ti.cutT) }
+                    if ti.type.isDip { cmBoundaries.append(ti.cutT) }
                 }
-                let sortedCM = Array(Set(cmBoundaries.map { $0.value })).sorted().map { CMTime(value: $0, timescale: ts) }
+                let sortedCM = Array(Set(cmBoundaries.map { CMTimeConvertScale($0, timescale: ts, method: .default).value }))
+                    .sorted().map { CMTime(value: $0, timescale: ts) }
+                    .filter { $0 <= composition.duration }
 
-                var instructions: [AVMutableVideoCompositionInstruction] = []
-                for i in 0..<(sortedCM.count - 1) {
+                let tracksForEntries = videoCompTracks.map { ($0.track, $0.clip) }
+                var instructions: [any AVVideoCompositionInstructionProtocol] = []
+                for i in 0..<max(0, sortedCM.count - 1) {
                     let segStartCM = sortedCM[i]
-                    let segEndCM   = sortedCM[i + 1]
-                    let segDur = segEndCM - segStartCM
+                    let segDur = sortedCM[i + 1] - segStartCM
                     guard segDur.seconds > 0.001 else { continue }
-
-                    let instruction = AVMutableVideoCompositionInstruction()
-                    instruction.timeRange = CMTimeRange(start: segStartCM, duration: segDur)
-                    instruction.backgroundColor = CGColor(gray: 0, alpha: 1)
-
-                    var layerInstructions: [AVMutableVideoCompositionLayerInstruction] = []
-                    for (idx, entry) in videoCompTracks.enumerated() {
-                        let li = AVMutableVideoCompositionLayerInstruction(assetTrack: entry.track)
-                        let clipStart = videoClipCMRanges[idx].start
-                        let clipEnd   = videoClipCMRanges[idx].end
-                        let active = segStartCM >= clipStart && segStartCM < clipEnd
-                        if active {
-                            let natSize = (try? await entry.track.load(.naturalSize)) ?? .zero
-                            let srcTF = (try? await entry.track.load(.preferredTransform)) ?? .identity
-                            if natSize.width > 0, natSize.height > 0 {
-                                let t = ProjectState.videoTransform(clip: entry.clip, natSize: natSize,
-                                                                    renderSize: renderSize,
-                                                                    sourceTransform: srcTF)
-                                li.setTransform(t, at: .zero)
-                                let c = entry.clip
-                                if c.cropTop > 0.001 || c.cropBottom > 0.001 || c.cropLeft > 0.001 || c.cropRight > 0.001 {
-                                    li.setCropRectangle(ProjectState.videoCropRect(clip: c, natSize: natSize,
-                                                                                   sourceTransform: srcTF),
-                                                        at: .zero)
-                                }
-                                ProjectState.applyTransitionRamp(
-                                    li: li, track: entry.track, clip: entry.clip,
-                                    transform: t, natSize: natSize, renderSize: renderSize,
-                                    segStart: segStartCM, transitions: transitionInfos
-                                )
-                            }
-                        } else {
-                            li.setOpacity(0, at: .zero)
-                        }
-                        layerInstructions.append(li)
-                    }
-                    instruction.layerInstructions = layerInstructions
-                    instructions.append(instruction)
+                    let seg = await ProjectState.compositorVideoEntries(
+                        segStartCM: segStartCM, videoCompTracks: tracksForEntries,
+                        videoClipCMRanges: videoClipCMRanges,
+                        transitionInfos: transitionInfos, renderSize: renderSize)
+                    let data = ColorCompositionData()
+                    data.entries = seg.entries
+                    data.renderSize = renderSize
+                    data.forExport = true
+                    ProjectState.applySegmentTransitionFX(data, segStartCM: segStartCM,
+                                                          transitionInfos: transitionInfos)
+                    instructions.append(ColorInstruction(
+                        timeRange: CMTimeRange(start: segStartCM, duration: segDur),
+                        trackIDs: seg.tracks.map(\.trackID), data: data))
                 }
                 if !instructions.isEmpty { vc.instructions = instructions }
                 videoComposition = vc
@@ -1439,13 +1420,8 @@ actor TimelineExporter {
             )
 
             // ── 色调范围表（仅视频 clip），图片色调在 renderImageOverlay 中处理 ──
-            let colorRanges: [(start: Double, end: Double, adj: ColorAdjust)] =
-                input.videoTracks.flatMap { track -> [(Double, Double, ColorAdjust)] in
-                    guard track.isVisible else { return [] }
-                    return track.clips.compactMap { clip in
-                        clip.colorAdjust.isIdentity ? nil : (clip.startTime, clip.endTime, clip.colorAdjust)
-                    }
-                }
+            // 视频片段的调色已经在合成器里按片段做了（跟预览一样），逐帧处理不用再整帧套一遍
+            let colorRanges: [(start: Double, end: Double, adj: ColorAdjust)] = []
 
             // 收集文字图层数据
             let visibleTextClips = input.textTracks
@@ -1474,8 +1450,10 @@ actor TimelineExporter {
 
             // ── 快速路径：无 overlay 时用 AVAssetExportSession（5-10x 加速）──
             let needsPerFrameProcessing = subRenderInfo.hasSubtitles || !visibleTextClips.isEmpty || !visibleShapeClips.isEmpty || !visibleImageClips.isEmpty || !colorRanges.isEmpty || compoundHasOverlays
+            let exportT0 = Date()
             if !needsPerFrameProcessing {
                 try? FileManager.default.removeItem(at: input.outputURL)
+                defer { DiagLog.log("[导出] 快速导出用时 \(String(format: "%.1f", Date().timeIntervalSince(exportT0)))s，成片 \(String(format: "%.1f", composition.duration.seconds))s") }
                 try await fastExportSession(
                     composition: composition,
                     videoComposition: videoComposition!,
@@ -1489,6 +1467,7 @@ actor TimelineExporter {
 
             // ── 用 AVAssetWriter 导出（逐帧处理：按 overlayTrackOrder 合成）──
             try? FileManager.default.removeItem(at: input.outputURL)
+            defer { DiagLog.log("[导出] 逐帧导出用时 \(String(format: "%.1f", Date().timeIntervalSince(exportT0)))s，成片 \(String(format: "%.1f", composition.duration.seconds))s") }
             try await writerExport(
                 composition: composition,
                 videoComposition: videoComposition!,
@@ -2627,3 +2606,4 @@ private extension Character {
             || (0xAC00...0xD7AF).contains(v)
     }
 }
+

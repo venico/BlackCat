@@ -151,6 +151,8 @@ extension ProjectState {
         lastRebuildFingerprint = fp
         rebuildTask?.cancel()
         rebuildTask = Task {
+            let diagT0 = Date()  // TMPDIAG 预览计时
+            DiagLog.log("[预览计时] 开始重建 视频片段 \(vTracks.flatMap(\.clips).count) 音频片段 \(aTracks.flatMap(\.clips).count)")  // TMPDIAG
             let composition = AVMutableComposition()
             var audioParams: [(trackID: CMPersistentTrackID, volume: Float, left: Float, right: Float, startTime: Double, duration: Double, fadeIn: Double, fadeOut: Double)] = []
             var videoCompTracks: [(track: AVMutableCompositionTrack, clip: VideoClip, startTime: Double, endTime: Double)] = []  // from video clips
@@ -176,7 +178,7 @@ extension ProjectState {
                           abs(cA.endTime - cB.startTime) < 0.05 else { continue }
                     let wantedHalf = trans.duration / 2
                     let half: Double
-                    if trans.type == .fadeToBlack {
+                    if trans.type.isDip {
                         // fadeToBlack 无 overlap，half 直接用 wantedHalf（各自消耗自己的内容）
                         half = wantedHalf
                     } else {
@@ -192,6 +194,7 @@ extension ProjectState {
                 }
             }
 
+            DiagLog.log("[预览计时] 视频时长读完 +\(String(format: "%.2f", Date().timeIntervalSince(diagT0)))s")  // TMPDIAG
             // 视频轨道+复合视频 — 按 videoSectionOrder 反序添加（底层先、顶层后覆盖）
             for ref in vSectionOrder.reversed() {
                 switch ref {
@@ -211,8 +214,8 @@ extension ProjectState {
                         guard useDur.seconds > 0.01 else { continue }
                         let srcContentDurSec = useDur.seconds * speed
 
-                        let aExtend  = transAdjusts.first(where: { $0.clipAID == clip.id && $0.type != .fadeToBlack })?.half ?? 0
-                        let bAdvance = transAdjusts.first(where: { $0.clipBID == clip.id && $0.type != .fadeToBlack })?.half ?? 0
+                        let aExtend  = transAdjusts.first(where: { $0.clipAID == clip.id && !$0.type.isDip })?.half ?? 0
+                        let bAdvance = transAdjusts.first(where: { $0.clipBID == clip.id && !$0.type.isDip })?.half ?? 0
 
                         let actualTrimSt = CMTime(seconds: clip.trimStart - bAdvance, preferredTimescale: 600)
                         let actualSrcDur = CMTime(seconds: srcContentDurSec + bAdvance + aExtend, preferredTimescale: 600)
@@ -656,7 +659,7 @@ extension ProjectState {
                 for ti in transitionInfos {
                     cmBoundaries.append(ti.overlapStart)
                     cmBoundaries.append(ti.overlapEnd)
-                    if ti.type == .fadeToBlack { cmBoundaries.append(ti.cutT) }
+                    if ti.type.isDip { cmBoundaries.append(ti.cutT) }
                 }
                 let sortedCM = Array(Set(cmBoundaries.map { $0.value })).sorted().map { CMTime(value: $0, timescale: ts) }
 
@@ -692,104 +695,15 @@ extension ProjectState {
                     var activeTracks: [AVCompositionTrack]   = []
                     var hasTween = false
 
-                    // 视频 track（底层）
-                    for (idx, entry) in videoCompTracks.enumerated() {
-                        let clipStart = videoClipCMRanges[idx].start
-                        let clipEnd   = videoClipCMRanges[idx].end
-                        guard segStartCM >= clipStart && segStartCM < clipEnd else { continue }
-                        guard let natSize = try? await entry.track.load(.naturalSize) else { continue }
-                        let clip = entry.clip
-                        if clip.mirrorH || clip.mirrorV || clip.rotation != 0 {
-                            NSLog("[Preview] CompositorEntry: mirrorH=\(clip.mirrorH) mirrorV=\(clip.mirrorV) rot=\(clip.rotation)")
-                        }
-                        var te = CompositorTrackEntry(
-                            trackID:     entry.track.trackID,
-                            userScaleX:  CGFloat(clip.scaleX),
-                            userScaleY:  CGFloat(clip.scaleY),
-                            userOffsetX: CGFloat(clip.offsetX),
-                            userOffsetY: CGFloat(clip.offsetY),
-                            cropTop:     CGFloat(clip.cropTop),
-                            cropBottom:  CGFloat(clip.cropBottom),
-                            cropLeft:    CGFloat(clip.cropLeft),
-                            cropRight:   CGFloat(clip.cropRight),
-                            colorAdjust: clip.colorAdjust,
-                            mirrorH:     clip.mirrorH,
-                            mirrorV:     clip.mirrorV,
-                            rotation:    Double(clip.rotation),
-                            naturalSize: natSize,
-                            sourceTransform: (try? await entry.track.load(.preferredTransform)) ?? .identity,
-                            opacityRamp: nil,
-                            pushRamp:    nil)
-                        // 转场渐变
-                        for trans in transitionInfos {
-                            let isA = entry.track === trans.trackA
-                            let isB = entry.track === trans.trackB
-                            guard isA || isB else { continue }
-                            let effStart: CMTime
-                            let effEnd: CMTime
-                            if trans.type == .fadeToBlack {
-                                effStart = isA ? trans.overlapStart : trans.cutT
-                                effEnd   = isA ? trans.cutT : trans.overlapEnd
-                            } else {
-                                effStart = trans.overlapStart
-                                effEnd   = trans.overlapEnd
-                            }
-                            guard segStartCM >= effStart && segStartCM < effEnd else { continue }
-                            let fOp: Float = isA ? 1.0 : 0.0
-                            let tOp: Float = isA ? 0.0 : 1.0
-                            switch trans.type {
-                            case .dissolve:
-                                // 淡入淡出：前一段保持不透明，只让后一段从 0 渐显盖上去。
-                                // 原来两段各自反向渐变、都叠在黑底上，正中间那帧是
-                                // 0.5×后段 + 0.25×前段，整体暗了四分之一 —— 看着就是「黑一下」、
-                                // 过渡不明显。后一段在同一条轨上排在前一段之后画，天然在上面
-                                if isB {
-                                    te.opacityRamp = (from: 0, to: 1,
-                                                      start: effStart.seconds, end: effEnd.seconds)
-                                }
-                                hasTween = true
-                            case .fadeToBlack:
-                                te.opacityRamp = (from: fOp, to: tOp,
-                                                  start: effStart.seconds, end: effEnd.seconds)
-                                hasTween = true
-                            case .pushLeft, .pushRight, .pushUp, .pushDown:
-                                let (dx, dy): (CGFloat, CGFloat) = {
-                                    switch trans.type {
-                                    case .pushLeft:  return (-renderSize.width,  0)
-                                    case .pushRight: return ( renderSize.width,  0)
-                                    case .pushUp:    return (0,  renderSize.height)
-                                    default:         return (0, -renderSize.height)
-                                    }
-                                }()
-                                te.pushRamp = (dx: dx, dy: dy, isA: isA,
-                                               start: effStart.seconds, end: effEnd.seconds)
-                                hasTween = true
-                            case .zoom:
-                                te.opacityRamp = (from: fOp, to: tOp,
-                                                  start: effStart.seconds, end: effEnd.seconds)
-                                te.zoomRamp = (from: isA ? 1.0 : 1.4, to: isA ? 1.4 : 1.0,
-                                               start: effStart.seconds, end: effEnd.seconds)
-                                hasTween = true
-                            case .slideLeft, .slideRight, .slideUp, .slideDown:
-                                if isB {
-                                    let (dx, dy): (CGFloat, CGFloat) = {
-                                        switch trans.type {
-                                        case .slideLeft:  return (-renderSize.width,  0)
-                                        case .slideRight: return ( renderSize.width,  0)
-                                        case .slideUp:    return (0,  renderSize.height)
-                                        default:          return (0, -renderSize.height)
-                                        }
-                                    }()
-                                    te.pushRamp = (dx: dx, dy: dy, isA: false,
-                                                   start: effStart.seconds, end: effEnd.seconds)
-                                }
-                                hasTween = true
-                            }
-                            break
-                        }
-                        entries.append(te)
-                        activeTracks.append(entry.track)
-                    }
+                    // 视频 track（底层）。跟导出共用一份（见 compositorVideoEntries）
+                    let vSeg = await Self.compositorVideoEntries(
+                        segStartCM: segStartCM,
+                        videoCompTracks: videoCompTracks.map { ($0.track, $0.clip) },
+                        videoClipCMRanges: videoClipCMRanges,
+                        transitionInfos: transitionInfos, renderSize: renderSize)
+                    entries += vSeg.entries
+                    activeTracks += vSeg.tracks
+                    hasTween = hasTween || vSeg.hasTween
 
                     // 图片 track（顶层）
                     for (idx, entry) in imageCompTracks.enumerated() {
@@ -825,6 +739,8 @@ extension ProjectState {
                     instr.enablePostProcessing = hasTween
 
                     let colorData = ColorCompositionData()
+                    Self.applySegmentTransitionFX(colorData, segStartCM: segStartCM,
+                                                  transitionInfos: transitionInfos)
                     colorData.entries    = entries
                     colorData.renderSize = renderSize
                     // 滤镜在所有画面合成完之后统一套，所以整份轨道原样带过去
@@ -855,6 +771,18 @@ extension ProjectState {
                     self.playerItem = nil
                 } else {
                     let item = AVPlayerItem(asset: composition)
+                    ColorCompositor.diagFirstFrameLogged = false  // TMPDIAG
+                    DiagLog.log("[预览计时] 合成建好 +\(String(format: "%.2f", Date().timeIntervalSince(diagT0)))s")  // TMPDIAG
+                    Task { @MainActor in  // TMPDIAG 等 playerItem 就绪
+                        for _ in 0..<300 {
+                            if item.status != .unknown {
+                                DiagLog.log("[预览计时] playerItem \(item.status == .readyToPlay ? "就绪" : "失败 \(item.error?.localizedDescription ?? "")") +\(String(format: "%.2f", Date().timeIntervalSince(diagT0)))s")
+                                return
+                            }
+                            try? await Task.sleep(nanoseconds: 100_000_000)
+                        }
+                        DiagLog.log("[预览计时] playerItem 30s 还没就绪")
+                    }
                     item.audioTimePitchAlgorithm = .varispeed
                     item.audioMix = audioMix
                     if let vc = videoComposition {
@@ -862,6 +790,181 @@ extension ProjectState {
                     }
                     self.playerItem = item
                 }
+            }
+        }
+    }
+
+    // MARK: - 合成器段落（预览与导出共用）
+
+    /// 某一段时间里，视频轨各片段交给 ColorCompositor 的图层参数（变换、裁剪、调色、转场渐变）。
+    /// 预览和导出都走它，**同一种转场只写一遍**，两边画出来一定一样
+    static func compositorVideoEntries(
+        segStartCM: CMTime,
+        videoCompTracks: [(track: AVMutableCompositionTrack, clip: VideoClip)],
+        videoClipCMRanges: [(start: CMTime, end: CMTime)],
+        transitionInfos: [TransitionCompInfo],
+        renderSize: CGSize
+    ) async -> (entries: [CompositorTrackEntry], tracks: [AVCompositionTrack], hasTween: Bool) {
+        var entries:      [CompositorTrackEntry] = []
+        var activeTracks: [AVCompositionTrack]   = []
+        var hasTween = false
+        // 视频 track（底层）
+        for (idx, entry) in videoCompTracks.enumerated() {
+            let clipStart = videoClipCMRanges[idx].start
+            let clipEnd   = videoClipCMRanges[idx].end
+            guard segStartCM >= clipStart && segStartCM < clipEnd else { continue }
+            guard let natSize = try? await entry.track.load(.naturalSize) else { continue }
+            let clip = entry.clip
+            if clip.mirrorH || clip.mirrorV || clip.rotation != 0 {
+                NSLog("[Preview] CompositorEntry: mirrorH=\(clip.mirrorH) mirrorV=\(clip.mirrorV) rot=\(clip.rotation)")
+            }
+            var te = CompositorTrackEntry(
+                trackID:     entry.track.trackID,
+                userScaleX:  CGFloat(clip.scaleX),
+                userScaleY:  CGFloat(clip.scaleY),
+                userOffsetX: CGFloat(clip.offsetX),
+                userOffsetY: CGFloat(clip.offsetY),
+                cropTop:     CGFloat(clip.cropTop),
+                cropBottom:  CGFloat(clip.cropBottom),
+                cropLeft:    CGFloat(clip.cropLeft),
+                cropRight:   CGFloat(clip.cropRight),
+                colorAdjust: clip.colorAdjust,
+                mirrorH:     clip.mirrorH,
+                mirrorV:     clip.mirrorV,
+                rotation:    Double(clip.rotation),
+                naturalSize: natSize,
+                sourceTransform: (try? await entry.track.load(.preferredTransform)) ?? .identity,
+                opacityRamp: nil,
+                pushRamp:    nil)
+            // 转场渐变
+            for trans in transitionInfos {
+                let isA = entry.track === trans.trackA
+                let isB = entry.track === trans.trackB
+                guard isA || isB else { continue }
+                let effStart: CMTime
+                let effEnd: CMTime
+                if trans.type.isDip {
+                    effStart = isA ? trans.overlapStart : trans.cutT
+                    effEnd   = isA ? trans.cutT : trans.overlapEnd
+                } else {
+                    effStart = trans.overlapStart
+                    effEnd   = trans.overlapEnd
+                }
+                guard segStartCM >= effStart && segStartCM < effEnd else { continue }
+                let fOp: Float = isA ? 1.0 : 0.0
+                let tOp: Float = isA ? 0.0 : 1.0
+                switch trans.type {
+                case .dissolve:
+                    // 淡入淡出：前一段保持不透明，只让后一段从 0 渐显盖上去。
+                    // 原来两段各自反向渐变、都叠在黑底上，正中间那帧是
+                    // 0.5×后段 + 0.25×前段，整体暗了四分之一 —— 看着就是「黑一下」、
+                    // 过渡不明显。后一段在同一条轨上排在前一段之后画，天然在上面
+                    if isB {
+                        te.opacityRamp = (from: 0, to: 1,
+                                          start: effStart.seconds, end: effEnd.seconds)
+                    }
+                    hasTween = true
+                case .fadeToBlack, .flashWhite:
+                    // 闪白的白底由 colorData.whiteBase 给（见下面收集段落级效果那段）
+                    te.opacityRamp = (from: fOp, to: tOp,
+                                      start: effStart.seconds, end: effEnd.seconds)
+                    hasTween = true
+                case .blur:
+                    // 画面本身按叠化走，整帧的模糊在合成器最后统一加（colorData.blurRamp）
+                    if isB {
+                        te.opacityRamp = (from: 0, to: 1,
+                                          start: effStart.seconds, end: effEnd.seconds)
+                    }
+                    hasTween = true
+                case .zoomOut:
+                    // 前片缩小退后；后片从放大缩回，同时渐显盖上去（前片不淡，免得中间发暗）
+                    if isB {
+                        te.opacityRamp = (from: 0, to: 1,
+                                          start: effStart.seconds, end: effEnd.seconds)
+                    }
+                    te.zoomRamp = (from: isA ? 1.0 : 1.6, to: isA ? 0.6 : 1.0,
+                                   start: effStart.seconds, end: effEnd.seconds)
+                    hasTween = true
+                case .rotate:
+                    // 前片转走并放大，后片从反方向转回、从小变大并渐显
+                    if isB {
+                        te.opacityRamp = (from: 0, to: 1,
+                                          start: effStart.seconds, end: effEnd.seconds)
+                    }
+                    te.rotateRamp = (from: isA ? 0 : -90, to: isA ? 90 : 0,
+                                     start: effStart.seconds, end: effEnd.seconds)
+                    te.zoomRamp = (from: isA ? 1.0 : 0.5, to: isA ? 1.5 : 1.0,
+                                   start: effStart.seconds, end: effEnd.seconds)
+                    hasTween = true
+                case .circleOpen, .circleClose, .blinds, .copyMachine, .ripple, .pageCurl,
+                     .glitch, .shake, .chromatic, .lightLeak, .splitScreen:
+                    // 两片都照常画，混合在合成器里拿整帧做（colorData.frameBlend）
+                    hasTween = true
+                case .wipeLeft, .wipeRight, .wipeUp, .wipeDown:
+                    // 后片在上层，露出的范围从一条边扫开
+                    if isB {
+                        te.wipeRamp = (type: trans.type,
+                                       start: effStart.seconds, end: effEnd.seconds)
+                    }
+                    hasTween = true
+                case .pushLeft, .pushRight, .pushUp, .pushDown:
+                    let (dx, dy): (CGFloat, CGFloat) = {
+                        switch trans.type {
+                        case .pushLeft:  return (-renderSize.width,  0)
+                        case .pushRight: return ( renderSize.width,  0)
+                        case .pushUp:    return (0,  renderSize.height)
+                        default:         return (0, -renderSize.height)
+                        }
+                    }()
+                    te.pushRamp = (dx: dx, dy: dy, isA: isA,
+                                   start: effStart.seconds, end: effEnd.seconds)
+                    hasTween = true
+                case .zoom:
+                    te.opacityRamp = (from: fOp, to: tOp,
+                                      start: effStart.seconds, end: effEnd.seconds)
+                    te.zoomRamp = (from: isA ? 1.0 : 1.4, to: isA ? 1.4 : 1.0,
+                                   start: effStart.seconds, end: effEnd.seconds)
+                    hasTween = true
+                case .slideLeft, .slideRight, .slideUp, .slideDown:
+                    if isB {
+                        let (dx, dy): (CGFloat, CGFloat) = {
+                            switch trans.type {
+                            case .slideLeft:  return (-renderSize.width,  0)
+                            case .slideRight: return ( renderSize.width,  0)
+                            case .slideUp:    return (0,  renderSize.height)
+                            default:          return (0, -renderSize.height)
+                            }
+                        }()
+                        te.pushRamp = (dx: dx, dy: dy, isA: false,
+                                       start: effStart.seconds, end: effEnd.seconds)
+                    }
+                    hasTween = true
+                }
+                break
+            }
+            entries.append(te)
+            activeTracks.append(entry.track)
+        }
+        return (entries, activeTracks, hasTween)
+    }
+
+    /// 段落级的转场效果：闪白要白底，模糊要整帧糊，特效类要两帧混合
+    static func applySegmentTransitionFX(_ colorData: ColorCompositionData, segStartCM: CMTime,
+                                         transitionInfos: [TransitionCompInfo]) {
+        for trans in transitionInfos
+        where segStartCM >= trans.overlapStart && segStartCM < trans.overlapEnd {
+            if trans.type == .flashWhite { colorData.whiteBase = true }
+            if trans.type == .blur {
+                colorData.blurRamp = (start: trans.overlapStart.seconds,
+                                      end: trans.overlapEnd.seconds,
+                                      cut: trans.cutT.seconds)
+            }
+            if trans.type.blendsFrames {
+                colorData.frameBlend = (type: trans.type,
+                                        start: trans.overlapStart.seconds,
+                                        end: trans.overlapEnd.seconds,
+                                        trackA: trans.trackA.trackID,
+                                        trackB: trans.trackB.trackID)
             }
         }
     }
@@ -957,95 +1060,6 @@ extension ProjectState {
     }
 
     // MARK: - Transition ramp helper
-
-    static func applyTransitionRamp(
-        li: AVMutableVideoCompositionLayerInstruction,
-        track: AVMutableCompositionTrack,
-        clip: VideoClip,
-        transform t: CGAffineTransform,
-        natSize: CGSize,
-        renderSize: CGSize,
-        segStart: CMTime,
-        transitions: [TransitionCompInfo]
-    ) {
-        let ts: CMTimeScale = 600
-        for trans in transitions {
-            let isA = track === trans.trackA
-            let isB = track === trans.trackB
-            guard isA || isB else { continue }
-
-            let segStart_forA: CMTime
-            let segEnd_forA:   CMTime
-            let segStart_forB: CMTime
-            let segEnd_forB:   CMTime
-            if trans.type == .fadeToBlack {
-                segStart_forA = trans.overlapStart;  segEnd_forA = trans.cutT
-                segStart_forB = trans.cutT;          segEnd_forB = trans.overlapEnd
-            } else {
-                segStart_forA = trans.overlapStart;  segEnd_forA = trans.overlapEnd
-                segStart_forB = trans.overlapStart;  segEnd_forB = trans.overlapEnd
-            }
-
-            let effectStart = isA ? segStart_forA : segStart_forB
-            let effectEnd   = isA ? segEnd_forA   : segEnd_forB
-            guard segStart >= effectStart && segStart < effectEnd else { continue }
-
-            let fadeRange = CMTimeRange(start: effectStart, duration: effectEnd - effectStart)
-            let fromOpacity: Float = isA ? 1 : 0
-            let toOpacity:   Float = isA ? 0 : 1
-
-            let pushDX: CGFloat
-            let pushDY: CGFloat
-            switch trans.type {
-            case .pushLeft:  pushDX = -renderSize.width;  pushDY = 0
-            case .pushRight: pushDX =  renderSize.width;  pushDY = 0
-            case .pushUp:    pushDX = 0; pushDY =  renderSize.height
-            case .pushDown:  pushDX = 0; pushDY = -renderSize.height
-            default:         pushDX = 0; pushDY = 0
-            }
-
-            switch trans.type {
-            case .dissolve, .fadeToBlack:
-                li.setOpacityRamp(fromStartOpacity: fromOpacity, toEndOpacity: toOpacity,
-                                  timeRange: fadeRange)
-            case .pushLeft, .pushRight, .pushUp, .pushDown:
-                let offsetFwd = CGAffineTransform(translationX:  pushDX, y:  pushDY)
-                let offsetRev = CGAffineTransform(translationX: -pushDX, y: -pushDY)
-                let fromT = isA ? t : t.concatenating(offsetRev)
-                let toT   = isA ? t.concatenating(offsetFwd) : t
-                li.setTransformRamp(fromStart: fromT, toEnd: toT, timeRange: fadeRange)
-            case .zoom:
-                let cx = renderSize.width / 2, cy = renderSize.height / 2
-                func zoomAffine(_ s: CGFloat) -> CGAffineTransform {
-                    CGAffineTransform(translationX: cx, y: cy)
-                        .scaledBy(x: s, y: s)
-                        .translatedBy(x: -cx, y: -cy)
-                }
-                let fromS: CGFloat = isA ? 1.0 : 1.4
-                let toS:   CGFloat = isA ? 1.4 : 1.0
-                li.setOpacityRamp(fromStartOpacity: fromOpacity, toEndOpacity: toOpacity,
-                                  timeRange: fadeRange)
-                li.setTransformRamp(fromStart: t.concatenating(zoomAffine(fromS)),
-                                    toEnd:     t.concatenating(zoomAffine(toS)),
-                                    timeRange: fadeRange)
-            case .slideLeft, .slideRight, .slideUp, .slideDown:
-                if isB {
-                    let (sdx, sdy): (CGFloat, CGFloat) = {
-                        switch trans.type {
-                        case .slideLeft:  return (-renderSize.width,  0)
-                        case .slideRight: return ( renderSize.width,  0)
-                        case .slideUp:    return (0,  renderSize.height)
-                        default:          return (0, -renderSize.height)
-                        }
-                    }()
-                    let offsetRev = CGAffineTransform(translationX: -sdx, y: -sdy)
-                    li.setTransformRamp(fromStart: t.concatenating(offsetRev),
-                                        toEnd: t, timeRange: fadeRange)
-                }
-            }
-            break
-        }
-    }
 
     /// Select a clip for preview and seek to its start so the user sees it.
     func loadClipForPreview(_ clip: VideoClip) {

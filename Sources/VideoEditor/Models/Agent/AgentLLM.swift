@@ -275,6 +275,11 @@ enum AgentLLM {
 
     // MARK: - Claude
 
+    private static func claudeImageBlock(_ img: Data) -> [String: Any] {
+        ["type": "image", "source": ["type": "base64", "media_type": "image/jpeg",
+                                      "data": img.base64EncodedString()]]
+    }
+
     private static func sendClaude(_ messages: [AgentMessage], _ tools: [AgentToolSpec],
                                    _ system: String, _ key: String,
                                    _ webSearch: Bool) async throws -> AgentTurn {
@@ -299,15 +304,23 @@ enum AgentLLM {
                 }
                 if !content.isEmpty { msgs.append(["role": "assistant", "content": content]) }
             case .toolResult(let id, _, let text, let img):
-                var inner: [[String: Any]] = [["type": "text", "text": text]]
-                if let img {
-                    inner.append(["type": "image",
-                                  "source": ["type": "base64", "media_type": "image/jpeg",
-                                             "data": img.base64EncodedString()]])
+                // 图**不放进 tool_result 里**，放在同一条 user 消息的末尾单独一块。
+                // 中转站转发时会把 tool_result 里的图丢掉（实测 Claude 走中转回「只拿到图片路径」，
+                // 同一张图走 OpenAI 那套单独发的格式 GPT / DeepSeek 都认得出）。
+                // 同一轮的多个工具结果并进一条消息：tool_result 块必须排在最前，图跟在后面
+                let result: [String: Any] = ["type": "tool_result", "tool_use_id": id, "content": text]
+                if let last = msgs.last, last["role"] as? String == "user",
+                   var content = last["content"] as? [[String: Any]],
+                   content.first?["type"] as? String == "tool_result" {
+                    let firstNonResult = content.firstIndex { $0["type"] as? String != "tool_result" } ?? content.count
+                    content.insert(result, at: firstNonResult)
+                    if let img { content.append(Self.claudeImageBlock(img)) }
+                    msgs[msgs.count - 1]["content"] = content
+                } else {
+                    var content: [[String: Any]] = [result]
+                    if let img { content.append(Self.claudeImageBlock(img)) }
+                    msgs.append(["role": "user", "content": content])
                 }
-                msgs.append(["role": "user", "content": [[
-                    "type": "tool_result", "tool_use_id": id, "content": inner
-                ]]])
             }
         }
 

@@ -659,6 +659,8 @@ extension ProjectState {
 
     /// Generate timeline thumbnail strip for a video asset (evenly spaced frames).
     func loadTimelineThumbnails(assetID: UUID, url: URL) {
+        // 同 loadWaveform：丢失的文件交给 AVFoundation 会挂到超时，还会堵住别的解码
+        guard FileManager.default.fileExists(atPath: url.path) else { return }
         // 空数组是"上次没生成出来"，不能当成已有缓存 —— 否则那条片段的缩略图
         // 会一直空着且永不重试，只有重启 app 清掉内存缓存才恢复
         if let cached = assetThumbnails[assetID], !cached.isEmpty { return }
@@ -687,6 +689,15 @@ extension ProjectState {
         thumbnailsGenerating.insert(id)
         // 线程模型说明见 loadMediaThumbnail：专属 pthread + 信号量超时，不碰协作池/GCD 全局池
         let worker = Thread {
+            // 抽过的直接从硬盘读，不排队、不解码（老项目打开时缩略图秒出）
+            if let cached = ThumbnailDiskCache.load(for: url) {
+                DispatchQueue.main.async {
+                    self.assetThumbnails[id] = cached
+                    self.thumbnailsReloading.remove(id)
+                    self.thumbnailsGenerating.remove(id)
+                }
+                return
+            }
             // 排队等一个名额再开工。wait 必须在这条新线程里做，不能在调用方（主线程）等
             Self.thumbnailGenSlots.wait()
             defer { Self.thumbnailGenSlots.signal() }
@@ -802,14 +813,18 @@ extension ProjectState {
                 DiagLog.log("[缩略图] \(url.lastPathComponent) AVFoundation 时长不可用，直接 ffmpeg 抽条")
             }
             // 超时或全失败 → ffmpeg 整条重抽；ffmpeg 也没出帧时保留超时前的部分帧
+            var complete = !timedOut && !sorted.isEmpty
             if timedOut || sorted.isEmpty {
                 let ffFrames = Self.ffmpegFrameStrip(url: url, interval: interval)
                 if !ffFrames.isEmpty {
                     DiagLog.log("[缩略图] \(url.lastPathComponent) ffmpeg 兜底成功，出帧 \(ffFrames.count) 张")
                     sorted = ffFrames
+                    complete = true
                 }
             }
             let finalFrames = sorted
+            // 完整抽完的才落盘；超时剩下的半截不存，下次还会重抽补全
+            if complete { ThumbnailDiskCache.save(finalFrames, for: url) }
             DispatchQueue.main.async {
                 // 两条路都没出帧才算失败，别留空数组挡住重试
                 if finalFrames.isEmpty {
@@ -836,6 +851,10 @@ extension ProjectState {
     func loadWaveform(assetID: UUID, url: URL) {
         guard waveformCache[assetID] == nil else { return }
         guard !waveformGenerating.contains(assetID) else { return }
+        // 文件不在就别碰 AVFoundation：AVAssetReader 读不存在的文件不会立刻报错，
+        // 而是挂满 8 秒超时，期间把预览读视频时长也堵住（实测打开项目预览晚出 7.6 秒，
+        // 恰好等这几个丢失的临时配音文件超时放弃）
+        guard FileManager.default.fileExists(atPath: url.path) else { return }
         waveformGenerating.insert(assetID)
         let id = assetID
         Thread.detachNewThread {

@@ -702,15 +702,37 @@ extension AgentToolbox {
             return (s, e)
         }
 
+        /// 带素材的片段（视频 / 音频）：开头动了素材起点要跟着挪，两头都不能超出素材，
+        /// 时间轴秒数和素材秒数之间按倍速换算。跟界面上拖边缘是同一套规则
+        func bounded(start oldS: Double, end oldE: Double, trimStart: Double, speed rawSpeed: Double,
+                     assetID: UUID) -> (s: Double, e: Double, trim: Double, note: String)? {
+            let speed = max(0.01, rawSpeed)
+            guard var (s, e) = apply((oldS, oldE)) else { return nil }
+            var notes: [String] = []
+            let minStart = oldS - trimStart / speed
+            if s < minStart - 0.001 { s = minStart; notes.append("开头已经到素材起点") }
+            let trim = max(0, trimStart + (s - oldS) * speed)
+            let assetDur = p.mediaAssets.first { $0.id == assetID }?.duration ?? 0
+            if assetDur > 0 {
+                let maxEnd = s + (assetDur - trim) / speed
+                if e > maxEnd + 0.001 { e = maxEnd; notes.append("结尾已经到素材末尾") }
+            }
+            guard e - s > 0.05 else { return nil }
+            return (s, e, trim, notes.isEmpty ? "" : "（\(notes.joined(separator: "，"))，没法再往外拉）")
+        }
+
         for ti in p.videoTracks.indices {
             guard let ci = p.videoTracks[ti].clips.firstIndex(where: { "\($0.id)".hasPrefix(key) })
             else { continue }
             let c = p.videoTracks[ti].clips[ci]
-            guard let (s, e) = apply((c.startTime, c.endTime)) else { return .fail("裁完长度会变成 0。") }
-            p.videoTracks[ti].clips[ci].startTime = s
-            p.videoTracks[ti].clips[ci].endTime = e
+            guard let r = bounded(start: c.startTime, end: c.endTime, trimStart: c.trimStart,
+                                  speed: c.speed, assetID: c.assetID) else { return .fail("裁完长度会变成 0。") }
+            p.pushUndo()
+            p.videoTracks[ti].clips[ci].startTime = r.s
+            p.videoTracks[ti].clips[ci].endTime = r.e
+            p.videoTracks[ti].clips[ci].trimStart = r.trim
             p.rebuildTimelinePreview(); p.scheduleAutoSave()
-            return .ok("「\(c.name)」现在是 \(fmt(s)) → \(fmt(e))。")
+            return .ok("「\(c.name)」现在是 \(fmt(r.s)) → \(fmt(r.e))。\(r.note)")
         }
         for ti in p.imageTracks.indices {
             guard let ci = p.imageTracks[ti].clips.firstIndex(where: { "\($0.id)".hasPrefix(key) })
@@ -726,11 +748,14 @@ extension AgentToolbox {
             guard let ci = p.audioTracks[ti].clips.firstIndex(where: { "\($0.id)".hasPrefix(key) })
             else { continue }
             let c = p.audioTracks[ti].clips[ci]
-            guard let (s, e) = apply((c.startTime, c.endTime)) else { return .fail("裁完长度会变成 0。") }
-            p.audioTracks[ti].clips[ci].startTime = s
-            p.audioTracks[ti].clips[ci].endTime = e
+            guard let r = bounded(start: c.startTime, end: c.endTime, trimStart: c.trimStart,
+                                  speed: c.speed, assetID: c.assetID) else { return .fail("裁完长度会变成 0。") }
+            p.pushUndo()
+            p.audioTracks[ti].clips[ci].startTime = r.s
+            p.audioTracks[ti].clips[ci].endTime = r.e
+            p.audioTracks[ti].clips[ci].trimStart = r.trim
             p.rebuildTimelinePreview(); p.scheduleAutoSave()
-            return .ok("「\(c.name)」现在是 \(fmt(s)) → \(fmt(e))。")
+            return .ok("「\(c.name)」现在是 \(fmt(r.s)) → \(fmt(r.e))。\(r.note)")
         }
         for ti in p.subtitleTracks.indices {
             guard let ci = p.subtitleTracks[ti].clips.firstIndex(where: { "\($0.id)".hasPrefix(key) })

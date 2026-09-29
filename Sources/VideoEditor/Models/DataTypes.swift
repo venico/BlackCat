@@ -238,10 +238,29 @@ enum TransitionType: String, Codable, CaseIterable {
     case slideRight     // 滑入(右)：后片从左滑入覆盖
     case slideUp        // 滑入(上)：后片从下滑入覆盖
     case slideDown      // 滑入(下)：后片从上滑入覆盖
+    case flashWhite     // 闪白：跟渐黑一样，中间是白色
+    case blur           // 模糊：前片越来越糊，最糊时换成后片再变清楚
+    case zoomOut        // 拉远：前片缩小退后，后片从放大缩回
+    case rotate         // 旋转：前片转出，后片转着进来
+    case wipeLeft       // 擦除(左)：一条边从右往左扫，扫过处露出后片
+    case wipeRight      // 擦除(右)：从左往右扫
+    case wipeUp         // 擦除(上)：从下往上扫
+    case wipeDown       // 擦除(下)：从上往下扫
+    case circleOpen     // 圆形展开：中间开一个圆洞露出后片，越开越大
+    case circleClose    // 圆形收缩：前片缩成中间一个圆，越缩越小
+    case blinds         // 百叶窗：一条条横杠翻开露出后片
+    case copyMachine    // 复印机：一道光带扫过去
+    case ripple         // 波纹：像水面起涟漪
+    case pageCurl       // 翻页：前片像书页卷起来翻走
+    case glitch         // 故障：画面横向错位撕裂 + 红蓝分离，中间最乱
+    case shake          // 抖动：镜头猛晃一下，晃的时候切过去
+    case chromatic      // 色差：红绿蓝三层拉开再合上，同时叠化过去
+    case lightLeak      // 漏光：一团暖光扫过画面，趁亮的时候换过去
+    case splitScreen    // 分屏：后片分成三条，交错着从上下滑进来
 
     var label: String {
         switch self {
-        case .dissolve:    return "淡入淡出"
+        case .dissolve:    return "叠化"
         case .fadeToBlack: return "渐黑"
         case .pushLeft:    return "推入(左)"
         case .pushRight:   return "推入(右)"
@@ -252,6 +271,25 @@ enum TransitionType: String, Codable, CaseIterable {
         case .slideRight:  return "滑入(右)"
         case .slideUp:     return "滑入(上)"
         case .slideDown:   return "滑入(下)"
+        case .flashWhite:  return "闪白"
+        case .blur:        return "模糊"
+        case .zoomOut:     return "拉远"
+        case .rotate:      return "旋转"
+        case .wipeLeft:    return "擦除(左)"
+        case .wipeRight:   return "擦除(右)"
+        case .wipeUp:      return "擦除(上)"
+        case .wipeDown:    return "擦除(下)"
+        case .circleOpen:  return "圆形展开"
+        case .circleClose: return "圆形收缩"
+        case .blinds:      return "百叶窗"
+        case .copyMachine: return "复印机"
+        case .ripple:      return "波纹"
+        case .pageCurl:    return "翻页"
+        case .glitch:      return "故障"
+        case .shake:       return "抖动"
+        case .chromatic:   return "色差"
+        case .lightLeak:   return "漏光"
+        case .splitScreen: return "分屏"
         }
     }
 
@@ -268,6 +306,57 @@ enum TransitionType: String, Codable, CaseIterable {
         case .slideRight:  return "arrow.right.to.line"
         case .slideUp:     return "arrow.up.to.line"
         case .slideDown:   return "arrow.down.to.line"
+        case .flashWhite:  return "sun.max"
+        case .blur:        return "drop"
+        case .zoomOut:     return "minus.magnifyingglass"
+        case .rotate:      return "arrow.clockwise"
+        case .wipeLeft:    return "rectangle.lefthalf.inset.filled"
+        case .wipeRight:   return "rectangle.righthalf.inset.filled"
+        case .wipeUp:      return "rectangle.tophalf.inset.filled"
+        case .wipeDown:    return "rectangle.bottomhalf.inset.filled"
+        case .circleOpen:  return "circle.dashed"
+        case .circleClose: return "circle.circle"
+        case .blinds:      return "line.3.horizontal"
+        case .copyMachine: return "light.beacon.max"
+        case .ripple:      return "water.waves"
+        case .pageCurl:    return "book.pages"
+        case .glitch:      return "bolt"
+        case .shake:       return "waveform"
+        case .chromatic:   return "circle.grid.3x3"
+        case .lightLeak:   return "sun.haze"
+        case .splitScreen: return "rectangle.split.3x1"
+        }
+    }
+
+    /// 要拿前后两片**各自的整帧**混合的那几种（形状 / 特效类）。
+    /// 预览里合成器拿两帧直接混；导出时系统合成器做不了，前片正常出、后片另抽帧，逐帧混
+    var blendsFrames: Bool {
+        switch self {
+        case .circleOpen, .circleClose, .blinds, .copyMachine, .ripple, .pageCurl,
+             .glitch, .shake, .chromatic, .lightLeak, .splitScreen: return true
+        default: return false
+        }
+    }
+
+    /// 素材面板里的分组（可折叠），顺序即显示顺序
+    static let groups: [(title: String, items: [TransitionType])] = [
+        ("基础", [.dissolve, .fadeToBlack, .flashWhite, .blur]),
+        ("推入", [.pushLeft, .pushRight, .pushUp, .pushDown]),
+        ("滑入", [.slideLeft, .slideRight, .slideUp, .slideDown]),
+        ("擦除", [.wipeLeft, .wipeRight, .wipeUp, .wipeDown]),
+        ("缩放旋转", [.zoom, .zoomOut, .rotate]),
+        ("特效", [.circleOpen, .circleClose, .blinds, .copyMachine, .ripple, .pageCurl]),
+        ("动感", [.glitch, .shake, .chromatic, .lightLeak, .splitScreen]),
+    ]
+
+    /// 「闪」类：前片淡到纯色、后片从纯色淡出。各自消耗自己的内容，**不需要重叠区**
+    var isDip: Bool { self == .fadeToBlack || self == .flashWhite }
+
+    /// 是否为擦除类
+    var isWipe: Bool {
+        switch self {
+        case .wipeLeft, .wipeRight, .wipeUp, .wipeDown: return true
+        default: return false
         }
     }
 
@@ -905,6 +994,13 @@ enum FilterKind: String, Codable, CaseIterable {
 
     /// 列表里显示的那些（LUT 是导入进来的，不进内置列表）
     static var builtins: [FilterKind] { allCases.filter { $0 != .lut } }
+
+    /// 素材面板里的分组（可折叠）
+    static let groups: [(title: String, items: [FilterKind])] = [
+        ("彩色", [.vibrance, .chrome, .instant, .process, .transfer, .fade, .sepia, .cool]),
+        ("黑白", [.noir, .mono, .tonal]),
+        ("特殊", [.posterize, .comic, .vignette]),
+    ]
 }
 
 /// 时间轴上的一段滤镜。**覆盖这段时间内的整幅画面** ——

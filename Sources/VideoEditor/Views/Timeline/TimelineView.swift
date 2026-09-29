@@ -349,11 +349,15 @@ struct TimelineView: View {
                 labelColumn
                 clipArea
             }
+            // 底下留一截空：不然滚到底时最后一条轨道贴着底边，被横向滚动条压住
+            .padding(.bottom, 24)
             .background(GeometryReader { g in
                 Color.clear.preference(key: VScrollOffsetKey.self,
                                        value: g.frame(in: .named("tlVScroll")).minY)
             })
         }
+        // 滚动条从刻度尺下沿开始：上面 rulerH 那段被顶条盖着，滚动条画进去会被下面的 mask 切掉一截
+        .contentMargins(.top, rulerH, for: .scrollIndicators)
         .coordinateSpace(name: "tlVScroll")
         .onPreferenceChange(VScrollOffsetKey.self) { v in
             let off = max(0, -v)
@@ -364,6 +368,29 @@ struct TimelineView: View {
             Color.clear
         })
         .clipped()
+        // 顶条没有底色（底色交给外层材质），轨道往上滚时会从刻度尺底下透出来叠在一起。
+        // 把可视区最上面 rulerH 那一截遮掉：滚上去的部分到顶条下沿就消失。
+        // mask 不影响点击，点顶条「漏下去」的那套判断照旧
+        .mask(
+            VStack(spacing: 0) {
+                Color.clear.frame(height: rulerH)
+                Color.black
+            }
+        )
+        // 播放头竖线：固定层，从刻度尺下沿一直画到轨道区底边，不跟竖向滚动走
+        .overlay(alignment: .topLeading) {
+            GeometryReader { geo in
+                Canvas { ctx, size in
+                    let x = labelW + clock.currentTime * project.pixelsPerSecond - scrollOffsetX
+                    guard x >= labelW, x <= size.width else { return }
+                    ctx.fill(Path(CGRect(x: x - 0.5, y: rulerH, width: 1,
+                                         height: max(0, size.height - rulerH))),
+                             with: .color(Color.accent))
+                }
+                .frame(width: geo.size.width, height: geo.size.height)
+            }
+            .allowsHitTesting(false)
+        }
         .simultaneousGesture(
             MagnificationGesture()
                 .onChanged { value in
@@ -485,6 +512,7 @@ struct TimelineView: View {
 
             // ⌘C → 复制
             if event.modifierFlags.contains(.command) && event.charactersIgnoringModifiers == "c" {
+                DiagLog.log("[复制诊断] ⌘C 被时间轴拿走 焦点=\(NSApp.keyWindow?.firstResponder.map { String(describing: type(of: $0)) } ?? "nil")")  // TMPDIAG
                 project.copySelected()
                 return nil
             }
@@ -1089,9 +1117,8 @@ struct TimelineView: View {
                             .allowsHitTesting(false)
                     }
 
-                    DraggablePlayhead(pps: project.pixelsPerSecond, fullHeight: effectiveH,
-                                      topInset: rulerH)
-                        .zIndex(10)
+                    // 播放头竖线不在这儿画了，挪到外层固定层（见 body 里的 playheadLine），
+                    // 画在滚动内容里会跟着滚：底部留白里没线，往下拉出弹性空白时还会跟刻度尺断开
 
                     if let hid = hoveredMarkerID, editingMarkerID == nil,
                        let hm = project.allMarkersAbsolute.first(where: { $0.id == hid }) {
@@ -1362,15 +1389,7 @@ struct TimelineView: View {
                     }
                     // 转场图标优先（图标在片段内部，不在边缘）
                     if let transClipID = hitTestTransitionIcon(at: v.startLocation) {
-                        project.selectedTransitionClipID = transClipID
-                        project.mediaLibraryTab = "transition"
-                        project.effectCategory = "effTransition"   // 连子标签一起切，否则停在特效那页
-                        project.selectedVideoClipID    = nil
-                        project.selectedImageClipID    = nil
-                        project.selectedAudioClipID    = nil
-                        project.selectedSubtitleClipID = nil
-                        project.selectedTextClipID     = nil
-                        project.selectedClipIDs.removeAll()
+                        project.selectTransition(transClipID, extend: NSEvent.modifierFlags.contains(.shift))
                     }
                     let isShift = NSEvent.modifierFlags.contains(.shift)
                     let hitTransition = hitTestTransitionIcon(at: v.startLocation) != nil
@@ -1623,16 +1642,7 @@ struct TimelineView: View {
 
         // 检测转场菱形图标点击（±10px 范围）
         if let transClipID = hitTestTransitionIcon(at: pt) {
-            project.selectedTransitionClipID = transClipID
-            project.mediaLibraryTab = "transition"
-                        project.effectCategory = "effTransition"   // 连子标签一起切，否则停在特效那页
-            // 清除片段选中
-            project.selectedVideoClipID = nil
-            project.selectedImageClipID = nil
-            project.selectedAudioClipID = nil
-            project.selectedSubtitleClipID = nil
-            project.selectedTextClipID = nil
-            project.selectedClipIDs.removeAll()
+            project.selectTransition(transClipID, extend: NSEvent.modifierFlags.contains(.shift))
             dragOp = .ignored
             return
         }
@@ -2042,18 +2052,22 @@ struct TimelineView: View {
                 }
             }
         case .trimVideoLeft(let id, let originStart, let originEnd, let originTrimStart, let assetDur):
+            // 时间轴上的 1 秒 = 素材里 speed 秒。trimStart 是素材秒数，换算都要带上倍速，
+            // 不然变速片段能拉出素材范围（后面一截黑屏）
+            let speed = max(0.01, project.videoTracks.flatMap(\.clips).first { $0.id == id }?.speed ?? 1)
             var ns = max(0, min(originStart + dt, originEnd - 0.1))
             // 不能左移超过素材起点
-            let minStart = originStart - originTrimStart
+            let minStart = originStart - originTrimStart / speed
             ns = max(minStart, ns)
             let (snapped, sp) = snapEdge(ns, excluding: [id])
             ns = max(minStart, snapped); activeSnapTime = sp
-            let newTrimStart = max(0, originTrimStart + (ns - originStart))
+            let newTrimStart = max(0, originTrimStart + (ns - originStart) * speed)
             project.updateVideoClip(id: id) { $0.startTime = ns; $0.trimStart = newTrimStart }
         case .trimVideoRight(let id, let originStart, let originEnd, let originTrimStart, let assetDur):
+            let speed = max(0.01, project.videoTracks.flatMap(\.clips).first { $0.id == id }?.speed ?? 1)
             var ne = max(originStart + 0.1, originEnd + dt)
-            // 不能超过素材总时长
-            let maxEnd = originStart + (assetDur - originTrimStart)
+            // 不能超过素材总时长（剩下的素材秒数按倍速折成时间轴秒数）
+            let maxEnd = originStart + (assetDur - originTrimStart) / speed
             ne = min(ne, maxEnd)
             let (snapped, sp) = snapEdge(ne, excluding: [id])
             ne = min(snapped, maxEnd); activeSnapTime = sp
@@ -2071,16 +2085,18 @@ struct TimelineView: View {
             project.updateImageClip(id: id) { $0.endTime = ne }
             if ne > clock.duration { clock.duration = ne }
         case .trimAudioLeft(let id, let originStart, let originEnd, let originTrimStart, let assetDur):
+            let speed = max(0.01, project.audioTracks.flatMap(\.clips).first { $0.id == id }?.speed ?? 1)
             var ns = max(0, min(originStart + dt, originEnd - 0.1))
-            let minStart = originStart - originTrimStart
+            let minStart = originStart - originTrimStart / speed
             ns = max(minStart, ns)
             let (snapped, sp) = snapEdge(ns, excluding: [id])
             ns = max(minStart, snapped); activeSnapTime = sp
-            let newTrimStart = max(0, originTrimStart + (ns - originStart))
+            let newTrimStart = max(0, originTrimStart + (ns - originStart) * speed)
             project.updateAudioClip(id: id) { $0.startTime = ns; $0.trimStart = newTrimStart }
         case .trimAudioRight(let id, let originStart, let originEnd, let originTrimStart, let assetDur):
+            let speed = max(0.01, project.audioTracks.flatMap(\.clips).first { $0.id == id }?.speed ?? 1)
             var ne = max(originStart + 0.1, originEnd + dt)
-            let maxEnd = originStart + (assetDur - originTrimStart)
+            let maxEnd = originStart + (assetDur - originTrimStart) / speed
             ne = min(ne, maxEnd)
             let (snapped, sp) = snapEdge(ne, excluding: [id])
             ne = min(snapped, maxEnd); activeSnapTime = sp
@@ -2210,11 +2226,15 @@ struct TimelineView: View {
             if !first { rowTop += 1 }; first = false
             rowTop += overlayH(entry)
         }
-        // 视频轨道
-        for ti in project.videoTracks.indices {
+        // 视频轨道。**按界面上的排列走**（videoSectionOrder，中间可能夹着复合片段轨），
+        // 跟片段点击判定同一套行位置。原来按 videoTracks 数组下标排，轨道拖动过顺序或
+        // 有复合轨时行对不上，点到别的轨同一竖线上会被当成点中了菱形
+        for item in resolvedVideoSection {
             if !first { rowTop += 1 }; first = false
-            let h = vidH(ti)
+            let h = videoSectionH(item)
             if pt.y >= rowTop && pt.y < rowTop + h {
+                guard item.kind == .video else { return nil }
+                let ti = item.trackIndex
                 let sorted = project.videoTracks[ti].clips.sorted { $0.startTime < $1.startTime }
                 guard sorted.count >= 2 else { return nil }
                 for idx in 1..<sorted.count {
@@ -3243,19 +3263,14 @@ struct TimelineView: View {
         let pairs = adjacentPairs(in: project.videoTracks[trackIndex])
             .filter { !isDraggingClip($0.clipID) }
         ForEach(pairs, id: \.clipID) { pair in
-            TransitionDiamond(hasTransition: pair.hasTransition, isSelected: project.selectedTransitionClipID == pair.clipID)
+            TransitionDiamond(hasTransition: pair.hasTransition,
+                              isSelected: project.selectedTransitionClipID == pair.clipID
+                                  || project.selectedTransitionClipIDs.contains(pair.clipID))
                 .offset(x: pair.cutX - 16, y: 0)
                 .zIndex(5)
                 .allowsHitTesting(true)
                 .onTapGesture {
-                    project.selectedTransitionClipID = pair.clipID
-                    project.mediaLibraryTab = "transition"
-                        project.effectCategory = "effTransition"   // 连子标签一起切，否则停在特效那页
-                    project.selectedVideoClipID    = nil
-                    project.selectedImageClipID    = nil
-                    project.selectedAudioClipID    = nil
-                    project.selectedSubtitleClipID = nil
-                    project.selectedClipIDs.removeAll()
+                    project.selectTransition(pair.clipID, extend: NSEvent.modifierFlags.contains(.shift))
                 }
                 .contextMenu {
                     Button(role: .destructive) {

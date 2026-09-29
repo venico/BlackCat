@@ -179,6 +179,10 @@ struct CompositorTrackEntry {
     var opacityRamp: (from: Float,  to: Float,  start: Double, end: Double)?
     var pushRamp:    (dx: CGFloat, dy: CGFloat, isA: Bool, start: Double, end: Double)?
     var zoomRamp:    (from: CGFloat, to: CGFloat, start: Double, end: Double)?
+    /// 旋转转场：角度（度），绕画面中心
+    var rotateRamp:  (from: CGFloat, to: CGFloat, start: Double, end: Double)?
+    /// 擦除转场：只露出从一条边扫开的那一块
+    var wipeRamp:    (type: TransitionType, start: Double, end: Double)?
 
     func effectiveOpacity(at t: Double) -> Float {
         guard let r = opacityRamp else { return 1.0 }
@@ -224,7 +228,33 @@ struct CompositorTrackEntry {
                 .translatedBy(x: -cx, y: -cy)
             result = result.concatenating(zoomT)
         }
+        // 旋转转场：以 render 中心为锚追加旋转
+        if let rr = rotateRamp {
+            let frac = CGFloat((t - rr.start) / max(rr.end - rr.start, 1e-6))
+            let c = Swift.max(0, Swift.min(1, frac))
+            let deg = rr.from + (rr.to - rr.from) * c
+            let cx = renderSize.width / 2, cy = renderSize.height / 2
+            let rotT = CGAffineTransform(translationX: cx, y: cy)
+                .rotated(by: deg * .pi / 180)
+                .translatedBy(x: -cx, y: -cy)
+            result = result.concatenating(rotT)
+        }
         return result
+    }
+
+    /// 擦除转场这一刻露出的范围（render 坐标，CIImage y 朝上）。nil = 不裁
+    func wipeRect(at t: Double, bounds: CGRect) -> CGRect? {
+        guard let w = wipeRamp else { return nil }
+        let frac = CGFloat((t - w.start) / max(w.end - w.start, 1e-6))
+        let c = Swift.max(0, Swift.min(1, frac))
+        let W = bounds.width, H = bounds.height
+        switch w.type {
+        case .wipeLeft:  return CGRect(x: W * (1 - c), y: 0, width: W * c, height: H)   // 从右往左扫
+        case .wipeRight: return CGRect(x: 0, y: 0, width: W * c, height: H)             // 从左往右扫
+        case .wipeUp:    return CGRect(x: 0, y: 0, width: W, height: H * c)             // 从下往上扫
+        case .wipeDown:  return CGRect(x: 0, y: H * (1 - c), width: W, height: H * c)   // 从上往下扫
+        default:         return nil
+        }
     }
 }
 
@@ -235,6 +265,33 @@ final class ColorCompositionData: NSObject {
     var renderSize: CGSize = .zero
     /// 滤镜轨道。**在所有画面合成完之后**统一套上去
     var filterTracks: [Track<FilterClip>] = []
+    /// 闪白转场这段用白底（默认黑底）
+    var whiteBase = false
+    /// 模糊转场：整帧模糊，切点处最糊
+    var blurRamp: (start: Double, end: Double, cut: Double)?
+    /// 特效类转场（圆形 / 百叶窗 / 复印机 / 波纹 / 翻页）：拿前后两片各自的整帧混合
+    var frameBlend: (type: TransitionType, start: Double, end: Double,
+                     trackA: CMPersistentTrackID, trackB: CMPersistentTrackID)?
+    /// 导出用。只画视频层和转场：叠加层、滤镜这些由导出的逐帧处理另画；
+    /// 预览那几样按轨道号存的临时状态（拖动偏移、实时调色）也不能套过来 —— 轨道号是两份合成各自编的
+    var forExport = false
+}
+
+/// 自带数据的合成指令。导出用它：数据跟着指令走，不经全局存储，
+/// 跟同时开着的预览（以及别的窗口）互不干扰
+final class ColorInstruction: NSObject, AVVideoCompositionInstructionProtocol {
+    let timeRange: CMTimeRange
+    let enablePostProcessing = false
+    let containsTweening = true
+    let requiredSourceTrackIDs: [NSValue]?
+    let passthroughTrackID: CMPersistentTrackID = kCMPersistentTrackID_Invalid
+    let data: ColorCompositionData
+
+    init(timeRange: CMTimeRange, trackIDs: [CMPersistentTrackID], data: ColorCompositionData) {
+        self.timeRange = timeRange
+        self.requiredSourceTrackIDs = trackIDs.isEmpty ? nil : trackIDs.map { NSNumber(value: $0) }
+        self.data = data
+    }
 }
 
 // AVMutableVideoCompositionInstruction extension（仅用于其他代码兼容）
@@ -475,9 +532,193 @@ final class ColorCompositor: NSObject, AVVideoCompositing {
 
 
 
+    /// TMPDIAG 预览计时：每次重建后第一帧画出来的时间
+    nonisolated(unsafe) static var diagFirstFrameLogged = false
+
+    /// 特效类转场：前片 → 后片，progress 0~1。预览和导出共用，两张图都得是铺满 extent 的整帧
+    static func blendTransition(_ type: TransitionType, from a: CIImage, to b: CIImage,
+                                progress: Double, extent: CGRect) -> CIImage {
+        let p = CGFloat(max(0, min(1, progress)))
+        let W = extent.width, H = extent.height
+        let center = CIVector(x: extent.midX, y: extent.midY)
+        let diag = sqrt(W * W + H * H) / 2
+        /// 白 = 露后片、黑 = 留前片的遮罩，拿它把两帧拼起来
+        func masked(_ mask: CIImage, top: CIImage, bottom: CIImage) -> CIImage {
+            top.applyingFilter("CIBlendWithMask", parameters: [
+                kCIInputBackgroundImageKey: bottom,
+                kCIInputMaskImageKey: mask.cropped(to: extent)
+            ]).cropped(to: extent)
+        }
+        func circle(radius r: CGFloat) -> CIImage {
+            CIFilter(name: "CIRadialGradient", parameters: [
+                "inputCenter": center, "inputRadius0": max(0, r - 2), "inputRadius1": r + 2,
+                "inputColor0": CIColor.white, "inputColor1": CIColor.black
+            ])?.outputImage ?? CIImage(color: .black)
+        }
+        switch type {
+        case .circleOpen:
+            return masked(circle(radius: diag * p), top: b, bottom: a)
+        case .circleClose:
+            return masked(circle(radius: diag * (1 - p)), top: a, bottom: b)
+        case .blinds:
+            // 10 条横杠，每条从自己的上沿往下长
+            let n = 10
+            let bandH = H / CGFloat(n)
+            var mask = CIImage(color: .black).cropped(to: extent)
+            for i in 0..<n {
+                let r = CGRect(x: extent.minX, y: extent.minY + CGFloat(i) * bandH + bandH * (1 - p),
+                               width: W, height: bandH * p)
+                mask = CIImage(color: .white).cropped(to: r).composited(over: mask)
+            }
+            return masked(mask, top: b, bottom: a)
+        case .copyMachine:
+            return a.applyingFilter("CICopyMachineTransition", parameters: [
+                kCIInputTargetImageKey: b, kCIInputExtentKey: CIVector(cgRect: extent),
+                kCIInputTimeKey: p, kCIInputWidthKey: W * 0.2, kCIInputAngleKey: 0,
+                "inputOpacity": 1.3, kCIInputColorKey: CIColor(red: 0.6, green: 1, blue: 0.8)
+            ]).cropped(to: extent)
+        case .ripple:
+            let shading = CIImage(color: CIColor(red: 1, green: 1, blue: 1, alpha: 0.25)).cropped(to: extent)
+            return a.applyingFilter("CIRippleTransition", parameters: [
+                kCIInputTargetImageKey: b, kCIInputShadingImageKey: shading,
+                kCIInputCenterKey: center, kCIInputExtentKey: CIVector(cgRect: extent),
+                kCIInputTimeKey: p, kCIInputWidthKey: W * 0.08, kCIInputScaleKey: 50
+            ]).cropped(to: extent)
+        case .pageCurl:
+            let shading = CIImage(color: CIColor(red: 0, green: 0, blue: 0, alpha: 0.3)).cropped(to: extent)
+            return a.applyingFilter("CIPageCurlTransition", parameters: [
+                kCIInputTargetImageKey: b, "inputBacksideImage": a, kCIInputShadingImageKey: shading,
+                kCIInputExtentKey: CIVector(cgRect: extent), kCIInputTimeKey: p,
+                kCIInputAngleKey: CGFloat.pi * 0.85, kCIInputRadiusKey: min(W, H) * 0.15
+            ]).cropped(to: extent)
+        case .glitch:
+            // 前半段是前片、后半段是后片，中间那一下最乱：横条错位 + 红蓝拉开
+            let k = 1 - abs(2 * p - 1)
+            let src = p < 0.5 ? a : b
+            // 每秒换 20 次花样，同一时刻结果固定（导出和预览一致）
+            let seed = Int(p * 20)
+            var torn = src
+            let bands = 8
+            for i in 0..<bands {
+                let r = hash01(seed &* 31 &+ i)
+                guard r > 0.45 else { continue }
+                let y = extent.minY + CGFloat(hash01(seed &* 17 &+ i &* 7)) * H
+                let h = H * (0.02 + 0.08 * CGFloat(hash01(seed &+ i &* 13)))
+                let dx = (CGFloat(hash01(seed &* 7 &+ i)) - 0.5) * W * 0.25 * k
+                let slice = src.cropped(to: CGRect(x: extent.minX, y: y, width: W, height: h))
+                    .transformed(by: CGAffineTransform(translationX: dx, y: 0))
+                torn = slice.composited(over: torn)
+            }
+            return rgbSplit(torn.cropped(to: extent), dx: W * 0.012 * k, extent: extent)
+        case .shake:
+            // 镜头猛晃：放大一点藏住边，随机偏移，中间最狠；切点前后 15% 叠化过去
+            let k = 1 - abs(2 * p - 1)
+            let mix = max(0, min(1, (p - 0.35) / 0.3))
+            let src = dissolve(from: a, to: b, mix: mix, extent: extent)
+            let seed = Int(p * 30)
+            let dx = (CGFloat(hash01(seed &* 11)) - 0.5) * W * 0.06 * k
+            let dy = (CGFloat(hash01(seed &* 23 &+ 5)) - 0.5) * H * 0.06 * k
+            let s = 1 + 0.08 * k
+            let tr = CGAffineTransform(translationX: extent.midX + dx, y: extent.midY + dy)
+                .scaledBy(x: s, y: s).translatedBy(x: -extent.midX, y: -extent.midY)
+            return src.clampedToExtent().transformed(by: tr).cropped(to: extent)
+        case .chromatic:
+            let k = 1 - abs(2 * p - 1)
+            let src = dissolve(from: a, to: b, mix: p, extent: extent)
+            return rgbSplit(src, dx: W * 0.03 * k, extent: extent)
+        case .lightLeak:
+            // 一团暖光从左扫到右，最亮的时候（中间）叠化过去
+            let k = 1 - abs(2 * p - 1)
+            let mix = max(0, min(1, (p - 0.3) / 0.4))
+            let src = dissolve(from: a, to: b, mix: mix, extent: extent)
+            let cx = extent.minX + W * (-0.2 + 1.4 * p)
+            let glow = CIFilter(name: "CIRadialGradient", parameters: [
+                "inputCenter": CIVector(x: cx, y: extent.midY + H * 0.1),
+                "inputRadius0": 0, "inputRadius1": max(W, H) * 0.75,
+                "inputColor0": CIColor(red: 1, green: 0.62, blue: 0.3, alpha: 0.95 * k),
+                "inputColor1": CIColor(red: 1, green: 0.3, blue: 0.1, alpha: 0)
+            ])?.outputImage?.cropped(to: extent) ?? CIImage.empty()
+            return glow.applyingFilter("CIScreenBlendMode", parameters: [kCIInputBackgroundImageKey: src])
+                .cropped(to: extent)
+        case .splitScreen:
+            // 后片切成三条竖条，中间那条从上、两边从下，依次错开滑进来
+            var out = a
+            for i in 0..<3 {
+                let delay = CGFloat(i) * 0.15
+                let q = max(0, min(1, (p - delay) / (1 - 0.3)))
+                let e = 1 - (1 - q) * (1 - q)          // 先快后慢
+                let dir: CGFloat = i == 1 ? 1 : -1
+                let strip = CGRect(x: extent.minX + W * CGFloat(i) / 3, y: extent.minY, width: W / 3, height: H)
+                out = b.cropped(to: strip)
+                    .transformed(by: CGAffineTransform(translationX: 0, y: dir * H * (1 - e)))
+                    .cropped(to: extent)
+                    .composited(over: out)
+            }
+            return out.cropped(to: extent)
+        default:
+            // 兜底：叠化
+            return b.applyingFilter("CIColorMatrix", parameters: [
+                "inputAVector": CIVector(x: 0, y: 0, z: 0, w: p)
+            ]).composited(over: a).cropped(to: extent)
+        }
+    }
+
+    /// 0~1 的伪随机数，同一个输入永远同一个结果（故障、抖动要预览和导出画得一模一样）
+    private static func hash01(_ n: Int) -> Double {
+        var x = UInt64(bitPattern: Int64(n)) &+ 0x9E3779B97F4A7C15
+        x = (x ^ (x >> 30)) &* 0xBF58476D1CE4E5B9
+        x = (x ^ (x >> 27)) &* 0x94D049BB133111EB
+        x = x ^ (x >> 31)
+        return Double(x % 10_000) / 10_000
+    }
+
+    /// 叠化：后片按 mix 渐显盖在前片上
+    private static func dissolve(from a: CIImage, to b: CIImage, mix: CGFloat, extent: CGRect) -> CIImage {
+        guard mix > 0.001 else { return a }
+        guard mix < 0.999 else { return b }
+        return b.applyingFilter("CIColorMatrix", parameters: [
+            "inputAVector": CIVector(x: 0, y: 0, z: 0, w: mix)
+        ]).composited(over: a).cropped(to: extent)
+    }
+
+    /// 红绿蓝三层左右拉开（红往左、蓝往右），拉开量 dx 像素
+    private static func rgbSplit(_ img: CIImage, dx: CGFloat, extent: CGRect) -> CIImage {
+        guard dx > 0.5 else { return img }
+        func channel(_ r: CGFloat, _ g: CGFloat, _ b: CGFloat) -> CIImage {
+            img.clampedToExtent().applyingFilter("CIColorMatrix", parameters: [
+                "inputRVector": CIVector(x: r, y: 0, z: 0, w: 0),
+                "inputGVector": CIVector(x: 0, y: g, z: 0, w: 0),
+                "inputBVector": CIVector(x: 0, y: 0, z: b, w: 0),
+                "inputAVector": CIVector(x: 0, y: 0, z: 0, w: 1)
+            ])
+        }
+        let red = channel(1, 0, 0).transformed(by: CGAffineTransform(translationX: -dx, y: 0))
+        let green = channel(0, 1, 0)
+        let blue = channel(0, 0, 1).transformed(by: CGAffineTransform(translationX: dx, y: 0))
+        return red.applyingFilter("CIAdditionCompositing", parameters: [kCIInputBackgroundImageKey: green])
+            .applyingFilter("CIAdditionCompositing", parameters: [kCIInputBackgroundImageKey: blue])
+            .cropped(to: extent)
+    }
+
+    /// 模糊转场的整帧模糊。预览和导出共用，半径按画面高度折算（1080 高时最糊 36）
+    static func transitionBlur(_ image: CIImage, at t: Double,
+                               ramp: (start: Double, end: Double, cut: Double),
+                               bounds: CGRect) -> CIImage {
+        let half = max(ramp.end - ramp.start, 1e-6) / 2
+        let k = max(0, 1 - abs(t - ramp.cut) / half)
+        let r = 36 * (bounds.height / 1080) * CGFloat(k)
+        guard r > 0.3 else { return image }
+        return image.clampedToExtent().applyingGaussianBlur(sigma: Double(r)).cropped(to: bounds)
+    }
+
     func startRequest(_ req: AVAsynchronousVideoCompositionRequest) {
+        if !Self.diagFirstFrameLogged {  // TMPDIAG
+            Self.diagFirstFrameLogged = true
+            DiagLog.log("[预览计时] 合成器画出第一帧 t=\(String(format: "%.2f", req.compositionTime.seconds))")
+        }
         let instrRange = req.videoCompositionInstruction.timeRange
-        guard let data = Self.getData(for: instrRange) else {
+        guard let data = (req.videoCompositionInstruction as? ColorInstruction)?.data
+                ?? Self.getData(for: instrRange) else {
             // 无自定义数据：透传第一个 source frame（自动 fit-to-output）
             if let firstIDVal = req.videoCompositionInstruction.requiredSourceTrackIDs?.first,
                let firstID   = (firstIDVal as? NSNumber)?.int32Value,
@@ -522,17 +763,21 @@ final class ColorCompositor: NSObject, AVVideoCompositing {
         let bounds = CGRect(x: 0, y: 0, width: outW, height: outH)
         let renderSize = outW > 0 && outH > 0 ? CGSize(width: outW, height: outH) : data.renderSize
 
-        var result: CIImage = CIImage(color: CIColor(red: 0, green: 0, blue: 0, alpha: 1))
+        let base: CGFloat = data.whiteBase ? 1 : 0
+        var result: CIImage = CIImage(color: CIColor(red: base, green: base, blue: base, alpha: 1))
             .cropped(to: bounds)
 
+        // 特效类转场：前后两片先各自画好整帧，循环完再一起混
+        var blendA: CIImage?
+        var blendB: CIImage?
         for var entry in data.entries {
             guard let srcBuf = req.sourceFrame(byTrackID: entry.trackID) else { continue }
 
-            if let drag = Self.getDragOffset(trackID: entry.trackID) {
+            if !data.forExport, let drag = Self.getDragOffset(trackID: entry.trackID) {
                 entry.userOffsetX = drag.x
                 entry.userOffsetY = drag.y
             }
-            if let live = Self.getLiveColorAdjust(trackID: entry.trackID) {
+            if !data.forExport, let live = Self.getLiveColorAdjust(trackID: entry.trackID) {
                 entry.colorAdjust = live
             }
 
@@ -643,17 +888,37 @@ final class ColorCompositor: NSObject, AVVideoCompositing {
                 ])
             }
 
-            // 6. 裁到 render 边界
-            ci = ci.cropped(to: bounds)
+            // 6. 裁到 render 边界（擦除转场再裁成扫开的那一块）
+            ci = ci.cropped(to: entry.wipeRect(at: t, bounds: bounds) ?? bounds)
 
             // 7. 叠加
+            if let fx = data.frameBlend, entry.trackID == fx.trackA || entry.trackID == fx.trackB {
+                if entry.trackID == fx.trackA { blendA = ci } else { blendB = ci }
+                continue
+            }
             result = ci.composited(over: result)
+        }
+        if let fx = data.frameBlend {
+            let bg = result
+            let a = (blendA ?? CIImage.empty()).composited(over: bg).cropped(to: bounds)
+            let b = (blendB ?? CIImage.empty()).composited(over: bg).cropped(to: bounds)
+            result = Self.blendTransition(fx.type, from: a, to: b,
+                                          progress: (t - fx.start) / max(fx.end - fx.start, 1e-6),
+                                          extent: bounds)
         }
 
         // 8. 滤镜：全部画面合成完之后再套，所以这段时间内谁都跑不掉。
         //    取静态存储而不是 data，跟上面那条透传路径同一个来源
-        // 8. 叠加层 + 三类效果轨道，按图层顺序一次走完（见 drawOverlays）
-        result = Self.drawOverlays(result, at: t, renderSize: bounds.size).cropped(to: bounds)
+        // 7.5 模糊转场：整帧模糊，切点处最糊，两头清楚
+        if let br = data.blurRamp {
+            result = Self.transitionBlur(result, at: t, ramp: br, bounds: bounds)
+        }
+
+        // 8. 叠加层 + 三类效果轨道，按图层顺序一次走完（见 drawOverlays）。
+        //    导出时这一步归导出的逐帧处理，这里不画
+        if !data.forExport {
+            result = Self.drawOverlays(result, at: t, renderSize: bounds.size).cropped(to: bounds)
+        }
 
         Self.sharedCtx.render(result, to: outBuf,
                               bounds: bounds,

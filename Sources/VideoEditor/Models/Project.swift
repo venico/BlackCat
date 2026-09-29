@@ -774,7 +774,54 @@ final class ProjectState: ObservableObject {
     @Published var penEditingClipID: UUID? = nil
     var penRawPoints: [(x: Double, y: Double, cInDX: Double, cInDY: Double, cOutDX: Double, cOutDY: Double, smooth: Bool)] = []
     // Transition selection
-    @Published var selectedTransitionClipID: UUID? = nil  // 当前选中的转场（clip ID，其 inTransition 被编辑）
+    @Published var selectedTransitionClipID: UUID? = nil {  // 当前选中的转场（clip ID，其 inTransition 被编辑）
+        // 清掉主选中 = 整组都不选了。各处取消选中都只置空这一个，这里顺手把组也清了
+        didSet { if selectedTransitionClipID == nil && !selectedTransitionClipIDs.isEmpty { selectedTransitionClipIDs = [] } }
+    }
+    private var lastTransitionPick: (id: UUID, at: Date)?
+    /// Shift 加选的整组转场（含主选中那个）。面板换转场、属性区改时长都对整组生效
+    @Published var selectedTransitionClipIDs: Set<UUID> = []
+
+    /// 当前选中的全部转场，主选中排第一
+    var allSelectedTransitionIDs: [UUID] {
+        guard let primary = selectedTransitionClipID else { return [] }
+        return [primary] + selectedTransitionClipIDs.subtracting([primary]).sorted { $0.uuidString < $1.uuidString }
+    }
+
+    /// 点转场菱形。extend = 按住 Shift：没选的加进来，已选的去掉
+    func selectTransition(_ id: UUID, extend: Bool) {
+        // 一次点击时间轴上可能有两处都接到（菱形自己的点击 + 轨道区的拖动手势起点）。
+        // 普通点击重复设同一个值无所谓；Shift 是「切换」，接两次就等于点了又取消 —— 防一下
+        let now = Date()
+        if extend, let last = lastTransitionPick, last.id == id, now.timeIntervalSince(last.at) < 0.3 { return }
+        lastTransitionPick = (id, now)
+        if extend, let cur = selectedTransitionClipID {
+            var set = selectedTransitionClipIDs.union([cur])
+            if set.contains(id) {
+                set.remove(id)
+                guard let next = (cur == id ? set.first : cur) else {
+                    selectedTransitionClipID = nil
+                    return
+                }
+                selectedTransitionClipID = next
+            } else {
+                set.insert(id)
+                selectedTransitionClipID = id
+            }
+            selectedTransitionClipIDs = set
+        } else {
+            selectedTransitionClipID = id
+            selectedTransitionClipIDs = [id]
+        }
+        mediaLibraryTab = "transition"
+        effectCategory = "effTransition"   // 连子标签一起切，否则停在特效那页
+        selectedVideoClipID    = nil
+        selectedImageClipID    = nil
+        selectedAudioClipID    = nil
+        selectedSubtitleClipID = nil
+        selectedTextClipID     = nil
+        selectedClipIDs.removeAll()
+    }
 
     var selectedSubtitleClip: SubtitleClip? {
         guard let id = selectedSubtitleClipID else { return nil }

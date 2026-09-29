@@ -2428,6 +2428,22 @@ private struct TransitionInspector: View {
         project.videoTracks.flatMap(\.clips).first(where: { $0.id == clipID })?.inTransition
     }
 
+    /// 要改的全部转场：Shift 多选时是整组，否则就是这一个
+    private var targetIDs: [UUID] {
+        let all = project.allSelectedTransitionIDs
+        return all.isEmpty ? [clipID] : all
+    }
+
+    /// 多选时显示「已选 N 个」，种类都一样就带上名字，不一样写「多种」
+    private func typeSummary(_ t: Transition) -> String {
+        let ids = targetIDs
+        guard ids.count > 1 else { return t.type.label }
+        let clips = project.videoTracks.flatMap(\.clips)
+        let types = Set(ids.compactMap { id in clips.first { $0.id == id }?.inTransition?.type })
+        let name = types.count == 1 ? t.type.label : "多种"
+        return "已选 \(ids.count) 个 · \(name)"
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             if let t = transition {
@@ -2436,7 +2452,7 @@ private struct TransitionInspector: View {
                         Image(systemName: "diamond.fill")
                             .font(.system(size: 10))
                             .foregroundColor(Color.accent)
-                        Text(t.type.label)
+                        Text(typeSummary(t))
                             .font(.system(size: 12, weight: .medium))
                             .foregroundColor(Color.labelPrimary)
                     }
@@ -2447,9 +2463,12 @@ private struct TransitionInspector: View {
                         value: Binding(
                             get: { t.duration },
                             set: { v in
+                                // Shift 选了好几个就一起改
                                 project.pushUndoThrottled()
-                                project.updateVideoClip(id: clipID) {
-                                    $0.inTransition?.duration = max(0.1, min(v, 2.0))
+                                for id in targetIDs {
+                                    project.updateVideoClip(id: id) {
+                                        $0.inTransition?.duration = max(0.1, min(v, 2.0))
+                                    }
                                 }
                                 project.rebuildTimelinePreviewDebounced()
                             }
