@@ -347,10 +347,7 @@ struct TimelineView: View {
         ScrollView(.vertical, showsIndicators: true) {
             HStack(alignment: .top, spacing: 0) {
                 labelColumn
-                // 外层给滚动条设的「顶上让出刻度尺高度」会顺着环境传进里面的横向滚动区，
-                // 把轨道内容整体往下推一截，跟左边标题错位。里层清零
                 clipArea
-                    .contentMargins(.top, 0)
             }
             // 底下留一截空：不然滚到底时最后一条轨道贴着底边，被横向滚动条压住
             .padding(.bottom, 24)
@@ -1146,7 +1143,10 @@ struct TimelineView: View {
                     }
                 }
                 .frame(width: totalW, alignment: .topLeading)
-                .frame(minHeight: effectiveH)
+                // **必须贴顶**。原来靠里面那条满高的播放头竖线把这层撑满，轨道行自然在顶上；
+                // 竖线挪到外层以后这层只剩轨道那么高，minHeight 默认居中，
+                // 内容比视口矮时轨道整体往下掉半截，跟左边标题错位
+                .frame(minHeight: effectiveH, alignment: .top)
                 .contentShape(Rectangle())
                 .contextMenu {
                     let selID = project.selectedVideoClipID ?? project.selectedImageClipID
