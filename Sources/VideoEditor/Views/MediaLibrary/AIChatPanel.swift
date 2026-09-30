@@ -1753,25 +1753,29 @@ HStack(spacing: 2) {
                 let pt = FileDropRouter.lastGlobalPoint
                 switch payload {
                 case .conversation(let moved):
+                    // 拖的是多选里的一条 → 整组一起搬，按列表顺序；否则只搬这一条
+                    let picked = orderedSelection
+                    let batch = (picked.count > 1 && picked.contains(moved)) ? picked : [moved]
                     if let hit = rowHitEdge(pt) {
                         if let g = service.conversationGroups.first(where: { $0.id == hit.id }) {
                             // 落在分组行上＝收进这个组
-                            service.moveConversation(moved, toGroup: g.id)
+                            for id in batch { service.moveConversation(id, toGroup: g.id) }
                         } else if let conv = service.history.first(where: { $0.id == hit.id }),
-                                  conv.id != moved {
+                                  !batch.contains(conv.id) {
                             // 落在某条会话上：上半插它前面、**下半插它后面**，
                             // 并跟着它进同一个组
                             var ids = service.conversations(inGroup: conv.groupID).map(\.id)
-                            ids.removeAll { $0 == moved }
+                            ids.removeAll { batch.contains($0) }
                             if let at = ids.firstIndex(of: conv.id) {
-                                ids.insert(moved, at: hit.after ? at + 1 : at)
-                            } else { ids.append(moved) }
+                                ids.insert(contentsOf: batch, at: hit.after ? at + 1 : at)
+                            } else { ids.append(contentsOf: batch) }
                             service.reorderConversations(ids, inGroup: conv.groupID)
                         }
                     } else {
                         // 落在空白处＝移出分组，回到最下面那堆
-                        service.moveConversation(moved, toGroup: nil)
+                        for id in batch { service.moveConversation(id, toGroup: nil) }
                     }
+                    if batch.count > 1 { selectedConvIDs.removeAll() }
                 case .conversationGroup(let moved):
                     guard let target = groupDropTarget(pt, moved: moved) else { return }
                     var ids = service.sortedGroups.map(\.id)
@@ -3895,10 +3899,6 @@ struct SelectableMarkdownView: NSViewRepresentable {
 /// 只为了改右键菜单而存在的子类。
 /// 回复区（只读）和输入框（可编辑）共用同一套菜单规则，区别只在剪切要不要留
 class ChatTextView: NSTextView, NSMenuDelegate {
-    override func copy(_ sender: Any?) {  // TMPDIAG
-        DiagLog.log("[复制诊断] 气泡 copy 选中 \(selectedRange().length) 字 可编辑=\(isEditable)")
-        super.copy(sender)
-    }
     var onAddSubtitle: ((String) -> Void)?
     var onAddTitle: ((String) -> Void)?
     /// 输入框要留着剪切，只读的回复区不留

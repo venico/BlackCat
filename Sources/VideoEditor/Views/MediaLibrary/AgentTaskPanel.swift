@@ -224,9 +224,10 @@ struct AgentTaskEntry: View {
     private func subtitle(_ item: AgentBackgroundTasks.Item) -> String {
         switch item.state {
         case .running:
-            return "\(item.kind.rawValue) · 已经 \(Int(Date().timeIntervalSince(item.startedAt))) 秒"
+            return "\(item.displayKind) · 已经 \(Int(Date().timeIntervalSince(item.startedAt))) 秒"
         case .done:
-            return "\(item.kind.rawValue) · 已完成，素材已进库"
+            return item.resultText.map { "\(item.displayKind) · " + String($0.prefix(40)) }
+                ?? "\(item.kind.rawValue) · 已完成，素材已进库"
         case .failed(let m):
             return String(m.prefix(40))
         case .needsConfirm(let reason, _):

@@ -1428,6 +1428,7 @@ extension ProjectState {
                 newClip.rotation = clip.rotation; newClip.opacity = clip.opacity
                 newClip.posX = clip.posX; newClip.posY = clip.posY
                 newClip.animation = clip.animation
+                newClip.animationDuration = clip.animationDuration
                 let idx = textTracks.indices.contains(trackIdx) ? trackIdx : 0
                 if textTracks.indices.contains(idx) {
                     let hasOverlap = textTracks[idx].clips.contains {

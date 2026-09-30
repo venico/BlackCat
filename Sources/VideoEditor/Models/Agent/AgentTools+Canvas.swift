@@ -124,7 +124,8 @@ extension AgentToolbox {
                                                    + "会自动连好线再开跑。「照着某张图改」就填它"],
                         "model": ["type": "string",
                                   "description": "用哪家模型生成，比如 seedream、image2、nanobanana。"
-                                               + "不填就用设置里选的那家"]
+                                               + "不填就用设置里选的那家"],
+                        "then": Self.followUpParam
                     ] as [String: Any],
                     "required": ["node_id"]
                 ],
@@ -265,6 +266,7 @@ extension AgentToolbox {
                 return .fail("这张卡片没有提示词，先用 update_canvas_node 填上 prompt。")
             }
             guard !node.isGenerating else { return .fail("这张卡片正在生成，等它跑完。") }
+            if let no = Self.followUpRejection(args) { return no }
             // 点名了就用它那家。画布卡片本来就能换模型（界面上卡片底下那排下拉），
             // 工具不暴露的话只能一直用默认那家
             let category = node.kind.providerCategory
@@ -292,11 +294,20 @@ extension AgentToolbox {
                                                 canvas?.cancelGeneration(nodeID: node.id)
                                             })
             canvas.submitGeneration(nodeID: node.id, provider: provider)
+            let then = (args["then"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            if !then.isEmpty {
+                AgentBackgroundTasks.shared.attachFollowUp(
+                    instruction: then, taskIDs: [node.id],
+                    labels: [node.id: "画布卡片 id \(shortID(node.id))"],
+                    project: p, mode: AppSettings.shared.agentMode)
+            }
             let refNote = linked.isEmpty
                 ? (canvas.upstreamNodes(of: node.id).isEmpty
                    ? "（没有参考素材，这是纯文字生图）" : "")
                 : "（参考：\(linked.joined(separator: "、"))）"
-            return .ok("已经让它开跑了\(refNote)，用的是 \(provider.displayName)，后台生成。跑完我会在这儿说一声。")
+            let thenNote = then.isEmpty ? "跑完我会在这儿说一声。"
+                : "跑完会自动起后台助手接着「\(then)」，这一轮不用等，也别让用户等好了再叫你。"
+            return .ok("已经让它开跑了\(refNote)，用的是 \(provider.displayName)，后台生成。\(thenNote)")
 
         case "delete_canvas_node":
             guard let node = resolveNode(args["node_id"], canvas) else { return nodeNotFound(args["node_id"]) }

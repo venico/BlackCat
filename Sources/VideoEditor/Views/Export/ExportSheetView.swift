@@ -90,7 +90,11 @@ final class ExportManager: ObservableObject {
         DispatchQueue.main.asyncAfter(deadline: .now() + 5, execute: item)
     }
 
-    func startExport(snapshot: ExportInput, owner: WindowID?) {
+    /// 这个导出还在跑没有。Agent 盯着它等导完
+    func isExporting(_ id: UUID) -> Bool { exportTasks[id] != nil }
+
+    @discardableResult
+    func startExport(snapshot: ExportInput, owner: WindowID?) -> UUID {
         let job = Job(owner: owner,
                       filename: snapshot.outputURL.lastPathComponent,
                       outputURL: snapshot.outputURL)
@@ -134,6 +138,7 @@ final class ExportManager: ObservableObject {
             }
         }
         exportTasks[jobID] = task
+        return jobID
     }
 }
 

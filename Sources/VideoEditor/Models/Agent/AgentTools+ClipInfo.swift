@@ -134,7 +134,8 @@ extension AgentToolbox {
                 "背景：background_color \(c.bgColor.toHex())、background_opacity \(n(c.bgOpacity))",
                 c.strokeWidth > 0 ? "描边：stroke_color \(c.strokeColor.toHex())、stroke_width \(n(c.strokeWidth))、stroke_softness \(n(c.strokeSoftness))" : "描边：无",
                 "位置：x \(pct(c.posX))%、y \(pct(c.posY))%，旋转：rotation \(n(c.rotation))°，不透明度：opacity \(n(c.opacity))",
-                "入场动画：animation \(c.animation.rawValue)（\(c.animation.label)）",
+                "入场动画：animation \(c.animation.rawValue)（\(c.animation.label)）"
+                    + (c.animation == .none ? "" : "，animation_duration \(n(c.entranceLength)) 秒"),
                 "文本框：" + (c.boxWidth.map { "box_width \(n($0, 0))" } ?? "宽自适应") + "、"
                     + (c.boxHeight.map { "box_height \(n($0, 0))" } ?? "高自适应"),
                 cropLine(c.cropTop, c.cropBottom, c.cropLeft, c.cropRight),

@@ -127,6 +127,8 @@ struct TimelineView: View {
     @Environment(\.windowID) private var windowID
     private let labelW: CGFloat = 84
     private let rulerH: CGFloat = 26
+    /// 轨道内容底下给横向滚动条留的空（跟滚动条可点高度 22 差不多）
+    private static let scrollBarRoom: CGFloat = 24
 
     // 可拖动轨道高度
     @State private var imageTrackHeights: [Int: CGFloat] = [:]
@@ -349,8 +351,6 @@ struct TimelineView: View {
                 labelColumn
                 clipArea
             }
-            // 底下留一截空：不然滚到底时最后一条轨道贴着底边，被横向滚动条压住
-            .padding(.bottom, 24)
             .background(GeometryReader { g in
                 Color.clear.preference(key: VScrollOffsetKey.self,
                                        value: g.frame(in: .named("tlVScroll")).minY)
@@ -390,6 +390,28 @@ struct TimelineView: View {
                 .frame(width: geo.size.width, height: geo.size.height)
             }
             .allowsHitTesting(false)
+        }
+        // 横向滚动条：固定贴在轨道区底边，不跟竖向滚动走。
+        // 原来放在滚动内容里，内容比视口高时它落在内容底部，滚到底才贴边
+        .overlay(alignment: .bottomLeading) {
+            if scrollViewportFraction < 1 {
+                GeometryReader { geo in
+                    TimelineScrollBar(
+                        fraction: scrollFraction,
+                        viewportFraction: scrollViewportFraction,
+                        isVisible: scrollBarHovered,
+                        isScrolling: scrollBarScrolling,
+                        onDrag: { newFrac in
+                            guard let sv = project.timelineHScrollView, let doc = sv.documentView else { return }
+                            let maxX = doc.frame.width - sv.contentView.bounds.width
+                            sv.contentView.scroll(to: NSPoint(x: max(0, newFrac * maxX), y: 0))
+                            sv.reflectScrolledClipView(sv.contentView)
+                        }
+                    )
+                    .frame(width: max(geo.size.width - labelW, 0))
+                    .offset(x: labelW, y: geo.size.height - 22)
+                }
+            }
         }
         .simultaneousGesture(
             MagnificationGesture()
@@ -512,7 +534,6 @@ struct TimelineView: View {
 
             // ⌘C → 复制
             if event.modifierFlags.contains(.command) && event.charactersIgnoringModifiers == "c" {
-                DiagLog.log("[复制诊断] ⌘C 被时间轴拿走 焦点=\(NSApp.keyWindow?.firstResponder.map { String(describing: type(of: $0)) } ?? "nil")")  // TMPDIAG
                 project.copySelected()
                 return nil
             }
@@ -1059,8 +1080,10 @@ struct TimelineView: View {
             // 「视口 / 内容宽」，余量太小它就短不下来
             let contentW = project.timelineContentWidth(viewportWidth: visibleW)
             let totalW = max(contentW, max(visibleW, 800))
-            let effectiveH = max(totalContentH(), viewportH)
-            ZStack(alignment: .bottom) {
+            // 内容底下多留一截（scrollBarRoom）：滚到底时最后一条轨道不被横向滚动条压住。
+            // 算进 effectiveH 而不是外面加 padding —— 加 padding 的话内容比视口矮时
+            // 也凭空多出这一截，能往下滚
+            let effectiveH = max(totalContentH() + Self.scrollBarRoom, viewportH)
             ScrollView(.horizontal, showsIndicators: false) {
                 ZStack(alignment: .topLeading) {
                     TimelineScrollViewFinder(project: project, onScroll: { frac, vpFrac, offX in
@@ -1254,8 +1277,9 @@ struct TimelineView: View {
                     case .active(let loc):
                         // 24 必须 ≤ TimelineScrollBar.hitH(22) 对应的实际可点范围，
                         // 否则最下面那几 pt 是"看得见滚动条、却拖不动"的死区。
-                        // 这里取 22 跟它对齐
-                        scrollBarHovered = loc.y > effectiveH - 22
+                        // 这里取 22 跟它对齐。滚动条固定在视口底边，loc 是内容坐标，
+                        // 要减掉竖向滚动量换成视口里的位置
+                        scrollBarHovered = loc.y - vScrollOffset > viewportH - 22
                         let hoverTime = loc.x / project.pixelsPerSecond
                         if loc.y >= rulerH, let hm = project.allMarkersAbsolute.first(where: {
                             abs($0.absoluteTime - hoverTime) * project.pixelsPerSecond < 6
@@ -1302,24 +1326,6 @@ struct TimelineView: View {
                         .onDisappear { FileDropRouter.unregister(windowID, kind: .timeline) }
                 })
             }
-
-
-            // 自定义水平滚动条
-            if scrollViewportFraction < 1 {
-                TimelineScrollBar(
-                    fraction: scrollFraction,
-                    viewportFraction: scrollViewportFraction,
-                    isVisible: scrollBarHovered,
-                    isScrolling: scrollBarScrolling,
-                    onDrag: { newFrac in
-                        guard let sv = project.timelineHScrollView, let doc = sv.documentView else { return }
-                        let maxX = doc.frame.width - sv.contentView.bounds.width
-                        sv.contentView.scroll(to: NSPoint(x: max(0, newFrac * maxX), y: 0))
-                        sv.reflectScrolledClipView(sv.contentView)
-                    }
-                )
-            }
-            } // ZStack
         }
     }
 

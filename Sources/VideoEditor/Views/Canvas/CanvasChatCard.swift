@@ -38,7 +38,6 @@ struct CanvasChatCard: View {
     @AppStorage("canvas.chatCard.minimized") private var minimized = false
     /// 进画布前外边停在哪条会话。画布用的是它自己那条，
     /// 关掉画布得把外边那条还回去 —— 两边的聊天记录各存各的
-    @State private var outsideConversationID: UUID?
 
     private static let minW: CGFloat = 260
     private static let minH: CGFloat = 240
@@ -142,7 +141,6 @@ struct CanvasChatCard: View {
 
     /// 画布聊天记录存在这张画布自己的会话里，跟侧栏那条分开
     private func enterCanvasConversation() {
-        outsideConversationID = service.currentConversationId
         if let id = project.canvas.conversationID {
             if service.currentConversationId != id { service.loadConversation(id) }
         } else {
@@ -151,10 +149,18 @@ struct CanvasChatCard: View {
         }
     }
 
+    /// 关画布：侧栏回到进画布前那条普通聊天；外面原本是空白新对话就回到空白。
+    /// 原来是卡片出现时才记「外面是哪条」，那时当前会话已经切成画布自己了，
+    /// 关掉画布侧栏就留在画布的聊天记录上
     private func leaveCanvasConversation() {
-        guard let back = outsideConversationID,
-              back != service.currentConversationId else { return }
-        service.loadConversation(back)
+        guard let cur = service.currentConversationId,
+              service.history.first(where: { $0.id == cur })?.isCanvas == true else { return }
+        if let back = service.lastChatConversationID,
+           service.history.contains(where: { $0.id == back }) {
+            service.loadConversation(back)
+        } else {
+            service.clearHistory()
+        }
     }
 
     /// 收起后的圆球。点一下展开，按住能拖着走。

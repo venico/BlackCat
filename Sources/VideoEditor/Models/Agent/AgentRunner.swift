@@ -317,12 +317,86 @@ final class AgentRunner: ObservableObject {
         history = msgs
     }
 
+    // MARK: - 后台接着做
+
+    /// 生成任务挂的「做完之后接着做」，由 AgentBackgroundTasks 在生成了结后调。
+    ///
+    /// 跟 `run` 的区别：不占会话界面（不写 states，用户该聊别的照聊），
+    /// 上下文只有「生成出了什么 + 要接着做什么」这一句，不带会话历史；
+    /// **危险工具一律不给**（生成、删除这类）—— 后台没人看着，
+    /// 不能让它自己接着花钱，链也就不会自己往下长
+    func runFollowUp(prompt: String, mode: AgentMode, project: ProjectState,
+                     convID: UUID) async -> (text: String, ok: Bool) {
+        AgentToolGate.shared.activate(matching: prompt)
+        // 系统提示词和工具表**跟主会话一字不差**：这两样是缓存前缀，对上了就直接命中，
+        // 另拼一份的话每次都从头算，后台助手的请求明显比主会话慢。
+        // 「你是后台助手」这些交代放进用户消息里；危险工具照样挂着，执行时挡（见 execute）
+        let system = Self.systemPrompt(mode: mode, inCanvas: project.showCanvas)
+                   + AgentMemory.shared.promptSection
+                   + AgentSkills.shared.promptSection
+                   + AgentMCP.shared.promptSection
+                   + AgentToolGate.shared.promptSection(inCanvas: project.showCanvas)
+        let brief = """
+            （这条是系统发的，不是用户说的）你现在是后台助手：用户之前交代的事，前半截在后台刚做完，\
+            你来把后半截做完。用户这会儿不一定在看，不要反问，按最合理的理解直接做。
+            只做交代的这件事。不能生成、配音、导出、删除 —— 真要用到这些，就停下来，在汇报里说清需要用户决定什么。
+            做完用一两句话汇报：做了什么、放在哪（哪条时间线、第几秒）。
+
+            """
+        var msgs: [AgentMessage] = [.user(brief + prompt, images: [])]
+        // 整件事一个撤销点，⌘Z 一次撤回。主会话这会儿也在跑的话它已经关了快照，
+        // 这边的改动就并进它那一步，别去动那个开关
+        let ownsUndo = !project.suppressUndoPush
+        if ownsUndo { project.pushUndo(); project.suppressUndoPush = true }
+        defer { if ownsUndo { project.suppressUndoPush = false } }
+
+        // 生成一跑就是几分钟，池子里的连接这期间可能已经被对端悄悄断掉，
+        // 直接复用会干等 60 秒才超时（实测）。开跑前换新连接
+        await AgentLLM.freshConnection()
+
+        var finalText = ""
+        do {
+            for _ in 0..<min(maxSteps, 20) {
+                if Task.isCancelled { return ("已取消", false) }
+                let tools = AgentToolGate.shared.tools(mode: mode, inCanvas: project.showCanvas)
+                    + (mode == .plan ? [] : AgentToolbox.mcpGateTool + AgentToolbox.mcpTools)
+                let turn = try await AgentLLM.send(messages: msgs.compactedForSending(),
+                                                   tools: tools, systemPrompt: system,
+                                                   webSearch: false)
+                if !turn.text.isEmpty { finalText = turn.text }
+                guard !turn.toolCalls.isEmpty else {
+                    return (finalText.isEmpty ? "做完了。" : finalText, true)
+                }
+                msgs.append(.assistant(text: turn.text, calls: turn.toolCalls))
+                for call in turn.toolCalls {
+                    if Task.isCancelled { return ("已取消", false) }
+                    let result = await execute(call, mode: mode, project: project,
+                                               convID: convID, background: true)
+                    let toModel = result.text.count > 3000
+                        ? String(result.text.prefix(3000)) + "\n……（结果太长，截掉了）"
+                        : result.text
+                    msgs.append(.toolResult(callID: call.id, name: call.name,
+                                            text: toModel, imageData: result.imageData))
+                }
+            }
+        } catch {
+            return (error.isUserCancellation ? "已取消" : "出错了：\(error.localizedDescription)", false)
+        }
+        DiagLog.log("[Agent] 后台接着做：步数用尽，未完成")
+        return ((finalText.isEmpty ? "" : finalText + "\n") + "步数用完了，没做完。", false)
+    }
+
     // MARK: - 单个工具
 
     private func execute(_ call: AgentToolCall, mode: AgentMode,
-                         project: ProjectState, convID: UUID) async -> AgentToolResult {
+                         project: ProjectState, convID: UUID,
+                         background: Bool = false) async -> AgentToolResult {
         guard let spec = AgentToolbox.allSpecs.first(where: { $0.name == call.name }) else {
             return .fail("没有叫 \(call.name) 的工具。")
+        }
+        // 后台助手的工具表里本来就没有危险工具，模型硬调（照历史名字猜）也在这儿挡住
+        if background && spec.risk == .dangerous {
+            return .fail("后台助手不能做这一步（生成、删除这类）。停下来，在汇报里说清需要用户决定什么。")
         }
         // 模式先拦一道
         if let reason = mode.rejection(for: spec.risk) { return .fail(reason) }

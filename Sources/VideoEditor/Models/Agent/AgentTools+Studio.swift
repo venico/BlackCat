@@ -61,7 +61,8 @@ extension AgentToolbox {
                         "language": ["type": "string",
                                      "description": "目标语言，比如「英语」「日语」「中文（简体）」。不传用设置里的"],
                         "clip_ids": ["type": "array", "items": ["type": "string"],
-                                     "description": "只翻这几条字幕（id 前 8 位就行）。给了就不用 track_index，按它们所在的轨"]
+                                     "description": "只翻这几条字幕（id 前 8 位就行）。给了就不用 track_index，按它们所在的轨"],
+                        "then": Self.followUpParam
                     ] as [String: Any],
                     "required": [] as [String]
                 ],
@@ -76,7 +77,8 @@ extension AgentToolbox {
                 parameters: [
                     "type": "object",
                     "properties": [
-                        "track_index": ["type": "integer", "description": "第几条字幕轨，不传就用第一条"]
+                        "track_index": ["type": "integer", "description": "第几条字幕轨，不传就用第一条"],
+                        "then": Self.followUpParam
                     ] as [String: Any],
                     "required": [] as [String]
                 ],
@@ -93,7 +95,8 @@ extension AgentToolbox {
                     "type": "object",
                     "properties": [
                         "clip_id": ["type": "string"],
-                        "scale": ["type": "integer", "description": "放大倍数，2 或 4，默认 2"]
+                        "scale": ["type": "integer", "description": "放大倍数，2 或 4，默认 2"],
+                        "then": Self.followUpParam
                     ] as [String: Any],
                     "required": ["clip_id"]
                 ],
@@ -107,7 +110,8 @@ extension AgentToolbox {
                 """,
                 parameters: [
                     "type": "object",
-                    "properties": ["clip_id": ["type": "string"]] as [String: Any],
+                    "properties": ["clip_id": ["type": "string"],
+                                   "then": Self.followUpParam] as [String: Any],
                     "required": ["clip_id"]
                 ],
                 risk: .mutating),
@@ -119,7 +123,8 @@ extension AgentToolbox {
                 """,
                 parameters: [
                     "type": "object",
-                    "properties": ["clip_id": ["type": "string"]] as [String: Any],
+                    "properties": ["clip_id": ["type": "string"],
+                                   "then": Self.followUpParam] as [String: Any],
                     "required": ["clip_id"]
                 ],
                 risk: .mutating),
@@ -133,7 +138,8 @@ extension AgentToolbox {
                 """,
                 parameters: [
                     "type": "object",
-                    "properties": ["clip_id": ["type": "string"]] as [String: Any],
+                    "properties": ["clip_id": ["type": "string"],
+                                   "then": Self.followUpParam] as [String: Any],
                     "required": [] as [String]
                 ],
                 risk: .dangerous),
@@ -260,6 +266,8 @@ extension AgentToolbox {
         guard !originals.isEmpty else { return .fail("那条字幕轨是空的。") }
         let lang = (args["language"] as? String) ?? p.translationTargetLang
 
+        // 挂不上「接着做」就别动手 —— 下面一开始就要往时间线上插一条占位轨
+        if let no = Self.followUpRejection(args) { return no }
         var newTrack = Track<SubtitleClip>(label: "翻译·\(lang)")
         newTrack.subtitleStyle = p.subtitleTracks[idx].subtitleStyle
         // 先占位，翻完再逐条填回去 —— 不然界面上会先空一段
@@ -271,7 +279,9 @@ extension AgentToolbox {
         let trackID = newTrack.id
         let texts = originals.map(\.text)
 
+        let running = RunFlag()
         Task { @MainActor in
+            defer { running.on = false }
             let out = await Translator.translateConcurrent(texts, to: lang)
             guard let ti = p.subtitleTracks.firstIndex(where: { $0.id == trackID }) else { return }
             for (i, s) in out.enumerated() where p.subtitleTracks[ti].clips.indices.contains(i) {
@@ -282,10 +292,12 @@ extension AgentToolbox {
             p.showSuccessToast(icon: "checkmark.circle.fill", iconColor: .green,
                                title: "翻译完成", subtitle: "\(out.count) 条 → \(lang)", autoCountdown: true)
         }
-        return .ok("""
-            已经开始翻译 \(originals.count) 条字幕到\(lang)，结果放在新轨道「翻译·\(lang)」里。
-            后台跑，完事会有提示，不用在这儿等。
-            """)
+        return Self.runInBackground(
+            args, title: "翻译字幕到\(lang)", label: "翻译字幕", project: p,
+            checkIdle: false, busy: { running.on },
+            outcome: { (true, "\(originals.count) 条字幕翻成了\(lang)，在新字幕轨「翻译·\(lang)」") },
+            start: {},
+            started: "已经开始翻译 \(originals.count) 条字幕到\(lang)，结果放在新轨道「翻译·\(lang)」里。")
     }
 
     @MainActor
@@ -296,14 +308,16 @@ extension AgentToolbox {
         }
         let clips = p.subtitleTracks[idx].clips
         guard !clips.isEmpty else { return .fail("那条字幕轨是空的。") }
-        // 底层认的是「选中的字幕」，先全选上
-        p.selectedClipIDs = Set(clips.map(\.id))
-        p.selectedSubtitleClipID = clips.first?.id
-        p.convertSelectedSubtitlesToSpeech()
-        return .ok("""
-            已经开始给 \(clips.count) 条字幕配音，做完会成为一条新的音频轨。
-            后台跑的，进度在右下角。
-            """)
+        return Self.runInBackground(
+            args, title: "字幕配音", label: "字幕配音", project: p,
+            busy: { p.isGeneratingSpeech }, cancel: { p.cancelSpeechGeneration() },
+            start: {
+                // 底层认的是「选中的字幕」，先全选上
+                p.selectedClipIDs = Set(clips.map(\.id))
+                p.selectedSubtitleClipID = clips.first?.id
+                p.convertSelectedSubtitlesToSpeech()
+            },
+            started: "已经开始给 \(clips.count) 条字幕配音，做完会成为一条新的音频轨。")
     }
 
     @MainActor
@@ -311,23 +325,27 @@ extension AgentToolbox {
         let sel = selectVideo(p, key: args["clip_id"] as? String)
         guard sel.ok else { return .fail("找不到那条视频片段，先 list_tracks 看看。") }
         let scale: ProjectState.ClarityScale = ((args["scale"] as? Int) ?? 2) >= 4 ? .x4 : .x2
-        p.enhanceClaritySelection(scale: scale)
-        return .ok("""
-            已经开始给「\(sel.name)」做 \(scale.rawValue) 倍清晰度提升。
-            **这个很慢**，按素材时长算可能要几十分钟，后台跑，进度在右下角。
-            做完会多出一条新素材和新轨道，原片不动。
-            """)
+        return Self.runInBackground(
+            args, title: "清晰度提升「\(sel.name)」", label: "清晰度提升", project: p,
+            // 状态位要等它内部的 Task 跑起来才变，看 Task 句柄才准
+            busy: { p.clarityEnhanceTask != nil }, cancel: { p.cancelClarityEnhance() },
+            start: { p.enhanceClaritySelection(scale: scale) },
+            started: """
+                已经开始给「\(sel.name)」做 \(scale.rawValue) 倍清晰度提升。
+                **这个很慢**，按素材时长算可能要几十分钟。做完会多出一条新素材和新轨道，原片不动。
+                """)
     }
 
     @MainActor
     private static func separateAudio(_ p: ProjectState, args: [String: Any]) -> AgentToolResult {
         let sel = selectVideo(p, key: args["clip_id"] as? String)
         guard sel.ok else { return .fail("找不到那条片段，先 list_tracks 看看。") }
-        p.removeBackgroundMusicForSelection()
-        return .ok("""
-            已经开始分离「\(sel.name)」的声音，人声和伴奏会各成一条音频轨。
-            耗时约素材时长的 3 倍，后台跑。
-            """)
+        // 分离的状态位在它内部的 Task 里才立起来，看 separateTask 才准
+        return Self.runInBackground(
+            args, title: "分离声音「\(sel.name)」", label: "分离人声", project: p,
+            busy: { p.separateTask != nil }, cancel: { p.cancelSeparate() },
+            start: { p.removeBackgroundMusicForSelection() },
+            started: "已经开始分离「\(sel.name)」的声音，人声和伴奏会各成一条音频轨，耗时约素材时长的 3 倍。")
     }
 
     @MainActor
@@ -337,8 +355,11 @@ extension AgentToolbox {
         guard SceneDetector.isInstalled else {
             return .fail("场景检测组件还没装。让用户到设置 → AI 剪辑里装一下，再来找我。")
         }
-        p.sceneDetectSelectedClip()
-        return .ok("已经开始检测「\(sel.name)」的镜头切换点，找完会按点切开。进度在右下角。")
+        return Self.runInBackground(
+            args, title: "场景切分「\(sel.name)」", label: "场景切分", project: p,
+            busy: { p.isDetectingScenes }, cancel: { p.cancelSceneDetect() },
+            start: { p.sceneDetectSelectedClip() },
+            started: "已经开始检测「\(sel.name)」的镜头切换点，找完会按点切开。")
     }
 
     @MainActor
@@ -348,11 +369,11 @@ extension AgentToolbox {
         guard !AppSettings.shared.llmAPIKey.isEmpty else {
             return .fail("「AI 剪辑」还没配 API Key，让用户去设置 → AI 设置里填一个。")
         }
-        p.llmAnalyzeSelectedClip()
-        return .ok("""
-            已经开始分析「\(sel.name)」：先做语音识别，再让大模型挑精彩片段，
-            挑完会生成一条「精彩片段」轨道。后台跑，进度在右下角。
-            """)
+        return Self.runInBackground(
+            args, title: "挑精彩片段「\(sel.name)」", label: "挑精彩片段", project: p,
+            busy: { p.isLLMAnalyzing }, cancel: { p.cancelLLMAnalyze() },
+            start: { p.llmAnalyzeSelectedClip() },
+            started: "已经开始分析「\(sel.name)」：先做语音识别，再让大模型挑精彩片段，挑完会生成一条「精彩片段」轨道。")
     }
 }
 
@@ -568,3 +589,6 @@ extension AgentToolbox {
         }
     }
 }
+
+/// 后台 Task 还在不在跑。给「没有现成状态位」的活儿（翻译字幕、画布超分）用
+final class RunFlag { var on = true }

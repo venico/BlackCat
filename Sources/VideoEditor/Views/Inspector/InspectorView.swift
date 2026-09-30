@@ -1223,6 +1223,8 @@ private struct TextInspector: View {
     @State private var opacity: Double = 1
     @State private var animation: TextAnimation = .none
     @State private var syncing = false
+    /// 面板最近一次写进去的片段，用来认出「自己写入引起的回流」
+    @State private var lastWritten: TextClip? = nil
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -1351,22 +1353,30 @@ private struct TextInspector: View {
             ISection(title: "入场动画") {
                 IPicker(selection: $animation, options: TextAnimation.allCases.map { ($0, $0.label) })
                     .onChange(of: animation) { _ in write { $0.animation = animation } }
+                if animation != .none {
+                    // 没调过就显示默认值（打字机的默认跟字数走）；一拖就记成这条自己的时长
+                    ISlider(label: "动画时长",
+                            value: Binding(get: { clip.entranceLength },
+                                           set: { v in write { $0.animationDuration = v } }),
+                            range: 0.1...3, unit: "s", decimals: 1)
+                }
             }
 
         }
         .onAppear { syncAll() }
         .onChange(of: clip.id) { _ in syncAll() }
         // 只认 id 变化不够：应用文字模板改的是**同一个片段**的内容，id 没变，
-        // 面板就一直显示旧值。这里监听整个 clip —— 自己写入引起的回流由
-        // syncing 标志挡住（write 里 guard !syncing）
-        // 只认 id 变化不够：应用文字模板改的是**同一个片段**的内容，id 没变，
         // 面板就一直显示旧值。
         //
         // 必须用闭包参数里的新值 —— 闭包里的 `clip` 是视图**本次求值时**的旧快照，
         // 拿它去 syncAll 等于把旧值原样写回（实测：模板已把字号改成 32，
-        // 这里读到的仍是 64）。自己写入引起的回流由 syncing 标志挡住
+        // 这里读到的仍是 64）。
+        //
+        // 面板自己写进去的那一版不回流：原来每写一次都 syncAll 一遍，syncing 要到
+        // 下一轮才放开，拖取色器 / 滑块时紧跟着的那几下写入被 write 的 guard 吞掉，
+        // 面板显示 0% 而片段里还是 7%（拖一下播放头面板重同步才露馅）
         .onChange(of: clip) { newClip in
-            guard !syncing else { return }
+            guard !syncing, newClip != lastWritten else { return }
             syncAll(from: newClip)
         }
     }
@@ -1374,6 +1384,7 @@ private struct TextInspector: View {
     private func write(_ mutate: (inout TextClip) -> Void) {
         guard !syncing else { return }
         project.updateTextClip(id: clip.id, mutate)
+        lastWritten = project.textTracks.lazy.flatMap(\.clips).first { $0.id == clip.id }
         project.pushUndoThrottled()
     }
     /// 把片段的值同步进面板。

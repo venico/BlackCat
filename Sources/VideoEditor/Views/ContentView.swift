@@ -96,7 +96,6 @@ struct ContentView: View {
                     // 刚在聊天气泡里选了文字（点、双击、拖选）就别清焦点：
                     // 清掉之后 ⌘C 落不到气泡上，反被时间轴当成「复制片段」吃掉
                     let fr = NSApp.keyWindow?.firstResponder
-                    DiagLog.log("[复制诊断] 侧栏点击 焦点=\(fr.map { String(describing: type(of: $0)) } ?? "nil")")  // TMPDIAG
                     if let tv = fr as? NSTextView, !tv.isEditable { return }
                     NSApp.keyWindow?.makeFirstResponder(nil)
                 })

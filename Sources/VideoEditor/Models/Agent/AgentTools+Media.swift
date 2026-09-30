@@ -34,7 +34,8 @@ extension AgentToolbox {
                         "content": ["type": "string", "enum": ["video", "audio", "subtitle"]],
                         "resolution": ["type": "string", "enum": ExportSettings.resolutions],
                         "fps": ["type": "integer", "enum": ExportSettings.fpsOptions],
-                        "bitrate": ["type": "integer", "description": "码率 kbps。参考：2000 低、5000 标准、12000 高、30000 极高"]
+                        "bitrate": ["type": "integer", "description": "码率 kbps。参考：2000 低、5000 标准、12000 高、30000 极高"],
+                        "then": Self.followUpParam
                     ] as [String: Any],
                     "required": [] as [String]
                 ],
@@ -54,7 +55,8 @@ extension AgentToolbox {
                         "clip_id": ["type": "string",
                                     "description": "要识别哪条片段（list_tracks 给的 id，前 8 位就够）。不传就识别第一条视频"],
                         "proofread": ["type": "boolean",
-                                      "description": "识别完顺带让大模型校对一遍（修错别字、合并碎句）。默认 false"]
+                                      "description": "识别完顺带让大模型校对一遍（修错别字、合并碎句）。默认 false"],
+                        "then": Self.followUpParam
                     ] as [String: Any],
                     "required": [] as [String]
                 ],
@@ -139,6 +141,7 @@ extension AgentToolbox {
                         "stroke_softness": ["type": "number", "description": "描边柔和度 0~1（文字、图片）"],
                         "animation": ["type": "string", "enum": TextAnimation.allCases.map(\.rawValue),
                                       "description": "文字入场动画：" + TextAnimation.allCases.map { "\($0.rawValue)=\($0.label)" }.joined(separator: "，")],
+                        "animation_duration": ["type": "number", "description": "文字入场动画时长，秒，0.1~3"],
                         "box_width": ["type": "number", "description": "文本框宽 px，0 = 跟着文字自适应（文字）"],
                         "box_height": ["type": "number", "description": "文本框高 px，0 = 自适应（文字）"],
                         "subtitle_width": ["type": "number", "description": "字幕最大宽度，画面宽度百分比 20~100（字幕，整轨）"],
@@ -248,7 +251,7 @@ extension AgentToolbox {
 
         case "transcribe":
             return transcribe(p, clipKey: args["clip_id"] as? String,
-                              proofread: args["proofread"] as? Bool ?? false)
+                              proofread: args["proofread"] as? Bool ?? false, args: args)
 
         case "update_clip":
             let many = (args["clip_ids"] as? [Any])?.compactMap { $0 as? String }.filter { !$0.isEmpty } ?? []
@@ -327,19 +330,25 @@ extension AgentToolbox {
         let outputURL = AppSettings.shared.effectiveExportDir
             .appendingPathComponent("\(base).\(ext)")
 
-        ExportManager.shared.startExport(snapshot: p.makeExportInput(outputURL: outputURL),
-                                         owner: nil)
-        return .ok("""
-            已经开始导出「\(outputURL.lastPathComponent)」，放在\(outputURL.deletingLastPathComponent().path)。
-            后台跑的，进度在右下角，不用在这儿等它。
-            """)
+        var jobID: UUID?
+        let mgr = ExportManager.shared
+        return Self.runInBackground(
+            args, title: "导出「\(outputURL.lastPathComponent)」", label: "导出", project: p,
+            busy: { jobID.map { mgr.isExporting($0) } ?? false },
+            cancel: { if let j = jobID { mgr.cancelExport(j) } },
+            outcome: {
+                FileManager.default.fileExists(atPath: outputURL.path)
+                    ? (true, "导出到了 \(outputURL.path)") : (false, "导出没成，右下角有提示")
+            },
+            start: { jobID = mgr.startExport(snapshot: p.makeExportInput(outputURL: outputURL), owner: nil) },
+            started: "已经开始导出「\(outputURL.lastPathComponent)」，放在\(outputURL.deletingLastPathComponent().path)。进度在右下角。")
     }
 
     // MARK: - 语音识别
 
     @MainActor
     private static func transcribe(_ p: ProjectState, clipKey: String?,
-                                   proofread: Bool) -> AgentToolResult {
+                                   proofread: Bool, args: [String: Any]) -> AgentToolResult {
         guard !p.isTranscribing else { return .fail("已经有一个识别在跑了，等它完事。") }
         guard WhisperTranscriber.whisperReady else {
             return .fail("语音识别引擎没就绪（whisper-cli 缺失），去设置里看看。")
@@ -365,13 +374,12 @@ extension AgentToolbox {
             guard hit else { return .fail("找不到 id 以 \(key) 开头的视频或音频片段，先 list_tracks 看看。") }
         }
         // proofread=false 就是纯识别：不校对也不让大模型翻
-        p.autoTranscribeSelectedClip(engine: proofread ? nil : "",
-                                     aiModel: proofread ? nil : "")
-        return .ok("""
-            开始识别了\(proofread ? "（识别完还会让大模型校对一遍）" : "")。
-            后台跑，进度在右下角；完事会自己生成一条字幕轨。
-            用户问进度就让他看右下角，别在这儿空等。
-            """)
+        return Self.runInBackground(
+            args, title: "语音识别", label: "语音识别", project: p,
+            busy: { p.isTranscribing }, cancel: { p.cancelTranscribe() },
+            start: { p.autoTranscribeSelectedClip(engine: proofread ? nil : "",
+                                                  aiModel: proofread ? nil : "") },
+            started: "开始识别了\(proofread ? "（识别完还会让大模型校对一遍）" : "")，完事会生成一条字幕轨。")
     }
 
     // MARK: - 改片段
@@ -468,6 +476,7 @@ extension AgentToolbox {
                 if let w = a.num("stroke_width") { v.strokeWidth = max(0, w); note("描边宽度 \(w)") }
                 if let s = a.num("stroke_softness") { v.strokeSoftness = max(0, min(1, s)); note("描边柔和 \(s)") }
                 if let an = a.str("animation"), let k = TextAnimation(rawValue: an) { v.animation = k; note("入场动画 \(k.label)") }
+                if let d = a.num("animation_duration") { v.animationDuration = max(0.1, min(3, d)); note("动画时长 \(d) 秒") }
                 if let w = a.num("box_width") { v.boxWidth = w > 0 ? w : nil; note(w > 0 ? "文本框宽 \(Int(w))" : "文本框宽自适应") }
                 if let h = a.num("box_height") { v.boxHeight = h > 0 ? h : nil; note(h > 0 ? "文本框高 \(Int(h))" : "文本框高自适应") }
                 a.applyCrop(&v.cropTop, &v.cropBottom, &v.cropLeft, &v.cropRight, note)
@@ -476,7 +485,7 @@ extension AgentToolbox {
             return done("文字「\(c.text.prefix(10))」", transform.subtracting(["scale"]).union(
                 ["text", "font_size", "font_name", "bold", "italic", "color", "background_color",
                  "background_opacity", "alignment", "stroke_color", "stroke_width", "stroke_softness",
-                 "animation", "box_width", "box_height"]).union(ClipArgs.cropMirrorKeys))
+                 "animation", "animation_duration", "box_width", "box_height"]).union(ClipArgs.cropMirrorKeys))
         }
         // 图形
         for t in p.shapeTracks {

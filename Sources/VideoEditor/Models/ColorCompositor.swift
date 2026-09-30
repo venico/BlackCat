@@ -532,9 +532,6 @@ final class ColorCompositor: NSObject, AVVideoCompositing {
 
 
 
-    /// TMPDIAG 预览计时：每次重建后第一帧画出来的时间
-    nonisolated(unsafe) static var diagFirstFrameLogged = false
-
     /// 特效类转场：前片 → 后片，progress 0~1。预览和导出共用，两张图都得是铺满 extent 的整帧
     static func blendTransition(_ type: TransitionType, from a: CIImage, to b: CIImage,
                                 progress: Double, extent: CGRect) -> CIImage {
@@ -712,10 +709,6 @@ final class ColorCompositor: NSObject, AVVideoCompositing {
     }
 
     func startRequest(_ req: AVAsynchronousVideoCompositionRequest) {
-        if !Self.diagFirstFrameLogged {  // TMPDIAG
-            Self.diagFirstFrameLogged = true
-            DiagLog.log("[预览计时] 合成器画出第一帧 t=\(String(format: "%.2f", req.compositionTime.seconds))")
-        }
         let instrRange = req.videoCompositionInstruction.timeRange
         guard let data = (req.videoCompositionInstruction as? ColorInstruction)?.data
                 ?? Self.getData(for: instrRange) else {

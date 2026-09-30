@@ -398,6 +398,23 @@ enum AgentLLM {
 
     private static var providerName: String { currentProvider().rawValue }
 
+    /// Agent 专用的会话。
+    ///
+    /// 后台助手的第一发请求会卡在一条**已经死掉的复用连接**上：日志实据是等满 60.0 秒、
+    /// 底层码 60（ETIMEDOUT，TCP 层超时），同一份请求换新连接重发 3.5 秒就回来了。
+    /// 所以后台助手开跑前先 `freshConnection()`，超时时也换新连接重发一次
+    private static let session: URLSession = {
+        let c = URLSessionConfiguration.default
+        c.timeoutIntervalForRequest = 180
+        c.timeoutIntervalForResource = 600
+        return URLSession(configuration: c)
+    }()
+
+    /// 让下一发请求走新的 TCP 连接。`flush` 不清 Cookie 和缓存，只丢掉池子里的旧连接
+    static func freshConnection() async {
+        await session.flush()
+    }
+
     private static func post(_ urlString: String, key: String,
                              headers: [String: String], body: [String: Any]) async throws -> Data {
         guard let url = URL(string: urlString) else {
@@ -421,11 +438,39 @@ enum AgentLLM {
         var attempt = 0
         let data: Data
         let resp: URLResponse
+        let began = Date()
         while true {
             attempt += 1
             do {
-                (data, resp) = try await URLSession.shared.data(for: req)
+                (data, resp) = try await session.data(for: req)
                 break
+            } catch let e as URLError where e.code == .timedOut {
+                // 超时要留底：等了多久、请求多大、系统给的底层错误码，
+                // 才分得清是卡在连接上还是模型想太久
+                let waited = Date().timeIntervalSince(began)
+                let stream = e.errorUserInfo["_kCFStreamErrorCodeKey"].map { "\($0)" } ?? "-"
+                DiagLog.log("[Agent] 请求超时（第 \(attempt) 次）：等了 \(String(format: "%.1f", waited)) 秒，"
+                            + "请求体 \((req.httpBody?.count ?? 0) / 1024) KB，底层码 \(stream)")
+                if attempt == 1, let body = req.httpBody {
+                    // 请求原样存一份（Key 在请求头里，这里只有正文），排查时对照
+                    let f = DiagLog.fileURL.deletingLastPathComponent().appendingPathComponent("last-timeout-request.json")
+                    try? body.write(to: f)
+                }
+                // 多半是卡在死掉的复用连接上（见 session 的注释），换一条全新的连接再发一次；
+                // 还不行才报错
+                guard attempt == 1 else { throw e }
+                let fresh = URLSession(configuration: .ephemeral)
+                do {
+                    let t0 = Date()
+                    (data, resp) = try await fresh.data(for: req)
+                    DiagLog.log("[Agent] 换新连接重发成功，用时 \(String(format: "%.1f", Date().timeIntervalSince(t0))) 秒")
+                    fresh.finishTasksAndInvalidate()
+                    break
+                } catch {
+                    fresh.invalidateAndCancel()
+                    DiagLog.log("[Agent] 换新连接重发也失败：\(error.localizedDescription)")
+                    throw error
+                }
             } catch let e as URLError where Self.isTransientNetworkError(e) && attempt < maxAttempts {
                 DiagLog.log("[Agent] 第 \(attempt) 次请求失败（\(e.code.rawValue) \(e.localizedDescription)），重试")
                 // 退避 0.6s / 1.8s。Task.sleep 在取消时会抛，正好让用户点停止能立刻生效

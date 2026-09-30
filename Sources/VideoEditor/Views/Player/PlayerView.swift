@@ -442,7 +442,7 @@ private struct OverlayStack: View {
                         }
                         .position(x: geo.size.width * clip.posX, y: geo.size.height * clip.posY)
                 } else {
-                    TextLabel(clip: clip, scale: scale, selected: false)
+                    TextLabel(clip: clip, scale: scale, selected: false, time: clock.currentTime)
                         .overlay(
                             project.selectedClipIDs.count > 1 && project.selectedClipIDs.contains(clip.id)
                             ? Rectangle().stroke(Color.accent, lineWidth: 1.5) : nil
@@ -781,7 +781,7 @@ private struct OverlayStack: View {
             let scale = geo.size.width / max(project.previewRenderSize.width, 1)
             let clips = track.clips.filter { $0.startTime <= it && $0.endTime > it }
             ForEach(clips) { clip in
-                TextLabel(clip: clip, scale: scale)
+                TextLabel(clip: clip, scale: scale, time: it)
                     .position(x: geo.size.width * clip.posX, y: geo.size.height * clip.posY)
             }
         }
@@ -1267,6 +1267,8 @@ struct TextLabel: View {
     /// 是否自己转。ImageRenderer 出图时按未旋转的尺寸裁切，
     /// 转过的部分会被切掉一角，所以渲染时关掉它、改由画布上下文旋转
     var applyRotation: Bool = true
+    /// 播放头时间。给了就按它播入场动画；封面这类静态画面不给
+    var time: Double? = nil
 
     /// 描边模糊半径。**柔和度 0 时压到极小 = 硬边**，
     /// 以前写死成宽度的一半，所以怎么调都是糊的
@@ -1275,8 +1277,20 @@ struct TextLabel: View {
     }
     private var strokeOffset: CGFloat { max(0.6, clip.strokeWidth) * scale }
 
+    private var anim: TextEntrance { time.map { clip.entrance(at: $0) } ?? TextEntrance() }
+
+    /// 打字机没打到的字画成透明，排版照旧（框不跟着一个字一个字变宽）
+    private var displayText: AttributedString {
+        var a = AttributedString(clip.text.isEmpty ? " " : clip.text)
+        if let n = anim.visibleChars, n < a.characters.count {
+            let i = a.characters.index(a.startIndex, offsetBy: n)
+            a[i..<a.endIndex].foregroundColor = .clear
+        }
+        return a
+    }
+
     var body: some View {
-        Text(clip.text.isEmpty ? " " : clip.text)
+        Text(displayText)
             .font(.custom(clip.fontName, size: clip.fontSize * scale)
                     .weight(clip.bold ? .bold : .regular))
             .transformEffect(italicSkew(clip.italic, fontSize: clip.fontSize * scale))
@@ -1296,7 +1310,10 @@ struct TextLabel: View {
             .modifier(TextCropMask(clip: clip))
             .scaleEffect(x: clip.mirrorH ? -1 : 1, y: clip.mirrorV ? -1 : 1)
             .rotationEffect(.degrees(applyRotation ? clip.rotation : 0))
-            .opacity(clip.opacity)
+            // 入场动画只动画面（scaleEffect / offset 不改布局），选中框、变换框的尺寸不受影响
+            .scaleEffect(anim.scale)
+            .offset(y: anim.offsetY * scale)
+            .opacity(clip.opacity * anim.opacity)
             .overlay(
                 selected
                 ? RoundedRectangle(cornerRadius: 4 * scale)
@@ -3531,7 +3548,24 @@ final class PlayerController: ObservableObject {
         let dt  = now.timeIntervalSince(last)
         lastTick = now
 
-        let cur = (getTime?() ?? 0) + dt
+        // 播放器真在走就跟它的实际位置，不自己按墙钟累加：
+        // 图片 / 文字 / 字幕是 SwiftUI 按这个时间画的，视频画面是播放器出的。
+        // 墙钟起播就往前跑、播放器起播有延迟，两边差几帧 —— 图片按时消失了、
+        // 底下视频轨还停在空段上，画面黑一下
+        let cur: Double
+        switch player.currentItem == nil ? .paused : player.timeControlStatus {
+        case .playing:
+            cur = player.currentTime().seconds
+        case .waitingToPlayAtSpecifiedRate:
+            // 还在缓冲，画面没动，时间也别动
+            cur = getTime?() ?? 0
+        case .paused where player.rate > 0:
+            // 刚调完 play()、状态还没切过来
+            cur = getTime?() ?? 0
+        default:
+            // 没有可放的东西（空时间轴）或播放器已经自己停了，照旧按墙钟走到底
+            cur = (getTime?() ?? 0) + dt
+        }
         let dur = getDuration?() ?? 0
 
         if cur >= dur && dur > 0 {

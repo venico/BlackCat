@@ -41,12 +41,30 @@ extension AgentToolbox {
                         "color": ["type": "string", "description": "#RRGGBB，none = 默认"],
                         "x": ["type": "number"], "y": ["type": "number"],
                         "width": ["type": "number"], "height": ["type": "number"],
-                        "path": ["type": "string", "description": "export 时存到哪（绝对路径，含文件名或文件夹）"]
+                        "path": ["type": "string", "description": "export 时存到哪（绝对路径，含文件名或文件夹）"],
+                        "then": Self.followUpParam
                     ] as [String: Any],
                     "required": ["action"]
                 ],
                 risk: .mutating)
         ]
+    }
+
+    /// 画布上那两件慢活儿（超分、分离）：卡片转圈就是在跑，停了看有没有报错
+    @MainActor
+    private static func watchCanvasNode(_ args: [String: Any], nodeID: UUID, title: String,
+                                        project p: ProjectState, started: String) -> AgentToolResult {
+        let canvas = p.canvas
+        return runInBackground(
+            args, title: title, label: title, project: p,
+            checkIdle: false, busy: { canvas.node(nodeID)?.isGenerating == true },
+            outcome: {
+                // 出错就报错；成功交给时间线比对（结果卡片的文件会进素材库，比对能报出路径）
+                if let f = canvas.node(nodeID)?.failure { return (false, f) }
+                return nil
+            },
+            start: {},
+            started: started + "结果卡片在原卡片右边。")
     }
 
     @MainActor
@@ -195,6 +213,8 @@ extension AgentToolbox {
             if !useSystemSR, !(proModel?.isDownloaded ?? model.isDownloaded) {
                 return .fail("超分模型还没下载，让用户去「设置 → 清晰度提升」下一个。")
             }
+            if let no = Self.followUpRejection(args) { return no }
+            guard !node.isGenerating else { return .fail("这张卡片正在处理别的，等它做完。") }
             let nodeID = node.id
             let workDir = FileManager.default.temporaryDirectory.appendingPathComponent("canvas_clarity_\(UUID().uuidString)")
             let out = CanvasImageOps.outputURL(basedOn: url, suffix: "_超分", ext: url.pathExtension)
@@ -225,12 +245,15 @@ extension AgentToolbox {
                 }
                 try? FileManager.default.removeItem(at: workDir)
             }
-            return .ok("开始提升清晰度了，很慢，进度显示在卡片上，做完结果会另起一张卡片。")
+            return Self.watchCanvasNode(args, nodeID: nodeID, title: "画布超分", project: p,
+                                        started: "开始提升清晰度了，很慢，进度显示在卡片上，做完结果会另起一张卡片。")
         case "separate_audio":
             guard let node = one(), let url = node.mediaURL, node.kind == .video || node.kind == .audio else {
                 return .fail("要一张有内容的视频或音频卡片。")
             }
             guard AudioSeparator.demucsReady else { return .fail("分离音轨的组件没装好。") }
+            if let no = Self.followUpRejection(args) { return no }
+            guard !node.isGenerating else { return .fail("这张卡片正在处理别的，等它做完。") }
             let nodeID = node.id
             canvas.updateNode(id: nodeID) { $0.isGenerating = true; $0.failure = nil; $0.progressText = "准备中…"; $0.progress = 0 }
             Task { @MainActor in
@@ -255,7 +278,8 @@ extension AgentToolbox {
                     }
                 }
             }
-            return .ok("开始分离了，进度在卡片上，分完每一轨各一张音频卡片。")
+            return Self.watchCanvasNode(args, nodeID: nodeID, title: "画布分离人声", project: p,
+                                        started: "开始分离了，进度在卡片上，分完每一轨各一张音频卡片。")
         default:
             return .fail("action 不认识。")
         }

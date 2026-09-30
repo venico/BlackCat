@@ -49,6 +49,60 @@ extension AgentToolbox {
         }
     }
 
+    /// 后台类工具共用的 `then` 参数：这件事做完之后要接着做的事
+    static let followUpParam: [String: Any] = [
+        "type": "string",
+        "description": "这件事是后台跑的，做完之后要接着做什么就写在这里，一句话写清楚，"
+            + "比如「放到当前时间线末尾」「把识别出的字幕翻译成英文」「把分离出的人声轨音量调到 120%」。"
+            + "用户的要求里还有后续动作就写这里：一做完会自动起一个后台助手去做，"
+            + "你这一轮不用等，也别跟用户说「等好了再叫我」。后台助手能调用剪辑、字幕、识别这类不花钱的能力，"
+            + "但不能生成、配音、导出、删除，要连着花钱的只写不花钱的那部分。同时最多挂 \(AgentBackgroundTasks.maxFollowUps) 个"
+    ]
+
+    static func followUpText(_ args: [String: Any]) -> String {
+        (args["then"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    }
+
+    /// 开跑一件后台活儿并登记：先确认没有同类在跑，调 `start`，
+    /// 看 `busy` 有没有立起来（没起来＝底层自己拦下了，缺组件、没选中之类），
+    /// 起来了就进后台任务清单、挂上 `then`
+    @MainActor
+    static func runInBackground(_ args: [String: Any], title: String, label: String,
+                                project p: ProjectState,
+                                checkIdle: Bool = true,
+                                busy: @escaping () -> Bool,
+                                cancel: (() -> Void)? = nil,
+                                outcome: (() -> (ok: Bool, text: String)?)? = nil,
+                                start: () -> Void,
+                                started: String) -> AgentToolResult {
+        if let no = followUpRejection(args) { return no }
+        // 已经自己开跑了的（翻译、画布那两件先起 Task 再登记）不查这一道
+        if checkIdle, busy() { return .fail("\(label)已经有一件在跑了，等它做完再来。") }
+        start()
+        guard let id = AgentBackgroundTasks.shared.watch(title: title, label: label, project: p,
+                                                         busy: busy, cancel: cancel,
+                                                         outcome: outcome) else {
+            return .fail("\(label)没能开始（缺组件、没选中片段或者缺 Key 之类），右下角有提示，照着告诉用户。")
+        }
+        let then = followUpText(args)
+        if !then.isEmpty {
+            AgentBackgroundTasks.shared.attachFollowUp(instruction: then, taskIDs: [id],
+                                                       project: p, mode: AppSettings.shared.agentMode)
+        }
+        return .ok(started + (then.isEmpty
+            ? "\n做完后台任务里会报结果，用户问进度就让他看那儿，别在这儿空等。"
+            : "\n做完会自动起后台助手接着「\(then)」，这一轮不用等，也别让用户等好了再叫你。"))
+    }
+
+    /// 挂不上「接着做」时的拒绝理由。**先查再提交** —— 提交完才发现挂不上，钱已经花了
+    @MainActor
+    static func followUpRejection(_ args: [String: Any]) -> AgentToolResult? {
+        guard let t = args["then"] as? String, !t.trimmingCharacters(in: .whitespaces).isEmpty,
+              !AgentBackgroundTasks.shared.canAttachFollowUp else { return nil }
+        return .fail("后台等着接着做的任务已经有 \(AgentBackgroundTasks.maxFollowUps) 个了，这次没提交。"
+                     + "告诉用户先等前面的做完再来。")
+    }
+
     static var generateTools: [AgentToolSpec] {
         [
             AgentToolSpec(
@@ -73,7 +127,8 @@ extension AgentToolbox {
                                   "description": "生成几张。**用户说了几张就传几**（「来三张」传 3），"
                                       + "没说数量就别传，默认 1 张。上限跟模型走："
                                       + "Image2 最多 10 张；Seedream 5.0 Pro 只能 1 张，"
-                                      + "5.0 Lite 最多 15 张。要超了会自动收到上限，并告诉你收成了几张"]
+                                      + "5.0 Lite 最多 15 张。要超了会自动收到上限，并告诉你收成了几张"],
+                        "then": Self.followUpParam
                     ] as [String: Any],
                     "required": ["prompt"]
                 ],
@@ -90,7 +145,8 @@ extension AgentToolbox {
                         "ratio": ["type": "string", "description": "16:9、9:16、1:1"],
                         "model": ["type": "string",
                                   "description": "指定用哪个模型。配好 Key 的有："
-                                      + Self.modelList(.video) + "。用户没点名就别传"]
+                                      + Self.modelList(.video) + "。用户没点名就别传"],
+                        "then": Self.followUpParam
                     ] as [String: Any],
                     "required": ["prompt"]
                 ],
@@ -121,7 +177,8 @@ extension AgentToolbox {
                         // 用户说「用 elevenlabs 生成」根本传不下来
                         "model": ["type": "string",
                                   "description": "指定用哪个模型。配好 Key 的有："
-                                      + Self.modelList(.audio) + "。用户没点名就别传"]
+                                      + Self.modelList(.audio) + "。用户没点名就别传"],
+                        "then": Self.followUpParam
                     ] as [String: Any],
                     "required": ["prompt"]
                 ],
@@ -299,6 +356,7 @@ extension AgentToolbox {
             guard let prompt = args["prompt"] as? String, !prompt.isEmpty else {
                 return .fail("缺 prompt")
             }
+            if let no = Self.followUpRejection(args) { return no }
             let category: AIVideoService.ProviderCategory =
                 name == "generate_image" ? .image : (name == "generate_video" ? .video : .audio)
 
@@ -367,11 +425,18 @@ extension AgentToolbox {
                 ?? provider.displayName
             // 一张一个任务。Seedream lite 那种「组图」是一次请求出多张、图之间还带关联，
             // 这里图的是各自独立、失败也只砸一张，对海报这类需求更合适
+            var taskIDs: [UUID] = []
             for _ in 0..<count {
-                _ = Self.submitGeneration(category: category, prompt: prompt, args: args,
-                                          provider: provider, project: project,
-                                          allowFallback: allowFallback, tried: [provider],
-                                          modelOverride: modelOverride)
+                taskIDs.append(Self.submitGeneration(category: category, prompt: prompt, args: args,
+                                                     provider: provider, project: project,
+                                                     allowFallback: allowFallback, tried: [provider],
+                                                     modelOverride: modelOverride))
+            }
+            let then = (args["then"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            if !then.isEmpty {
+                AgentBackgroundTasks.shared.attachFollowUp(instruction: then, taskIDs: taskIDs,
+                                                           project: project,
+                                                           mode: AppSettings.shared.agentMode)
             }
             // 真提交出去了才占名额 —— 没配 Key 之类的早退不该把这一轮堵死
             svc.agentRoundGenerated.insert(category)
@@ -384,9 +449,11 @@ extension AgentToolbox {
             let where_ = project.showCanvas
                 ? "做完会自己落到画布上"
                 : "做完会自动进素材库"
-            let next = project.showCanvas
-                ? "接着做别的，或者告诉用户好了之后再接着往下连。"
-                : "接着做别的，或者告诉用户等好了叫你放进时间轴。"
+            let next = !then.isEmpty
+                ? "做完后会自动起后台助手接着「\(then)」，这一轮不用等，也别让用户等好了再叫你。"
+                : (project.showCanvas
+                   ? "接着做别的，或者告诉用户好了之后再接着往下连。"
+                   : "接着做别的，或者告诉用户等好了叫你放进时间轴。")
             return .ok("""
                 已经交给「\(usedName)」去做了\(count > 1 ? "，一共 \(count) 张" : "")\
                 （后台任务，几十秒到几分钟）。\(capNote)
@@ -404,14 +471,16 @@ extension AgentToolbox {
                 let state: String
                 switch it.state {
                 case .running: state = "进行中（已经 \(Int(Date().timeIntervalSince(it.startedAt))) 秒）"
-                case .done:    state = "已完成，素材已进库"
+                case .done:    state = it.resultText.map { "已完成：" + $0 } ?? "已完成，素材已进库"
                 case .failed(let m): state = "失败：\(m)"
                 case .needsConfirm(let reason, let nextName):
                     // 说清楚是在等用户点，别让模型以为还在跑、回头报「还在生成中」
                     state = "\(reason)。正等用户决定要不要改用「\(nextName)」重试，"
                         + "按钮在后台任务卡片上，他点了才会继续"
                 }
-                s += "- [\(it.kind.rawValue)] \(it.title) — \(state)\n"
+                let then = AgentBackgroundTasks.shared.followUpInstruction(for: it.id)
+                    .map { "；完成后会自动接着「\($0)」" } ?? ""
+                s += "- [\(it.displayKind)] \(it.title) — \(state)\(then)\n"
             }
             return .ok(s)
 

@@ -423,7 +423,17 @@ enum OverlayRenderer {
                 .init(kCTForegroundColorAttributeName as String): textCGColor,
                 .init(kCTParagraphStyleAttributeName as String): ctPS
             ]
-            let attrStr = NSAttributedString(string: clip.text.isEmpty ? " " : clip.text, attributes: attrs)
+            let attrStr = NSMutableAttributedString(string: clip.text.isEmpty ? " " : clip.text, attributes: attrs)
+            // 打字机：没打到的字照样排版（框的大小、换行不跳），只是画成透明
+            let typed = clip.entrance(at: time).visibleChars
+            if let n = typed {
+                let loc = (String(clip.text.prefix(n)) as NSString).length
+                if loc < attrStr.length {
+                    attrStr.addAttribute(.init(kCTForegroundColorAttributeName as String),
+                                         value: CGColor(red: 0, green: 0, blue: 0, alpha: 0),
+                                         range: NSRange(location: loc, length: attrStr.length - loc))
+                }
+            }
             let setter = CTFramesetterCreateWithAttributedString(attrStr)
             // 设过文本框宽度就按它换行，没设才按文字自己撑开（跟预览一致）
             let boxW = clip.boxWidth.map { CGFloat($0) * scale }
@@ -439,30 +449,23 @@ enum OverlayRenderer {
             let xOrig = centerX - layerW / 2
             let yOrig = centerY - layerH / 2
 
+            // 入场动画：透明度乘进去，缩放 / 上滑绕文字中心做
+            let anim = clip.entrance(at: time)
             ctx.saveGState()
-            ctx.setAlpha(clip.opacity)
+            ctx.setAlpha(clip.opacity * anim.opacity)
 
             if clip.rotation != 0 {
                 ctx.translateBy(x: centerX, y: centerY)
                 ctx.rotate(by: -clip.rotation * .pi / 180)
                 ctx.translateBy(x: -centerX, y: -centerY)
             }
-
-            if clip.strokeWidth > 0 {
-                let sc = NSColor(clip.strokeColor).usingColorSpace(.sRGB) ?? .black
-                var sr: CGFloat = 0, sg: CGFloat = 0, sb: CGFloat = 0, sa: CGFloat = 0
-                sc.getRed(&sr, green: &sg, blue: &sb, alpha: &sa)
-                let strokeCG = CGColor(red: sr, green: sg, blue: sb, alpha: sa)
-                // 柔和度 0 = 硬边；以前 blur 写死成宽度的一半，怎么调都是糊的
-                let r = max(0.35, clip.strokeWidth * clip.strokeSoftness) * scale
-                let off = max(0.6, clip.strokeWidth) * scale
-                ctx.setShadow(offset: CGSize(width: off, height: off), blur: r, color: strokeCG)
-            } else {
-                ctx.setShadow(offset: CGSize(width: 1 * scale, height: 1 * scale),
-                              blur: 1 * scale,
-                              color: CGColor(red: 0, green: 0, blue: 0, alpha: 0.6))
+            if anim.scale != 1 || anim.offsetY != 0 {
+                ctx.translateBy(x: centerX, y: centerY + CGFloat(anim.offsetY) * scale)
+                ctx.scaleBy(x: anim.scale, y: anim.scale)
+                ctx.translateBy(x: -centerX, y: -centerY)
             }
 
+            // 背景框不带描边：预览里背景在描边外层，描边只围着字转
             if clip.bgOpacity > 0 {
                 let nc = NSColor(clip.bgColor).usingColorSpace(.sRGB) ?? .black
                 var br: CGFloat = 0, bg: CGFloat = 0, bb: CGFloat = 0, ba: CGFloat = 0
@@ -474,22 +477,70 @@ enum OverlayRenderer {
                 ctx.fillPath()
             }
 
-            ctx.saveGState()
-            ctx.translateBy(x: 0, y: CGFloat(h))
-            ctx.scaleBy(x: 1.0, y: -1.0)
-            let textRectYUp = CGFloat(h) - yOrig - layerH + padV
-            let textRect = CGRect(x: xOrig + padH, y: textRectYUp,
-                                  width: layerW - padH * 2, height: layerH - padV * 2)
-            let ctFrame = CTFramesetterCreateFrame(setter, CFRange(),
-                                                    CGPath(rect: textRect, transform: nil), nil)
-            CTFrameDraw(ctFrame, ctx)
-            ctx.restoreGState()
+            // 字 + 描边：照预览（TextLabel / TextStroke）的做法画 ——
+            // 字先画在一张局部小图上，再依次叠八个方向的阴影，**每一层都是给前面叠好的整体加阴影**
+            // （SwiftUI 连着写 .shadow 就是这么叠的）。原来这里只设了一个往右下偏的阴影，
+            // 出来是投影不是描边，背景框也跟着带了影子，跟预览对不上
+            if let img = Self.strokedTextImage(clip, setter: setter, layerW: layerW, layerH: layerH,
+                                               padH: padH, padV: padV, scale: scale) {
+                let (image, margin) = img
+                ctx.saveGState()
+                // 主画布是左上原点，图要翻过来贴
+                ctx.translateBy(x: xOrig - margin, y: yOrig - margin + CGFloat(image.height))
+                ctx.scaleBy(x: 1, y: -1)
+                ctx.draw(image, in: CGRect(x: 0, y: 0, width: image.width, height: image.height))
+                ctx.restoreGState()
+            }
 
             ctx.restoreGState()
         }
 
         guard let cgImage = ctx.makeImage() else { return nil }
         return CIImage(cgImage: cgImage)
+    }
+
+    /// 文字连同描边画成一张图（左下原点），返回图和四周留的边距。
+    /// 参数跟预览的 TextLabel 一一对应：偏移 max(0.6, 宽度)、模糊 max(0.35, 宽度×柔和)，
+    /// 没开描边时也有一圈淡淡的（描边色 × 0.6）
+    private static func strokedTextImage(_ clip: TextClip, setter: CTFramesetter,
+                                         layerW: CGFloat, layerH: CGFloat,
+                                         padH: CGFloat, padV: CGFloat,
+                                         scale: CGFloat) -> (CGImage, CGFloat)? {
+        let off = max(0.6, clip.strokeWidth) * scale
+        let blur = max(0.35, clip.strokeWidth * clip.strokeSoftness) * scale
+        // 八层阴影一层叠一层，轮廓最多往外扩出 off×(1+√2) 再加模糊，边距给足
+        let margin = ceil(off * 3 + blur * 3 + 2)
+        let lw = Int(ceil(layerW + margin * 2)), lh = Int(ceil(layerH + margin * 2))
+        guard lw > 0, lh > 0 else { return nil }
+        let space = CGColorSpaceCreateDeviceRGB()
+        let info = CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue
+        func canvas() -> CGContext? {
+            CGContext(data: nil, width: lw, height: lh, bitsPerComponent: 8, bytesPerRow: 0,
+                      space: space, bitmapInfo: info)
+        }
+        guard let base = canvas() else { return nil }
+        let textRect = CGRect(x: margin + padH, y: margin + padV,
+                              width: layerW - padH * 2, height: layerH - padV * 2)
+        CTFrameDraw(CTFramesetterCreateFrame(setter, CFRange(), CGPath(rect: textRect, transform: nil), nil), base)
+        guard var img = base.makeImage() else { return nil }
+
+        let sc = NSColor(clip.strokeColor).usingColorSpace(.sRGB) ?? .black
+        var sr: CGFloat = 0, sg: CGFloat = 0, sb: CGFloat = 0, sa: CGFloat = 0
+        sc.getRed(&sr, green: &sg, blue: &sb, alpha: &sa)
+        let color = CGColor(red: sr, green: sg, blue: sb, alpha: sa * (clip.strokeWidth > 0 ? 1 : 0.6))
+        guard sa > 0 else { return (img, margin) }
+        let k = off * 0.707
+        let dirs: [(CGFloat, CGFloat)] = [(off, 0), (-off, 0), (0, off), (0, -off),
+                                          (k, k), (-k, k), (k, -k), (-k, -k)]
+        let full = CGRect(x: 0, y: 0, width: lw, height: lh)
+        for (dx, dy) in dirs {
+            guard let c = canvas() else { return nil }
+            c.setShadow(offset: CGSize(width: dx, height: dy), blur: blur, color: color)
+            c.draw(img, in: full)
+            guard let next = c.makeImage() else { return nil }
+            img = next
+        }
+        return (img, margin)
     }
 
     // MARK: - 图形 overlay 逐帧绘制（导出用，与预览 ShapeOverlay 一致）

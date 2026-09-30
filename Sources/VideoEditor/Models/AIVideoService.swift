@@ -1026,7 +1026,17 @@ final class AIVideoService: ObservableObject {
     @Published var history: [ConversationRecord] = []
     /// 会话列表的分组。单独存一个文件，不动 history 那份存档的格式
     @Published var conversationGroups: [ConversationGroup] = []
-    @Published var currentConversationId: UUID? = nil
+    @Published var currentConversationId: UUID? = nil {
+        didSet {
+            // 记下最近一条**普通聊天**。关画布时侧栏要回到它 ——
+            // 进画布的两条路（新建画布、从历史里点开画布）都是先把当前会话切成画布那条，
+            // 画布卡片出现时再去记「外面是哪条」已经晚了，记到的是画布自己
+            guard let id = currentConversationId else { lastChatConversationID = nil; return }
+            if history.first(where: { $0.id == id })?.isCanvas == false { lastChatConversationID = id }
+        }
+    }
+    /// 最近一条普通聊天会话。nil = 外面本来就是空白的新对话界面
+    private(set) var lastChatConversationID: UUID?
     /// 当前是停在历史列表还是某条会话里。**不能放面板的 @State** ——
     /// 切到素材库再切回来，面板整个重建，状态一重置就弹回列表了
     @Published var showChatHistory = true

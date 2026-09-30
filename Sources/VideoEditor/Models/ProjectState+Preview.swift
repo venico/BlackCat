@@ -151,8 +151,6 @@ extension ProjectState {
         lastRebuildFingerprint = fp
         rebuildTask?.cancel()
         rebuildTask = Task {
-            let diagT0 = Date()  // TMPDIAG 预览计时
-            DiagLog.log("[预览计时] 开始重建 视频片段 \(vTracks.flatMap(\.clips).count) 音频片段 \(aTracks.flatMap(\.clips).count)")  // TMPDIAG
             let composition = AVMutableComposition()
             var audioParams: [(trackID: CMPersistentTrackID, volume: Float, left: Float, right: Float, startTime: Double, duration: Double, fadeIn: Double, fadeOut: Double)] = []
             var videoCompTracks: [(track: AVMutableCompositionTrack, clip: VideoClip, startTime: Double, endTime: Double)] = []  // from video clips
@@ -194,7 +192,6 @@ extension ProjectState {
                 }
             }
 
-            DiagLog.log("[预览计时] 视频时长读完 +\(String(format: "%.2f", Date().timeIntervalSince(diagT0)))s")  // TMPDIAG
             // 视频轨道+复合视频 — 按 videoSectionOrder 反序添加（底层先、顶层后覆盖）
             for ref in vSectionOrder.reversed() {
                 switch ref {
@@ -771,18 +768,6 @@ extension ProjectState {
                     self.playerItem = nil
                 } else {
                     let item = AVPlayerItem(asset: composition)
-                    ColorCompositor.diagFirstFrameLogged = false  // TMPDIAG
-                    DiagLog.log("[预览计时] 合成建好 +\(String(format: "%.2f", Date().timeIntervalSince(diagT0)))s")  // TMPDIAG
-                    Task { @MainActor in  // TMPDIAG 等 playerItem 就绪
-                        for _ in 0..<300 {
-                            if item.status != .unknown {
-                                DiagLog.log("[预览计时] playerItem \(item.status == .readyToPlay ? "就绪" : "失败 \(item.error?.localizedDescription ?? "")") +\(String(format: "%.2f", Date().timeIntervalSince(diagT0)))s")
-                                return
-                            }
-                            try? await Task.sleep(nanoseconds: 100_000_000)
-                        }
-                        DiagLog.log("[预览计时] playerItem 30s 还没就绪")
-                    }
                     item.audioTimePitchAlgorithm = .varispeed
                     item.audioMix = audioMix
                     if let vc = videoComposition {

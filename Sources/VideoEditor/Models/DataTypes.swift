@@ -538,6 +538,7 @@ struct TextTemplate: Identifiable, Codable, Equatable {
     var rotation: Double = 0
     var opacity: Double = 1
     var animation: TextAnimation = .none
+    var animationDuration: Double? = nil
 
     static func from(_ clip: TextClip, name: String) -> TextTemplate {
         TextTemplate(
@@ -552,7 +553,8 @@ struct TextTemplate: Identifiable, Codable, Equatable {
             alignment: clip.alignment,
             rotation: clip.rotation,
             opacity: clip.opacity,
-            animation: clip.animation
+            animation: clip.animation,
+            animationDuration: clip.animationDuration
         )
     }
 
@@ -568,6 +570,7 @@ struct TextTemplate: Identifiable, Codable, Equatable {
         clip.rotation = rotation
         clip.opacity = opacity
         clip.animation = animation
+        clip.animationDuration = animationDuration
     }
 }
 
@@ -611,6 +614,8 @@ struct TextClip: Identifiable, Equatable, Codable {
     var rotation: Double  = 0          // 旋转角度(度)
     var opacity: Double   = 1
     var animation: TextAnimation = .none
+    /// 入场动画时长（秒）。nil = 默认：淡入 / 弹入 / 上滑入 0.5 秒，打字机按字数（每字 0.08、最长 2 秒）
+    var animationDuration: Double? = nil
     var markers: [Marker]? = nil
     // 裁剪：0~1 比例，从各边往里裁掉多少（跟图片片段同一个语义）。
     // 只露半个字这种做法就靠它
@@ -631,7 +636,7 @@ struct TextClip: Identifiable, Equatable, Codable {
         case id, text, startTime, endTime, posX, posY
         case fontName, fontSize, bold, italic
         case textColorHex, strokeColorHex, strokeWidth, strokeSoftness, bgColorHex, bgOpacity
-        case alignment, rotation, opacity, animation
+        case alignment, rotation, opacity, animation, animationDuration
         case markers
         case cropTop, cropBottom, cropLeft, cropRight
         case boxWidth, boxHeight
@@ -659,6 +664,7 @@ struct TextClip: Identifiable, Equatable, Codable {
         try c.encode(rotation, forKey: .rotation)
         try c.encode(opacity, forKey: .opacity)
         try c.encode(animation, forKey: .animation)
+        try c.encodeIfPresent(animationDuration, forKey: .animationDuration)
         try c.encodeIfPresent(markers, forKey: .markers)
         try c.encode(cropTop, forKey: .cropTop)
         try c.encode(cropBottom, forKey: .cropBottom)
@@ -692,6 +698,7 @@ struct TextClip: Identifiable, Equatable, Codable {
         rotation    = (try? c.decode(Double.self, forKey: .rotation)) ?? 0
         opacity     = (try? c.decode(Double.self, forKey: .opacity)) ?? 1
         animation   = (try? c.decode(TextAnimation.self, forKey: .animation)) ?? .none
+        animationDuration = try? c.decode(Double.self, forKey: .animationDuration)
         markers = try? c.decode([Marker].self, forKey: .markers)
         cropTop    = (try? c.decode(Double.self, forKey: .cropTop)) ?? 0
         cropBottom = (try? c.decode(Double.self, forKey: .cropBottom)) ?? 0
@@ -705,6 +712,58 @@ struct TextClip: Identifiable, Equatable, Codable {
     }
     init(text: String = "标题文字", startTime: Double, endTime: Double) {
         self.text = text; self.startTime = startTime; self.endTime = endTime
+    }
+}
+
+/// 文字入场动画在某一刻的样子。**预览（SwiftUI）和导出（CoreGraphics）共用这一份算法**，
+/// 两边各画各的，但数值从这里取，出来的效果才一致
+struct TextEntrance {
+    var opacity = 1.0
+    var scale = 1.0
+    /// 往下偏多少，单位跟 fontSize 一样（画的时候再乘缩放）
+    var offsetY = 0.0
+    /// 打字机：露出前几个字。nil = 全露
+    var visibleChars: Int? = nil
+}
+
+extension TextClip {
+    /// 淡入 / 弹入 / 上滑入的默认时长
+    static let entranceDuration = 0.5
+
+    /// 这条文字的入场动画实际要多久（没压到片段长度之前）
+    var entranceLength: Double {
+        if let d = animationDuration, d > 0 { return d }
+        // 打字机默认按字数：每个字 0.08 秒，最长 2 秒
+        return animation == .typewriter ? min(2.0, 0.08 * Double(text.count)) : Self.entranceDuration
+    }
+
+    func entrance(at t: Double) -> TextEntrance {
+        var e = TextEntrance()
+        let local = t - startTime
+        guard animation != .none, local >= 0 else { return e }
+        if animation == .typewriter {
+            let n = text.count
+            let total = min(entranceLength, duration)
+            guard total > 0, local < total else { return e }
+            e.visibleChars = Int(Double(n) * local / total)
+            return e
+        }
+        let d = min(entranceLength, duration)
+        guard d > 0, local < d else { return e }
+        let p = local / d
+        let ease = 1 - pow(1 - p, 3)              // 先快后慢
+        e.opacity = ease
+        switch animation {
+        case .popIn:
+            // 冲过头一点再回来（easeOutBack）：0.6 → 约 1.04 → 1
+            let c1 = 1.70158, c3 = c1 + 1
+            let back = 1 + c3 * pow(p - 1, 3) + c1 * pow(p - 1, 2)
+            e.scale = 0.6 + 0.4 * back
+        case .slideUp:
+            e.offsetY = Double(fontSize) * 1.2 * (1 - ease)
+        default: break
+        }
+        return e
     }
 }
 
@@ -1475,14 +1534,24 @@ extension Color {
     init(hex: String) {
         let h = hex.trimmingCharacters(in: CharacterSet.alphanumerics.inverted)
         var v: UInt64 = 0; Scanner(string: h).scanHexInt64(&v)
-        self.init(red: Double((v>>16)&0xFF)/255, green: Double((v>>8)&0xFF)/255, blue: Double(v&0xFF)/255)
+        // 8 位 = #RRGGBBAA，带不透明度；6 位是老格式，按不透明处理
+        if h.count == 8 {
+            self.init(red: Double((v>>24)&0xFF)/255, green: Double((v>>16)&0xFF)/255,
+                      blue: Double((v>>8)&0xFF)/255, opacity: Double(v&0xFF)/255)
+        } else {
+            self.init(red: Double((v>>16)&0xFF)/255, green: Double((v>>8)&0xFF)/255, blue: Double(v&0xFF)/255)
+        }
     }
 
+    /// 不透明时写 #RRGGBB（跟老文件一致），带透明度才写 #RRGGBBAA。
+    /// 原来一律丢掉透明度：取色器里把不透明度拉到 0，存盘再打开又变回实色
     func toHex() -> String {
         let nc = NSColor(self).usingColorSpace(.sRGB) ?? .white
         var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
         nc.getRed(&r, green: &g, blue: &b, alpha: &a)
-        return String(format: "#%02X%02X%02X", Int(r * 255), Int(g * 255), Int(b * 255))
+        let rgb = String(format: "#%02X%02X%02X", Int(r * 255), Int(g * 255), Int(b * 255))
+        let alpha = Int((a * 255).rounded())
+        return alpha >= 255 ? rgb : rgb + String(format: "%02X", alpha)
     }
 }
 
