@@ -1,32 +1,12 @@
 import sys
-import types
-
-# --- Compat shim -----------------------------------------------------------
-# torchvision >= 0.17 removed `torchvision.transforms.functional_tensor`
-# (deprecated since 0.15). basicsr==1.4.2's degradations.py still does
-# `from torchvision.transforms.functional_tensor import rgb_to_grayscale`,
-# which raises ModuleNotFoundError with torch==2.5.1 / torchvision==0.20.1
-# (the officially paired versions pinned in requirements.txt -- there is no
-# newer torchvision with the old module, and downgrading would mean
-# downgrading torch too). `rgb_to_grayscale` still exists, unchanged, in
-# `torchvision.transforms.functional`, so we register a tiny shim module
-# that re-exports it under the old name before basicsr is imported.
-# (Same shim as inference_check.py from Task 1 -- reused verbatim since it
-# was already reviewed and confirmed to be a precise, side-effect-free fix.)
-import torchvision.transforms.functional as _tv_functional
-if 'torchvision.transforms.functional_tensor' not in sys.modules:
-    _shim = types.ModuleType('torchvision.transforms.functional_tensor')
-    _shim.rgb_to_grayscale = _tv_functional.rgb_to_grayscale
-    sys.modules['torchvision.transforms.functional_tensor'] = _shim
-# --- End compat shim ---------------------------------------------------------
 
 import torch
 import coremltools as ct
-from basicsr.archs.rrdbnet_arch import RRDBNet
-import basicsr.archs.rrdbnet_arch as _rrdbnet_arch_module
+from rrdbnet_arch import RRDBNet
+import rrdbnet_arch as _rrdbnet_arch_module
 
 # --- pixel_unshuffle static-shape patch --------------------------------------
-# basicsr's pixel_unshuffle() (used by RRDBNet.forward only on the scale=2
+# rrdbnet_arch.pixel_unshuffle() (copied from basicsr; used by RRDBNet.forward only on the scale=2
 # branch; the scale=4 branch skips it entirely -- confirmed x4plus converts
 # fine with the unpatched function) does:
 #     b, c, hh, hw = x.size()
@@ -46,7 +26,7 @@ import basicsr.archs.rrdbnet_arch as _rrdbnet_arch_module
 # (batch=1, channels=3, spatial=tile_size -- all known at trace time) instead
 # of tensor-derived sizes, producing an identical reshape/permute result for
 # our actual input but with a fully static graph. Scoped as a module patch
-# (not an edit to the installed basicsr package) so it's easy to see/revert.
+# (not an edit to rrdbnet_arch.py itself) so it's easy to see/revert.
 def _make_static_pixel_unshuffle(tile_size):
     def _static_pixel_unshuffle(x, scale):
         b, c, hh, hw = 1, 3, tile_size, tile_size

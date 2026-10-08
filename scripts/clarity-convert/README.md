@@ -39,10 +39,16 @@ python3 -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-`requirements.txt` 里的版本是配套关系，别单独升级：`basicsr==1.4.2` 只被
-`convert_coreml.py` / `inference_check.py` / `verify_coreml.py` 用到（RRDBNet 那条线），
-而它在 `torchvision>=0.17` 下会 import 一个已删除的模块，脚本顶部有 shim 兜着（见第五节）。
-`convert_compact.py` 和 `convert_cugan.py` 不依赖 basicsr。
+主环境只有 torch + coremltools（加 pillow / numpy）。
+
+**2026-10-08 起不再装 basicsr / realesrgan / torchvision**：RRDBNet 那条线
+（`convert_coreml.py` / `inference_check.py` / `verify_coreml.py`）只用到 basicsr 里的网络结构，
+已抄成本目录的 `rrdbnet_arch.py`；torchvision 原本只是为了让 basicsr 能 import 才装的。
+同时 torch 从 2.5.1 升到 2.14.1（GitHub 对 2.5.1 报了 9 条安全问题，basicsr 1.4.2 报了 1 条且无修复版本）。
+
+coremltools 9.0 会提示「只测到 torch 2.7」，**可以忽略**：升级当天用新环境把 6 个 `.mlpackage`
+（上线的 4 个 + RRDBNet 2 个）全部重转了一遍，拿同一张测试图跟旧产物逐像素比，**输出完全一致**
+（最大差 0）；`verify_coreml.py` 2x / 4x 照常通过。以后升 torch 也照这个办法验。
 
 **fsrcnn/ 需要两个额外环境**，都跟主环境冲突，各建各的 venv：
 
@@ -200,15 +206,14 @@ Real-CUGAN 到处用 `F.pad(x, (-4,-4,-4,-4))` 当裁剪使（UNet1/UNet2 内部
 trace 遇到 `x.shape[i]` 会生成 `aten::size` + `aten::Int`，CoreML 转不了。
 
 **3. `pixel_unshuffle` 的动态形状。**
-basicsr 的实现从 `x.size()` 取维度，`torch.jit.trace` 会把它录成动态形状算子，
+basicsr 的实现（现在抄在 `rrdbnet_arch.py` 里）从 `x.size()` 取维度，`torch.jit.trace` 会把它录成动态形状算子，
 coremltools 9.0 报 `TypeError: only 0-dimensional arrays can be converted to Python scalars`。
 `convert_coreml.py` 把它换成写死 int 的等价实现（反正 CoreML 本来就要求静态输入尺寸）。
 只有 scale=2 分支会走到，scale=4 不调用它。
 
-**4. torchvision ≥ 0.17 删了 `transforms.functional_tensor`，basicsr 1.4.2 还在 import 它。**
-`rgb_to_grayscale` 本身还在 `transforms.functional` 里没变，所以在 import basicsr 之前
-注册一个只重导出这一个函数的 shim 模块即可。降版本不行：torch 2.5.1 / torchvision 0.20.1
-是官方配套，没有更新的 torchvision 还带旧模块。
+**4. （已不适用）torchvision ≥ 0.17 删了 `transforms.functional_tensor`，basicsr 1.4.2 还在 import 它。**
+原来靠在 import basicsr 之前注册一个 shim 模块兜着。2026-10-08 起不装 basicsr 了，这个坑跟着消失，
+脚本里的 shim 已删。留这条是为了以后有人想换回 pip 装的 basicsr 时知道会撞上什么。
 
 **5. FSRCNN 官方权重的 `b8` 不是卷积的 per-channel bias。**
 它是加在 PixelShuffle **之后**的最终单通道输出上的一个标量（如果是 conv 的 bias，

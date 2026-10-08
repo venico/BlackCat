@@ -1,19 +1,10 @@
 import sys
-import types
-
-# --- Compat shim (same as Task 1's inference_check.py / convert_coreml.py) --
-import torchvision.transforms.functional as _tv_functional
-if 'torchvision.transforms.functional_tensor' not in sys.modules:
-    _shim = types.ModuleType('torchvision.transforms.functional_tensor')
-    _shim.rgb_to_grayscale = _tv_functional.rgb_to_grayscale
-    sys.modules['torchvision.transforms.functional_tensor'] = _shim
-# --- End compat shim ---------------------------------------------------------
 
 import coremltools as ct
 import torch
 import numpy as np
 from PIL import Image
-from basicsr.archs.rrdbnet_arch import RRDBNet
+from rrdbnet_arch import RRDBNet
 
 CROP_SIZE = 256
 

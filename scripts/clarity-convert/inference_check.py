@@ -1,25 +1,7 @@
 import sys
-import types
-
-# --- Compat shim -----------------------------------------------------------
-# torchvision >= 0.17 removed `torchvision.transforms.functional_tensor`
-# (deprecated since 0.15). basicsr==1.4.2's degradations.py still does
-# `from torchvision.transforms.functional_tensor import rgb_to_grayscale`,
-# which raises ModuleNotFoundError with torch==2.5.1 / torchvision==0.20.1
-# (the officially paired versions pinned in requirements.txt -- there is no
-# newer torchvision with the old module, and downgrading would mean
-# downgrading torch too). `rgb_to_grayscale` still exists, unchanged, in
-# `torchvision.transforms.functional`, so we register a tiny shim module
-# that re-exports it under the old name before basicsr is imported.
-import torchvision.transforms.functional as _tv_functional
-if 'torchvision.transforms.functional_tensor' not in sys.modules:
-    _shim = types.ModuleType('torchvision.transforms.functional_tensor')
-    _shim.rgb_to_grayscale = _tv_functional.rgb_to_grayscale
-    sys.modules['torchvision.transforms.functional_tensor'] = _shim
-# --- End compat shim ---------------------------------------------------------
 
 import torch
-from basicsr.archs.rrdbnet_arch import RRDBNet
+from rrdbnet_arch import RRDBNet
 from PIL import Image
 import numpy as np
 
