@@ -59,6 +59,8 @@ final class AgentRunner: ObservableObject {
     @Published var streamingText = ""
     /// 正等着用户点确认的那个工具调用
     @Published var pendingConfirm: PendingConfirm?
+    /// 正等着用户选的那道选择题（ask_user）
+    @Published var pendingQuestion: PendingQuestion?
 
     /// 一条会话跑一轮的全部状态
     private struct RunState {
@@ -70,6 +72,9 @@ final class AgentRunner: ObservableObject {
         var phase = ""
         var streamingText = ""
         var pendingConfirm: PendingConfirm?
+        var pendingQuestion: PendingQuestion?
+        /// 用户在这一轮跑着的时候又发来的话，等下一步之前塞给模型
+        var queuedInputs: [String] = []
         var startedAt: Date?
         var task: Task<Void, Never>?
         var ticker: Timer?
@@ -93,6 +98,7 @@ final class AgentRunner: ObservableObject {
         phase = st.phase
         streamingText = st.streamingText
         pendingConfirm = st.pendingConfirm
+        pendingQuestion = st.pendingQuestion
     }
 
     private func mutate(_ id: UUID, _ body: (inout RunState) -> Void) {
@@ -115,13 +121,46 @@ final class AgentRunner: ObservableObject {
         let onAnswer: (Bool) -> Void
     }
 
+    /// 一道选择题。`onAnswer(nil)` = 用户没答（按了停止）
+    struct PendingQuestion: Identifiable {
+        let id = UUID()
+        let question: String
+        let options: [String]
+        let onAnswer: (String?) -> Void
+    }
+
     /// 一轮最多让它调多少次工具。绕圈子的话到这就停。
     /// 走设置（AI → 通用 → 步数上限），每轮开跑时读一次
     private var maxSteps: Int { max(1, Int(AppSettings.shared.agentMaxSteps)) }
 
     /// 停的是**当前看着那条**的活儿
+    /// 这一轮还在跑时用户又发了一句。不另起一轮，下一步之前交给模型，它自己决定怎么调整。
+    /// 学的是 Claude Code：干活中途插话直接进当前这轮，而不是等它做完
+    /// - Returns: 收下了返回 true；这条会话没在跑就是 false，调用方照常起一轮
+    func enqueue(_ text: String, in convID: UUID?) -> Bool {
+        guard let convID, states[convID]?.isRunning == true else { return false }
+        mutate(convID) { $0.queuedInputs.append(text) }
+        return true
+    }
+
+    /// 取走排着的话
+    private func drainQueue(_ cid: UUID) -> [String] {
+        let q = states[cid]?.queuedInputs ?? []
+        if !q.isEmpty { mutate(cid) { $0.queuedInputs = [] } }
+        return q
+    }
+
+    private static func queuedNote(_ q: [String]) -> String {
+        "[你干活的时候用户又发来了话，看看要不要调整接下来的做法；跟前面冲突的以这几句为准]\n"
+            + q.map { "「\($0)」" }.joined(separator: "\n")
+    }
+
     func cancel() {
         guard let id = visibleID else { return }
+        // 停了就不再塞，排着的话已经显示在会话里，下一轮会进历史
+        states[id]?.queuedInputs = []
+        // 正等着选的那道题先放掉，不然执行循环一直挂在那儿
+        states[id]?.pendingQuestion?.onAnswer(nil)
         states[id]?.task?.cancel()
         states[id]?.ticker?.invalidate()
         mutate(id) {
@@ -145,7 +184,7 @@ final class AgentRunner: ObservableObject {
              mode: AgentMode,
              project: ProjectState,
              webSearch: Bool = false,
-             onFinish: @escaping (String) -> Void) {
+             onFinish: @escaping (_ reply: String, _ history: [AgentMessage]) -> Void) {
         // 这一轮归哪条会话。整轮的状态都写进它名下，别的会话不受影响
         let cid = AIVideoService.shared.currentConversationId ?? UUID()
         guard states[cid]?.isRunning != true else { return }
@@ -219,6 +258,9 @@ final class AgentRunner: ObservableObject {
             do {
                 for _ in 0..<maxSteps {
                     if Task.isCancelled { break }
+                    // 用户中途追加的话，下一次问模型之前带上
+                    let queued = self.drainQueue(cid)
+                    if !queued.isEmpty { msgs.append(.user(Self.queuedNote(queued))) }
                     self.mutate(cid) { $0.phase = "正在思考" }
                     let turn = try await AgentLLM.send(messages: msgs.compactedForSending(),
                                                        tools: buildTools(),
@@ -229,7 +271,16 @@ final class AgentRunner: ObservableObject {
                         finalText = turn.text
                         self.mutate(cid) { $0.streamingText = turn.text }
                     }
-                    guard !turn.toolCalls.isEmpty else { ranOut = false; break }
+                    guard !turn.toolCalls.isEmpty else {
+                        // 模型准备收尾了，可用户刚好又发了话 —— 不收尾，带上接着做
+                        let late = self.drainQueue(cid)
+                        if !late.isEmpty {
+                            msgs.append(.assistant(text: turn.text, calls: []))
+                            msgs.append(.user(Self.queuedNote(late)))
+                            continue
+                        }
+                        ranOut = false; break
+                    }
                     msgs.append(.assistant(text: turn.text, calls: turn.toolCalls))
 
                     for call in turn.toolCalls {
@@ -303,6 +354,11 @@ final class AgentRunner: ObservableObject {
                 DiagLog.log("[Agent] 步数用尽（\(maxSteps) 轮），任务未完成")
             }
             if !finalText.isEmpty { msgs.append(.assistant(text: finalText, calls: [])) }
+            // 回了「做不了」却没报缺口的，替它记一笔
+            if !Task.isCancelled {
+                AgentToolbox.autoReportGapIfNeeded(prompt: prompt, reply: finalText,
+                                                   calledTools: self.states[cid]?.steps.map(\.toolName) ?? [])
+            }
             project.suppressUndoPush = false
             self.states[cid]?.ticker?.invalidate()
             self.mutate(cid) {
@@ -311,9 +367,14 @@ final class AgentRunner: ObservableObject {
                 $0.phase = ""
                 $0.isRunning = false
             }
-            onFinish(finalText)
+            // **这一轮的完整记录（工具调用、结果、最后的回复）要从这里交回去。**
+            // 原来是在 run 末尾 `history = msgs` 同步写回 —— 那时这个 Task 还没开跑，
+            // 写回去的只有用户这句话。同一次运行里 Agent 的记忆于是只剩用户连着说的几句、
+            // 一句自己的回复都没有，看着就像前面的要求还没做，下一轮连上一条一起又做一遍（实测）
+            onFinish(finalText, msgs)
         }
         mutate(cid) { $0.task = task }
+        // 先把用户这句写进去：这一轮跑着的时候用户切走再切回来，记忆里至少有这一句
         history = msgs
     }
 
@@ -394,6 +455,26 @@ final class AgentRunner: ObservableObject {
         guard let spec = AgentToolbox.allSpecs.first(where: { $0.name == call.name }) else {
             return .fail("没有叫 \(call.name) 的工具。")
         }
+        if call.name == "view_attachments" { return AgentToolbox.viewAttachments(call.arguments) }
+        if call.name == "report_gap" { return AgentToolbox.runGapTool(call.arguments) }
+        if call.name == "search_tools" {
+            return AgentToolGate.shared.search(call.arguments["query"] as? String ?? "")
+        }
+        if call.name == "ask_user" {
+            guard !background else {
+                return .fail("后台助手不能问用户。按最合理的理解做，在汇报里说清你是怎么理解的。")
+            }
+            let question = (call.arguments["question"] as? String)?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let options = Array(AgentToolbox.askOptions(call.arguments).prefix(4))
+            guard !question.isEmpty, options.count >= 2 else {
+                return .fail("ask_user 要一个 question 和 2～4 个 options。")
+            }
+            guard let answer = await ask(question, options: options, convID: convID) else {
+                return .fail("用户没回答，这一轮停了。")
+            }
+            return .ok("用户的回答：\(answer)\n照这个接着做，不用再确认一遍。")
+        }
         // 后台助手的工具表里本来就没有危险工具，模型硬调（照历史名字猜）也在这儿挡住
         if background && spec.risk == .dangerous {
             return .fail("后台助手不能做这一步（生成、删除这类）。停下来，在汇报里说清需要用户决定什么。")
@@ -405,10 +486,22 @@ final class AgentRunner: ObservableObject {
             guard ok else { return .fail("用户拒绝了这一步，换个做法或者停下来问问他。") }
         }
 
+        // 会动项目的一步跑完，让属性面板重读一遍
+        if spec.risk != .readOnly {
+            defer { project.inspectorRevision &+= 1 }
+            return await executeTool(call, project: project)
+        }
+        return await executeTool(call, project: project)
+    }
+
+    private func executeTool(_ call: AgentToolCall, project: ProjectState) async -> AgentToolResult {
         if let r = await AgentToolbox.runReadTool(call.name, args: call.arguments, project: project) {
             return r
         }
         if let r = AgentToolbox.runEditTool(call.name, args: call.arguments, project: project) {
+            return r
+        }
+        if let r = AgentToolbox.runPropsTool(call.name, args: call.arguments, project: project) {
             return r
         }
         if let r = AgentToolbox.runGenerateTool(call.name, args: call.arguments, project: project) {
@@ -455,6 +548,19 @@ final class AgentRunner: ObservableObject {
             return r
         }
         return .fail("工具 \(call.name) 还没接上。")
+    }
+
+    private func ask(_ question: String, options: [String], convID: UUID) async -> String? {
+        await withCheckedContinuation { cont in
+            mutate(convID) {
+                $0.pendingQuestion = PendingQuestion(question: question, options: options) { [weak self] ans in
+                    // 只认第一次：停止按钮和点选项可能前后脚到，resume 两次会崩
+                    guard self?.states[convID]?.pendingQuestion != nil else { return }
+                    self?.mutate(convID) { $0.pendingQuestion = nil }
+                    cont.resume(returning: ans)
+                }
+            }
+        }
     }
 
     private func confirm(_ tool: String, detail: String, convID: UUID) async -> Bool {
@@ -513,6 +619,10 @@ final class AgentRunner: ObservableObject {
         · 要改某条片段必须先拿到它的 id（list_tracks 会给），不要按名字猜。
         · 涉及画面好坏的判断（太暗、主体位置、有没有穿帮），调 capture_frame 亲眼看，别靠推测。
         · 一次只做用户要求的事。顺手多改的东西他没法预料，只会添乱。
+        · **说「没有这个功能」「做不了」之前，先用 search_tools 换几个说法搜一遍**。
+          你的工具很多、分组挂着，手上没看到不等于没有（实测：加图形、改圆角投影其实都有，它却回没有）。
+          get_properties / set_properties 能读改任何片段的全部属性，专门工具没开放的参数先试它。
+          都试过还是做不了，调 report_gap 记下来，再如实告诉用户。
         · 干完用一两句话说清楚你改了什么，不用复述每一步工具调用。
         · 生成图片/视频/音频是后台任务，**提交完就接着做别的，别在那儿等**。
           用户问「好了没」的时候再去查 list_background_tasks。
@@ -572,7 +682,7 @@ final class AgentRunner: ObservableObject {
               做法：新建一张卡片写好提示词，generate_canvas_node 时把原图填进
               reference（会自动连线）；原图那张留着别动，好坏可以对比。
             · 用户说「画布上的图」而画布上**不止一张**时，先说清楚你打算动哪张，
-              或者直接问他 —— 别自己挑一张就改，改错了他得重新生成一次（花钱）。
+              或者用 ask_user 让他选 —— 别自己挑一张就改，改错了他得重新生成一次（花钱）。
             · 画布卡片**能指定用哪家模型**（generate_canvas_node 的 model 参数）。
               用户说「用 seedream 再来一版」就填上，别回他「画布不支持切换模型」。
 
@@ -665,6 +775,13 @@ enum AgentPhaseText {
         "add_effect":            "正在加特效",
         "add_adjust":            "正在加调节",
         "capture_frame":         "正在截取画面",
+        "ask_user":              "正在等你选择",
+        "view_attachments":      "正在看你发的图",
+        "search_tools":          "正在找合适的工具",
+        "save_skill":            "正在存成技能",
+        "report_gap":            "正在记录能力缺口",
+        "get_properties":        "正在读属性",
+        "set_properties":        "正在改属性",
         "split_at":              "正在分割片段",
         "move_clip":             "正在移动片段",
         "move_track":            "正在调整轨道顺序",

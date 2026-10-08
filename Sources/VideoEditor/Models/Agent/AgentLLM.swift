@@ -294,7 +294,15 @@ enum AgentLLM {
                                     "source": ["type": "base64", "media_type": "image/jpeg",
                                                "data": img.base64EncodedString()]], at: 0)
                 }
-                msgs.append(["role": "user", "content": content])
+                // 前一条也是 user（工具结果、或者用户干活中途追加的话）就并进去 ——
+                // 连着两条 user 有的中转站不收
+                if let last = msgs.last, last["role"] as? String == "user",
+                   var prev = last["content"] as? [[String: Any]] {
+                    prev += content
+                    msgs[msgs.count - 1]["content"] = prev
+                } else {
+                    msgs.append(["role": "user", "content": content])
+                }
             case .assistant(let t, let calls):
                 var content: [[String: Any]] = []
                 if !t.isEmpty { content.append(["type": "text", "text": t]) }

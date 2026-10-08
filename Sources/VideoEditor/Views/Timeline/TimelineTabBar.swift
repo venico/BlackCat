@@ -192,6 +192,7 @@ struct ClosedTimelinePlaceholder: View {
     /// TimelineView 根本不在视图树上，它那个 monitor 早随 onDisappear 拆了。
     /// 表现是：工具栏的撤销图标点了有效，⌘Z 没反应
     @State private var undoMonitor: Any? = nil
+    @State private var isDragOver = false
 
     /// 一条都不剩，跟「收起来了」是两码事
     private var noTimelines: Bool { project.tabs.isEmpty }
@@ -221,8 +222,41 @@ struct ClosedTimelinePlaceholder: View {
                 .padding(.top, 2)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        // 拖入反馈：跟素材区一个样式，整块染个底色
+        .background(isDragOver ? RoundedRectangle(cornerRadius: 10).fill(Color.accent.opacity(0.06)) : nil)
+        // 一条时间线都没有时，素材拖到这儿要自动建一条再放上去（右键「添加到时间轴」早就这样）。
+        // 这会儿 TimelineView 不在视图树上，它登记的拖放区跟着拆了 —— 不在这儿另登记一块，
+        // 拖过来的素材没人接，松手什么也不发生。
+        // 用单独的 kind：两边一个出现一个消失时，onDisappear 按 kind 注销不会误删对方那块
+        .background(GeometryReader { g in
+            Color.clear
+                .onAppear { registerDropZone(g.frame(in: .global)) }
+                .onChange(of: g.frame(in: .global)) { _, r in registerDropZone(r) }
+        })
         .onAppear { setupUndoMonitor() }
-        .onDisappear { teardownUndoMonitor() }
+        .onDisappear {
+            teardownUndoMonitor()
+            FileDropRouter.unregister(windowID, kind: .timelinePlaceholder)
+        }
+    }
+
+    /// 只收素材库拖来的素材，而且只在「一条都没有」时收 ——
+    /// 「全收起来了」的话往哪条里放说不清，不擅自往收起的那条里塞
+    private func registerDropZone(_ rect: CGRect) {
+        FileDropRouter.register(
+            windowID, kind: .timelinePlaceholder, rect: rect,
+            accepts: { payload in
+                guard project.tabs.isEmpty, case .asset = payload else { return false }
+                return true
+            },
+            onDrop: { payload, _ in
+                guard case .asset(let assetID) = payload,
+                      let asset = project.mediaAssets.first(where: { $0.id == assetID }),
+                      asset.fileExists else { return }
+                // 空时间线没有刻度可对，从 0 秒放；建时间线在 addToTimelineAt 里，跟右键那条同一个口子
+                project.addToTimelineAt(asset, time: 0)
+            },
+            onTargetChange: { isDragOver = $0 })
     }
 
     /// 守卫照抄 TimelineView 那份：**local monitor 是进程级的**，

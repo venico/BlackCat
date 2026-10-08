@@ -33,6 +33,9 @@ struct AIChatPanel: View {
     /// agentHistory 是这一次运行期间的内存状态。记下它对应哪个会话，
     /// 换了会话（或重启后压根没有）就得从落盘的聊天记录重建
     @State private var historyConvID: UUID?
+    /// agentHistory 已经覆盖到会话里第几条消息。两轮之间后台补进会话的东西
+    /// （生成完成的卡片、「接着做」的汇报）从这里往后找，补给 Agent
+    @State private var historySyncedCount = 0
     /// 进面板默认就是历史列表 —— 用户过来多半是要找之前那条，
     /// 而不是从空白开始
     @State private var swapHovering = false
@@ -1050,6 +1053,14 @@ struct AIChatPanel: View {
                     .padding(.leading, leadPad).padding(.trailing, 10)
                     .padding(.bottom, 6)
             }
+            // Agent 出的选择题，同一个位置。id 跟着题走，换题时输入框的草稿清掉
+            if let q = agent.pendingQuestion {
+                AgentQuestionBar(question: q.question, options: q.options, onAnswer: q.onAnswer)
+                    .id(q.id)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.leading, leadPad).padding(.trailing, 10)
+                    .padding(.bottom, 6)
+            }
 
             // 后台任务入口在输入区正上方，占正常的位置 —— 浮起来的话会压到
             // 会话最后一条上。没有任务时它自己不显示
@@ -1197,10 +1208,12 @@ struct AIChatPanel: View {
                     // 停止只在每条生成中的消息气泡上，不在这里做全局停止
                     // Agent 跑着的时候这个位置就是停止 —— 发出去之后要停，
                     // 手会自然回到刚才点的地方，不该再去别处找一个按钮
+                    // 跑着的时候输入框里有字 = 插话，按钮是发送；空着才是停止
+                    let showStop = agent.isRunning && !canSend
                     Button {
-                        if agent.isRunning { agent.cancel(project: project) } else { sendMessage() }
+                        if showStop { agent.cancel(project: project) } else { sendMessage() }
                     } label: {
-                        Image(nsImage: SidebarSVGIcon.load(agent.isRunning ? "toastStop" : "send",
+                        Image(nsImage: SidebarSVGIcon.load(showStop ? "toastStop" : "send",
                                                            size: 16))
                             .renderingMode(.template)
                             .resizable()
@@ -1213,7 +1226,7 @@ struct AIChatPanel: View {
                     }
                     .buttonStyle(.plain)
                     .disabled(!agent.isRunning && !canSend)
-                    .help(agent.isRunning ? "停止" : "发送")
+                    .help(showStop ? "停止" : (agent.isRunning ? "插话：正在做的这一轮会接着看到这句" : "发送"))
 
                 }
                 .padding(.horizontal, 8)
@@ -2197,12 +2210,46 @@ HStack(spacing: 2) {
         inputRevision += 1
         slashQuery = nil
 
+        // Agent 正等着选的时候，大输入框里打的字就是回答，不另起一轮
+        if let q = agent.pendingQuestion {
+            q.onAnswer(text)
+            return
+        }
+
+        // 这一轮还在跑：不另起一轮，插进当前这轮（学 Claude Code 的做法）
+        if agent.isRunning {
+            queueWhileRunning(text)
+            return
+        }
+
         // **一律交给 Agent**。挂没挂参考素材都一样 —— 生成走它的
         // generate_* 工具，界面上才有步骤条。
         // 以前挂了参考图会绕开 Agent 直接调生成接口：那条路没有步骤条，
         // 显示的是「正在生成回复」，而且模型按下拉里选的那家发，
         // 跟 `/命令` 点名的对不上
         runAgent(text)
+    }
+
+    /// 干活中途插话：会话里照常落一条用户消息，再交给正在跑的那一轮，下一步之前它会看到。
+    /// 正在跑的那条回复挪到最后 —— 不挪的话最终回答会出现在用户这句**上面**，读着顺序是乱的
+    private func queueWhileRunning(_ text: String) {
+        // 图片、附件这些要走整套参考素材的流程，中途塞不进去，等这轮做完再发
+        if !agentAttachments.isEmpty || !referenceContents.isEmpty
+            || firstFrameImage != nil || lastFrameImage != nil {
+            service.agentInputText = text
+            project.showSuccessToast(icon: "exclamationmark.triangle", iconColor: .orange,
+                                     title: "这一轮还没做完",
+                                     subtitle: "图片和附件等它做完再发，只发文字可以直接插话")
+            return
+        }
+        // 先交给正在跑的那轮；它恰好刚收尾（没收下）就照常起一轮
+        guard agent.enqueue(text, in: service.currentConversationId) else { runAgent(text); return }
+        _ = service.appendUserEntry(text)
+        if let rid = agent.runningMessageID,
+           let i = service.messages.firstIndex(where: { $0.id == rid }) {
+            let m = service.messages.remove(at: i)
+            service.messages.append(m)
+        }
     }
 
     /// 界面上挂着上一轮的对话，Agent 却说「没有上文」—— agentHistory 是
@@ -2229,7 +2276,7 @@ HStack(spacing: 2) {
         // 挂到 user 那边就没这问题：模型不会模仿用户说话
         var pendingLog: String?
         for m in past {
-            var t = m.content.trimmingCharacters(in: .whitespacesAndNewlines)
+            var t = historyText(m)
             guard !t.isEmpty else { continue }
             // 失败**不能**从历史里剔掉。原来一律跳过，模型于是不知道上一次
             // 生成砸了 —— 用户再说一遍同样的需求，它当没做过，又提交一个。
@@ -2281,6 +2328,35 @@ HStack(spacing: 2) {
         }
         agentHistory = out
         historyConvID = service.currentConversationId
+        historySyncedCount = service.messages.count
+    }
+
+    /// 一条消息在 Agent 眼里怎么说。生成结果的卡片正文只有「视频生成完成」，补上文件名
+    private func historyText(_ m: AIVideoService.ChatMessage) -> String {
+        let t = m.content.trimmingCharacters(in: .whitespacesAndNewlines)
+        let file = (m.videoURL ?? m.imageURL ?? m.audioURL)?.lastPathComponent
+        return file.map { t.isEmpty ? $0 : "\(t)：\($0)" } ?? t
+    }
+
+    /// 两轮之间会话里多出来的后台消息，补进 agentHistory。
+    ///
+    /// 同一次运行里 agentHistory 是接着用的，不会重建 —— 可后台的生成完成、
+    /// 「接着做」的后台助手干完活，都只写进了会话（界面上看得见），Agent 的记忆里没有。
+    /// 它记得的最后一句还是「生成完会自动放到轨道」，下一轮就又去放一遍（实测）
+    private func syncBackgroundMessages(before newUserMsg: UUID) {
+        guard let end = service.messages.firstIndex(where: { $0.id == newUserMsg }),
+              historySyncedCount < end else { return }
+        let lines = service.messages[historySyncedCount..<end].compactMap { m -> String? in
+            guard m.role == .assistant else { return nil }
+            let t = historyText(m)
+            guard !t.isEmpty, !t.hasPrefix("已取消"), !t.contains("已被用户取消") else { return nil }
+            if case .failed = m.status { return "· 没成：" + String(t.prefix(160)) }
+            return "· " + String(t.prefix(300))
+        }
+        historySyncedCount = end
+        guard !lines.isEmpty else { return }
+        agentHistory.append(.user("[系统记录·上一轮之后后台发生的事，已经做完了，不要重复做]\n"
+                                  + lines.joined(separator: "\n") + "\n[记录结束]"))
     }
 
     /// 交给 Agent 跑一轮
@@ -2312,8 +2388,12 @@ HStack(spacing: 2) {
     private func runAgent(_ text: String) {
         // 会话里先落一条用户消息（把这轮挂的图一起带上，气泡里才回显），
         // 回答回来再补 assistant 那条
-        _ = service.appendUserEntry(text, attachments: currentRoundAttachments())
-        if historyConvID != service.currentConversationId { rebuildAgentHistory() }
+        let userMsgID = service.appendUserEntry(text, attachments: currentRoundAttachments())
+        if historyConvID != service.currentConversationId {
+            rebuildAgentHistory()
+        } else {
+            syncBackgroundMessages(before: userMsgID)
+        }
         // 点名了 Skill 就把这话挑明。光把 `/名字` 混在句子里发过去，
         // 模型未必看得出这是「必须走这条」而不是随口提了一句
         var prompt = text
@@ -2351,17 +2431,13 @@ HStack(spacing: 2) {
         // 先占一条空回复，步骤就长在这条气泡里，跑完再把正文填进去
         let replyID = service.beginAgentReply()
         agent.setRunningMessage(replyID, in: service.currentConversationId)
-        // 附件：图片压成 JPEG 直接给模型看，文本读出来贴在提示词后面
-        var images: [Data] = []
+        // 附件：文本读出来贴在提示词后面；图片**不直接发给模型**，见下面「挂的图给谁」
         var docs: [String] = []
-        // 附件里的图片/视频/音频**同时也当参考素材**交给生成模型 ——
-        // 点没点名 `/命令` 都一样。以前只有参考区那份算数，
-        // 普通对话里挂张图说「照这张画一版」，模型看得见图、生成时却一张参考都没带
+        // 附件里的图片/视频/音频也当参考素材候选 —— 以前只有参考区那份算数，
+        // 普通对话里挂张图说「照这张画一版」，生成时却一张参考都没带
         var extraRefs: [AIVideoService.RefContent] = []
         for a in agentAttachments {
-            if let img = a.thumb {
-                if let d = AgentAttachmentIO.jpegData(img) { images.append(d) }
-            } else if AgentAttachmentIO.isTextDoc(a.url),
+            if !a.isImage, AgentAttachmentIO.isTextDoc(a.url),
                       let text = AgentAttachmentIO.readText(a.url) {
                 docs.append("<文件 name=\"\(a.name)\">\n\(text)\n</文件>")
             }
@@ -2379,19 +2455,10 @@ HStack(spacing: 2) {
         if !docs.isEmpty {
             prompt += "\n\n" + docs.joined(separator: "\n\n")
         }
-        if !images.isEmpty {
-            prompt += "\n\n[用户带了 \(images.count) 张图，就在这条消息里。]"
-        }
         agentAttachments.removeAll()
 
         // 挂着的参考素材：留一份快照给生成工具（它是异步跑的，等执行时
         // 界面上那份早清空了）。
-        //
-        // **参考图不发给 Agent 模型**：它只要知道「挂了图、调工具时会自动带上」
-        // 就够了，真正看图的是生成模型。而带图的请求在中转站上极慢 ——
-        // 实测 1KB 的小图也要 58 秒、53KB 要 97 秒（不带图几秒就回，
-        // 跟图大小几乎无关），撑过 180 秒超时就报「网络连接已中断」。
-        // 要让模型看图，走 ＋ 上传附件那条，那才是给它看的
         // 参考区那份在前（用户是特意挑的），附件里的接在后面，同一个文件不重复
         service.agentRoundReferences = referenceContents
             + extraRefs.filter { e in !referenceContents.contains { $0.url == e.url } }
@@ -2401,17 +2468,53 @@ HStack(spacing: 2) {
         service.agentRoundGenerated = []
         // 从这轮原话里认张数，不等模型传 count
         service.agentRoundImageCount = AIVideoService.parseImageCount(from: prompt)
-        if !service.agentRoundReferences.isEmpty || firstFrameImage != nil {
-            prompt += "\n\n[用户挂了参考素材，调生成工具时会自动带上，不用再问他要。]"
+
+        // **挂的图给谁，看用户的话。** Agent 默认不看图，只读用户的话来判断：
+        // · 「这是啥」「图里写的什么」—— 它调 view_attachments 现看
+        // · 「照这张生成一张竖版的」—— 它不用看，生成时把图交给生成模型就行
+        // · 用 `/seedance` 这类命令点名了生成模型 ＝ 图就是给生成用的，生成时自动带上
+        //
+        // 原来是一律只给生成模型：参考区借的是图片生成那家、它收参考，于是 ＋ 上传、拖入、粘贴的图
+        // 全进了参考区，Agent 一张都看不到，用户问「这是啥」它只能去截播放头那一帧来猜（实测）。
+        // 也不能反过来一律发给 Agent —— 只是挂给生成用的图，让它看一遍纯属白花 token
+        let forGeneration = namedModel(in: text) != nil
+        service.agentRoundRefsNeedOptIn = !forGeneration
+        // 这轮挂的图取会话里刚落下的那条消息的附件 —— 那是已经复制进 app 目录的那份，
+        // 跟 view_attachments 读的是同一批文件，编号才对得上
+        let viewable = (service.messages.first { $0.id == userMsgID }?.attachments ?? [])
+            .filter { [.image, .firstFrame, .lastFrame].contains($0.kind) }
+            .compactMap { $0.resolvedURL() }
+        let all = service.conversationImageURLs()
+        let firstNew = all.firstIndex { viewable.contains($0) }
+        service.agentRoundViewStart = firstNew.map { $0 + 1 }
+        if forGeneration, !service.agentRoundReferences.isEmpty || firstFrameImage != nil {
+            prompt += "\n\n[用户挂了参考素材，是给生成模型用的，调生成工具时会自动带上，不用再问他要。]"
+        } else if !forGeneration {
+            if !viewable.isEmpty {
+                let start = service.agentRoundViewStart ?? 1
+                prompt += "\n\n[用户这轮挂了 \(viewable.count) 张图（编号 \(start)～\(start + viewable.count - 1)："
+                    + viewable.map(\.lastPathComponent).joined(separator: "、")
+                    + "），你现在看不到。按他的原话判断：要你说图里是什么、根据图的内容做判断的，"
+                    + "调 view_attachments 看图，别去截预览画面代替；要拿图当参考去生成的，不用看，"
+                    + "直接调生成工具并传 use_references=true。]"
+            }
+            // 视频 / 音频谁也看不到，但没点名模型时也得 Agent 点头才带，得让它知道有这些
+            let mediaRefs = service.agentRoundReferences.filter { $0.type != .image }
+            if !mediaRefs.isEmpty {
+                prompt += "\n\n[用户还挂了 \(mediaRefs.count) 个视频/音频："
+                    + mediaRefs.map(\.url.lastPathComponent).joined(separator: "、")
+                    + "。要拿它们当参考去生成，调生成工具时传 use_references=true。]"
+            }
         }
         referenceContents.removeAll()
         firstFrameImage = nil
         lastFrameImage = nil
         refExpanded = false
 
-        agent.run(prompt: prompt, images: images, history: &agentHistory,
+        let convAtStart = service.currentConversationId
+        agent.run(prompt: prompt, history: &agentHistory,
                   mode: settings.agentMode, project: project,
-                  webSearch: service.webSearchEnabled) { reply in
+                  webSearch: service.webSearchEnabled) { reply, fullHistory in
             service.finishAgentReply(id: replyID, text: reply,
                                      steps: agent.steps.map {
                                          .init(tool: $0.toolName, summary: $0.summary,
@@ -2423,6 +2526,11 @@ HStack(spacing: 2) {
                                      },
                                      elapsed: agent.elapsed, tokens: agent.totalTokens)
             agent.setRunningMessage(nil, in: service.currentConversationId)
+            // 这一轮的完整记录写回记忆。只认还是这条会话的 —— 跑的时候用户切到别的会话，
+            // agentHistory 已经换成那边的了，写回去就串了
+            if historyConvID == convAtStart { agentHistory = fullHistory }
+            // 这一轮的问答已经在 agentHistory 里了，从这往后的才算「两轮之间」
+            historySyncedCount = service.messages.count
         }
     }
 

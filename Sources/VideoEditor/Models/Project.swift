@@ -1359,6 +1359,10 @@ final class ProjectState: ObservableObject {
     /// AI 画布是否展开。每个窗口一份 —— 开关是界面状态，
     /// 画布**内容**是全局的（跟会话走，B5 接）
     @Published var showCanvas = false
+    /// 属性面板的版本号。片段被「面板以外」改了（Agent 改属性、撤销重做）就加一，
+    /// 面板跟着重建、重新读一遍数据。大部分面板只在换选中对象时读，
+    /// 原来 Agent 改完时长，面板上还是旧值，要切一下选中才变（实测）
+    @Published var inspectorRevision = 0
     /// 聊天区点开的图片/视频，全屏查看用。nil 表示没在看
     @Published var mediaPreview: MediaPreviewItem?
     /// 输入区 ＋ 菜单：按钮在窗口里的位置（nil = 菜单关着）。

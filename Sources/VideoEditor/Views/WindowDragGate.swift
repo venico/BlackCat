@@ -77,7 +77,7 @@ enum FileDropRouter {
 
     /// 接收区。素材区收文件，时间轴收素材 id —— 两边收的载荷类型不同，
     /// 所以匹配时既要看落点在不在区里，也要看这个区收不收这种载荷
-    enum Kind: Hashable { case mediaLibrary, timeline, aiChat, canvasChat, canvas, chatHistory }
+    enum Kind: Hashable { case mediaLibrary, timeline, timelinePlaceholder, aiChat, canvasChat, canvas, chatHistory }
 
     /// 匹配顺序。**必须固定**：AI 面板和素材库是同一块地方的两个标签页，
     /// 矩形几乎重合，而素材库那块登记后不会撤（切标签页只是不显示）。
@@ -88,7 +88,7 @@ enum FileDropRouter {
     // 排前面的话拖到画布左半边会被底下的侧栏吃掉，变成 Agent 附件而不是落成卡片。
     // 卡片浮在画布之上，所以 `.canvasChat` 又要排在 `.canvas` 前面
     private static let matchOrder: [Kind] = [.chatHistory, .canvasChat, .canvas, .aiChat,
-                                             .mediaLibrary, .timeline]
+                                             .mediaLibrary, .timeline, .timelinePlaceholder]
 
     private struct Zone {
         /// SwiftUI `.global` 坐标系（原点左上）里的接收区

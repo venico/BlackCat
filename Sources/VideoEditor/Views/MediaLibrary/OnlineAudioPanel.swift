@@ -610,7 +610,7 @@ struct OnlineAudioPanel: View {
                 hint("加载中…")
             } else {
                 // 库是英文索引的，中文词基本搜不到
-                hint(hasCJK ? "没搜到。这个库是英文的，换成英文词试试（如 雨 → rain）" : "没有结果，换个词试试")
+                hint(hasCJK ? "没搜索到，请换成英文关键词重试" : "没有结果，换个词试试")
             }
         } else {
             list(store.results, paged: true)

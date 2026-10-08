@@ -359,6 +359,77 @@ struct AgentConfirmBar: View {
     }
 }
 
+/// Agent 出的选择题（ask_user）：2～4 个选项按钮，最后一行是「自己写」的输入框。
+/// 长在输入框正上方，跟危险操作的确认栏同一个位置；答完 Agent 这一轮接着往下做。
+/// 底下那个大输入框直接打字发送也算回答（AIChatPanel.sendMessage 里转过来）
+struct AgentQuestionBar: View {
+    let question: String
+    let options: [String]
+    let onAnswer: (String?) -> Void
+    @State private var custom = ""
+    @State private var hovered: Int?
+
+    private func submitCustom() {
+        let t = custom.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !t.isEmpty else { return }
+        onAnswer(t)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(question)
+                .font(.system(size: 11.5, weight: .medium))
+                .foregroundColor(Color.labelPrimary)
+                .fixedSize(horizontal: false, vertical: true)
+                .padding(.bottom, 2)
+            ForEach(Array(options.enumerated()), id: \.offset) { i, opt in
+                Button { onAnswer(opt) } label: {
+                    HStack(alignment: .firstTextBaseline, spacing: 7) {
+                        Text("\(i + 1)")
+                            .font(.system(size: 10, weight: .semibold).monospacedDigit())
+                            .foregroundColor(Color.labelSecondary)
+                            .frame(width: 16, height: 16)
+                            .background(Circle().fill(Color.white.opacity(0.08)))
+                        Text(opt)
+                            .font(.system(size: 11))
+                            .foregroundColor(Color.labelPrimary)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .padding(.horizontal, 8).padding(.vertical, 6)
+                    .background(RoundedRectangle(cornerRadius: 6)
+                        .fill(Color.white.opacity(hovered == i ? 0.12 : 0.06)))
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .onHover { hovered = $0 ? i : (hovered == i ? nil : hovered) }
+            }
+            // 都不合适就自己写，回车提交
+            HStack(spacing: 6) {
+                TextField("其他，自己写…", text: $custom)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 11))
+                    .onSubmit(submitCustom)
+                Button(action: submitCustom) {
+                    Image(nsImage: SidebarSVGIcon.load("send", size: 13))
+                        .renderingMode(.template)
+                        .foregroundColor(custom.trimmingCharacters(in: .whitespaces).isEmpty
+                                         ? Color.labelSecondary.opacity(0.5) : Color.accent)
+                        .frame(width: 20, height: 20)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .disabled(custom.trimmingCharacters(in: .whitespaces).isEmpty)
+            }
+            .padding(.horizontal, 8).frame(height: 28)
+            .background(RoundedRectangle(cornerRadius: 6).fill(Color.black.opacity(0.22)))
+        }
+        .padding(10)
+        .background(RoundedRectangle(cornerRadius: 8).fill(Color.accent.opacity(0.08)))
+        .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.accent.opacity(0.28), lineWidth: 1))
+    }
+}
+
 /// 悬停提示。
 ///
 /// SwiftUI 的 `.help()` 在自绘 Button 上时灵时不灵，索性自己画一个：

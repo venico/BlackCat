@@ -35,7 +35,7 @@ extension AgentToolbox {
 
             AgentToolSpec(
                 name: "add_shape",
-                description: "在播放头处加一个图形（矩形、圆形、箭头这类），加完可以用 update_clip 调位置大小。",
+                description: "在播放头处加一个图形（矩形、圆形、箭头这类）。加完用 update_clip 改它：位置大小、填充颜色、描边、圆角（矩形）、投影、透明度都能调。",
                 parameters: [
                     "type": "object",
                     "properties": [

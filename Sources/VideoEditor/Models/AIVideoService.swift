@@ -703,6 +703,45 @@ final class AIVideoService: ObservableObject {
     var agentRoundReferences: [RefContent] = []
     var agentRoundFirstFrame: URL?
     var agentRoundLastFrame: URL?
+    /// 这轮挂的图要不要等 Agent 点头才当参考。
+    /// 用户点名了生成模型（`/seedance`）＝ 图就是给生成用的，自动带上；
+    /// 没点名＝ 图先给 Agent 看，它按用户的话判断要不要当参考（生成工具传 use_references）
+    var agentRoundRefsNeedOptIn = false
+    /// 这一轮新挂的图在 `conversationImageURLs()` 里从第几张开始（1 起）。没新图 = nil
+    var agentRoundViewStart: Int?
+
+    /// 当前会话里用户发过的图（按先后，最近 12 张）。view_attachments 从这里取。
+    ///
+    /// **从会话记录里读，不另存一份** —— 图本来就作为附件随会话落盘，重开软件、切回会话都还在。
+    /// 原来记在内存里，一重启就没了；更早只认「这一轮」挂的，用户上一句发图、
+    /// 这一句说「照刚才那张改」，它回「附件是空的」（实测）
+    func conversationImageURLs() -> [URL] {
+        var out: [URL] = []
+        for m in messages where m.role == .user {
+            for a in m.attachments where [.image, .firstFrame, .lastFrame].contains(a.kind) {
+                guard let u = a.resolvedURL() else { continue }
+                out.removeAll { $0 == u }
+                out.append(u)
+            }
+        }
+        return Array(out.suffix(12))
+    }
+
+    /// 用户发的图复制一份到 app 自己的目录，会话记录指向这份。
+    /// 原图被挪走、删掉，或者是临时目录里的截图，会话里的图都不会跟着没了
+    private func persistedChatImage(_ a: Attachment) -> Attachment {
+        guard [.image, .firstFrame, .lastFrame].contains(a.kind) else { return a }
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        let dir = base.appendingPathComponent("黑猫剪辑/chat-images", isDirectory: true)
+        let src = a.resolvedURL() ?? a.url
+        // 已经是自己目录里的（重发、从记录里再挂一次）就不再复制
+        guard !src.path.hasPrefix(dir.path) else { return a }
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let name = src.deletingPathExtension().lastPathComponent
+        let dest = dir.appendingPathComponent("\(name)_\(UUID().uuidString.prefix(4)).\(src.pathExtension)")
+        guard (try? FileManager.default.copyItem(at: src, to: dest)) != nil else { return a }
+        return makeAttachment(url: dest, kind: a.kind)
+    }
 
     /// 这一轮已经提交过哪几类生成任务。**一轮每类只放行一次**。
     ///
@@ -1523,7 +1562,7 @@ final class AIVideoService: ObservableObject {
     func appendUserEntry(_ text: String, attachments: [Attachment] = []) -> UUID {
         if currentConversationId == nil { newConversation() }
         var msg = ChatMessage(role: .user, content: text)
-        msg.attachments = attachments
+        msg.attachments = attachments.map(persistedChatImage)
         messages.append(msg)
         persist(msg, isUser: true, steps: nil)
         return msg.id

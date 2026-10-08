@@ -98,6 +98,65 @@ final class AgentSkills: ObservableObject {
         reload()
     }
 
+    /// Agent 自己写的 Skill 在 `.source` 里记这个，设置页归成一组，也用来判断能不能覆盖
+    static let agentSource = "agent"
+
+    /// Agent 把一套做法存成 Skill。
+    /// - Returns: 出错的话是原因，成功是 nil
+    func saveFromAgent(name rawName: String, description: String, body: String,
+                       scripts: [String: String], overwrite: Bool) -> String? {
+        // 文件夹名：去掉路径分隔符这类，太长截掉
+        let name = String(rawName.trimmingCharacters(in: .whitespacesAndNewlines)
+            .map { "/\\:*?\"<>|".contains($0) ? "-" : $0 }.prefix(40))
+        guard !name.isEmpty, !name.hasPrefix(".") else { return "name 不能为空" }
+        let fm = FileManager.default
+        let dir = Self.rootURL.appendingPathComponent(name, isDirectory: true)
+        if fm.fileExists(atPath: dir.path) {
+            let src = (try? String(contentsOf: dir.appendingPathComponent(".source"), encoding: .utf8))?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            guard overwrite else {
+                return "已经有一个叫「\(name)」的 Skill 了。换个名字，或者问用户要不要覆盖（覆盖传 overwrite=true）"
+            }
+            // 用户自己装的不让 Agent 覆盖，只能覆盖它自己写的
+            guard src == Self.agentSource else {
+                return "「\(name)」是用户自己装的 Skill，不能覆盖，换个名字"
+            }
+            try? fm.removeItem(at: dir)
+        }
+        for f in scripts.keys {
+            let ext = (f as NSString).pathExtension
+            guard ["sh", "py", "js"].contains(ext), !f.contains("/") else {
+                return "脚本「\(f)」不行：只收 .sh / .py / .js，而且不能带路径"
+            }
+        }
+        do {
+            try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+            let oneLine = description.replacingOccurrences(of: "\n", with: " ")
+            let md = """
+            ---
+            name: \(name)
+            description: \(oneLine)
+            author: Agent
+            version: 1
+            ---
+
+            \(body.trimmingCharacters(in: .whitespacesAndNewlines))
+
+            """
+            try md.write(to: dir.appendingPathComponent("SKILL.md"), atomically: true, encoding: .utf8)
+            try Self.agentSource.write(to: dir.appendingPathComponent(".source"), atomically: true, encoding: .utf8)
+            for (f, content) in scripts {
+                let u = dir.appendingPathComponent(f)
+                try content.write(to: u, atomically: true, encoding: .utf8)
+                try? fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: u.path)
+            }
+        } catch {
+            return "写不进去：\(error.localizedDescription)"
+        }
+        reload()
+        return nil
+    }
+
     /// 从别处拷一个 Skill 文件夹进来。**要求里面有 SKILL.md** ——
     /// 没有的话它对 Agent 就是一堆看不懂的文件
     @discardableResult

@@ -44,6 +44,8 @@ extension AgentToolbox {
                 ],
                 risk: .dangerous),
 
+            Self.saveSkillTool,
+
             AgentToolSpec(
                 name: "install_skill",
                 description: """
@@ -70,9 +72,48 @@ extension AgentToolbox {
         ]
     }
 
+    /// 把一套做法存成 Skill。下次碰到同类的事，它在提示词的 Skill 清单里看得到，会自己读来照做
+    static let saveSkillTool = AgentToolSpec(
+        name: "save_skill",
+        description: """
+        把一套做法存成 Skill（技能），存进设置里的 Skill 列表，下次同类的事你会自己读来照做。
+        **用户同意了才存**：他说「存成技能」「记住这套做法」就直接存；你刚做完一套多步的流程、
+        觉得以后用得上，先用 ask_user 问他要不要存，别擅自存。
+        正文写成通用的步骤：用哪几个工具、按什么顺序、关键参数怎么定、哪里要注意 ——
+        **不要写死这次的片段 id、文件路径、时间点**，那些下次都不一样。
+        真要靠电脑上的命令（ffmpeg 这类）才能做的，可以带脚本，正文里写清楚什么时候用 run_skill_script 跑哪个。
+        """,
+        parameters: [
+            "type": "object",
+            "properties": [
+                "name": ["type": "string", "description": "技能名，简短，比如「竖屏短视频包装」"],
+                "description": ["type": "string",
+                                "description": "一句话：什么时候该用它。这句会出现在你以后的 Skill 清单里，写清楚触发场景"],
+                "body": ["type": "string", "description": "完整说明（markdown）：步骤、用到的工具和参数、注意事项"],
+                "scripts": ["type": "object",
+                            "description": "可选。要带的脚本 {文件名: 内容}，只收 .sh / .py / .js"],
+                "overwrite": ["type": "boolean", "description": "同名的是你以前存的、用户也同意更新时才传 true"]
+            ] as [String: Any],
+            "required": ["name", "description", "body"]
+        ],
+        risk: .mutating)
+
     @MainActor
     static func runSkillTool(_ name: String, args: [String: Any]) async -> AgentToolResult? {
         switch name {
+        case "save_skill":
+            let n = (args["name"] as? String) ?? ""
+            let d = ((args["description"] as? String) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            let b = (args["body"] as? String) ?? ""
+            guard !d.isEmpty, !b.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                return .fail("description 和 body 都要写。")
+            }
+            let scripts = (args["scripts"] as? [String: Any])?.compactMapValues { $0 as? String } ?? [:]
+            if let err = AgentSkills.shared.saveFromAgent(name: n, description: d, body: b, scripts: scripts,
+                                                          overwrite: (args["overwrite"] as? Bool) ?? false) {
+                return .fail(err)
+            }
+            return .ok("存好了：Skill「\(n)」。用户在 设置 → Skills 里能看到、改、关掉；以后你的 Skill 清单里会有它。")
         case "install_skill":
             guard let repo = (args["repo"] as? String)?
                     .trimmingCharacters(in: .whitespacesAndNewlines), !repo.isEmpty else {

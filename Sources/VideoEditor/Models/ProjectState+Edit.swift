@@ -93,6 +93,8 @@ extension ProjectState {
         redoCount = redoStack.count
         isSaved = false
         scheduleAutoSave()
+        // 撤回来的值属性面板也得跟上，不然显示的还是撤销前的
+        inspectorRevision &+= 1
     }
 
     func redo() {
@@ -105,6 +107,8 @@ extension ProjectState {
         redoCount = redoStack.count
         isSaved = false
         scheduleAutoSave()
+        // 撤回来的值属性面板也得跟上，不然显示的还是撤销前的
+        inspectorRevision &+= 1
     }
 
     func currentSnapshot(includeAssets: Bool = false) -> ProjectSnapshot {

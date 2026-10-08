@@ -41,23 +41,22 @@ final class TimelineTabTests: XCTestCase {
         XCTAssertEqual(p.tabs.count, 1, "删除才是真的丢掉")
     }
 
-    /// 最后一条也能删，删完补一条全新的空时间线
-    func testDeletingLastTabLeavesAFreshOne() {
+    /// 最后一条也能删。v6.2.0 起删光就进空状态，**不再自动补一条**（用户定的）；
+    /// 再往里加素材时才自动建一条（v6.4.0，ensureTimelineTab）
+    func testDeletingLastTabLeavesEmptyState() {
         let p = ProjectState()
         p.addTextAtPlayhead(text: "会被删掉")
         let oldID = p.tabs[0].id
 
         p.deleteTab(id: oldID)
-        XCTAssertEqual(p.tabs.count, 1, "删光之后该补一条新的，不能一条都不剩")
+        XCTAssertTrue(p.tabs.isEmpty, "删光就是空状态，不补新的")
+        XCTAssertTrue(p.textTracks.flatMap(\.clips).isEmpty, "空状态下读轨道不崩、没有片段")
+
+        // 空状态下加东西会自动建一条新的
+        p.ensureTimelineTab()
+        XCTAssertEqual(p.tabs.count, 1)
         XCTAssertNotEqual(p.tabs[0].id, oldID, "补的是全新的一条")
-        XCTAssertTrue(p.textTracks.flatMap(\.clips).isEmpty, "新时间线该是空的")
-        // 默认那几条空轨道要在
-        XCTAssertEqual(p.videoTracks.count, 1)
-        XCTAssertEqual(p.audioTracks.count, 1)
-        XCTAssertEqual(p.imageTracks.count, 1)
-        XCTAssertEqual(p.subtitleTracks.count, 1)
-        XCTAssertEqual(p.textTracks.count, 1)
-        XCTAssertEqual(p.shapeTracks.count, 1)
+        XCTAssertEqual(p.videoTracks.count, 1, "新时间线带默认空轨")
     }
 
     /// 关掉当前这个，要落到旁边还开着的那个上
@@ -101,10 +100,11 @@ final class TimelineTabTests: XCTestCase {
         XCTAssertFalse(p.audioSectionOrder.isEmpty, "音频顺序表空着，音频轨不显示")
     }
 
-    /// 删光之后补出来的那条也一样
+    /// 删光之后、再加素材时自动建出来的那条也一样（v6.4.0 起删光进空状态，加素材才补）
     func testFreshTabAfterDeleteHasOrderTables() {
         let p = ProjectState()
         p.deleteTab(id: p.tabs[0].id)
+        p.ensureTimelineTab()
         XCTAssertFalse(p.overlayTrackOrder.isEmpty)
         XCTAssertFalse(p.videoSectionOrder.isEmpty)
         XCTAssertFalse(p.audioSectionOrder.isEmpty)

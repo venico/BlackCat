@@ -62,6 +62,8 @@ struct InspectorView: View {
                         ProjectInspector()
                     }
                 }
+                // 片段被面板以外的地方改了，整块重建、重读数据
+                .id(project.inspectorRevision)
                 .padding(.bottom, 16)
                 // **宽度写死成容器宽度**，不让 ScrollView 自己推断。
                 // alignment 必须给 leading：不给的话默认居中，内容一旦比容器宽

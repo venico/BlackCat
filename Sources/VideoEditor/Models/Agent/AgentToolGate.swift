@@ -40,7 +40,7 @@ final class AgentToolGate {
         /// 给模型看的一句话说明（进系统提示词，要短）
         var summary: String {
             switch self {
-            case .edit:     return "往时间轴加东西、分割、移动、换轨、调轨道顺序、删片段、加字幕文字滤镜特效"
+            case .edit:     return "往时间轴加东西（片段、字幕、文字、图形如矩形圆形箭头、滤镜特效）、改片段属性（位置大小、颜色填充、描边、圆角、投影、透明度）、读写任意片段/轨道的全部属性、分割、移动、换轨、调轨道顺序、删片段"
             case .canvas:   return "在 AI 画布上加卡片、连线、让卡片开始生成，成组、副本、裁剪镜像旋转、存素材库、卡片去背景超分分离音频"
             case .generate: return "生成图片、视频、音频"
             case .studio:   return "转场、翻译字幕、字幕配音、清晰度提升、抠图、去背景音乐、场景切分、挑精彩片段、保存撤销重命名"
@@ -59,7 +59,9 @@ final class AgentToolGate {
                 return ["时间轴", "时间线", "轨道", "片段", "字幕", "文字", "标题", "滤镜",
                         "特效", "调节", "分割", "切开", "删掉", "删除", "移动", "导入",
                         "加进", "放到", "素材库", "剪",
-                        "顺序", "置顶", "盖住", "上层", "下层", "换轨"]
+                        "顺序", "置顶", "盖住", "上层", "下层", "换轨",
+                        "图形", "形状", "矩形", "方块", "圆形", "椭圆", "三角", "箭头", "线条",
+                        "填充", "圆角", "投影", "阴影", "描边", "颜色", "透明"]
             case .canvas:
                 return ["画布", "卡片", "连线", "节点", "连到", "画板"]
             case .generate:
@@ -97,6 +99,66 @@ final class AgentToolGate {
         }
     }
 
+    /// 按功能搜工具。
+    ///
+    /// 工具是分组按需挂的，组的说明写漏一样，模型就会以为没有这个能力 ——
+    /// 加图形、改填充圆角投影其实都有，只因为不在它去要的那组里，它就回「没有添加图形的功能」（实测）。
+    /// 搜的是**全部**工具的名字和说明，搜到的顺手把所在的组挂上，下一步就能直接调
+    static let searchToolSpec = AgentToolSpec(
+        name: "search_tools",
+        description: """
+        按功能搜你有哪些工具（全部工具都搜，不管挂没挂上）。搜到的会自动挂上，下一步直接调。
+        **说「没有这个功能」「做不了」之前必须先搜一次**，换两三个说法搜（比如「矩形」「图形」「形状」）。
+        """,
+        parameters: [
+            "type": "object",
+            "properties": [
+                "query": ["type": "string", "description": "想做的事，几个关键词，空格隔开。比如：矩形 圆角 投影"]
+            ] as [String: Any],
+            "required": ["query"]
+        ],
+        risk: .readOnly)
+
+    @MainActor
+    func search(_ query: String) -> AgentToolResult {
+        // 中文没有空格分词：每个词再切成两字一组去比，「加矩形」也能撞上说明里的「矩形」
+        let words = query.lowercased()
+            .split(whereSeparator: { " ,，、;；/".contains($0) }).map(String.init).filter { !$0.isEmpty }
+        guard !words.isEmpty else { return .fail("query 写几个关键词。") }
+        var probes = Set<String>()
+        for w in words {
+            probes.insert(w)
+            let cs = Array(w)
+            if cs.count > 2 { for i in 0..<(cs.count - 1) { probes.insert(String(cs[i...i + 1])) } }
+        }
+        var seen = Set<String>()
+        let all = AgentToolbox.allSpecs.filter { seen.insert($0.name).inserted && $0.name != "search_tools" }
+        let scored: [(spec: AgentToolSpec, score: Int)] = all.map { spec in
+            let hay = (spec.name + " " + spec.description + " " + paramText(spec)).lowercased()
+            return (spec, probes.reduce(0) { $0 + (hay.contains($1) ? ($1.count >= 3 ? 2 : 1) : 0) })
+        }.filter { $0.score > 0 }.sorted { $0.score > $1.score }
+        let top = Array(scored.prefix(8))
+        guard !top.isEmpty else {
+            return .ok("没搜到跟「\(query)」相关的工具。换个说法再搜一次；还是没有的话，如实告诉用户这个暂时做不到。")
+        }
+        var lines: [String] = []
+        for t in top {
+            if let g = Group.allCases.first(where: { g in specs(of: g).contains { $0.name == t.spec.name } }) {
+                activated.insert(g)
+            }
+            let first = t.spec.description.components(separatedBy: "\n").first ?? ""
+            lines.append("· \(t.spec.name)：\(first.prefix(90))")
+        }
+        return .ok("搜到这些（已经挂上，直接调）：\n" + lines.joined(separator: "\n"))
+    }
+
+    /// 参数名和参数说明也算进去：「圆角」「投影」只写在 update_clip 的参数里
+    private func paramText(_ spec: AgentToolSpec) -> String {
+        guard let props = spec.parameters["properties"] as? [String: Any] else { return "" }
+        return props.map { k, v in k + " " + (((v as? [String: Any])?["description"] as? String) ?? "") }
+            .joined(separator: " ")
+    }
+
     /// 模型自己要。名字写中文标签或英文 key 都认
     func enable(_ raw: String) -> AgentToolResult {
         let want = raw.trimmingCharacters(in: .whitespaces).lowercased()
@@ -117,8 +179,16 @@ final class AgentToolGate {
         case .edit:
             // 在画布上要来这组时，「看轨道 / 看项目 / 截预览帧」也得一起给 ——
             // 光有「加片段」却看不见时间轴上现在有什么，它只能瞎放
+            //
+            // 加图形（add_shape，原在加工组）和改片段属性（update_clip，原在媒体组）也放进来：
+            // 「加个红色圆角矩形带投影」模型只会去要剪辑这组，要来了却找不到这俩，
+            // 回一句「没有添加图形的功能」（实测）。两边都挂着，按名字去重
+            let crossGroup: Set<String> = ["add_shape", "update_clip"]
             return (AgentToolbox.readTools.filter { Self.timelineOnlyNames.contains($0.name) }
-                    + AgentToolbox.editTools)
+                    + AgentToolbox.editTools
+                    + (AgentToolbox.studioTools + AgentToolbox.mediaTools).filter { crossGroup.contains($0.name) }
+                    // 通用读写属性：专门工具没开放的参数靠它兜底
+                    + AgentToolbox.propsTools)
                 .filter { !Self.alwaysOnNames.contains($0.name) }
         case .canvas:   return (AgentToolbox.canvasTools + AgentToolbox.canvasEditTools)
                 .filter { !Self.alwaysOnNames.contains($0.name) }
@@ -173,7 +243,12 @@ final class AgentToolGate {
     func tools(mode: AgentMode, inCanvas: Bool) -> [AgentToolSpec] {
         let shared = (AgentToolbox.readTools + AgentToolbox.editTools + AgentToolbox.canvasTools)
             .filter { Self.alwaysOnNames.contains($0.name) }
-        var list: [AgentToolSpec] = shared + [gateTool]
+        // ask_user 两边都常驻：碰到歧义随时要能问，挂不上就又退回「写一段 A/B/C 等你打字」
+        var list: [AgentToolSpec] = shared + [gateTool, Self.searchToolSpec, AgentToolbox.reportGapTool,
+                                              AgentToolbox.askTool, AgentToolbox.viewAttachmentsTool]
+        // 读技能、存技能常驻：Skill 清单就在提示词里，看到对得上的得能当场读；
+        // 做完一套流程问用户「要不要存成技能」，他点了得能当场存
+        list += AgentToolbox.skillTools.filter { ["read_skill", "save_skill"].contains($0.name) }
         if inCanvas {
             // 画布上：画布那组直接给全，不用它开口要
             list += AgentToolbox.canvasTools + AgentToolbox.canvasEditTools
@@ -203,7 +278,7 @@ final class AgentToolGate {
 
         ## 还没挂上来的工具
         你手上只有常用的那些。下面这几组还没挂，需要就调 enable_tools 要，
-        要完接着干，**不要因为工具不在手上就说做不了**：
+        要完接着干，**不要因为工具不在手上就说做不了**。拿不准在哪组就用 search_tools 按功能搜：
         \(lines)
 
         """

@@ -38,6 +38,7 @@ final class FileDropRouterTests: XCTestCase {
                 switch $0 {
                 case .asset, .shape, .filter, .adjust, .effect: return true
                 case .files, .folder:                          return false
+                case .conversation, .conversationGroup:        return false
                 }
             },
             onDrop: { payload, local in
@@ -46,6 +47,7 @@ final class FileDropRouterTests: XCTestCase {
                 case .shape(let t):  onShape(t, local)
                 case .filter, .adjust, .effect: break
                 case .files, .folder: break
+                case .conversation, .conversationGroup: break
                 }
             },
             onTargetChange: tlTargeted)

@@ -1088,7 +1088,9 @@ struct SettingsView: View {
 
         for s in all {
             // 没有来源的用自己的路径当键，等于自成一组
-            let key = s.source.isEmpty ? "local:" + s.folderURL.path : s.source
+            // Agent 自己存的也各算一组：它们 .source 都写 agent，不拆开的话会被当成同一个仓库并成一组
+            let key = (s.source.isEmpty || s.source == AgentSkills.agentSource)
+                ? "local:" + s.folderURL.path : s.source
             if buckets[key] == nil { order.append(key) }
             buckets[key, default: []].append(s)
         }

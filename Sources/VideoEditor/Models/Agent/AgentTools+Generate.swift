@@ -59,6 +59,14 @@ extension AgentToolbox {
             + "但不能生成、配音、导出、删除，要连着花钱的只写不花钱的那部分。同时最多挂 \(AgentBackgroundTasks.maxFollowUps) 个"
     ]
 
+    /// 用户这轮挂的图要不要当参考带给生成模型
+    static let useReferencesParam: [String: Any] = [
+        "type": "boolean",
+        "description": "用户这轮挂了图、又没用 / 命令点名生成模型时才有意义：他要拿图当参考生成"
+            + "（「照这张」「参考这张」「把这张变成…」）就传 true；只是让你看图、问图里是什么，别传。"
+            + "用 / 命令点名了模型的，图会自动带上，不用管这个参数"
+    ]
+
     static func followUpText(_ args: [String: Any]) -> String {
         (args["then"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     }
@@ -128,6 +136,7 @@ extension AgentToolbox {
                                       + "没说数量就别传，默认 1 张。上限跟模型走："
                                       + "Image2 最多 10 张；Seedream 5.0 Pro 只能 1 张，"
                                       + "5.0 Lite 最多 15 张。要超了会自动收到上限，并告诉你收成了几张"],
+                        "use_references": Self.useReferencesParam,
                         "then": Self.followUpParam
                     ] as [String: Any],
                     "required": ["prompt"]
@@ -146,6 +155,7 @@ extension AgentToolbox {
                         "model": ["type": "string",
                                   "description": "指定用哪个模型。配好 Key 的有："
                                       + Self.modelList(.video) + "。用户没点名就别传"],
+                        "use_references": Self.useReferencesParam,
                         "then": Self.followUpParam
                     ] as [String: Any],
                     "required": ["prompt"]
@@ -178,6 +188,7 @@ extension AgentToolbox {
                         "model": ["type": "string",
                                   "description": "指定用哪个模型。配好 Key 的有："
                                       + Self.modelList(.audio) + "。用户没点名就别传"],
+                        "use_references": Self.useReferencesParam,
                         "then": Self.followUpParam
                     ] as [String: Any],
                     "required": ["prompt"]
@@ -235,7 +246,10 @@ extension AgentToolbox {
         // 面板上那条会永远停在「进行中」
         // 用户在输入框上边那排挂着的参考内容要带上 —— 原来一张都没往下传，
         // 表现就是「我明明给了参考图，模型还让我上传」
-        let refs = svc.agentRoundReferences
+        // 没点名生成模型时，挂的图要 Agent 明说「拿来当参考」才带
+        let optedIn = (args["use_references"] as? Bool) ?? ((args["use_references"] as? String) == "true")
+        let useRefs = !svc.agentRoundRefsNeedOptIn || optedIn
+        let refs = useRefs ? svc.agentRoundReferences : []
         let refImages = refs.filter { $0.type == .image }.map(\.url)
         let refVideos = refs.filter { $0.type == .video }.map(\.url)
         let refAudios = refs.filter { $0.type == .audio }.map(\.url)
@@ -261,8 +275,8 @@ extension AgentToolbox {
             referenceImages: refImages,
             referenceVideos: refVideos,
             referenceAudios: refAudios,
-            firstFrame: svc.agentRoundFirstFrame,
-            lastFrame: svc.agentRoundLastFrame,
+            firstFrame: useRefs ? svc.agentRoundFirstFrame : nil,
+            lastFrame: useRefs ? svc.agentRoundLastFrame : nil,
             modelOverride: modelOverride,
             lyrics: lyricsArg
         ) { result in
