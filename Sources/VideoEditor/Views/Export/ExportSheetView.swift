@@ -1284,6 +1284,43 @@ actor TimelineExporter {
 
             let hasVideoClipTransforms = !videoCompTracks.isEmpty
 
+            // 什么时候走快速导出：没有要一帧帧画上去的叠加层（字幕、文字、图形、图片、
+            // 带这些的复合片段）。滤镜 / 调节 / 特效轨不算 —— 只有它们时直接在合成器里套，
+            // 照样快速导出；跟叠加层混着的才归逐帧处理（顺序要跟图层表一致）
+            let overlaysPresent = input.subtitleTracks.contains { $0.isVisible && !$0.clips.isEmpty }
+                || input.textTracks.contains { $0.isVisible && !$0.clips.isEmpty }
+                || input.shapeTracks.contains { $0.isVisible && !$0.clips.isEmpty }
+                || input.imageTracks.contains { $0.isVisible && !$0.clips.isEmpty }
+                || input.compoundTracks.filter(\.isVisible).flatMap(\.clips).contains { clip in
+                    let c = clip.flattened()
+                    return !c.subtitleTracks.isEmpty || !c.textTracks.isEmpty
+                        || !c.shapeTracks.isEmpty || !c.imageTracks.isEmpty
+                }
+            let hasEffectLayers = input.filterTracks.contains { $0.isVisible && !$0.clips.isEmpty }
+                || input.adjustTracks.contains { $0.isVisible && !$0.clips.isEmpty }
+                || input.effectTracks.contains { $0.isVisible && !$0.clips.isEmpty }
+            let effectsInCompositor = hasVideoClipTransforms && hasEffectLayers && !overlaysPresent
+            var exportEffects: PreviewCompositorState?
+            if effectsInCompositor {
+                let st = PreviewCompositorState()
+                st.setFilterTracks(input.filterTracks)
+                st.setAdjustTracks(input.adjustTracks)
+                st.setEffectTracks(input.effectTracks)
+                // 图层表里只留效果那几层，顺序照旧
+                let order = ProjectState.overlayLayersBottomUp(
+                    overlayTrackOrder: input.overlayTrackOrder,
+                    filterTracks: input.filterTracks, adjustTracks: input.adjustTracks,
+                    effectTracks: input.effectTracks, compoundTracks: input.compoundTracks)
+                    .filter { ref in
+                        switch ref {
+                        case .filter, .adjust, .effect: return true
+                        default: return false
+                        }
+                    }
+                st.setOverlayInput(ColorCompositor.OverlayInput(order: order))
+                exportEffects = st
+            }
+
             // 视频合成 / 分辨率帧率变更（图片不再参与 AVVideoComposition，改由 CIImage overlay）
             if hasVideoClipTransforms {
                 let vc = AVMutableVideoComposition()
@@ -1327,6 +1364,7 @@ actor TimelineExporter {
                     data.entries = seg.entries
                     data.renderSize = renderSize
                     data.forExport = true
+                    data.live = exportEffects
                     ProjectState.applySegmentTransitionFX(data, segStartCM: segStartCM,
                                                           transitionInfos: transitionInfos)
                     instructions.append(ColorInstruction(
@@ -1454,7 +1492,9 @@ actor TimelineExporter {
                 }
 
             // ── 快速路径：无 overlay 时用 AVAssetExportSession（5-10x 加速）──
-            let needsPerFrameProcessing = subRenderInfo.hasSubtitles || !visibleTextClips.isEmpty || !visibleShapeClips.isEmpty || !visibleImageClips.isEmpty || !colorRanges.isEmpty || compoundHasOverlays
+            // 效果轨没能放进合成器的（跟叠加层混着、或者根本没有视频）才要逐帧。
+            // 原来这三样两头都没算：只有视频 + 调节轨时走了快速导出，调节整个没进成片
+            let needsPerFrameProcessing = subRenderInfo.hasSubtitles || !visibleTextClips.isEmpty || !visibleShapeClips.isEmpty || !visibleImageClips.isEmpty || !colorRanges.isEmpty || compoundHasOverlays || (hasEffectLayers && !effectsInCompositor)
             let exportT0 = Date()
             if !needsPerFrameProcessing {
                 try? FileManager.default.removeItem(at: input.outputURL)
@@ -1776,7 +1816,11 @@ actor TimelineExporter {
         let shapeClipsByTrack: [UUID: [ShapeClip]] = Dictionary(
             uniqueKeysWithValues: shapeTracks.filter { $0.isVisible }.map { ($0.id, $0.clips) })
         let compoundClips = compoundTracks.filter { $0.isVisible }.flatMap(\.clips)
-        let hasOverlays = hasSubtitles || !imageClipsByTrack.isEmpty || !textClipsByTrack.isEmpty || !shapeClipsByTrack.isEmpty || !compoundClips.isEmpty
+        // 滤镜 / 调节 / 特效轨也算：不算的话只有这几样时每帧原样写出，效果整个没进成片
+        let hasEffectLayers = filterTracks.contains { $0.isVisible && !$0.clips.isEmpty }
+            || adjustTracks.contains { $0.isVisible && !$0.clips.isEmpty }
+            || effectTracks.contains { $0.isVisible && !$0.clips.isEmpty }
+        let hasOverlays = hasSubtitles || !imageClipsByTrack.isEmpty || !textClipsByTrack.isEmpty || !shapeClipsByTrack.isEmpty || !compoundClips.isEmpty || hasEffectLayers
         // 图层清单跟预览共用同一份（含未登记复合轨道的兜底，见 overlayLayersBottomUp）。
         // 每帧重算太浪费，在这儿算一次
         let layersBottomUp = ProjectState.overlayLayersBottomUp(
@@ -2004,6 +2048,10 @@ actor TimelineExporter {
                                             var outBuf: CVPixelBuffer?
                                             CVPixelBufferPoolCreatePixelBuffer(nil, pool, &outBuf)
                                             if let outBuf = outBuf {
+                                                // 合成器交过来的帧四周是透明的（见 ColorCompositor），
+                                                // 效果都套完了才垫黑底，黑边才不会被调节调灰
+                                                image = image.composited(over: CIImage(color: CIColor(red: 0, green: 0, blue: 0)))
+                                                    .cropped(to: CGRect(origin: .zero, size: renderSize))
                                                 ciCtx.render(image, to: outBuf)
                                                 // 第一帧换成封面（见上面「封面当第一帧」）
                                                 adaptor.append(frameIndex == 0 ? (coverFramePB ?? outBuf) : outBuf,

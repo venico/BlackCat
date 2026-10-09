@@ -374,6 +374,9 @@ final class ProjectState: ObservableObject {
 
     // Playback — 高频属性委托给 PlaybackClock，避免刷新全部视图
     let clock = PlaybackClock()
+    /// 这个项目自己的预览合成状态（滤镜/调节/特效轨、叠加层、拖动中的临时值）。
+    /// 每个窗口一份，别的窗口重建预览不会盖掉它
+    let previewCompositor = PreviewCompositorState()
     var currentTime: Double {
         get { clock.currentTime }
         set { clock.currentTime = newValue }
@@ -1505,12 +1508,18 @@ final class ProjectState: ObservableObject {
     var coverGenerating: Set<UUID> = []
     /// 波形生成中的素材（防重复起线程，同上）
     var waveformGenerating: Set<UUID> = []
+    /// 读时长中的素材（防重复起线程，同上）
+    var durationLoading: Set<UUID> = []
     @Published var waveformCache: [UUID: WaveformData] = [:]       // asset ID → waveform peaks
     var imageVideoCache: [UUID: URL] = [:]                         // asset ID → generated video file
     var avAssetCache: [URL: AVURLAsset] = [:]             // URL → cached AVURLAsset（避免重复创建）
+    /// 预览重建在后台跑，上一次被取消的还没停、新的已经开始，两边会同时读写这张表 ——
+    /// 字典并发写会直接崩（测试里偶发的 `-[__NSCFNumber count]` 就是它）
+    private let avAssetCacheLock = NSLock()
 
     /// 获取或创建缓存的 AVURLAsset
     func cachedAVAsset(url: URL) -> AVURLAsset {
+        avAssetCacheLock.lock(); defer { avAssetCacheLock.unlock() }
         if let cached = avAssetCache[url] { return cached }
         let asset = AVURLAsset(url: url)
         avAssetCache[url] = asset

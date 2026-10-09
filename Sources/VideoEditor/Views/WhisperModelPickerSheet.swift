@@ -224,6 +224,13 @@ struct TranscribeOptionsSheet: View {
                         .font(.system(size: 10))
                         .foregroundColor(Color.labelSecondary)
                         .fixedSize(horizontal: false, vertical: true)
+                    // 选中的这档没下载：说清楚点开始会先下载，不会偷偷换成别的档
+                    if !WhisperTranscriber.isReady(settings.selectedWhisperModel) {
+                        Text("这个模型还没下载，开始识别时会先下载（\(settings.selectedWhisperModel.sizeDesc.components(separatedBy: " · ").first ?? "")）")
+                            .font(.system(size: 10))
+                            .foregroundColor(.orange)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
                 }
 
                 // ② 翻译方式：不翻译 / AI 翻译 / 各家翻译引擎。

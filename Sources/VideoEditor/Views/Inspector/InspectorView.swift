@@ -2332,7 +2332,7 @@ private struct VideoInspector: View {
             $0.cropRight = cropRight
         }
         if let trackID = project.videoClipTrackIDMap[clip.id] {
-            ColorCompositor.setDragOffset(trackID: trackID, offsetX: CGFloat(offsetX), offsetY: CGFloat(offsetY))
+            project.previewCompositor.setDragOffset(trackID: trackID, offsetX: CGFloat(offsetX), offsetY: CGFloat(offsetY))
             project.clock.refreshSeekRequest &+= 1
         }
         project.rebuildTimelinePreviewDebounced()
@@ -2349,9 +2349,9 @@ private struct VideoInspector: View {
         // 视频的色调在 compositor 里逐帧算，光改 clip 要等 rebuild 才可见（防抖 0.15s，
         // 表现就是"松手才变"）。这里照位移滑块的做法把值直接喂给 compositor
         // 并逼播放器重绘当前帧，拖动过程就是实时的。
-        // rebuild 仍然照常跑：它会 clearStore 把这份覆盖清掉，届时 entries 里已是同样的真值
+        // rebuild 仍然照常跑：它会 clearTransient 把这份覆盖清掉，届时 entries 里已是同样的真值
         if let trackID = project.videoClipTrackIDMap[clip.id] {
-            ColorCompositor.setLiveColorAdjust(trackID: trackID, adj)
+            project.previewCompositor.setLiveColorAdjust(trackID: trackID, adj)
             project.clock.refreshSeekRequest &+= 1
         }
         project.rebuildTimelinePreviewDebounced()

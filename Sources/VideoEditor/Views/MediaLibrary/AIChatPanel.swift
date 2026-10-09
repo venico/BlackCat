@@ -2515,8 +2515,11 @@ HStack(spacing: 2) {
         agent.run(prompt: prompt, history: &agentHistory,
                   mode: settings.agentMode, project: project,
                   webSearch: service.webSearchEnabled) { reply, fullHistory in
+            // 步骤、用时按**这条会话**取。agent.steps 是界面正看着那条的镜像，
+            // 用户中途切走的话拿到的是别的会话的步骤
+            let run = agent.summary(of: convAtStart)
             service.finishAgentReply(id: replyID, text: reply,
-                                     steps: agent.steps.map {
+                                     steps: run.steps.map {
                                          .init(tool: $0.toolName, summary: $0.summary,
                                                isError: $0.isError,
                                                args: $0.args.isEmpty ? nil : $0.args,
@@ -2524,13 +2527,16 @@ HStack(spacing: 2) {
                                                thinking: $0.thinking.isEmpty ? nil : $0.thinking,
                                                imagePath: $0.imagePath.isEmpty ? nil : $0.imagePath)
                                      },
-                                     elapsed: agent.elapsed, tokens: agent.totalTokens)
-            agent.setRunningMessage(nil, in: service.currentConversationId)
+                                     elapsed: run.elapsed, tokens: run.tokens,
+                                     conversationID: convAtStart)
+            agent.setRunningMessage(nil, in: convAtStart)
             // 这一轮的完整记录写回记忆。只认还是这条会话的 —— 跑的时候用户切到别的会话，
             // agentHistory 已经换成那边的了，写回去就串了
-            if historyConvID == convAtStart { agentHistory = fullHistory }
-            // 这一轮的问答已经在 agentHistory 里了，从这往后的才算「两轮之间」
-            historySyncedCount = service.messages.count
+            if historyConvID == convAtStart, service.currentConversationId == convAtStart {
+                agentHistory = fullHistory
+                // 这一轮的问答已经在 agentHistory 里了，从这往后的才算「两轮之间」
+                historySyncedCount = service.messages.count
+            }
         }
     }
 

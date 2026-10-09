@@ -430,6 +430,9 @@ struct ContentView: View {
 
         .canvasKeyMonitor(canvas: project.canvas, windowID: windowID, isActive: project.showCanvas)
         .onReceive(NotificationCenter.default.publisher(for: .showSettings)) { note in
+            // 这条通知是广播的（菜单、快捷键、各处「去设置」按钮都发它），
+            // 只让当前窗口接，不然开着几个项目就弹几个设置
+            guard WindowManager.shared.activeWindowID == windowID else { return }
             // object 带了标签下标就定位过去（字幕校对弹窗跳「AI 生成」用）
             SettingsView.pendingTab = (note.object as? Int) ?? 0
             project.showSettings = true

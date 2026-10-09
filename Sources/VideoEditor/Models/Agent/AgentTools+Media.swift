@@ -44,10 +44,13 @@ extension AgentToolbox {
             AgentToolSpec(
                 name: "transcribe",
                 description: """
-                对视频/音频片段做语音识别，识别结果直接落成一条字幕轨。**离线跑，不花钱。**
+                对视频/音频片段做语音识别，识别结果直接落成一条字幕轨。识别本身离线跑，不花钱。
+                **识别模型、翻译方式、AI 模型都按用户在「语音识别字幕」弹窗里选的来**，别自己另定。
 
-                用户说「加字幕」「识别一下说了什么」「转文字」就用它。
-                耗时大约是素材时长的几分之一，后台跑，进度在右下角。
+                用户说「加字幕」「识别一下说了什么」「转文字」就用它（只识别）。
+                说「识别并翻译成 X」就 translate=true，**一步做完**（跟用户手动点「开始识别」一样：
+                AI 翻译时整批带上下文翻、顺带合并碎句，出一条翻好的字幕轨），别拆成识别 + translate_subtitles 两步。
+                用户选的识别模型没下载时会退回说明，那时用 ask_user 问他「先下载」还是「这次用已下载的」，再带 model_choice 重调。
                 """,
                 parameters: [
                     "type": "object",
@@ -56,6 +59,12 @@ extension AgentToolbox {
                                     "description": "要识别哪条片段（list_tracks 给的 id，前 8 位就够）。不传就识别第一条视频"],
                         "proofread": ["type": "boolean",
                                       "description": "识别完顺带让大模型校对一遍（修错别字、合并碎句）。默认 false"],
+                        "translate": ["type": "boolean",
+                                      "description": "识别完翻译。用户说「识别并翻译」时传 true。翻译方式按弹窗里的设置"],
+                        "language": ["type": "string",
+                                     "description": "翻译成哪种语言，比如「中文（简体）」「英语」。不传用项目的翻译目标语言"],
+                        "model_choice": ["type": "string", "enum": ["download", "use_downloaded"],
+                                         "description": "选中的识别模型没下载时，问过用户后再传：download = 先下载它；use_downloaded = 这次用已下载的"],
                         "then": Self.followUpParam
                     ] as [String: Any],
                     "required": [] as [String]
@@ -240,7 +249,12 @@ extension AgentToolbox {
 
     /// 这一轮 OCR 了几次。开跑前由 AgentRunner 清零
     @MainActor
-    static var ocrCallsThisRound = 0
+    /// 这一轮 OCR 了几次。按会话分开数，两条会话同时在扫不会互相顶到上限
+    private static var ocrCallsByConversation: [UUID: Int] = [:]
+    @MainActor static var ocrCallsThisRound: Int {
+        get { ocrCallsByConversation[AgentContext.key] ?? 0 }
+        set { ocrCallsByConversation[AgentContext.key] = newValue }
+    }
 
     @MainActor
     static func runMediaTool(_ name: String, args: [String: Any],
@@ -353,8 +367,27 @@ extension AgentToolbox {
         guard WhisperTranscriber.whisperReady else {
             return .fail("语音识别引擎没就绪（whisper-cli 缺失），去设置里看看。")
         }
-        guard WhisperTranscriber.modelReady else {
-            return .fail("语音识别模型还没下载。让用户到设置 → 语音识别里下一个，再来找我。")
+        // 用户选的那档没下载：先问他，别悄悄换档（原来会退回用已下载的，选均衡跑出来是极速）
+        let chosen = AppSettings.shared.selectedWhisperModel
+        let choice = args["model_choice"] as? String
+        var allowFallback = false
+        if !WhisperTranscriber.isReady(chosen) {
+            let size = chosen.sizeDesc.components(separatedBy: " · ").first ?? ""
+            switch choice {
+            case "download": break          // autoTranscribe 会先下载再识别
+            case "use_downloaded":
+                guard WhisperTranscriber.bestReadyModel != nil else {
+                    return .fail("本机一个识别模型都没有，只能先下载「\(chosen.featureName)」（\(size)）。")
+                }
+                allowFallback = true
+            default:
+                let fallback = WhisperTranscriber.bestReadyModel.map { "这次先用已下载的「\($0.featureName)」" }
+                // 不算出错，是要用户拿主意 —— 标成失败的话步骤条一片红，模型也容易当成故障去重试
+                return .ok("用户选的识别模型「\(chosen.featureName)」还没下载（\(size)），这次没开始。"
+                    + "用 ask_user 问他：先下载「\(chosen.featureName)」再识别"
+                    + (fallback.map { "，还是\($0)" } ?? "")
+                    + "。他选了再调 transcribe，带上 model_choice（download / use_downloaded），其余参数照旧。")
+            }
         }
         // 点名了就先把它选中 —— 识别走的是「当前选中片段」那套
         if let key = clipKey, !key.isEmpty {
@@ -373,13 +406,47 @@ extension AgentToolbox {
             }
             guard hit else { return .fail("找不到 id 以 \(key) 开头的视频或音频片段，先 list_tracks 看看。") }
         }
-        // proofread=false 就是纯识别：不校对也不让大模型翻
+        // 翻译方式、AI 模型都取弹窗里存的。只识别时两样都关掉，只要校对时只开 AI
+        let translate = (args["translate"] as? Bool) ?? ((args["translate"] as? String) == "true")
+        let lang = (args["language"] as? String)?.trimmingCharacters(in: .whitespaces)
+        let aiModel = p.transcribeAIModel
+        let aiReady = AIVideoService.Provider(rawValue: aiModel).map { !AIVideoService.apiKey(for: $0).isEmpty } ?? false
+        var engine = ""
+        if translate {
+            engine = p.transcribeTranslateEngine
+            // 弹窗里是「不翻译」、或者选了 AI 翻译但那家没配 Key：退到设置里的翻译引擎
+            if engine.isEmpty || (engine == "ai" && !aiReady) {
+                engine = AppSettings.shared.translateProvider.rawValue
+            }
+        }
+        let useAI = (translate && engine == "ai") || proofread
+        let modelName = allowFallback ? (WhisperTranscriber.bestReadyModel?.featureName ?? "") : chosen.featureName
+        var how = "识别模型：\(modelName)"
+        if !WhisperTranscriber.isReady(chosen) && !allowFallback { how += "（先下载）" }
+        if translate {
+            let target = (lang?.isEmpty == false ? lang! : p.translationTargetLang)
+            how += engine == "ai"
+                ? "；AI 翻译成\(target)（\(Self.aiModelLabel(aiModel))，整批带上下文、顺带合并碎句）"
+                : "；用「\(AppSettings.TranslateProvider(rawValue: engine)?.displayName ?? engine)」翻译成\(target)"
+        } else if proofread {
+            how += "；识别完让 \(Self.aiModelLabel(aiModel)) 校对一遍"
+        }
         return Self.runInBackground(
-            args, title: "语音识别", label: "语音识别", project: p,
+            args, title: translate ? "识别并翻译字幕" : "语音识别", label: "语音识别", project: p,
             busy: { p.isTranscribing }, cancel: { p.cancelTranscribe() },
-            start: { p.autoTranscribeSelectedClip(engine: proofread ? nil : "",
-                                                  aiModel: proofread ? nil : "") },
-            started: "开始识别了\(proofread ? "（识别完还会让大模型校对一遍）" : "")，完事会生成一条字幕轨。")
+            start: { p.autoTranscribeSelectedClip(engine: engine, aiModel: useAI ? aiModel : "",
+                                                  targetLang: (lang?.isEmpty == false) ? lang : nil,
+                                                  allowModelFallback: allowFallback) },
+            started: "开始了（\(how)），完事会生成一条字幕轨。")
+    }
+
+    /// 「DeepSeek · Deepseek-V4-Flash」这样的说法，给回复和汇报用
+    static func aiModelLabel(_ raw: String) -> String {
+        guard let p = AIVideoService.Provider(rawValue: raw) else { return raw.isEmpty ? "未选模型" : raw }
+        let sub = AppSettings.shared.providerModel(for: p.rawValue).trimmingCharacters(in: .whitespaces)
+        let label = p.subModels.first { $0.id == sub || $0.label == sub }?.label
+            ?? (sub.isEmpty ? p.subModels.first?.label : sub)
+        return label.map { "\(p.displayName) · \($0)" } ?? p.displayName
     }
 
     // MARK: - 改片段

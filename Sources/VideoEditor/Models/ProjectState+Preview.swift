@@ -23,9 +23,9 @@ extension ProjectState {
         guard !isShutDown else { return }
         // 三类效果轨道的参数也一起推。只推图层不推它们的话，
         // 拖滤镜强度、改特效参数时合成器手上还是旧的那份
-        ColorCompositor.setFilterTracks(filterTracks)
-        ColorCompositor.setAdjustTracks(adjustTracks)
-        ColorCompositor.setEffectTracks(effectTracks)
+        previewCompositor.setFilterTracks(filterTracks)
+        previewCompositor.setAdjustTracks(adjustTracks)
+        previewCompositor.setEffectTracks(effectTracks)
         // 叠加层归谁画，就只让谁手上有数据。
         //
         // **不归合成器画的时候要主动清空它那份**：`drawOverlays` 是无条件跑的，
@@ -34,11 +34,11 @@ extension ProjectState {
         // 合成器却还照着上次推的数据继续画，画面上就留着那条字幕。
         // 删掉视频轨再加回来能好，正是因为那样触发了完整重建、重推了数据
         if overlayDrawnByCompositor {
-            ColorCompositor.setOverlayInput(makeOverlayInput())
+            previewCompositor.setOverlayInput(makeOverlayInput())
             // jitter seek 逼合成器重画。SwiftUI 自己会重绘，不用多跳这一次
             clock.refreshSeekRequest &+= 1
         } else {
-            ColorCompositor.setOverlayInput(ColorCompositor.OverlayInput())
+            previewCompositor.setOverlayInput(ColorCompositor.OverlayInput())
         }
     }
 
@@ -618,16 +618,7 @@ extension ProjectState {
             // Build AVVideoComposition to layer image tracks on top of video tracks.
             let allVideoTracks = videoCompTracks.map(\.track) + imageCompTracks.map(\.track)
             var videoComposition: AVMutableVideoComposition? = nil
-            // 没有视频轨（纯图片项目）时合成器不会跑，但预览那层会自己调
-            // `ColorCompositor.drawOverlays` 出整帧图 —— **照样得把这三样灌进去**。
-            // 原来这儿是清空的（怕留着上个项目的），结果那条路读到空数组，
-            // 滤镜/调节/特效全被跳过，画面出得来却一点效果没有。
-            // 灌当前项目的值同样不会串项目
-            if allVideoTracks.isEmpty {
-                ColorCompositor.setFilterTracks(fTracks)
-                ColorCompositor.setAdjustTracks(adjTracks)
-                ColorCompositor.setEffectTracks(fxTracks)
-            }
+            let live = previewCompositor
             if !allVideoTracks.isEmpty && composition.duration.seconds > 0.01 {
                 let vc = AVMutableVideoComposition()
                 vc.renderSize = renderSize
@@ -661,36 +652,15 @@ extension ProjectState {
                 let sortedCM = Array(Set(cmBoundaries.map { $0.value })).sorted().map { CMTime(value: $0, timescale: ts) }
 
                 vc.customVideoCompositorClass = ColorCompositor.self
-                ColorCompositor.clearStore()
-                // 滤镜单独存一份静态的：合成器有条「透传」快路径拿不到指令数据
-                ColorCompositor.setFilterTracks(fTracks)
-                ColorCompositor.setAdjustTracks(adjTracks)
-                ColorCompositor.setEffectTracks(fxTracks)
-                // 叠加层也交给合成器画。**这样特效才是作用在合成后的整帧上**，
-                // 跟导出完全一致；预览再单独画一遍的话，几何类特效两边对不上。
-                //
-                // **但只在归它画的时候给数据**。原来这儿是无条件推的：没有效果轨时
-                // 叠加层本该由 SwiftUI 画，合成器却也拿着一份照着画 —— 之后隐藏
-                // 某条字幕轨，SwiftUI 那层不画了，合成器手上还是重建时那份，
-                // 画面上就留着一条抹不掉的字幕
-                if overlayDrawnByCompositor {
-                    ColorCompositor.setOverlayInput(makeOverlayInput())
-                } else {
-                    ColorCompositor.setOverlayInput(ColorCompositor.OverlayInput())
-                }
-                var colorInstructions: [AVVideoCompositionInstruction] = []
+                var colorInstructions: [any AVVideoCompositionInstructionProtocol] = []
                 for i in 0..<(sortedCM.count - 1) {
                     let segStartCM = sortedCM[i]
                     let segEndCM   = sortedCM[i + 1]
                     let segDur = segEndCM - segStartCM
                     guard segDur.seconds > 0.001 else { continue }
 
-                    let instr = AVMutableVideoCompositionInstruction()
-                    instr.timeRange = CMTimeRange(start: segStartCM, duration: segDur)
-
                     var entries:      [CompositorTrackEntry] = []
                     var activeTracks: [AVCompositionTrack]   = []
-                    var hasTween = false
 
                     // 视频 track（底层）。跟导出共用一份（见 compositorVideoEntries）
                     let vSeg = await Self.compositorVideoEntries(
@@ -700,7 +670,6 @@ extension ProjectState {
                         transitionInfos: transitionInfos, renderSize: renderSize)
                     entries += vSeg.entries
                     activeTracks += vSeg.tracks
-                    hasTween = hasTween || vSeg.hasTween
 
                     // 图片 track（顶层）
                     for (idx, entry) in imageCompTracks.enumerated() {
@@ -730,11 +699,6 @@ extension ProjectState {
                         activeTracks.append(entry.track)
                     }
 
-                    instr.layerInstructions = activeTracks.map {
-                        AVMutableVideoCompositionLayerInstruction(assetTrack: $0)
-                    }
-                    instr.enablePostProcessing = hasTween
-
                     let colorData = ColorCompositionData()
                     Self.applySegmentTransitionFX(colorData, segStartCM: segStartCM,
                                                   transitionInfos: transitionInfos)
@@ -742,10 +706,12 @@ extension ProjectState {
                     colorData.renderSize = renderSize
                     // 滤镜在所有画面合成完之后统一套，所以整份轨道原样带过去
                     colorData.filterTracks = fTracks
-                    let key = CMTimeConvertScale(segStartCM, timescale: 600, method: .default).value
-                    ColorCompositor.setData(colorData, forStartValue: key)
-
-                    colorInstructions.append(instr)
+                    colorData.live = live
+                    // 数据跟着指令走（跟导出一样），不再按起点存进全局表 ——
+                    // 那张表所有窗口共用，一个窗口重建就把别的窗口的分段数据清掉了
+                    colorInstructions.append(ColorInstruction(
+                        timeRange: CMTimeRange(start: segStartCM, duration: segDur),
+                        trackIDs: activeTracks.map(\.trackID), data: colorData))
                 }
                 if !colorInstructions.isEmpty {
                     vc.instructions = colorInstructions
@@ -760,6 +726,25 @@ extension ProjectState {
 
             guard !Task.isCancelled else { return }
             await MainActor.run {
+                // 合成状态**只在这儿推**，排在取消检查之后。原来是重建半路就推了：
+                // 上一次重建被取消后并没有马上停，晚跑完的话会把旧的滤镜轨道盖回去
+                //
+                // 没有视频轨（纯图片项目）时合成器不会跑，但预览那层会自己调
+                // `previewCompositor.drawOverlays` 出整帧图 —— 效果轨照样得灌进去，
+                // 不然那条路读到空数组，滤镜/调节/特效全被跳过
+                live.setFilterTracks(fTracks)
+                live.setAdjustTracks(adjTracks)
+                live.setEffectTracks(fxTracks)
+                if videoComposition != nil {
+                    live.clearTransient()
+                    // 叠加层也交给合成器画。**这样特效才是作用在合成后的整帧上**，
+                    // 跟导出完全一致；预览再单独画一遍的话，几何类特效两边对不上。
+                    //
+                    // **但只在归它画的时候给数据**：没有效果轨时叠加层归 SwiftUI 画，
+                    // 合成器也拿着一份的话，隐藏某条字幕轨之后画面上会留着那条字幕
+                    live.setOverlayInput(self.overlayDrawnByCompositor
+                                         ? self.makeOverlayInput() : ColorCompositor.OverlayInput())
+                }
                 self.videoClipTrackIDMap = trackMap
                 self.lastVideoEndTime = visualEnd
                 self.duration = max(endTime, 0.01)

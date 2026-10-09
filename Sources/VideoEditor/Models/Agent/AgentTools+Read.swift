@@ -30,12 +30,14 @@ extension AgentToolbox {
 
             AgentToolSpec(
                 name: "list_assets",
-                description: "列出素材库里的素材（含 id、名字、类型、时长）。往时间轴加东西之前先看这里有什么。",
+                description: "列出素材库里的素材（含 id、名字、类型、时长），**最近加入的排在最前**。往时间轴加东西之前先看这里有什么。",
                 parameters: [
                     "type": "object",
                     "properties": [
                         "type": ["type": "string", "enum": ["all", "video", "audio", "image", "subtitle"],
-                                 "description": "只看某一类，默认全部"]
+                                 "description": "只看某一类，默认全部"],
+                        "name": ["type": "string",
+                                 "description": "按文件名找（包含这段文字就算，不分大小写），比如 gpt_image_C6C1CB68"]
                     ] as [String: Any]
                 ],
                 risk: .readOnly),
@@ -68,7 +70,8 @@ extension AgentToolbox {
         case "get_project":   return .ok(projectOverview(project))
         case "list_tracks":   return .ok(trackDump(project))
         case "get_clip":      return clipInfo(project, args: args)
-        case "list_assets":   return .ok(assetDump(project, type: args["type"] as? String))
+        case "list_assets":   return .ok(assetDump(project, type: args["type"] as? String,
+                                                   name: args["name"] as? String))
         case "capture_frame": return await captureFrame(project, time: args["time"] as? Double,
                                                         source: args["source"] as? String)
         default: return nil
@@ -157,18 +160,27 @@ extension AgentToolbox {
     }
 
     @MainActor
-    private static func assetDump(_ p: ProjectState, type: String?) -> String {
+    private static func assetDump(_ p: ProjectState, type: String?, name: String? = nil) -> String {
         let want = (type ?? "all").lowercased()
-        let list = p.mediaAssets.filter { a in
-            want == "all" || a.type.rawValue.lowercased() == want
+        let key = (name ?? "").trimmingCharacters(in: .whitespaces)
+        // **最近加入的排前面**。新素材是追加在库尾的，原来按库里顺序只给前 40 个，
+        // 库一大，刚生成、刚导入的那几个永远排不进来 —— 后台助手「生成完放进时间轴」
+        // 就是这么栽的：查不到新图的 id，反复导入、翻文件，步数用光也没放进去
+        let list = p.mediaAssets.reversed().filter { a in
+            (want == "all" || a.type.rawValue.lowercased() == want)
+                && (key.isEmpty || a.name.localizedCaseInsensitiveContains(key)
+                    || a.url.lastPathComponent.localizedCaseInsensitiveContains(key))
         }
-        guard !list.isEmpty else { return "素材库里没有\(want == "all" ? "" : want)素材。" }
+        guard !list.isEmpty else {
+            return key.isEmpty ? "素材库里没有\(want == "all" ? "" : want)素材。"
+                               : "素材库里没有名字含「\(key)」的素材。"
+        }
         // 表格形式给回去，模型可以原样贴出来 —— 省得它自己组织，界面上也整齐。
         // 列压在三列以内：聊天面板窄，再多就排不下了
         // 素材可以有好几百个，全量吐回去光这一条就上万字，而且历史每轮重发。
         // 超过这个数就只给前面一批，剩下的让它按 type 缩小范围再问
         let cap = 40
-        var s = "素材库（\(list.count) 个\(list.count > cap ? "，下面只列前 \(cap) 个" : "")）：\n\n"
+        var s = "素材库（\(list.count) 个，最近加入的在前\(list.count > cap ? "，下面只列最近的 \(cap) 个" : "")）：\n\n"
         s += "| id | 类型 | 名称 |\n|---|---|---|\n"
         for a in list.prefix(cap) {
             let dur = a.duration > 0 ? " \(fmt(a.duration))" : ""
@@ -177,8 +189,8 @@ extension AgentToolbox {
             s += "| \(String("\(a.id)".prefix(8))) | \(a.type.rawValue)\(dur) | \(a.name)\(missing) |\n"
         }
         if list.count > cap {
-            s += "\n还有 \(list.count - cap) 个没列出来。要找特定的东西就加 type 参数"
-                + "（video / audio / image）缩小范围。\n"
+            s += "\n还有 \(list.count - cap) 个没列出来。要找特定的东西就加 name（按文件名）"
+                + "或 type（video / audio / image）缩小范围。\n"
         }
         return s
     }
@@ -229,14 +241,32 @@ extension AgentToolbox {
         // 按原始渲染尺寸抽，叠加层才能按跟导出同一套坐标画上去；最后再缩给模型
         let renderSize = item.videoComposition?.renderSize ?? p.previewRenderSize
         var actual = CMTime.zero
-        var cg = try gen.copyCGImage(at: CMTime(seconds: t, preferredTimescale: 600), actualTime: &actual)
+        let box = CGRect(origin: .zero, size: renderSize)
+        let cg0: CGImage
+        do {
+            cg0 = try gen.copyCGImage(at: CMTime(seconds: t, preferredTimescale: 600), actualTime: &actual)
+        } catch {
+            // 这一刻底下**没有视频**（视频之后、片段之间的空档，只有图片/文字这些叠加层）：
+            // 视频合成里这段一帧都没有，抽帧直接报「无法打开」。可预览里这时是黑底 + 叠加层，
+            // 照样有画面 —— 按预览的样子自己画：黑底，叠加层和效果轨全画上
+            DiagLog.log("[Agent] 时间轴 \(String(format: "%.2f", t))s 抽不到视频帧（\(error.localizedDescription)），按黑底 + 叠加层出图")
+            // 透明底上画、最后垫黑：跟预览一样，黑底不被调节调灰
+            let clear = CIImage(color: CIColor(red: 0, green: 0, blue: 0, alpha: 0)).cropped(to: box)
+            let composed = p.previewCompositor.drawOverlays(clear, at: t, renderSize: renderSize,
+                                                             input: p.makeOverlayInput())
+                .composited(over: CIImage(color: CIColor(red: 0, green: 0, blue: 0)))
+                .cropped(to: box)
+            guard let out = CIContext().createCGImage(composed, from: box) else { throw error }
+            return out
+        }
+        var cg = cg0
         // 字幕 / 文字 / 图形 / 图片这些叠加层**不在视频合成里**：没有效果轨时它们是
         // 预览界面上另画的，抽出来的帧里没有。这种情况自己按导出那套画上去，
         // 截到的才跟用户看到的、导出的成片一致。有效果轨时合成器已经画过了，不再画一遍
         if !p.overlayDrawnByCompositor {
             let base = CIImage(cgImage: cg)
-            let composed = ColorCompositor.drawOverlays(base, at: t, renderSize: renderSize,
-                                                        input: p.makeOverlayInput())
+            let composed = p.previewCompositor.drawOverlays(base, at: t, renderSize: renderSize,
+                                                             input: p.makeOverlayInput())
                 .cropped(to: CGRect(origin: .zero, size: renderSize))
             if let out = CIContext().createCGImage(composed, from: composed.extent) { cg = out }
         }

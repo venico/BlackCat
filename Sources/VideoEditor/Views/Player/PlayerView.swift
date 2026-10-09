@@ -129,7 +129,7 @@ struct PlayerView: View {
         .onChange(of: project.playerItem) {
             let seekTo = clock.pendingSeekTime ?? clock.currentTime
             clock.pendingSeekTime = nil
-            ctrl.setItem(project.playerItem, seekTo: seekTo)
+            ctrl.setItem(project.playerItem, seekTo: seekTo, compositor: project.previewCompositor)
         }
         // User-initiated seek (playhead/ruler drag) → tell AVPlayer to follow.
         .onChange(of: clock.seekRequest) {
@@ -269,9 +269,10 @@ private struct OverlayStack: View {
                 //
                 // 不走 overlayChain 了 —— 它靠把视图重塞进新的 NSHostingView 来挂
                 // CALayer.filters，实测滤镜、调节、特效三种全是黑屏（内容整个没了）。
-                // 直接拿 ColorCompositor.drawOverlays 出图，跟有视频时是同一份代码，
+                // 直接拿合成器那套 drawOverlays 出图，跟有视频时是同一份代码，
                 // 效果也就天然一致
-                ComposedOverlayFrame(renderSize: project.previewRenderSize,
+                ComposedOverlayFrame(compositor: project.previewCompositor,
+                                     renderSize: project.previewRenderSize,
                                      time: clock.currentTime,
                                      contentKey: project.overlayContentKey(at: clock.currentTime),
                                      effectKey: project.effectContentKey(at: clock.currentTime))
@@ -1804,7 +1805,7 @@ private struct VideoTransformOverlay: View {
                     $0.offsetY = newOffY
                 }
                 if let trackID = project.videoClipTrackIDMap[clip.id] {
-                    ColorCompositor.setDragOffset(trackID: trackID, offsetX: CGFloat(newOffX), offsetY: CGFloat(newOffY))
+                    project.previewCompositor.setDragOffset(trackID: trackID, offsetX: CGFloat(newOffX), offsetY: CGFloat(newOffY))
                     clock.refreshSeekRequest &+= 1
                 }
                 let ndx = value.translation.width / viewSize.width
@@ -3457,7 +3458,7 @@ final class PlayerController: ObservableObject {
     var getTime: (() -> Double)?
     var getDuration: (() -> Double)?
 
-    func setItem(_ item: AVPlayerItem?, seekTo: Double) {
+    func setItem(_ item: AVPlayerItem?, seekTo: Double, compositor: PreviewCompositorState) {
         let wasPlaying = isPlaying
         if wasPlaying { pause() }
 
@@ -3473,7 +3474,7 @@ final class PlayerController: ObservableObject {
             }
             player.seek(to: CMTime(seconds: seekTo, preferredTimescale: 600),
                          toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] _ in
-                ColorCompositor.clearDragOffsets()
+                compositor.clearDragOffsets()
                 if wasPlaying { DispatchQueue.main.async { self?.play() } }
             }
         }
@@ -3790,6 +3791,7 @@ struct EffectCenterHandle: View {
 /// 画面就全黑了。这里直接调合成器那份 `drawOverlays` 自己出图：
 /// 图层顺序、效果串接、强度混合全是同一份代码，不会出现两套画面对不上
 struct ComposedOverlayFrame: View {
+    let compositor: PreviewCompositorState
     let renderSize: CGSize
     let time: Double
     /// 叠加层内容指纹：图片位置、文字这些变了要重画
@@ -3801,7 +3803,7 @@ struct ComposedOverlayFrame: View {
     private static let ctx = CIContext(options: [.useSoftwareRenderer: false])
 
     var body: some View {
-        if let img = Self.render(renderSize: renderSize, at: time) {
+        if let img = Self.render(compositor, renderSize: renderSize, at: time) {
             Image(nsImage: img)
                 .resizable()
                 .aspectRatio(contentMode: .fit)
@@ -3809,12 +3811,12 @@ struct ComposedOverlayFrame: View {
         }
     }
 
-    static func render(renderSize: CGSize, at t: Double) -> NSImage? {
+    static func render(_ compositor: PreviewCompositorState, renderSize: CGSize, at t: Double) -> NSImage? {
         guard renderSize.width > 1, renderSize.height > 1 else { return nil }
         let box = CGRect(origin: .zero, size: renderSize)
         // 透明底：预览区自己的黑底透上来，不用在这儿铺一层黑
         let base = CIImage(color: CIColor.clear).cropped(to: box)
-        let out = ColorCompositor.drawOverlays(base, at: t, renderSize: renderSize)
+        let out = compositor.drawOverlays(base, at: t, renderSize: renderSize)
             .cropped(to: box)
         guard let cg = ctx.createCGImage(out, from: box) else { return nil }
         return NSImage(cgImage: cg, size: renderSize)

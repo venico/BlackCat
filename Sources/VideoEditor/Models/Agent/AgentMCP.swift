@@ -135,7 +135,12 @@ final class AgentMCP: ObservableObject {
     ///
     /// 命中之后**留到这轮会话结束**：说完「打开这个网页」再说「点一下登录按钮」，
     /// 第二句不该突然没工具了
-    @Published private(set) var activated: Set<UUID> = []
+    /// 每条会话各自挂各自的，一条会话要来的服务不会出现在别的会话里
+    private var activatedByConversation: [UUID: Set<UUID>] = [:]
+    private(set) var activated: Set<UUID> {
+        get { activatedByConversation[AgentContext.key] ?? [] }
+        set { activatedByConversation[AgentContext.key] = newValue }
+    }
 
     /// 拿用户这句话去碰各个服务的触发词
     func activate(matching prompt: String) {
@@ -154,8 +159,6 @@ final class AgentMCP: ObservableObject {
         }
     }
 
-    /// 换会话时清一次，别把上一段对话点亮的服务带过来
-    func resetActivation() { activated.removeAll() }
 
     /// 模型自己判断要用某个服务时调这个把工具挂进来。
     ///

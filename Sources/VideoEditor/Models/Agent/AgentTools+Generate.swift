@@ -119,14 +119,20 @@ extension AgentToolbox {
                 用 AI 生成一张图片。**提交后立刻返回，不会等它画完** —— \
                 结果进后台任务，完成后会自动加进素材库，那时候再叫你放到时间轴上。
 
-                **用户要几张就调几次，一张就只调一次。** 不要为了保险同一个提示词\
-                多调几家模型 —— 每调一次都真金白银花用户的钱。某一家失败了软件会\
-                问用户要不要换一家重试，轮不到你先铺开。用户点名了某个模型就只用那个。
+                **一轮只调一次。** 同一个内容要几张用 count；要几张**不一样的**\
+                （不同风格、不同主题）就把每张的提示词放进 prompts，一次提交，每个出一张。\
+                不要为了保险同一个提示词多调几家模型 —— 每调一次都真金白银花用户的钱。\
+                某一家失败了软件会问用户要不要换一家重试，轮不到你先铺开。用户点名了某个模型就只用那个。
                 """,
                 parameters: [
                     "type": "object",
                     "properties": [
-                        "prompt": ["type": "string", "description": "画什么。越具体越好"],
+                        "prompt": ["type": "string", "description": "画什么。越具体越好。用了 prompts 时可以不传"],
+                        "prompts": ["type": "array", "items": ["type": "string"],
+                                    "description": "要几张**内容不同**的图时用：每个元素是一张图的完整提示词，"
+                                        + "各出一张（这时别传 count）。比如「6 种风格的猫」就放 6 条。"
+                                        + "带了 then 的话每张做完各接各的，最多同时挂 "
+                                        + "\(AgentBackgroundTasks.maxFollowUps) 个，超出的不会提交"],
                         "ratio": ["type": "string", "description": "画面比例，比如 1:1、16:9、9:16"],
                         "model": ["type": "string",
                                   "description": "指定用哪个模型。配好 Key 的有："
@@ -138,8 +144,7 @@ extension AgentToolbox {
                                       + "5.0 Lite 最多 15 张。要超了会自动收到上限，并告诉你收成了几张"],
                         "use_references": Self.useReferencesParam,
                         "then": Self.followUpParam
-                    ] as [String: Any],
-                    "required": ["prompt"]
+                    ] as [String: Any]
                 ],
                 risk: .dangerous),
 
@@ -263,7 +268,7 @@ extension AgentToolbox {
             ?? (args["duration"] as? Double).map { String(Int($0)) }
 
         // 记下是哪条会话发起的：做完时人可能已经切走了，结果要回到这条会话里
-        let ownerConversation = svc.currentConversationId
+        let ownerConversation = svc.agentConversationID
         let box = TaskIDBox()
         let id = svc.generateForCanvas(
             prompt: prompt,
@@ -316,11 +321,13 @@ extension AgentToolbox {
                         }
                         // 全权模式才自己换。自动模式下每次生成都花钱，得他点头
                         if AppSettings.shared.agentMode == .full {
-                            svc.appendAgentFailure(reason + "，改用「\(next.displayName)」再试一次")
+                            svc.appendAgentFailure(reason + "，改用「\(next.displayName)」再试一次",
+                                                  conversationID: ownerConversation)
                             again()
                         } else {
                             svc.appendAgentFailure(
-                                reason + "。后台任务那儿可以点「改用 \(next.displayName)」再试。")
+                                reason + "。后台任务那儿可以点「改用 \(next.displayName)」再试。",
+                                conversationID: ownerConversation)
                             AgentBackgroundTasks.shared.askRetry(
                                 id: tid, reason: reason,
                                 nextName: next.displayName, retry: again)
@@ -333,7 +340,7 @@ extension AgentToolbox {
                         // 界面上要有那条橙色「已取消」，但它**不会进模型的历史**
                         // （rebuildAgentHistory 里专门滤掉了）—— 让模型看见的话，
                         // 它会把取消当成没办成的事主动补做
-                        svc.appendAgentFailure("已取消")
+                        svc.appendAgentFailure("已取消", conversationID: ownerConversation)
                         AgentBackgroundTasks.shared.fail(id: tid, "已被用户取消")
                         return
                     }
@@ -344,7 +351,8 @@ extension AgentToolbox {
                         text += "\n（这一类里没有别的配了 Key 的模型可换，"
                             + "去设置 → AI 设置里给另一家填上 Key 就能自动接手）"
                     }
-                    svc.appendAgentFailure(text)
+                    // 会话里那句由 fail() 报（带任务标题，切走了也会等切回来再报）。
+                    // 这儿原来还另 append 一条，同一次失败在会话里出现两行橙字
                     AgentBackgroundTasks.shared.fail(id: tid, text)
                 }
             }
@@ -367,9 +375,15 @@ extension AgentToolbox {
         let svc = AIVideoService.shared
         switch name {
         case "generate_image", "generate_video", "generate_audio":
-            guard let prompt = args["prompt"] as? String, !prompt.isEmpty else {
-                return .fail("缺 prompt")
-            }
+            // 「几张不一样的」：每条提示词各出一张（只有生图有这个参数）
+            let multi = name == "generate_image"
+                ? ((args["prompts"] as? [Any]) ?? []).compactMap {
+                    ($0 as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+                  }.filter { !$0.isEmpty }
+                : []
+            let prompt = ((args["prompt"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines))
+                .flatMap { $0.isEmpty ? nil : $0 } ?? multi.first ?? ""
+            guard !prompt.isEmpty else { return .fail("缺 prompt") }
             if let no = Self.followUpRejection(args) { return no }
             let category: AIVideoService.ProviderCategory =
                 name == "generate_image" ? .image : (name == "generate_video" ? .video : .audio)
@@ -381,7 +395,8 @@ extension AgentToolbox {
             guard !svc.agentRoundGenerated.contains(category) else {
                 return .fail("""
                     这一轮已经提交过「\(category.rawValue)」任务了，一轮只接一次。
-                    要多张不是多调几次，是**一次调用里把 count 写成张数**。
+                    要多张不是多调几次：同一个内容在一次调用里把 count 写成张数；
+                    内容各不相同的，一次调用里放进 prompts。
                     另外用户取消掉的任务就是不要了，不用补做。
                     """)
             }
@@ -394,7 +409,8 @@ extension AgentToolbox {
             // 它没传就用聊天框那排下拉里选的；用户话里说了数量以他说的为准
             // 优先信从用户原话里解析出来的数量 —— 模型传的 count 经常是它自己
             // 拆出来的「先来 1 张」，跟用户说的对不上
-            let asked = (category == .image ? svc.agentRoundImageCount : nil)
+            // 用了 prompts 就是每条一张，挑模型按单张挑
+            let asked = multi.count > 1 ? 1 : (category == .image ? svc.agentRoundImageCount : nil)
                 ?? (args["count"] as? Int)
                 ?? (args["count"] as? String).flatMap { Int($0) }
                 ?? (category == .image ? AppSettings.shared.aiImageCount : 1)
@@ -437,6 +453,43 @@ extension AgentToolbox {
             let usedName = modelOverride
                 .flatMap { m in provider.subModels.first { $0.id == m }?.label }
                 ?? provider.displayName
+            let then = (args["then"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            if multi.count > 1 {
+                // 每条提示词一个任务、各挂各的「接着做」。挂满了就停，后面的**不提交** ——
+                // 提交了却没人接着做，用户还得自己回来收拾
+                let list = Array(multi.prefix(10))
+                var submitted = 0
+                var skipped: [String] = []
+                for (i, pr) in list.enumerated() {
+                    if !then.isEmpty, !AgentBackgroundTasks.shared.canAttachFollowUp {
+                        skipped = Array(list[i...]); break
+                    }
+                    let tid = Self.submitGeneration(category: category, prompt: pr, args: args,
+                                                    provider: provider, project: project,
+                                                    allowFallback: allowFallback, tried: [provider],
+                                                    modelOverride: modelOverride)
+                    if !then.isEmpty {
+                        AgentBackgroundTasks.shared.attachFollowUp(
+                            instruction: then, taskIDs: [tid], labels: [tid: String(pr.prefix(30))],
+                            project: project, mode: AppSettings.shared.agentMode)
+                    }
+                    submitted += 1
+                }
+                if submitted > 0 { svc.agentRoundGenerated.insert(category) }
+                var text = "交给「\(usedName)」了：\(submitted) 张，每条提示词一张（后台任务，几十秒到几分钟）。"
+                if multi.count > list.count {
+                    text += "\n给了 \(multi.count) 条，一次最多 10 条，后面 \(multi.count - list.count) 条没提交，如实告诉用户。"
+                }
+                if !skipped.isEmpty {
+                    text += "\n后面 \(skipped.count) 条**没提交**：后台等着接着做的已经满 "
+                        + "\(AgentBackgroundTasks.maxFollowUps) 个了。告诉用户等前面的做完再来要这几张："
+                        + skipped.map { "「\($0.prefix(20))」" }.joined(separator: "、")
+                }
+                text += !then.isEmpty
+                    ? "\n每张做完会各自起后台助手接着「\(then)」（排队一个一个做），这一轮不用等。"
+                    : "\n做完会自动进素材库，聊天里也会出现卡片。"
+                return .ok(text)
+            }
             // 一张一个任务。Seedream lite 那种「组图」是一次请求出多张、图之间还带关联，
             // 这里图的是各自独立、失败也只砸一张，对海报这类需求更合适
             var taskIDs: [UUID] = []
@@ -446,7 +499,6 @@ extension AgentToolbox {
                                                      allowFallback: allowFallback, tried: [provider],
                                                      modelOverride: modelOverride))
             }
-            let then = (args["then"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             if !then.isEmpty {
                 AgentBackgroundTasks.shared.attachFollowUp(instruction: then, taskIDs: taskIDs,
                                                            project: project,

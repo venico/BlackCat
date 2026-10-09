@@ -32,14 +32,15 @@ extension AgentToolbox {
 
             AgentToolSpec(
                 name: "add_asset_to_timeline",
-                description: "把素材库里的一个素材加到时间轴。视频/音频/图片都走它，会自动落到对应类型的轨道上。",
+                description: "把素材库里的一个素材加到时间轴。视频/音频/图片都走它，会自动落到对应类型的轨道上。"
+                    + "asset_id 和 path 给一个就行：手上只有文件路径（比如后台生成完给的「文件 /…/gpt_image_1234.png」）就直接传 path。",
                 parameters: [
                     "type": "object",
                     "properties": [
                         "asset_id": ["type": "string", "description": "list_assets 给的 id，前 8 位就够"],
+                        "path": ["type": "string", "description": "素材文件的完整路径，代替 asset_id 用"],
                         "time": ["type": "number", "description": "落在第几秒，不传就放播放头处"]
-                    ] as [String: Any],
-                    "required": ["asset_id"]
+                    ] as [String: Any]
                 ],
                 risk: .mutating),
 
@@ -268,9 +269,20 @@ extension AgentToolbox {
                 """)
 
         case "add_asset_to_timeline":
-            guard let key = args["asset_id"] as? String,
-                  let asset = p.mediaAssets.first(where: { "\($0.id)".hasPrefix(key) })
-            else { return .fail("素材库里找不到 id 以 \(args["asset_id"] ?? "") 开头的素材，先调 list_assets 看看。") }
+            let asset: MediaAsset
+            if let raw = (args["path"] as? String)?.trimmingCharacters(in: .whitespaces), !raw.isEmpty {
+                let path = URL(fileURLWithPath: (raw as NSString).expandingTildeInPath).standardizedFileURL.path
+                guard let a = p.mediaAssets.last(where: { $0.url.standardizedFileURL.path == path }) else {
+                    return .fail("素材库里没有这个文件：\(raw)。先用 import_media 导进来再加。")
+                }
+                asset = a
+            } else if let key = (args["asset_id"] as? String)?.trimmingCharacters(in: .whitespaces), !key.isEmpty,
+                      let a = p.mediaAssets.first(where: { "\($0.id)".uppercased().hasPrefix(key.uppercased()) }) {
+                asset = a
+            } else {
+                return .fail("素材库里找不到 id 以 \(args["asset_id"] ?? "") 开头的素材。"
+                             + "手上有文件路径就改传 path；没有就调 list_assets（可加 name 按文件名找）。")
+            }
             guard asset.fileExists else { return .fail("「\(asset.name)」的源文件已经不在了，加不进去。") }
             p.addToTimelineAt(asset, time: args["time"] as? Double ?? p.currentTime, skipUndo: true)
             return .ok("已把「\(asset.name)」加到时间轴。")

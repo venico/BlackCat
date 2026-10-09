@@ -45,8 +45,12 @@ enum ThumbnailDiskCache {
     static func load(for url: URL) -> [ThumbnailFrame]? {
         guard let k = key(for: url) else { return nil }
         let file = dir.appendingPathComponent(k + ".plist")
-        lock.lock(); defer { lock.unlock() }
-        guard let data = try? Data(contentsOf: file),
+        // 锁只罩读文件这一下（防跟写入、清理撞上）。原来连解码 200 张图也罩在里面，
+        // 打开项目时几十个视频的缓存只能一个一个排队解，时间轴缩略图半天出不来
+        lock.lock()
+        let raw = try? Data(contentsOf: file)
+        lock.unlock()
+        guard let data = raw,
               let s = try? PropertyListDecoder().decode(Stored.self, from: data),
               s.times.count == s.images.count, !s.times.isEmpty else { return nil }
         var frames: [ThumbnailFrame] = []
@@ -56,7 +60,9 @@ enum ThumbnailDiskCache {
             frames.append(ThumbnailFrame(time: t, image: img))
         }
         // 碰一下修改时间，清理时按「最近用过」保留
+        lock.lock()
         try? FileManager.default.setAttributes([.modificationDate: Date()], ofItemAtPath: file.path)
+        lock.unlock()
         return frames
     }
 
@@ -80,6 +86,46 @@ enum ThumbnailDiskCache {
         lock.lock(); defer { lock.unlock() }
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         try? data.write(to: dir.appendingPathComponent(k + ".plist"), options: .atomic)
+        prune()
+    }
+
+    // MARK: - 音频波形
+    //
+    // 波形也落盘，同一个目录、同一套「文件没变才算数」的认法，清理时跟缩略图一起算总量。
+    // 原来每次打开都要把每个音频整段解码一遍，启动那阵子几十个视频正在抽缩略图，
+    // 系统音频解码排不上队，长一点的音乐每个都要干等 8 秒超时再换 ffmpeg 重来。
+    // 格式：8 字节时长（Double）+ 峰值数组（Float32），一首三分钟的歌约 16KB
+
+    static func loadWaveform(for url: URL) -> WaveformData? {
+        guard let k = key(for: url) else { return nil }
+        let file = dir.appendingPathComponent(k + ".wave")
+        lock.lock()
+        let raw = try? Data(contentsOf: file)
+        if raw != nil {
+            try? FileManager.default.setAttributes([.modificationDate: Date()], ofItemAtPath: file.path)
+        }
+        lock.unlock()
+        let head = MemoryLayout<Double>.size
+        guard let data = raw, data.count > head,
+              (data.count - head) % MemoryLayout<Float>.size == 0 else { return nil }
+        let dur = data.prefix(head).withUnsafeBytes { $0.loadUnaligned(as: Double.self) }
+        let samples: [Float] = data.dropFirst(head).withUnsafeBytes { buf in
+            (0..<(buf.count / MemoryLayout<Float>.size)).map {
+                buf.loadUnaligned(fromByteOffset: $0 * MemoryLayout<Float>.size, as: Float.self)
+            }
+        }
+        guard dur > 0, !samples.isEmpty else { return nil }
+        return WaveformData(totalDuration: dur, samples: samples)
+    }
+
+    static func saveWaveform(_ w: WaveformData, for url: URL) {
+        guard w.totalDuration > 0, !w.samples.isEmpty, let k = key(for: url) else { return }
+        var data = Data()
+        withUnsafeBytes(of: w.totalDuration) { data.append(contentsOf: $0) }
+        w.samples.withUnsafeBytes { data.append(contentsOf: $0) }
+        lock.lock(); defer { lock.unlock() }
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        try? data.write(to: dir.appendingPathComponent(k + ".wave"), options: .atomic)
         prune()
     }
 

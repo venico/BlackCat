@@ -50,8 +50,10 @@ extension AgentToolbox {
             AgentToolSpec(
                 name: "translate_subtitles",
                 description: """
-                把一条字幕轨整轨翻译成另一种语言，**结果放进一条新字幕轨**，原文那条不动。
-                只想翻其中几条就传 clip_ids（新轨上只有这几条的译文）。用的是设置里选的翻译引擎。
+                把一条现有字幕轨整轨翻译成另一种语言，**结果放进一条新字幕轨**，原文那条不动。
+                只想翻其中几条就传 clip_ids（新轨上只有这几条的译文）。
+                **翻译方式默认按「语音识别字幕」弹窗里选的**：那里选了 AI 翻译就用那里选的大模型（整批带上下文翻、顺带合并碎句），
+                否则用设置里的翻译引擎。用户点名了就传 engine。刚识别完要翻译的，用 transcribe 的 translate 一步做，别分两步。
                 """,
                 parameters: [
                     "type": "object",
@@ -62,6 +64,9 @@ extension AgentToolbox {
                                      "description": "目标语言，比如「英语」「日语」「中文（简体）」。不传用设置里的"],
                         "clip_ids": ["type": "array", "items": ["type": "string"],
                                      "description": "只翻这几条字幕（id 前 8 位就行）。给了就不用 track_index，按它们所在的轨"],
+                        "engine": ["type": "string",
+                                   "description": "翻译方式：ai = 大模型翻，或 " + AppSettings.TranslateProvider.allCases.map(\.rawValue).joined(separator: " / ")
+                                       + "。不传按弹窗里的设置"],
                         "then": Self.followUpParam
                     ] as [String: Any],
                     "required": [] as [String]
@@ -279,25 +284,56 @@ extension AgentToolbox {
         let trackID = newTrack.id
         let texts = originals.map(\.text)
 
+        // 翻译方式：点名了用点名的；否则跟识别弹窗一致（AI 翻译且那家配了 Key 就走大模型）
+        let aiModel = p.transcribeAIModel
+        let aiProvider = AIVideoService.Provider(rawValue: aiModel)
+        let aiReady = aiProvider.map { !AIVideoService.apiKey(for: $0).isEmpty } ?? false
+        let want = ((args["engine"] as? String) ?? p.transcribeTranslateEngine).trimmingCharacters(in: .whitespaces)
+        let useAI = want.lowercased() == "ai" && aiReady
+        let provider = AppSettings.TranslateProvider(rawValue: want) ?? AppSettings.shared.translateProvider
+        if want.lowercased() == "ai" && !aiReady, args["engine"] != nil {
+            return .fail("要 AI 翻译，但「语音识别字幕」弹窗里选的翻译模型（\(Self.aiModelLabel(aiModel))）没配 Key。")
+        }
+        let how = useAI ? "AI 翻译（\(Self.aiModelLabel(aiModel))）" : "「\(provider.displayName)」"
+
         let running = RunFlag()
+        var aiError: String?
         Task { @MainActor in
             defer { running.on = false }
-            let out = await Translator.translateConcurrent(texts, to: lang)
-            guard let ti = p.subtitleTracks.firstIndex(where: { $0.id == trackID }) else { return }
-            for (i, s) in out.enumerated() where p.subtitleTracks[ti].clips.indices.contains(i) {
-                p.subtitleTracks[ti].clips[i].text = s
+            if useAI, let m = aiProvider {
+                // 大模型整批带上下文翻，可能把碎句合并 —— 条数会变，整条轨换成它给的
+                let segs = originals.map { (start: $0.startTime, end: $0.endTime, text: $0.text) }
+                let r = await LLMAnalyzer.translateSubtitles(segs, to: lang, send: { prompt in
+                    try await AIVideoService.shared.generateText(provider: m, prompt: prompt)
+                }, progress: { _ in })
+                aiError = r.error
+                guard let ti = p.subtitleTracks.firstIndex(where: { $0.id == trackID }) else { return }
+                p.subtitleTracks[ti].clips = r.segs.map { SubtitleClip(text: $0.text, startTime: $0.start, endTime: $0.end) }
+            } else {
+                let out = await Translator.translateConcurrent(texts, to: lang, engine: provider)
+                guard let ti = p.subtitleTracks.firstIndex(where: { $0.id == trackID }) else { return }
+                for (i, s) in out.enumerated() where p.subtitleTracks[ti].clips.indices.contains(i) {
+                    p.subtitleTracks[ti].clips[i].text = s
+                }
             }
+            p.refreshOverlayComposite()
             p.rebuildTimelinePreview()
             p.scheduleAutoSave()
             p.showSuccessToast(icon: "checkmark.circle.fill", iconColor: .green,
-                               title: "翻译完成", subtitle: "\(out.count) 条 → \(lang)", autoCountdown: true)
+                               title: aiError == nil ? "翻译完成" : "AI 翻译未完成",
+                               subtitle: aiError.map { String($0.prefix(60)) } ?? "\(originals.count) 条 → \(lang)",
+                               autoCountdown: aiError == nil)
         }
         return Self.runInBackground(
             args, title: "翻译字幕到\(lang)", label: "翻译字幕", project: p,
             checkIdle: false, busy: { running.on },
-            outcome: { (true, "\(originals.count) 条字幕翻成了\(lang)，在新字幕轨「翻译·\(lang)」") },
+            outcome: {
+                if let e = aiError { return (false, "AI 翻译没完成：\(e)") }
+                let n = p.subtitleTracks.first { $0.id == trackID }?.clips.count ?? originals.count
+                return (true, "用\(how)把 \(originals.count) 条字幕翻成了\(lang)，新字幕轨「翻译·\(lang)」共 \(n) 条")
+            },
             start: {},
-            started: "已经开始翻译 \(originals.count) 条字幕到\(lang)，结果放在新轨道「翻译·\(lang)」里。")
+            started: "已经开始用\(how)翻译 \(originals.count) 条字幕到\(lang)，结果放在新轨道「翻译·\(lang)」里。")
     }
 
     @MainActor

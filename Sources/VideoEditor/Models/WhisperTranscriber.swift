@@ -232,6 +232,23 @@ enum WhisperTranscriber {
         supportDir.appendingPathComponent(size.fileName)
     }
 
+    /// 这个档位的模型本机有没有（下载的或者随包带的）。
+    /// `findModel()` 找不到选中那档会**退回别的档**，判断「用户选的那个能不能用」要用这个
+    static func isReady(_ size: ModelSize) -> Bool {
+        if FileManager.default.fileExists(atPath: downloadedModelURL(size).path) { return true }
+        if let r = Bundle.main.resourceURL?.appendingPathComponent(size.fileName),
+           FileManager.default.fileExists(atPath: r.path) { return true }
+        if let dir = Bundle.main.executableURL?.deletingLastPathComponent(),
+           FileManager.default.fileExists(atPath: dir.appendingPathComponent(size.fileName).path) { return true }
+        return FileManager.default.fileExists(
+            atPath: URL(fileURLWithPath: devDir).appendingPathComponent(size.fileName).path)
+    }
+
+    /// 本机已有的模型里最准的那档（选中那档没下载时，问用户「先用这个」时报给他）
+    static var bestReadyModel: ModelSize? {
+        ModelSize.allCases.reversed().first { isReady($0) }
+    }
+
     static func findModel() -> URL? {
         let preferred = AppSettings.shared.selectedWhisperModel
         let preferredURL = downloadedModelURL(preferred)

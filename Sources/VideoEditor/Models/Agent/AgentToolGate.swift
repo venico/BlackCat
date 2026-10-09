@@ -87,9 +87,15 @@ final class AgentToolGate {
         }
     }
 
-    private(set) var activated: Set<Group> = []
+    /// **每条会话各自点亮各自的**。原来全局一份、还从来没清过：
+    /// 一条会话要来的组，别的会话也全挂着
+    private var activatedByConversation: [UUID: Set<Group>] = [:]
+    private(set) var activated: Set<Group> {
+        get { activatedByConversation[AgentContext.key] ?? [] }
+        set { activatedByConversation[AgentContext.key] = newValue }
+    }
 
-    /// 换会话时清一次，别把上一段对话点亮的组带过来
+    /// 清掉当前这条会话点亮的组
     func reset() { activated.removeAll() }
 
     func activate(matching prompt: String) {

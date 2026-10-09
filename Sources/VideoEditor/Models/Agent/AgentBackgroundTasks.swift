@@ -79,7 +79,7 @@ final class AgentBackgroundTasks: ObservableObject {
     func add(id: UUID, title: String, kind: AIVideoService.ProviderCategory,
              conversationID: UUID? = nil, label: String? = nil,
              cancelAction: (() -> Void)? = nil) {
-        let cid = conversationID ?? AIVideoService.shared.currentConversationId
+        let cid = conversationID ?? AIVideoService.shared.agentConversationID
         // **新一轮开始时，把上一轮已经了结的清掉**。原来只增不减，全靠用户
         // 自己点「清除已完成」，跑几轮之后列表全是历史，正在跑的反而要翻半天。
         //
@@ -292,15 +292,19 @@ final class AgentBackgroundTasks: ObservableObject {
     /// 同时挂着（等生成 + 正在做）的「接着做」最多几个。
     /// 后台助手不能再生成，链不会自己往下长；这个上限防的是一次挂太多、
     /// 一齐起跑互相踩（都往同一条时间线末尾放）
-    static let maxFollowUps = 5
-    var canAttachFollowUp: Bool { followUps.count < Self.maxFollowUps }
+    nonisolated static let maxFollowUps = 5
+    /// 上限按会话算：这条会话挂满了不影响别的会话再挂
+    var canAttachFollowUp: Bool {
+        let cid = AIVideoService.shared.agentConversationID
+        return followUps.filter { $0.conversationID == cid }.count < Self.maxFollowUps
+    }
 
     func attachFollowUp(instruction: String, taskIDs: [UUID], labels: [UUID: String] = [:],
                         project: ProjectState, mode: AgentMode) {
         guard !taskIDs.isEmpty else { return }
         followUps.append(FollowUp(id: UUID(), instruction: instruction,
                                   waiting: Set(taskIDs), labels: labels,
-                                  conversationID: AIVideoService.shared.currentConversationId,
+                                  conversationID: AIVideoService.shared.agentConversationID,
                                   mode: mode, project: project))
     }
 
@@ -318,6 +322,10 @@ final class AgentBackgroundTasks: ObservableObject {
         guard followUps[f].waiting.isEmpty else { return }
         launch(followUps[f])
     }
+
+    /// 每条会话最后排上队的那个后台助手，同一条会话的下一个等它跑完再开始。
+    /// **按会话分开排**：不同会话的助手各干各的、可以同时跑，互不等待
+    private var helperChains: [UUID: Task<Void, Never>] = [:]
 
     private func launch(_ fu: FollowUp) {
         let title = "接着做「" + String(fu.instruction.prefix(20)) + "」"
@@ -338,7 +346,16 @@ final class AgentBackgroundTasks: ObservableObject {
         }
         context += "\n要接着做的事：" + fu.instruction
         let cid = fu.conversationID
+        // 后台助手**排队一个一个做**。一次提交几张图、各挂「放到时间轴末尾」时，
+        // 几个助手同时跑会读到同一个「末尾」，片段叠在一起
+        let chainKey = cid ?? fu.id
+        let previous = helperChains[chainKey]
         let work = Task { @MainActor [weak self] in
+            await previous?.value
+            guard !Task.isCancelled else {
+                self?.followUps.removeAll { $0.id == fu.id }
+                return
+            }
             let r = await AgentRunner.shared.runFollowUp(prompt: context, mode: fu.mode,
                                                          project: project, convID: cid ?? UUID())
             guard let self else { return }
@@ -349,6 +366,7 @@ final class AgentBackgroundTasks: ObservableObject {
             self.items[i].resultText = r.ok ? r.text : nil
             self.report(self.items[i])
         }
+        helperChains[chainKey] = work
         add(id: fu.id, title: title, kind: .text, conversationID: cid, label: "后台助手",
             cancelAction: { work.cancel() })
     }

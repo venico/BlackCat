@@ -1,5 +1,6 @@
 import SwiftUI
 import AVFoundation
+import ImageIO
 
 // MARK: - Media Library Management
 
@@ -256,13 +257,24 @@ extension ProjectState {
     /// 给缺资源的素材补生成。**按类型判断缺不缺** —— 音频封面不进
     /// `mediaThumbnails`（它出的是波形，进 `waveformCache`），只看 mediaThumbnails
     /// 的话音频永远算「缺」，挂在素材变更回调上就是每导入一条素材重算一遍所有波形
+    /// 只补缺的。素材库每变一次都会走这里（含读完一个时长写回去那次），
+    /// 原来是整套 loadMediaResources 重来、时长还没有防重复：启动时每读完一个时长
+    /// 就把所有还没出封面的素材再读一遍，几十个素材能滚出上百条线程，开软件头一分钟一直转圈
     func refreshMediaLibrary() {
         for asset in mediaAssets where asset.fileExists {
+            let aid = asset.id, url = asset.url
             switch asset.type {
-            case .video, .image:
-                if mediaThumbnails[asset.id] == nil { loadMediaResources(asset) }
+            case .video:
+                if mediaThumbnails[aid] == nil {
+                    loadMediaThumbnail(assetID: aid, url: url)
+                    loadTimelineThumbnails(assetID: aid, url: url)
+                }
+                if asset.duration <= 0 { updateAssetDuration(assetID: aid, url: url) }
+            case .image:
+                if mediaThumbnails[aid] == nil { loadImageThumbnail(assetID: aid, url: url) }
             case .audio:
-                if waveformCache[asset.id] == nil { loadMediaResources(asset) }
+                if waveformCache[aid] == nil { loadWaveform(assetID: aid, url: url) }
+                if asset.duration <= 0 { updateAssetDuration(assetID: aid, url: url) }
             case .subtitle:
                 break
             }
@@ -288,13 +300,18 @@ extension ProjectState {
 
     /// 素材时长更新（专属 pthread + 超时，挂起机器上安全）
     func updateAssetDuration(assetID: UUID, url: URL) {
+        guard !durationLoading.contains(assetID) else { return }
+        durationLoading.insert(assetID)
         Thread.detachNewThread {
-            if case .success(let d) = Self.durationSyncWithTimeout(url: url, seconds: 10) {
-                DispatchQueue.main.async {
-                    if let i = self.mediaAssets.firstIndex(where: { $0.id == assetID }) {
-                        self.mediaAssets[i].duration = d
-                    }
-                }
+            let outcome = Self.durationSyncWithTimeout(url: url, seconds: 10)
+            DispatchQueue.main.async {
+                self.durationLoading.remove(assetID)
+                guard case .success(let d) = outcome,
+                      let i = self.mediaAssets.firstIndex(where: { $0.id == assetID }),
+                      // 没变就别写：写一次素材库就广播一次，所有窗口都要跟着刷新
+                      abs(self.mediaAssets[i].duration - d) > 0.01
+                else { return }
+                self.mediaAssets[i].duration = d
             }
         }
     }
@@ -858,6 +875,18 @@ extension ProjectState {
         waveformGenerating.insert(assetID)
         let id = assetID
         Thread.detachNewThread {
+            // 算过的直接从硬盘读，不解码
+            if let cached = ThumbnailDiskCache.loadWaveform(for: url) {
+                DispatchQueue.main.async {
+                    self.waveformCache[id] = cached
+                    self.waveformGenerating.remove(id)
+                }
+                return
+            }
+            // 排队等名额再解码（wait 在这条新线程里做）。原来所有音频一起上，
+            // 跟同时在抽缩略图的视频抢系统解码，长音频个个卡满 8 秒超时
+            Self.waveformSlots.wait()
+            defer { Self.waveformSlots.signal() }
             let degraded = Self.avDecodeDegraded
             var result = degraded ? nil : Self.waveformSyncWithTimeout(url: url, timeout: 8)
             if result == nil {
@@ -869,6 +898,7 @@ extension ProjectState {
                 DiagLog.log(result != nil ? "[波形] ffmpeg 兜底成功 \(url.lastPathComponent)"
                                           : "[波形] ffmpeg 兜底也失败 \(url.lastPathComponent)")
             }
+            if let r = result { ThumbnailDiskCache.saveWaveform(r, for: url) }
             let data = result
             DispatchQueue.main.async {
                 if let d = data { self.waveformCache[id] = d }
@@ -876,6 +906,9 @@ extension ProjectState {
             }
         }
     }
+
+    /// 同时解码波形的上限，跟时间轴缩略图一样给两个
+    private static let waveformSlots = DispatchSemaphore(value: 2)
 
     /// AVAssetReader 波形读取（内层专属 pthread；外层信号量超时，挂死即遗弃该线程）
     nonisolated static func waveformSyncWithTimeout(url: URL, timeout: Double) -> WaveformData? {
@@ -1001,11 +1034,34 @@ extension ProjectState {
     }
 
     /// Load an image file as thumbnail for the media library.
+    ///
+    /// 后台出一张缩小图（长边 1024）。原来是主线程直接 `NSImage(contentsOf:)` 读原图，
+    /// 素材库一显示，几十张原图全在主线程解码（实测启动头 15 秒里占主线程 0.6 秒），
+    /// 开软件那阵子点什么都转圈
     func loadImageThumbnail(assetID: UUID, url: URL) {
-        guard mediaThumbnails[assetID] == nil else { return }
-        if let img = NSImage(contentsOf: url) {
-            mediaThumbnails[assetID] = img
+        guard mediaThumbnails[assetID] == nil, !coverGenerating.contains(assetID) else { return }
+        coverGenerating.insert(assetID)
+        DispatchQueue.global(qos: .utility).async {
+            let img = Self.downsampledImage(url: url, maxPixel: 1024)
+            DispatchQueue.main.async {
+                self.coverGenerating.remove(assetID)
+                if let img { self.mediaThumbnails[assetID] = img }
+            }
         }
+    }
+
+    /// ImageIO 直接解出缩小版，不先解整张原图。读不了的格式退回 NSImage
+    nonisolated static func downsampledImage(url: URL, maxPixel: Int) -> NSImage? {
+        if let src = CGImageSourceCreateWithURL(url as CFURL, nil),
+           let cg = CGImageSourceCreateThumbnailAtIndex(src, 0, [
+               kCGImageSourceCreateThumbnailFromImageAlways: true,
+               kCGImageSourceCreateThumbnailWithTransform: true,
+               kCGImageSourceShouldCacheImmediately: true,
+               kCGImageSourceThumbnailMaxPixelSize: maxPixel
+           ] as CFDictionary) {
+            return NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
+        }
+        return NSImage(contentsOf: url)
     }
 
     // MARK: - Relink missing asset

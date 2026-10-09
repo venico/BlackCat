@@ -1634,7 +1634,7 @@ extension ProjectState {
                 mutate(&effectTracks[ti].clips[ci])
                 isSaved = false
                 if live {
-                    ColorCompositor.setEffectTracks(effectTracks)
+                    previewCompositor.setEffectTracks(effectTracks)
                     clock.refreshSeekRequest &+= 1
                 } else {
                     rebuildTimelinePreviewDebounced()

@@ -700,15 +700,49 @@ final class AIVideoService: ObservableObject {
     ///
     /// 界面上那份（`referenceContents`）发完就清空了，而生成工具是**异步**跑的，
     /// 等它执行时早没了 —— 所以单独留一份给工具读
-    var agentRoundReferences: [RefContent] = []
-    var agentRoundFirstFrame: URL?
-    var agentRoundLastFrame: URL?
+    ///
+    /// **每条会话各一份**（下面这几个 agentRound* 都是）。原来全局一份：两条会话同时跑，
+    /// 后发的那条一开工就把参考图、生成名额、张数全换成自己的 —— 前一条生成时带的是
+    /// 别人的参考图，或者被「这一轮已经提交过」拦下。读写都按「这会儿在替哪条会话干活」取
+    struct AgentRoundState {
+        var references: [RefContent] = []
+        var firstFrame: URL?
+        var lastFrame: URL?
+        var refsNeedOptIn = false
+        var viewStart: Int?
+        var generated: Set<ProviderCategory> = []
+        var imageCount: Int?
+    }
+    private var agentRounds: [UUID: AgentRoundState] = [:]
+    /// 工具执行时是它所属的会话（task-local），界面上发起时是当前会话
+    var agentConversationID: UUID? { AgentContext.conversationID ?? currentConversationId }
+    private var roundKey: UUID { agentConversationID ?? Self.noConversationKey }
+    private static let noConversationKey = UUID()
+
+    var agentRoundReferences: [RefContent] {
+        get { agentRounds[roundKey]?.references ?? [] }
+        set { agentRounds[roundKey, default: .init()].references = newValue }
+    }
+    var agentRoundFirstFrame: URL? {
+        get { agentRounds[roundKey]?.firstFrame }
+        set { agentRounds[roundKey, default: .init()].firstFrame = newValue }
+    }
+    var agentRoundLastFrame: URL? {
+        get { agentRounds[roundKey]?.lastFrame }
+        set { agentRounds[roundKey, default: .init()].lastFrame = newValue }
+    }
     /// 这轮挂的图要不要等 Agent 点头才当参考。
     /// 用户点名了生成模型（`/seedance`）＝ 图就是给生成用的，自动带上；
     /// 没点名＝ 图先给 Agent 看，它按用户的话判断要不要当参考（生成工具传 use_references）
-    var agentRoundRefsNeedOptIn = false
+    var agentRoundRefsNeedOptIn: Bool {
+        get { agentRounds[roundKey]?.refsNeedOptIn ?? false }
+        set { agentRounds[roundKey, default: .init()].refsNeedOptIn = newValue }
+    }
     /// 这一轮新挂的图在 `conversationImageURLs()` 里从第几张开始（1 起）。没新图 = nil
-    var agentRoundViewStart: Int?
+    var agentRoundViewStart: Int? {
+        get { agentRounds[roundKey]?.viewStart }
+        set { agentRounds[roundKey, default: .init()].viewStart = newValue }
+    }
 
     /// 当前会话里用户发过的图（按先后，最近 12 张）。view_attachments 从这里取。
     ///
@@ -717,8 +751,13 @@ final class AIVideoService: ObservableObject {
     /// 这一句说「照刚才那张改」，它回「附件是空的」（实测）
     func conversationImageURLs() -> [URL] {
         var out: [URL] = []
-        for m in messages where m.role == .user {
-            for a in m.attachments where [.image, .firstFrame, .lastFrame].contains(a.kind) {
+        // 替别的会话干活时（用户已经切走了），读那条会话存下的记录，不读界面上这份
+        let cid = agentConversationID
+        let userAttachments: [[Attachment]] = (cid == nil || cid == currentConversationId)
+            ? messages.filter { $0.role == .user }.map(\.attachments)
+            : (history.first { $0.id == cid }?.entries ?? []).filter(\.isUser).map { $0.attachments ?? [] }
+        for atts in userAttachments {
+            for a in atts where [.image, .firstFrame, .lastFrame].contains(a.kind) {
                 guard let u = a.resolvedURL() else { continue }
                 out.removeAll { $0 == u }
                 out.append(u)
@@ -748,14 +787,20 @@ final class AIVideoService: ObservableObject {
     /// 模型总爱多提交：用户取消了一个再要 3 张，它交「1 张（补做的）+ 3 张」；
     /// 提示词里写死「取消就是不要了，不要补做」也照样补。
     /// 要多张走 count 参数，所以这道拦截不会误伤
-    var agentRoundGenerated: Set<ProviderCategory> = []
+    var agentRoundGenerated: Set<ProviderCategory> {
+        get { agentRounds[roundKey]?.generated ?? [] }
+        set { agentRounds[roundKey, default: .init()].generated = newValue }
+    }
 
     /// 从用户这轮原话里解析出来的张数（「生成3张海报」→ 3）。
     ///
     /// **不指望模型传 count**：实测跟它说「用户说了几张就传几」，它照样第一次
     /// 只调 1 张、第二次再调一次，被一轮一次的拦截挡下，最后只出 1 张。
     /// 这里自己认数字，不看它脸色
-    var agentRoundImageCount: Int?
+    var agentRoundImageCount: Int? {
+        get { agentRounds[roundKey]?.imageCount }
+        set { agentRounds[roundKey, default: .init()].imageCount = newValue }
+    }
 
     /// 认「3张 / 三张 / 3幅 / 3个」这类说法。认不出返回 nil
     static func parseImageCount(from text: String) -> Int? {
@@ -1197,7 +1242,7 @@ final class AIVideoService: ObservableObject {
         // 塞占位随机值的话永远对不上，画布生成时那个状态点一直是静的（实测）。
         // msgId 这条路确实用不上，占位即可
         runningTasks[taskID] = RunningGeneration(id: taskID,
-                                                 convId: currentConversationId ?? UUID(),
+                                                 convId: agentConversationID ?? UUID(),
                                                  msgId: UUID(),
                                                  source: .canvas, category: category, handle: nil)
 
@@ -1623,18 +1668,27 @@ final class AIVideoService: ObservableObject {
     /// 后台任务结束得让模型知道 —— 它只清楚自己提交过，之后是成了、砸了、
     /// 还是被用户取消了，一概看不到。不留痕的话用户再说一遍同样的需求，
     /// 它当没做过又提交一个，任务就这么一轮一轮累加上去
-    func appendAgentNote(_ text: String, kind: ChatMessage.NoteKind? = nil) {
-        if currentConversationId == nil { newConversation() }
+    /// - Parameter conversationID: 写进哪条会话。不给就按「这会儿在替谁干活」，
+    ///   再不行就是界面当前那条。不是当前那条的，直接写进它的存档，界面上这条不动
+    func appendAgentNote(_ text: String, kind: ChatMessage.NoteKind? = nil,
+                         conversationID: UUID? = nil) {
         var msg = ChatMessage(role: .assistant, content: text)
         msg.noteKind = kind
-        messages.append(msg)
-        persist(msg, isUser: false, steps: nil)
+        appendAgentMessage(msg, to: conversationID ?? agentConversationID)
     }
 
-    func appendAgentFailure(_ text: String) {
-        if currentConversationId == nil { newConversation() }
+    func appendAgentFailure(_ text: String, conversationID: UUID? = nil) {
         let msg = ChatMessage(role: .assistant, content: text,
                               status: .failed(error: text))
+        appendAgentMessage(msg, to: conversationID ?? agentConversationID)
+    }
+
+    private func appendAgentMessage(_ msg: ChatMessage, to owner: UUID?) {
+        if let owner, owner != currentConversationId, history.contains(where: { $0.id == owner }) {
+            persist(msg, isUser: false, steps: nil, to: owner)
+            return
+        }
+        if currentConversationId == nil { newConversation() }
         messages.append(msg)
         persist(msg, isUser: false, steps: nil)
     }
@@ -1679,9 +1733,22 @@ final class AIVideoService: ObservableObject {
 
     func finishAgentReply(id: UUID, text: String,
                           steps: [ConversationRecord.AgentStepRecord],
-                          elapsed: TimeInterval = 0, tokens: Int = 0) {
-        guard let i = messages.firstIndex(where: { $0.id == id }) else { return }
+                          elapsed: TimeInterval = 0, tokens: Int = 0,
+                          conversationID: UUID? = nil) {
         let clean = Self.stripFakeToolLog(text, didCallTools: !steps.isEmpty)
+        // 跑着的时候用户切到别的会话了：界面上这份 messages 已经是别人的，
+        // 原来在这里找不到占位就直接 return —— 回复整条丢了，那条会话里只剩个空气泡。
+        // 改成写进它自己的存档
+        if let owner = conversationID, owner != currentConversationId,
+           history.contains(where: { $0.id == owner }) {
+            var msg = ChatMessage(id: id, role: .assistant, content: clean.isEmpty ? "（没有输出）" : clean)
+            msg.agentElapsed = elapsed > 0 ? elapsed : nil
+            msg.agentTokens = tokens > 0 ? tokens : nil
+            DiagLog.log("[会话] 存回复（会话已切走，写进它的存档）：步骤 \(steps.count) 步")
+            persist(msg, isUser: false, steps: steps.isEmpty ? nil : steps, to: owner)
+            return
+        }
+        guard let i = messages.firstIndex(where: { $0.id == id }) else { return }
         messages[i].content = clean.isEmpty ? "（没有输出）" : clean
         DiagLog.log("[会话] 存回复：步骤 \(steps.count) 步"
                   + (steps.isEmpty ? "" : "（\(steps.map(\.tool).joined(separator: "、"))）"))
@@ -1692,8 +1759,8 @@ final class AIVideoService: ObservableObject {
     }
 
     private func persist(_ msg: ChatMessage, isUser: Bool,
-                         steps: [ConversationRecord.AgentStepRecord]?) {
-        guard let cid = currentConversationId,
+                         steps: [ConversationRecord.AgentStepRecord]?, to convID: UUID? = nil) {
+        guard let cid = convID ?? currentConversationId,
               let i = history.firstIndex(where: { $0.id == cid }) else { return }
         var entry = ConversationRecord.Entry(id: msg.id, isUser: isUser,
                                              text: msg.content, videoPath: nil)
@@ -1702,7 +1769,14 @@ final class AIVideoService: ObservableObject {
         entry.agentTokens = msg.agentTokens
         entry.noteKind = msg.noteKind
         if case .failed(let e) = msg.status { entry.failedError = e }
-        history[i].entries.append(entry)
+        entry.attachments = msg.attachments.isEmpty ? nil : msg.attachments
+        // 同一条已经存过（切会话时占位那条被一起存了）就原地更新，别再追加一条
+        if let j = history[i].entries.firstIndex(where: { $0.id == msg.id }) {
+            if entry.attachments == nil { entry.attachments = history[i].entries[j].attachments }
+            history[i].entries[j] = entry
+        } else {
+            history[i].entries.append(entry)
+        }
         // 会话标题还是「新对话」时，拿用户第一句话当标题
         if isUser, !history[i].titleIsCustom,
            history[i].title == "新对话" || history[i].title.isEmpty {

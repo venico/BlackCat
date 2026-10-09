@@ -185,9 +185,11 @@ extension ProjectState {
 
     // MARK: - 自动语音识别（Whisper）
 
-    func downloadModelAndTranscribe() {
+    /// 先把选中的识别模型下下来，再接着识别。参数原样传给 `autoTranscribeSelectedClip`
+    func downloadModelAndTranscribe(engine: String? = nil, aiModel: String? = nil, targetLang: String? = nil) {
         guard !isTranscribing else { return }
-        let model = selectedWhisperModel
+        // 跟识别弹窗、设置里是同一份选择（原来读的是项目里另一个默认 small 的字段，两边对不上）
+        let model = AppSettings.shared.selectedWhisperModel
         transcribeState = .downloading(0)
         transcribeTask = Task {
             do {
@@ -196,7 +198,7 @@ extension ProjectState {
                 }
                 await MainActor.run {
                     self.transcribeState = .idle
-                    self.autoTranscribeSelectedClip()
+                    self.autoTranscribeSelectedClip(engine: engine, aiModel: aiModel, targetLang: targetLang)
                 }
             } catch is CancellationError {
                 await MainActor.run { self.transcribeState = .idle }
@@ -217,7 +219,12 @@ extension ProjectState {
     ///   - engine: 翻译方式。nil = 用弹窗里存的；`""` 不翻译；`"ai"` 大模型翻；
     ///     其余是翻译引擎（`AppSettings.TranslateProvider` 的取值）
     ///   - aiModel: 识别后用哪个 AI 模型。nil = 用弹窗里存的；`""` = 不用 AI
-    func autoTranscribeSelectedClip(engine: String? = nil, aiModel: String? = nil) {
+    ///   - targetLang: 翻译成哪种语言。nil = 用「翻译目标语言」
+    ///   - allowModelFallback: 选中的识别模型没下载时，能不能退回用已下载的别的档。
+    ///     **默认不能** —— 原来会不声不响换成别的档，用户选的是均衡、实际跑的是极速，自己根本不知道。
+    ///     不许退回时先下载选中那档再识别
+    func autoTranscribeSelectedClip(engine: String? = nil, aiModel: String? = nil,
+                                    targetLang: String? = nil, allowModelFallback: Bool = false) {
         let transEngine = engine ?? transcribeTranslateEngine
         let modelID = aiModel ?? transcribeAIModel
         let useAI = !modelID.isEmpty
@@ -244,6 +251,10 @@ extension ProjectState {
             showSuccessToast(icon: "exclamationmark.triangle", iconColor: .red, title: "语音识别", subtitle: "请先选择一个视频或音频片段", autoCountdown: false)
             return
         }
+        if !allowModelFallback, !WhisperTranscriber.isReady(AppSettings.shared.selectedWhisperModel) {
+            downloadModelAndTranscribe(engine: engine, aiModel: aiModel, targetLang: targetLang)
+            return
+        }
         if !WhisperTranscriber.modelReady {
             showWhisperModelPicker = true
             return
@@ -258,7 +269,7 @@ extension ProjectState {
         transcribeState = .running(0)
 
         // 识别用自动检测原声，再按需翻译到「翻译目标语言」
-        let displayName = translationTargetLang
+        let displayName = targetLang ?? translationTargetLang
         let isTargetSimplified = (displayName == "中文（简体）")
         let targetBase = WhisperTranscriber.langCode(forDisplayName: displayName)  // zh/en/it...
 

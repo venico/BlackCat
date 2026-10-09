@@ -275,6 +275,8 @@ final class ColorCompositionData: NSObject {
     /// 导出用。只画视频层和转场：叠加层、滤镜这些由导出的逐帧处理另画；
     /// 预览那几样按轨道号存的临时状态（拖动偏移、实时调色）也不能套过来 —— 轨道号是两份合成各自编的
     var forExport = false
+    /// 预览用：这个项目窗口自己的实时状态（拖动偏移、实时调色、效果轨、叠加层）。导出不带
+    var live: PreviewCompositorState?
 }
 
 /// 自带数据的合成指令。导出用它：数据跟着指令走，不经全局存储，
@@ -294,91 +296,98 @@ final class ColorInstruction: NSObject, AVVideoCompositionInstructionProtocol {
     }
 }
 
-// AVMutableVideoCompositionInstruction extension（仅用于其他代码兼容）
-private var colorCompositionDataKey: UInt8 = 0
-extension AVMutableVideoCompositionInstruction {
-    var colorData: ColorCompositionData? {
-        get { objc_getAssociatedObject(self, &colorCompositionDataKey) as? ColorCompositionData }
-        set { objc_setAssociatedObject(self, &colorCompositionDataKey, newValue,
-                                       .OBJC_ASSOCIATION_RETAIN_NONATOMIC) }
-    }
-}
+// MARK: - PreviewCompositorState
+// 一个项目窗口自己的预览实时状态。
+//
+// 原来这些全是 ColorCompositor 上的静态变量，所有打开的项目共用一份：
+// 两个窗口都开着时，后重建的那个会把前一个的滤镜、叠加层、分段数据整个盖掉，
+// 前一个窗口的预览就套上了别的项目的滤镜，或者滤镜干脆没了。
+// 现在每个 ProjectState 一份，挂在预览指令的数据上（ColorCompositionData.live）带进合成器，
+// 跟导出「数据跟着指令走」是同一个做法。
 
-// MARK: - ColorCompositor
-// 用静态字典存 composition data，以 segment 起始 CMTime value（timescale=600）为 key。
-// 不依赖 associated object，避免 AVFoundation 内部 copy instruction 时丢失数据。
-
-final class ColorCompositor: NSObject, AVVideoCompositing {
-
-    // 静态数据存储（线程安全）
-    private static let lock = NSLock()
-    private static var store: [Int64: ColorCompositionData] = [:]
-    private static var dragOffsets: [CMPersistentTrackID: (x: CGFloat, y: CGFloat)] = [:]
-    /// 当前的滤镜轨道。**不能只挂在合成指令上** —— 单轨无转场时合成器走的是
-    /// 「透传」快路径，那条路拿不到指令数据，滤镜会整个失效
-    nonisolated(unsafe) private static var liveFilterTracks: [Track<FilterClip>] = []
-    nonisolated(unsafe) private static var liveAdjustTracks: [Track<AdjustClip>] = []
+final class PreviewCompositorState: @unchecked Sendable {
+    private let lock = NSLock()
+    /// 滤镜 / 调节 / 特效轨道。**不能只在重建时塞进分段数据**：拖强度、改特效参数
+    /// 是不重建的，只推这几样再逼播放器重画当前帧
+    private var filterTracks: [Track<FilterClip>] = []
+    private var adjustTracks: [Track<AdjustClip>] = []
+    private var effectTracks: [Track<EffectClip>] = []
+    private var overlay = ColorCompositor.OverlayInput()
+    private var dragOffsets: [CMPersistentTrackID: (x: CGFloat, y: CGFloat)] = [:]
     /// 拖色调滑块时的实时覆盖值。走这条就不用重建整个 composition ——
     /// 重建要重新 load playerItem，代价大到只能防抖，表现就是"松手才变"
-    private static var liveColorAdjusts: [CMPersistentTrackID: ColorAdjust] = [:]
+    private var liveColorAdjusts: [CMPersistentTrackID: ColorAdjust] = [:]
 
-    /// 注册一个 segment 的数据（在 rebuildTimelinePreview 主线程调用）
-    static func setData(_ data: ColorCompositionData, forStartValue key: Int64) {
+    func setFilterTracks(_ tracks: [Track<FilterClip>]) {
         lock.lock(); defer { lock.unlock() }
-        store[key] = data
+        filterTracks = tracks
     }
 
-    /// 重建前清空旧数据
-    static func clearStore() {
+    func getFilterTracks() -> [Track<FilterClip>] {
         lock.lock(); defer { lock.unlock() }
-        store.removeAll()
+        return filterTracks
+    }
+
+    func setAdjustTracks(_ tracks: [Track<AdjustClip>]) {
+        lock.lock(); defer { lock.unlock() }
+        adjustTracks = tracks
+    }
+
+    func setEffectTracks(_ tracks: [Track<EffectClip>]) {
+        lock.lock(); defer { lock.unlock() }
+        effectTracks = tracks
+    }
+
+    func setOverlayInput(_ input: ColorCompositor.OverlayInput) {
+        lock.lock(); defer { lock.unlock() }
+        overlay = input
+    }
+
+    func setDragOffset(trackID: CMPersistentTrackID, offsetX: CGFloat, offsetY: CGFloat) {
+        lock.lock(); defer { lock.unlock() }
+        dragOffsets[trackID] = (offsetX, offsetY)
+    }
+
+    func clearDragOffsets() {
+        lock.lock(); defer { lock.unlock() }
+        dragOffsets.removeAll()
+    }
+
+    /// 色调滑块拖动中的实时值。配合 `clock.refreshSeekRequest` 的 jitter seek
+    /// 逼播放器重绘当前帧，滑块就跟图片一样即时响应
+    func setLiveColorAdjust(trackID: CMPersistentTrackID, _ adj: ColorAdjust) {
+        lock.lock(); defer { lock.unlock() }
+        liveColorAdjusts[trackID] = adj
+    }
+
+    /// 整份重建时调：新的分段数据里已经是真值，拖动中的临时覆盖作废
+    func clearTransient() {
+        lock.lock(); defer { lock.unlock() }
         dragOffsets.removeAll()
         liveColorAdjusts.removeAll()
     }
 
-    static func setFilterTracks(_ tracks: [Track<FilterClip>]) {
+    func dragOffset(trackID: CMPersistentTrackID) -> (x: CGFloat, y: CGFloat)? {
         lock.lock(); defer { lock.unlock() }
-        liveFilterTracks = tracks
+        return dragOffsets[trackID]
     }
 
-    static func getFilterTracks() -> [Track<FilterClip>] {
+    func liveColorAdjust(trackID: CMPersistentTrackID) -> ColorAdjust? {
         lock.lock(); defer { lock.unlock() }
-        return liveFilterTracks
-    }
-
-    /// 叠加层（图片/字幕/文字/图形/复合）。
-    ///
-    /// **画进帧里再做特效**，跟导出走同一份 OverlayRenderer ——
-    /// 原先预览是让 SwiftUI 单独画这些图层、各自套一遍特效，
-    /// 漩涡这种改几何的就会出现「图片扭一套、视频扭另一套」，两边对不上
-    struct OverlayInput {
-        var order: [ProjectState.OverlayTrackRef] = []
-        var imageTracks: [Track<ImageClip>] = []
-        var textTracks: [Track<TextClip>] = []
-        var shapeTracks: [Track<ShapeClip>] = []
-        var compoundTracks: [Track<CompoundClip>] = []
-        var subtitleInfo: OverlayRenderer.SubtitleRenderInfo? = nil
-        var imageCICache: [URL: CIImage] = [:]
-        var fontScale: CGFloat = 1
-    }
-    private static var liveOverlay = OverlayInput()
-
-    static func setOverlayInput(_ input: OverlayInput) {
-        lock.lock(); defer { lock.unlock() }
-        liveOverlay = input
-    }
-
-    static func getOverlayInput() -> OverlayInput {
-        lock.lock(); defer { lock.unlock() }
-        return liveOverlay
+        return liveColorAdjusts[trackID]
     }
 
     /// 把叠加层画到帧上。顺序跟导出一致：从底到顶
-    /// - Parameter explicit: 不走合成器手上那份、直接用给定的数据画（Agent 截帧用：
-    ///   没有效果轨时合成器手上那份是空的，叠加层归 SwiftUI 画，截帧里就没有字幕）
-    static func drawOverlays(_ image: CIImage, at t: Double, renderSize: CGSize,
-                             input explicit: OverlayInput? = nil) -> CIImage {
-        let input = explicit ?? getOverlayInput()
+    /// - Parameter explicit: 不走手上那份、直接用给定的数据画（Agent 截帧用：
+    ///   没有效果轨时手上那份是空的，叠加层归 SwiftUI 画，截帧里就没有字幕）
+    func drawOverlays(_ image: CIImage, at t: Double, renderSize: CGSize,
+                      input explicit: ColorCompositor.OverlayInput? = nil) -> CIImage {
+        lock.lock()
+        let input = explicit ?? overlay
+        let filterTracks = self.filterTracks
+        let adjustTracks = self.adjustTracks
+        let effectTracks = self.effectTracks
+        lock.unlock()
         guard !input.order.isEmpty else { return image }
         var out = image
         var subtitleDone = false
@@ -419,21 +428,21 @@ final class ColorCompositor: NSObject, AVVideoCompositing {
                     imageCICache: input.imageCICache, subtitleInfo: info)
             case .filter(let tid):
                 // 滤镜只作用于排在它下面的图层，走到这一层就把已经画好的套一遍
-                guard let track = liveFilterTracks.first(where: { $0.id == tid }), track.isVisible
+                guard let track = filterTracks.first(where: { $0.id == tid }), track.isVisible
                 else { continue }
                 for clip in track.clips where clip.startTime <= t && clip.endTime > t {
                     out = FilterEngine.apply(clip, to: out)
                         .cropped(to: CGRect(origin: .zero, size: renderSize))
                 }
             case .adjust(let tid):
-                guard let track = liveAdjustTracks.first(where: { $0.id == tid }), track.isVisible
+                guard let track = adjustTracks.first(where: { $0.id == tid }), track.isVisible
                 else { continue }
                 for clip in track.clips where clip.startTime <= t && clip.endTime > t {
                     out = ColorAdjust.apply(out, clip.adjust)
                         .cropped(to: CGRect(origin: .zero, size: renderSize))
                 }
             case .effect(let tid):
-                guard let track = liveEffectTracks.first(where: { $0.id == tid }), track.isVisible
+                guard let track = effectTracks.first(where: { $0.id == tid }), track.isVisible
                 else { continue }
                 for clip in track.clips where clip.startTime <= t && clip.endTime > t {
                     out = EffectEngine.apply(clip, to: out, renderSize: renderSize)
@@ -443,77 +452,28 @@ final class ColorCompositor: NSObject, AVVideoCompositing {
         }
         return out
     }
+}
 
-    private static var liveEffectTracks: [Track<EffectClip>] = []
+// MARK: - ColorCompositor
+// 预览和导出的指令都是 ColorInstruction，分段数据跟着指令走；
+// 预览要的实时状态（拖动偏移、实时调色、效果轨、叠加层）在数据的 live 上，各项目各一份
 
-    static func setEffectTracks(_ tracks: [Track<EffectClip>]) {
-        lock.lock(); defer { lock.unlock() }
-        liveEffectTracks = tracks
-    }
+final class ColorCompositor: NSObject, AVVideoCompositing {
 
-    static func getEffectTracks() -> [Track<EffectClip>] {
-        lock.lock(); defer { lock.unlock() }
-        return liveEffectTracks
-    }
-
-    static func setAdjustTracks(_ tracks: [Track<AdjustClip>]) {
-        lock.lock(); defer { lock.unlock() }
-        liveAdjustTracks = tracks
-    }
-
-    static func getAdjustTracks() -> [Track<AdjustClip>] {
-        lock.lock(); defer { lock.unlock() }
-        return liveAdjustTracks
-    }
-
-    /// 把某一刻生效的调节全套上去。多条轨道从下往上依次作用
-    static func applyAdjustTracks(_ img: CIImage, at time: Double) -> CIImage {
-        var out = img
-        for track in getAdjustTracks() where track.isVisible {
-            for clip in track.clips where clip.startTime <= time && clip.endTime > time {
-                out = ColorAdjust.apply(out, clip.adjust)
-            }
-        }
-        return out
-    }
-
-    static func setDragOffset(trackID: CMPersistentTrackID, offsetX: CGFloat, offsetY: CGFloat) {
-        lock.lock(); defer { lock.unlock() }
-        dragOffsets[trackID] = (offsetX, offsetY)
-    }
-
-    static func clearDragOffsets() {
-        lock.lock(); defer { lock.unlock() }
-        dragOffsets.removeAll()
-    }
-
-    /// 色调滑块拖动中的实时值。配合 `clock.refreshSeekRequest` 的 jitter seek
-    /// 逼播放器重绘当前帧，滑块就跟图片一样即时响应
-    static func setLiveColorAdjust(trackID: CMPersistentTrackID, _ adj: ColorAdjust) {
-        lock.lock(); defer { lock.unlock() }
-        liveColorAdjusts[trackID] = adj
-    }
-
-    static func clearLiveColorAdjusts() {
-        lock.lock(); defer { lock.unlock() }
-        liveColorAdjusts.removeAll()
-    }
-
-    private static func getLiveColorAdjust(trackID: CMPersistentTrackID) -> ColorAdjust? {
-        lock.lock(); defer { lock.unlock() }
-        return liveColorAdjusts[trackID]
-    }
-
-    private static func getDragOffset(trackID: CMPersistentTrackID) -> (x: CGFloat, y: CGFloat)? {
-        lock.lock(); defer { lock.unlock() }
-        return dragOffsets[trackID]
-    }
-
-    private static func getData(for timeRange: CMTimeRange) -> ColorCompositionData? {
-        // 以 timescale=600 的 start.value 为 key
-        let key = CMTimeConvertScale(timeRange.start, timescale: 600, method: .default).value
-        lock.lock(); defer { lock.unlock() }
-        return store[key]
+    /// 叠加层（图片/字幕/文字/图形/复合）。
+    ///
+    /// **画进帧里再做特效**，跟导出走同一份 OverlayRenderer ——
+    /// 原先预览是让 SwiftUI 单独画这些图层、各自套一遍特效，
+    /// 漩涡这种改几何的就会出现「图片扭一套、视频扭另一套」，两边对不上
+    struct OverlayInput {
+        var order: [ProjectState.OverlayTrackRef] = []
+        var imageTracks: [Track<ImageClip>] = []
+        var textTracks: [Track<TextClip>] = []
+        var shapeTracks: [Track<ShapeClip>] = []
+        var compoundTracks: [Track<CompoundClip>] = []
+        var subtitleInfo: OverlayRenderer.SubtitleRenderInfo? = nil
+        var imageCICache: [URL: CIImage] = [:]
+        var fontScale: CGFloat = 1
     }
 
     // ---- AVVideoCompositing ----
@@ -709,10 +669,8 @@ final class ColorCompositor: NSObject, AVVideoCompositing {
     }
 
     func startRequest(_ req: AVAsynchronousVideoCompositionRequest) {
-        let instrRange = req.videoCompositionInstruction.timeRange
-        guard let data = (req.videoCompositionInstruction as? ColorInstruction)?.data
-                ?? Self.getData(for: instrRange) else {
-            // 无自定义数据：透传第一个 source frame（自动 fit-to-output）
+        guard let data = (req.videoCompositionInstruction as? ColorInstruction)?.data else {
+            // 不是我们的指令（拿不到数据）：透传第一个 source frame（自动 fit-to-output）
             if let firstIDVal = req.videoCompositionInstruction.requiredSourceTrackIDs?.first,
                let firstID   = (firstIDVal as? NSNumber)?.int32Value,
                let outBuf    = req.renderContext.newPixelBuffer(),
@@ -728,11 +686,6 @@ final class ColorCompositor: NSObject, AVVideoCompositing {
                 ci = ci.transformed(by: CGAffineTransform(scaleX: scale, y: scale)
                     .concatenating(CGAffineTransform(translationX: tx, y: ty)))
                 ci = ci.cropped(to: CGRect(x: 0, y: 0, width: outW, height: outH))
-                let box = CGRect(x: 0, y: 0, width: outW, height: outH)
-                let t = req.compositionTime.seconds
-                // 叠加层和三类效果轨道都在这一步：按图层顺序从底往上画，
-                // 走到效果那一层就把已经画好的整帧套一遍 —— 跟导出同一个套路
-                ci = Self.drawOverlays(ci, at: t, renderSize: box.size).cropped(to: box)
                 Self.sharedCtx.render(ci, to: outBuf,
                                       bounds: CGRect(x: 0, y: 0, width: outW, height: outH),
                                       colorSpace: CGColorSpaceCreateDeviceRGB())
@@ -756,9 +709,12 @@ final class ColorCompositor: NSObject, AVVideoCompositing {
         let bounds = CGRect(x: 0, y: 0, width: outW, height: outH)
         let renderSize = outW > 0 && outH > 0 ? CGSize(width: outW, height: outH) : data.renderSize
 
-        let base: CGFloat = data.whiteBase ? 1 : 0
-        var result: CIImage = CIImage(color: CIColor(red: base, green: base, blue: base, alpha: 1))
-            .cropped(to: bounds)
+        // **底色不算画面**：先在透明底上合成，滤镜 / 调节 / 特效只碰得到有内容的地方，
+        // 最后再垫黑底。原来一开始就铺一层不透明的黑，调亮之后视频四周的黑边跟着发灰。
+        // 闪白转场的白底是转场画面本身，照常参与
+        var result: CIImage = data.whiteBase
+            ? CIImage(color: CIColor(red: 1, green: 1, blue: 1, alpha: 1)).cropped(to: bounds)
+            : CIImage(color: CIColor(red: 0, green: 0, blue: 0, alpha: 0)).cropped(to: bounds)
 
         // 特效类转场：前后两片先各自画好整帧，循环完再一起混
         var blendA: CIImage?
@@ -766,11 +722,11 @@ final class ColorCompositor: NSObject, AVVideoCompositing {
         for var entry in data.entries {
             guard let srcBuf = req.sourceFrame(byTrackID: entry.trackID) else { continue }
 
-            if !data.forExport, let drag = Self.getDragOffset(trackID: entry.trackID) {
+            if !data.forExport, let drag = data.live?.dragOffset(trackID: entry.trackID) {
                 entry.userOffsetX = drag.x
                 entry.userOffsetY = drag.y
             }
-            if !data.forExport, let live = Self.getLiveColorAdjust(trackID: entry.trackID) {
+            if !data.forExport, let live = data.live?.liveColorAdjust(trackID: entry.trackID) {
                 entry.colorAdjust = live
             }
 
@@ -900,17 +856,22 @@ final class ColorCompositor: NSObject, AVVideoCompositing {
                                           extent: bounds)
         }
 
-        // 8. 滤镜：全部画面合成完之后再套，所以这段时间内谁都跑不掉。
-        //    取静态存储而不是 data，跟上面那条透传路径同一个来源
         // 7.5 模糊转场：整帧模糊，切点处最糊，两头清楚
         if let br = data.blurRamp {
             result = Self.transitionBlur(result, at: t, ramp: br, bounds: bounds)
         }
 
         // 8. 叠加层 + 三类效果轨道，按图层顺序一次走完（见 drawOverlays）。
-        //    导出时这一步归导出的逐帧处理，这里不画
-        if !data.forExport {
-            result = Self.drawOverlays(result, at: t, renderSize: bounds.size).cropped(to: bounds)
+        //    导出时只有「除了视频只有效果轨」才在这儿套（这样还能走快速导出）；
+        //    带字幕文字这些的，整套归导出的逐帧处理，这里不画
+        if let live = data.live {
+            result = live.drawOverlays(result, at: t, renderSize: bounds.size).cropped(to: bounds)
+        }
+        // 垫黑底。导出交给逐帧处理的那种例外：留着透明，等它套完效果再垫，
+        // 不然黑边又会被那边的调节调灰（透明处写进编码器本来就是黑的）
+        if !(data.forExport && data.live == nil) {
+            result = result.composited(over: CIImage(color: CIColor(red: 0, green: 0, blue: 0)))
+                .cropped(to: bounds)
         }
 
         Self.sharedCtx.render(result, to: outBuf,

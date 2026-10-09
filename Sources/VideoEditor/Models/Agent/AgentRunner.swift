@@ -13,6 +13,13 @@ import SwiftUI
 @MainActor
 final class AgentRunner: ObservableObject {
 
+    /// 这一轮的步骤、用时、花费（按会话取）。收尾写回会话时用 ——
+    /// 不能用上面那几个 @Published，那是「界面正看着哪条」的镜像，用户切走了就是别人的
+    func summary(of convID: UUID?) -> (steps: [Step], elapsed: TimeInterval, tokens: Int) {
+        guard let convID, let st = states[convID] else { return ([], 0, 0) }
+        return (st.steps, st.elapsed, st.totalTokens)
+    }
+
     /// 气泡里要显示实时步骤，会话列表里每一条都得能观察到它，做成单例最省事
     static let shared = AgentRunner()
 
@@ -193,13 +200,16 @@ final class AgentRunner: ObservableObject {
             $0.steps = []
             $0.streamingText = ""
         }
-        AgentToolbox.ocrCallsThisRound = 0
+        AgentContext.$conversationID.withValue(cid) { AgentToolbox.ocrCallsThisRound = 0 }
 
         history.append(.user(prompt, images: images))
         var msgs = history
 
         // 整轮一个撤销点：开跑前打一次，期间工具内部的 pushUndo 全部跳过
-        if mode != .plan {
+        // 同一个项目里另一条会话正在跑的话，它已经打开了这个开关：
+        // 这轮的改动并进它那一步，收尾时也别去关它的（不然它后面每个工具都单独记一步撤销）
+        let ownsUndo = mode != .plan && !project.suppressUndoPush
+        if ownsUndo {
             project.pushUndo()
             project.suppressUndoPush = true
         }
@@ -222,6 +232,9 @@ final class AgentRunner: ObservableObject {
 
         let task = Task { [weak self] in
             guard let self else { return }
+            // 整轮挂在这条会话名下：点亮哪些工具组、外部服务、每轮计数，全按它取。
+            // 不挂的话这些只认「界面正开着哪条」，用户一切会话就串了
+            await AgentContext.$conversationID.withValue(cid) {
             // 外接的 MCP 服务在这轮之前连一次（只连一次，之后走缓存）。
             // **必须在 Task 里** —— run 本身是同步的，而且工具表要等连上
             // 才知道对方有哪些工具
@@ -359,7 +372,7 @@ final class AgentRunner: ObservableObject {
                 AgentToolbox.autoReportGapIfNeeded(prompt: prompt, reply: finalText,
                                                    calledTools: self.states[cid]?.steps.map(\.toolName) ?? [])
             }
-            project.suppressUndoPush = false
+            if ownsUndo { project.suppressUndoPush = false }
             self.states[cid]?.ticker?.invalidate()
             self.mutate(cid) {
                 $0.ticker = nil
@@ -372,6 +385,7 @@ final class AgentRunner: ObservableObject {
             // 写回去的只有用户这句话。同一次运行里 Agent 的记忆于是只剩用户连着说的几句、
             // 一句自己的回复都没有，看着就像前面的要求还没做，下一轮连上一条一起又做一遍（实测）
             onFinish(finalText, msgs)
+            }
         }
         mutate(cid) { $0.task = task }
         // 先把用户这句写进去：这一轮跑着的时候用户切走再切回来，记忆里至少有这一句
@@ -388,6 +402,14 @@ final class AgentRunner: ObservableObject {
     /// 不能让它自己接着花钱，链也就不会自己往下长
     func runFollowUp(prompt: String, mode: AgentMode, project: ProjectState,
                      convID: UUID) async -> (text: String, ok: Bool) {
+        // 后台助手也挂在发起它的会话名下，跟那条会话共用点亮的工具组，别的会话不受影响
+        await AgentContext.$conversationID.withValue(convID) {
+            await runFollowUpInConversation(prompt: prompt, mode: mode, project: project, convID: convID)
+        }
+    }
+
+    private func runFollowUpInConversation(prompt: String, mode: AgentMode, project: ProjectState,
+                                           convID: UUID) async -> (text: String, ok: Bool) {
         AgentToolGate.shared.activate(matching: prompt)
         // 系统提示词和工具表**跟主会话一字不差**：这两样是缓存前缀，对上了就直接命中，
         // 另拼一份的话每次都从头算，后台助手的请求明显比主会话慢。
@@ -449,9 +471,20 @@ final class AgentRunner: ObservableObject {
 
     // MARK: - 单个工具
 
+    /// 工具执行时挂上「替哪条会话干活」。工具里读参考图、生成名额、报结果都按这个取 ——
+    /// 不挂的话它们只能看「界面上正开着哪条」，用户一切会话就串到别处去了
     private func execute(_ call: AgentToolCall, mode: AgentMode,
                          project: ProjectState, convID: UUID,
                          background: Bool = false) async -> AgentToolResult {
+        await AgentContext.$conversationID.withValue(convID) {
+            await executeInConversation(call, mode: mode, project: project,
+                                        convID: convID, background: background)
+        }
+    }
+
+    private func executeInConversation(_ call: AgentToolCall, mode: AgentMode,
+                                       project: ProjectState, convID: UUID,
+                                       background: Bool) async -> AgentToolResult {
         guard let spec = AgentToolbox.allSpecs.first(where: { $0.name == call.name }) else {
             return .fail("没有叫 \(call.name) 的工具。")
         }
@@ -840,5 +873,18 @@ enum AgentPhaseText {
     static func label(for tool: String) -> String {
         guard let t = table[tool] else { return tool }
         return t.hasPrefix("正在") ? String(t.dropFirst(2)) : t
+    }
+}
+
+
+/// 这会儿在替哪条会话干活。工具执行期间由 AgentRunner 挂上（task-local，跟着这一轮的
+/// 异步调用走，别的会话同时在跑也互不影响）；不在工具执行里就是 nil，按界面当前会话算
+enum AgentContext {
+    @TaskLocal static var conversationID: UUID?
+
+    private static let noConversation = UUID()
+    /// 按会话分开存东西时用的键：在替哪条会话干活就是哪条，否则是界面当前那条
+    @MainActor static var key: UUID {
+        conversationID ?? AIVideoService.shared.currentConversationId ?? noConversation
     }
 }
