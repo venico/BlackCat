@@ -22,7 +22,18 @@ enum LayerTransformIcon: String {
     case mirrorH, mirrorV, rotate
 }
 
+/// 关键帧挂钩：每个滑块后面的 `< ◇ >`、标签前的曲线展开箭头、滑块下面展开的曲线面板
+struct LayerKeyframeHooks {
+    /// nil = 这种元素的这个属性不能打关键帧（比如文字的范围框宽高），那一行就只是滑块
+    let nav: (KeyframeProp) -> AnyView?
+    let toggle: (KeyframeProp) -> AnyView?
+    let panel: (KeyframeProp) -> AnyView
+}
+
 struct LayerCommonSections: View {
+    /// 给了就在能打关键帧的滑块上挂关键帧控件（目前只有图片）
+    var keyframeHooks: LayerKeyframeHooks? = nil
+
     // ── 变换 ──
     var mirrorH: Binding<Bool>? = nil
     var mirrorV: Binding<Bool>? = nil
@@ -65,12 +76,29 @@ struct LayerCommonSections: View {
 
     var body: some View {
         Group {
-            transformSection
-            positionSection
-            scaleSection
-            cropSection
+            // 外观放在变换前面（各面板统一）
             appearanceSection
+            // 位置 / 缩放 / 裁剪是「变换」下面的三级分组，在 transformSection 里
+            transformSection
             alignSection
+        }
+    }
+
+    /// 滑块 + 关键帧控件。没给挂钩就只是滑块；id 给「选中关键帧时属性区滚到这一行」用
+    @ViewBuilder
+    private func kfRow<S: View>(_ p: KeyframeProp, @ViewBuilder _ slider: () -> S) -> some View {
+        if let h = keyframeHooks, let nav = h.nav(p) {
+            VStack(spacing: 10) {
+                HStack(spacing: 4) {
+                    slider()
+                        .environment(\.capsuleSliderLeading, h.toggle(p))
+                    nav
+                }
+                h.panel(p)
+            }
+            .id("kf-\(p.rawValue)")
+        } else {
+            slider()
         }
     }
 
@@ -78,7 +106,8 @@ struct LayerCommonSections: View {
 
     @ViewBuilder
     private var transformSection: some View {
-        if mirrorH != nil || mirrorV != nil || rotation != nil {
+        if mirrorH != nil || mirrorV != nil || rotation != nil
+            || posX != nil || scaleW != nil || cropTop != nil {
             ISection(title: "变换") {
                 HStack(spacing: 6) {
                     if let m = mirrorH {
@@ -102,14 +131,20 @@ struct LayerCommonSections: View {
                 if let r = rotation {
                     // 区间取 0~360，跟「左旋 90°」按钮规范化后的值对得上；
                     // 手柄自由转出来的负角度也在这儿折回正区间
-                    ISlider(label: "旋转", value: Binding(
-                        get: {
-                            let v = r.wrappedValue.truncatingRemainder(dividingBy: 360)
-                            return v < 0 ? v + 360 : v
-                        },
-                        set: { r.wrappedValue = $0 }
-                    ), range: 0...360, unit: "°")
+                    kfRow(.angle) {
+                        ISlider(label: "旋转", value: Binding(
+                            get: {
+                                let v = r.wrappedValue.truncatingRemainder(dividingBy: 360)
+                                return v < 0 ? v + 360 : v
+                            },
+                            set: { r.wrappedValue = $0 }
+                        ), range: 0...360, unit: "°")
+                    }
                 }
+                // 三级分组
+                positionSection
+                scaleSection
+                cropSection
             }
         }
     }
@@ -146,14 +181,13 @@ struct LayerCommonSections: View {
     @ViewBuilder
     private var positionSection: some View {
         if let x = posX, let y = posY {
-            ISection(title: nil) {
-                sectionHeader("位置") {
-                    if let center = onCenter {
-                        headerButton("居中") { onBeforeChange?(); center() }
-                    }
+            IFoldGroup(title: "位置", trailing: {
+                if let center = onCenter {
+                    headerButton("居中") { onBeforeChange?(); center() }
                 }
-                ISlider(label: "水平位置", value: x, range: 0...100, unit: "%")
-                ISlider(label: "垂直位置", value: y, range: 0...100, unit: "%")
+            }) {
+                kfRow(.offsetX) { ISlider(label: "水平位置", value: x, range: 0...100, unit: "%") }
+                kfRow(.offsetY) { ISlider(label: "垂直位置", value: y, range: 0...100, unit: "%") }
             }
         }
     }
@@ -163,8 +197,7 @@ struct LayerCommonSections: View {
     @ViewBuilder
     private var scaleSection: some View {
         if let w = scaleW, let h = scaleH {
-            ISection(title: nil) {
-                sectionHeader("缩放") {
+            IFoldGroup(title: "缩放", trailing: {
                     if let lock = lockAspect {
                         Button {
                             lock.wrappedValue.toggle()
@@ -179,26 +212,33 @@ struct LayerCommonSections: View {
                         .buttonStyle(.plain)
                         .help(lock.wrappedValue ? "已锁定比例，点击解锁分别调节" : "宽高分别调节，点击锁定等比")
                     }
-                }
+            }) {
                 // 锁着就只给一个滑块（拖它宽高一起走），解开才拆成两条
                 if lockAspect?.wrappedValue ?? false {
                     // 锁着的时候拖一条，宽高按**原来的比例**一起走，
                     // 直接把两个值设成一样会把非等比的元素拉方
-                    ISlider(label: scaleLabels.both, value: Binding(
-                        get: { w.wrappedValue },
-                        set: { v in
-                            let old = w.wrappedValue
-                            let k = old > 0.01 ? v / old : 1
-                            w.wrappedValue = v
-                            h.wrappedValue = max(scaleRange.lowerBound,
-                                                 min(scaleRange.upperBound, h.wrappedValue * k))
-                        }
-                    ), range: scaleRange, unit: scaleUnit)
+                    // 锁着时这一条代表宽高两个，关键帧挂在「宽」上（打帧时宽高成对打）
+                    kfRow(.scaleX) {
+                        ISlider(label: scaleLabels.both, value: Binding(
+                            get: { w.wrappedValue },
+                            set: { v in
+                                let old = w.wrappedValue
+                                let k = old > 0.01 ? v / old : 1
+                                w.wrappedValue = v
+                                h.wrappedValue = max(scaleRange.lowerBound,
+                                                     min(scaleRange.upperBound, h.wrappedValue * k))
+                            }
+                        ), range: scaleRange, unit: scaleUnit)
+                    }
                 } else {
-                    ISlider(label: scaleLabels.w, value: w, range: scaleRange,
-                            unit: scaleUnit)
-                    ISlider(label: scaleLabels.h, value: h, range: scaleRange,
-                            unit: scaleUnit)
+                    kfRow(.scaleX) {
+                        ISlider(label: scaleLabels.w, value: w, range: scaleRange,
+                                unit: scaleUnit)
+                    }
+                    kfRow(.scaleY) {
+                        ISlider(label: scaleLabels.h, value: h, range: scaleRange,
+                                unit: scaleUnit)
+                    }
                 }
             }
         }
@@ -209,18 +249,17 @@ struct LayerCommonSections: View {
     @ViewBuilder
     private var cropSection: some View {
         if let t = cropTop, let b = cropBottom, let l = cropLeft, let r = cropRight {
-            ISection(title: nil) {
-                sectionHeader("裁剪") {
-                    headerButton("重置") {
-                        onBeforeChange?()
-                        t.wrappedValue = 0; b.wrappedValue = 0
-                        l.wrappedValue = 0; r.wrappedValue = 0
-                    }
+            IFoldGroup(title: "裁剪", trailing: {
+                headerButton("重置") {
+                    onBeforeChange?()
+                    t.wrappedValue = 0; b.wrappedValue = 0
+                    l.wrappedValue = 0; r.wrappedValue = 0
                 }
-                ISlider(label: "上", value: t, range: 0...95, unit: "%")
-                ISlider(label: "下", value: b, range: 0...95, unit: "%")
-                ISlider(label: "左", value: l, range: 0...95, unit: "%")
-                ISlider(label: "右", value: r, range: 0...95, unit: "%")
+            }) {
+                kfRow(.cropTop)    { ISlider(label: "上", value: t, range: 0...95, unit: "%") }
+                kfRow(.cropBottom) { ISlider(label: "下", value: b, range: 0...95, unit: "%") }
+                kfRow(.cropLeft)   { ISlider(label: "左", value: l, range: 0...95, unit: "%") }
+                kfRow(.cropRight)  { ISlider(label: "右", value: r, range: 0...95, unit: "%") }
             }
         }
     }
@@ -232,7 +271,7 @@ struct LayerCommonSections: View {
         if opacity != nil || cornerRadius != nil {
             ISection(title: "外观") {
                 if let o = opacity {
-                    ISlider(label: "不透明度", value: o, range: 0...100, unit: "%")
+                    kfRow(.opacity) { ISlider(label: "不透明度", value: o, range: 0...100, unit: "%") }
                 }
                 if let c = cornerRadius {
                     // 间距 6 和标签宽度都跟 ICapsuleSlider 对齐，
@@ -330,10 +369,33 @@ struct AdjustSliders: View {
     /// 折叠态由外面给，两个入口的默认值不一样
     @State var expanded: Bool
     let onChange: () -> Void
+    /// 每个滑块后面的附加控件（视频片段放关键帧 `< ◇ >`）。nil = 不放
+    var rowAccessory: ((WritableKeyPath<ColorAdjust, Double>) -> AnyView?)? = nil
+    /// 每个滑块**下面**的附加内容（视频片段放展开的曲线面板）
+    var rowBelow: ((WritableKeyPath<ColorAdjust, Double>) -> AnyView?)? = nil
+    /// 每个滑块标签**前面**的小控件（视频片段放曲线面板的展开箭头）
+    var rowLeading: ((WritableKeyPath<ColorAdjust, Double>) -> AnyView?)? = nil
 
-    init(adjust: Binding<ColorAdjust>, expandedByDefault: Bool, onChange: @escaping () -> Void) {
+    /// 变了就展开（外面要滚到某一行时先展开）
+    var expandSignal: Int = 0
+    /// 每一行的滚动锚点 id
+    var rowAnchor: ((WritableKeyPath<ColorAdjust, Double>) -> String?)? = nil
+
+    init(adjust: Binding<ColorAdjust>, expandedByDefault: Bool,
+         expandSignal: Int = 0,
+         rowAnchor: ((WritableKeyPath<ColorAdjust, Double>) -> String?)? = nil,
+         rowAccessory: ((WritableKeyPath<ColorAdjust, Double>) -> AnyView?)? = nil,
+         rowLeading: ((WritableKeyPath<ColorAdjust, Double>) -> AnyView?)? = nil,
+         rowBelow: ((WritableKeyPath<ColorAdjust, Double>) -> AnyView?)? = nil,
+         onChange: @escaping () -> Void) {
         self._adjust = adjust
-        self._expanded = State(initialValue: expandedByDefault)
+        // 面板刚建出来时信号就已经在了（点关键帧时属性区从「项目」换成「视频」），onChange 等不到，直接展开
+        self._expanded = State(initialValue: expandedByDefault || expandSignal != 0)
+        self.expandSignal = expandSignal
+        self.rowAnchor = rowAnchor
+        self.rowAccessory = rowAccessory
+        self.rowLeading = rowLeading
+        self.rowBelow = rowBelow
         self.onChange = onChange
     }
 
@@ -346,9 +408,8 @@ struct AdjustSliders: View {
                     withAnimation(.easeInOut(duration: 0.15)) { expanded.toggle() }
                 } label: {
                     HStack(spacing: 4) {
-                        Image(systemName: "chevron.right")
-                            .font(.system(size: 8, weight: .bold))
-                            .rotationEffect(.degrees(expanded ? 90 : 0))
+                        // 实心三角，跟属性区其他分组的折叠图标一样
+                        IFoldTriangle(folded: !expanded)
                         Text("调节")
                             .font(.system(size: 11, weight: .semibold))
                             .tracking(0.2)
@@ -375,23 +436,24 @@ struct AdjustSliders: View {
 
             if expanded {
                 group("基础")
-                slider("亮度", $adjust.brightness, -1...1)
-                slider("对比", $adjust.contrast, -1...1)
-                slider("饱和", $adjust.saturation, -1...1)
-                slider("自然饱和", $adjust.vibrance, -1...1)
+                slider("亮度", \.brightness, -1...1)
+                slider("对比", \.contrast, -1...1)
+                slider("饱和", \.saturation, -1...1)
+                slider("自然饱和", \.vibrance, -1...1)
 
                 group("光影")
-                slider("曝光", $adjust.exposure, -2...2)
-                slider("伽马", $adjust.gamma, 0.25...4)
-                slider("高光", $adjust.highlight, -1...1)
-                slider("阴影", $adjust.shadow, -1...1)
+                slider("曝光", \.exposure, -2...2)
+                slider("伽马", \.gamma, 0.25...4)
+                slider("高光", \.highlight, -1...1)
+                slider("阴影", \.shadow, -1...1)
 
                 group("色彩")
-                slider("色温", $adjust.temperature, -1...1)
-                slider("色调", $adjust.tint, -1...1)
-                slider("色相", $adjust.hue, -180...180, decimals: 0, unit: "°")
+                slider("色温", \.temperature, -1...1)
+                slider("色调", \.tint, -1...1)
+                slider("色相", \.hue, -180...180, decimals: 0, unit: "°")
             }
         }
+        .onChange(of: expandSignal) { sig in if sig != 0 { expanded = true } }
     }
 
     private func group(_ t: String) -> some View {
@@ -401,11 +463,19 @@ struct AdjustSliders: View {
             .padding(.top, 2)
     }
 
-    private func slider(_ label: String, _ value: Binding<Double>,
+    private func slider(_ label: String, _ kp: WritableKeyPath<ColorAdjust, Double>,
                         _ range: ClosedRange<Double>,
                         decimals: Int = 2, unit: String = "") -> some View {
-        ICapsuleSlider(label: label, value: value, range: range,
-                       decimals: decimals, unit: unit, onChange: { _ in onChange() })
+        VStack(spacing: 10) {
+            HStack(spacing: 4) {
+                ICapsuleSlider(label: label, value: $adjust[dynamicMember: kp], range: range,
+                               decimals: decimals, unit: unit, onChange: { _ in onChange() })
+                    .environment(\.capsuleSliderLeading, rowLeading?(kp))
+                if let acc = rowAccessory?(kp) { acc }
+            }
+            if let below = rowBelow?(kp) { below }
+        }
+        .id(rowAnchor?(kp) ?? label)
     }
 }
 
@@ -418,4 +488,127 @@ enum InspectorLayout {
     static let minWidth: CGFloat = 260
     static let maxWidth: CGFloat = 450
     static let defaultWidth: CGFloat = 300
+}
+
+// MARK: - 关键帧导航 `< ◇ >`
+
+/// 属性分区标题右侧的关键帧控件：左右跳到上一帧 / 下一帧，中间的菱形在播放头处打 / 删关键帧。
+/// 自己盯着播放时钟（只有这一小块跟着播放头刷新，属性区其余部分不受影响）
+struct KeyframeNav: View {
+    @ObservedObject var clock: PlaybackClock
+    /// 这组关键帧在时间轴上的位置（升序）
+    let times: [Double]
+    /// 片段在时间轴上的范围，播放头在外面时菱形不可点
+    let clipStart: Double
+    let clipEnd: Double
+    let onToggle: () -> Void
+
+    private let snap = 0.02
+    private let accent = Color(hex: "#E8A54B")
+    @State private var hovering = false
+
+    var body: some View {
+        let now = clock.currentTime
+        let onFrame = times.contains { abs($0 - now) <= snap }
+        let prev = times.last { $0 < now - snap }
+        let next = times.first { $0 > now + snap }
+        let inClip = now >= clipStart - snap && now <= clipEnd + snap
+        HStack(spacing: 0) {
+            arrow("chevron.left", target: prev)
+            Button(action: onToggle) {
+                let hot = hovering && inClip
+                ZStack {
+                    // 悬停时空菱形变成灰色实心、里面白「+」（点了打一帧）；
+                    // 黄菱形里显示「−」（点了删掉）
+                    Image(systemName: onFrame || hot ? "diamond.fill" : "diamond")
+                        .font(.system(size: 12, weight: .regular))
+                        .foregroundColor(onFrame ? accent
+                                         : hot ? Color.white.opacity(0.35)
+                                         : (times.isEmpty ? Color.labelSecondary : Color.labelPrimary))
+                    if hot {
+                        Text(onFrame ? "−" : "+")
+                            .font(.system(size: 8, weight: .heavy))
+                            .foregroundColor(onFrame ? .black : .white)
+                            .offset(y: -0.5)
+                    }
+                }
+                .frame(width: 18, height: 18)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .disabled(!inClip)
+            .opacity(inClip ? 1 : 0.35)
+            .onHover { hovering = $0 }
+            .help(onFrame ? "删除关键帧" : "添加关键帧")
+            arrow("chevron.right", target: next)
+        }
+    }
+
+    private func arrow(_ icon: String, target: Double?) -> some View {
+        Button {
+            guard let t = target else { return }
+            clock.currentTime = t
+            clock.seekRequest += 1
+        } label: {
+            Image(systemName: icon)
+                .font(.system(size: 9, weight: .semibold))
+                .foregroundColor(Color.labelSecondary)
+                .frame(width: 14, height: 18)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(target == nil)
+        .opacity(target == nil ? 0.3 : 1)
+        .help(icon == "chevron.left" ? "上一个关键帧" : "下一个关键帧")
+    }
+}
+
+// MARK: - 关键帧控件工厂（图片面板用；视频面板自己有一份同样的）
+
+/// 给某个片段生成三样关键帧控件：`< ◇ >`、曲线展开箭头、曲线面板
+struct KeyframeControls {
+    let project: ProjectState
+    /// 当前片段（body 每次求值都传最新的进来）
+    let clip: any KeyframeAnimatable
+    /// 展开了曲线面板的属性。同一时间只开一个，锁着等比时宽高成对
+    let easingOpen: Binding<Set<KeyframeProp>>
+
+    func nav(_ p: KeyframeProp) -> AnyView? {
+        guard clip.propValue(p) != nil else { return nil }
+        let id = clip.id
+        return AnyView(KeyframeNav(clock: project.clock, times: clip.keyframeTimelineTimes(p),
+                                   clipStart: clip.startTime, clipEnd: clip.endTime) {
+            project.toggleKeyframe(clipID: id, prop: p)
+        })
+    }
+
+    /// 标签前的展开箭头（样子同转场分组）。这个属性不到两帧就不出现（一帧没有「两帧之间」可调）
+    func toggle(_ p: KeyframeProp) -> AnyView? {
+        guard (clip.keyframes?.frames(p).count ?? 0) >= 2 else { return nil }
+        let open = easingOpen.wrappedValue.contains(p)
+        let pair: Set<KeyframeProp> = clip.lockAspect && (p == .scaleX || p == .scaleY) ? [.scaleX, .scaleY] : [p]
+        let binding = easingOpen
+        return AnyView(
+            Button {
+                binding.wrappedValue = open ? binding.wrappedValue.subtracting(pair) : pair
+            } label: {
+                Image(nsImage: SidebarSVGIcon.load(open ? "groupExpanded" : "groupCollapsed", size: 9))
+                    .renderingMode(.template)
+                    .foregroundColor(Color.labelSecondary)
+                    .frame(width: 10, height: 18)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help(open ? "收起曲线" : "调节这一段的变化曲线")
+        )
+    }
+
+    func panel(_ p: KeyframeProp) -> AnyView {
+        guard easingOpen.wrappedValue.contains(p), (clip.keyframes?.frames(p).count ?? 0) >= 2 else { return AnyView(EmptyView()) }
+        return AnyView(KeyframeEasingPanel(clock: project.clock, clipID: clip.id, prop: p))
+    }
+
+    var hooks: LayerKeyframeHooks {
+        LayerKeyframeHooks(nav: nav, toggle: toggle, panel: panel)
+    }
 }

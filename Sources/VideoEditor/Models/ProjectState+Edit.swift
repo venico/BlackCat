@@ -261,6 +261,8 @@ extension ProjectState {
                         imageTracks[ti].clips[ci].endTime = t
                         var newClip = c; newClip.id = UUID()
                         newClip.startTime = t; newClip.endTime = c.endTime
+                        // 右半段起点往后挪了，关键帧入点跟着挪，动画还接得上
+                        newClip.shiftKeyframeIn(by: t - c.startTime)
                         imageTracks[ti].clips.insert(newClip, at: ci + 1)
                         changed = true
                     }
@@ -275,6 +277,7 @@ extension ProjectState {
                         textTracks[ti].clips[ci].endTime = t
                         var newClip = c; newClip.id = UUID()
                         newClip.startTime = t; newClip.endTime = c.endTime
+                        newClip.shiftKeyframeIn(by: t - c.startTime)   // 右半段关键帧不跑位
                         textTracks[ti].clips.insert(newClip, at: ci + 1)
                         changed = true
                     }
@@ -289,6 +292,7 @@ extension ProjectState {
                         shapeTracks[ti].clips[ci].endTime = t
                         var newClip = c; newClip.id = UUID()
                         newClip.startTime = t; newClip.endTime = c.endTime
+                        newClip.shiftKeyframeIn(by: t - c.startTime)   // 右半段关键帧不跑位
                         shapeTracks[ti].clips.insert(newClip, at: ci + 1)
                         changed = true
                     }
@@ -456,6 +460,8 @@ extension ProjectState {
             for ti in imageTracks.indices {
                 if let ci = imageTracks[ti].clips.firstIndex(where: { $0.id == id }) {
                     if imageTracks[ti].clips[ci].startTime + 0.01 < t && imageTracks[ti].clips[ci].endTime - 0.01 > t {
+                        // 左边裁掉一段：关键帧入点跟着挪，不跑位
+                        imageTracks[ti].clips[ci].shiftKeyframeIn(by: t - imageTracks[ti].clips[ci].startTime)
                         imageTracks[ti].clips[ci].startTime = t; changed = true
                     }; break
                 }
@@ -464,6 +470,7 @@ extension ProjectState {
             for ti in textTracks.indices {
                 if let ci = textTracks[ti].clips.firstIndex(where: { $0.id == id }) {
                     if textTracks[ti].clips[ci].startTime + 0.01 < t && textTracks[ti].clips[ci].endTime - 0.01 > t {
+                        textTracks[ti].clips[ci].shiftKeyframeIn(by: t - textTracks[ti].clips[ci].startTime)
                         textTracks[ti].clips[ci].startTime = t; changed = true
                     }; break
                 }
@@ -472,6 +479,7 @@ extension ProjectState {
             for ti in shapeTracks.indices {
                 if let ci = shapeTracks[ti].clips.firstIndex(where: { $0.id == id }) {
                     if shapeTracks[ti].clips[ci].startTime + 0.01 < t && shapeTracks[ti].clips[ci].endTime - 0.01 > t {
+                        shapeTracks[ti].clips[ci].shiftKeyframeIn(by: t - shapeTracks[ti].clips[ci].startTime)
                         shapeTracks[ti].clips[ci].startTime = t; changed = true
                     }; break
                 }

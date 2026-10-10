@@ -154,18 +154,20 @@ struct ColorAdjust: Codable, Equatable {
 
 struct CompositorTrackEntry {
     let trackID:     CMPersistentTrackID
-    let userScaleX:  CGFloat
-    let userScaleY:  CGFloat
+    var userScaleX:  CGFloat
+    var userScaleY:  CGFloat
     var userOffsetX: CGFloat
     var userOffsetY: CGFloat
-    let cropTop:     CGFloat
-    let cropBottom:  CGFloat
-    let cropLeft:    CGFloat
-    let cropRight:   CGFloat
+    var cropTop:     CGFloat
+    var cropBottom:  CGFloat
+    var cropLeft:    CGFloat
+    var cropRight:   CGFloat
     var colorAdjust: ColorAdjust
     var mirrorH: Bool = false
     var mirrorV: Bool = false
     var rotation: Double = 0
+    /// 视频片段的任意角度旋转（度），叠加在 rotation 上，**不参与**贴合画布的尺寸计算
+    var fineAngle: Double = 0
     /// 画面圆角（px，源坐标）。0 = 不切
     var cornerRadius: Double = 0
     /// 图层自身的不透明度（跟转场的 opacityRamp 是两回事，两者相乘）
@@ -183,6 +185,26 @@ struct CompositorTrackEntry {
     var rotateRamp:  (from: CGFloat, to: CGFloat, start: Double, end: Double)?
     /// 擦除转场：只露出从一条边扫开的那一块
     var wipeRamp:    (type: TransitionType, start: Double, end: Double)?
+    /// 打了关键帧的视频片段（时间已换算到合成时间轴上）。每帧按 t 求值后覆盖上面的
+    /// 位移 / 缩放 / 裁剪 / 调色 / 不透明度。预览和导出都走这里，两边一定一样
+    var keyframedClip: VideoClip?
+
+    /// 关键帧求值，覆盖这一帧的静态参数
+    mutating func applyKeyframes(at t: Double) {
+        guard let c = keyframedClip else { return }
+        applyStatic(c.animated(atTimeline: t))
+    }
+
+    /// 用一份（已求值的）片段参数覆盖位移 / 缩放 / 裁剪 / 调色 / 不透明度 / 角度
+    mutating func applyStatic(_ a: VideoClip) {
+        userOffsetX = CGFloat(a.offsetX); userOffsetY = CGFloat(a.offsetY)
+        userScaleX = CGFloat(a.scaleX);   userScaleY = CGFloat(a.scaleY)
+        cropTop = CGFloat(a.cropTop);     cropBottom = CGFloat(a.cropBottom)
+        cropLeft = CGFloat(a.cropLeft);   cropRight = CGFloat(a.cropRight)
+        colorAdjust = a.colorAdjust
+        baseOpacity = a.alpha
+        fineAngle = a.angleDeg
+    }
 
     func effectiveOpacity(at t: Double) -> Float {
         guard let r = opacityRamp else { return 1.0 }
@@ -317,6 +339,19 @@ final class PreviewCompositorState: @unchecked Sendable {
     /// 拖色调滑块时的实时覆盖值。走这条就不用重建整个 composition ——
     /// 重建要重新 load playerItem，代价大到只能防抖，表现就是"松手才变"
     private var liveColorAdjusts: [CMPersistentTrackID: ColorAdjust] = [:]
+    /// 属性区 / 预览手柄改视频片段时「这一刻」的样子（关键帧已求值）。
+    /// 拖滑块时画面实时跟上，不用等防抖后的整份重建
+    private var liveClips: [CMPersistentTrackID: VideoClip] = [:]
+
+    func setLiveClip(trackID: CMPersistentTrackID, _ clip: VideoClip) {
+        lock.lock(); defer { lock.unlock() }
+        liveClips[trackID] = clip
+    }
+
+    func liveClip(trackID: CMPersistentTrackID) -> VideoClip? {
+        lock.lock(); defer { lock.unlock() }
+        return liveClips[trackID]
+    }
 
     func setFilterTracks(_ tracks: [Track<FilterClip>]) {
         lock.lock(); defer { lock.unlock() }
@@ -365,6 +400,7 @@ final class PreviewCompositorState: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         dragOffsets.removeAll()
         liveColorAdjusts.removeAll()
+        liveClips.removeAll()
     }
 
     func dragOffset(trackID: CMPersistentTrackID) -> (x: CGFloat, y: CGFloat)? {
@@ -397,7 +433,7 @@ final class PreviewCompositorState: @unchecked Sendable {
                 guard let track = input.imageTracks.first(where: { $0.id == tid }), track.isVisible,
                       let clip = track.clips.first(where: { $0.startTime <= t && $0.endTime > t }),
                       let layer = OverlayRenderer.renderImageOverlay(
-                        clip: clip, renderSize: renderSize, ciCache: input.imageCICache)
+                        clip: clip, renderSize: renderSize, ciCache: input.imageCICache, atTime: t)
                 else { continue }
                 out = layer.composited(over: out)
             case .subtitle:
@@ -722,6 +758,12 @@ final class ColorCompositor: NSObject, AVVideoCompositing {
         for var entry in data.entries {
             guard let srcBuf = req.sourceFrame(byTrackID: entry.trackID) else { continue }
 
+            // 关键帧先求值，下面拖动中的临时值再盖上去（拖的时候跟手）
+            entry.applyKeyframes(at: t)
+            if !data.forExport, let lc = data.live?.liveClip(trackID: entry.trackID) {
+                entry.applyStatic(lc)
+            }
+
             if !data.forExport, let drag = data.live?.dragOffset(trackID: entry.trackID) {
                 entry.userOffsetX = drag.x
                 entry.userOffsetY = drag.y
@@ -806,11 +848,12 @@ final class ColorCompositor: NSObject, AVVideoCompositing {
             // 4. 镜像 / 旋转，绕**整幅画面**的中心（不是裁剪后那块的中心，
             //    否则裁过的画面转起来会自己跑位）
             var rotT = CGAffineTransform.identity
-            if entry.mirrorH || entry.mirrorV || entry.rotation != 0 {
+            if entry.mirrorH || entry.mirrorV || entry.rotation != 0 || entry.fineAngle != 0 {
                 rotT = CGAffineTransform(translationX: -fullCX, y: -fullCY)
                 if entry.mirrorH { rotT = rotT.concatenating(CGAffineTransform(scaleX: -1, y: 1)) }
                 if entry.mirrorV { rotT = rotT.concatenating(CGAffineTransform(scaleX: 1, y: -1)) }
-                let rad = CGFloat(entry.rotation) * .pi / 180
+                // CIImage y 朝上：正角度是逆时针。任意角度按预览里看到的顺时针为正，所以取反
+                let rad = CGFloat(entry.rotation - entry.fineAngle) * .pi / 180
                 if abs(rad) > 0.001 { rotT = rotT.concatenating(CGAffineTransform(rotationAngle: rad)) }
                 rotT = rotT.concatenating(CGAffineTransform(translationX: fullCX, y: fullCY))
                 ci = ci.transformed(by: rotT)

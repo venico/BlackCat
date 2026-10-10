@@ -60,7 +60,7 @@ enum OverlayRenderer {
                 if let track = compound.imageTracks.first(where: { $0.id == tid }), track.isVisible,
                    let clip = track.clips.first(where: { $0.startTime <= it && $0.endTime > it }),
                    let overlay = renderImageOverlay(clip: clip, renderSize: renderSize,
-                                                    ciCache: imageCICache) {
+                                                    ciCache: imageCICache, atTime: it) {
                     image = overlay.composited(over: image)
                 }
             case .subtitle:
@@ -116,8 +116,10 @@ enum OverlayRenderer {
     }
 
     static func renderImageOverlay(
-        clip: ImageClip, renderSize: CGSize, ciCache: [URL: CIImage]
+        clip rawClip: ImageClip, renderSize: CGSize, ciCache: [URL: CIImage], atTime t: Double? = nil
     ) -> CIImage? {
+        // 打了关键帧的话按这一刻求值（位置 / 缩放 / 旋转 / 不透明度 / 裁剪 / 调色）
+        let clip = t.map { rawClip.animated(atTimeline: $0) } ?? rawClip
         guard let url = clip.imageURL,
               // 导出会预先把所有图读进 ciCache；预览这边不预热，缓存里没有就现读。
               // 少了这条兜底，预览里图片图层会整个画不出来
@@ -366,7 +368,8 @@ enum OverlayRenderer {
     static func renderTextOverlay(
         atTime time: Double, clips: [TextClip], fontScale: CGFloat, renderSize: CGSize
     ) -> CIImage? {
-        let active = clips.filter { $0.startTime <= time && $0.endTime > time }
+        // 打了关键帧的按这一刻求值
+        let active = clips.filter { $0.startTime <= time && $0.endTime > time }.map { $0.animated(atTimeline: time) }
         guard !active.isEmpty else { return nil }
 
         let w = Int(renderSize.width)
@@ -547,7 +550,8 @@ enum OverlayRenderer {
 
     static func renderShapeOverlay(atTime time: Double, clips: [ShapeClip],
                                                 scale: CGFloat, renderSize: CGSize) -> CIImage? {
-        let active = clips.filter { $0.startTime <= time && $0.endTime > time }
+        // 打了关键帧的按这一刻求值
+        let active = clips.filter { $0.startTime <= time && $0.endTime > time }.map { $0.animated(atTimeline: time) }
         guard !active.isEmpty else { return nil }
         let w = Int(renderSize.width), h = Int(renderSize.height)
         guard w > 0, h > 0 else { return nil }

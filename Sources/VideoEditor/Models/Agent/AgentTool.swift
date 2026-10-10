@@ -79,7 +79,7 @@ extension AgentToolbox {
     @MainActor
     static var allSpecs: [AgentToolSpec] {
         readTools + editTools + mediaTools + studioTools + studioTools2 + canvasTools + projectTools + libraryTools + canvasEditTools + settingsTools
-        + generateTools + skillTools + propsTools
+        + generateTools + skillTools + propsTools + keyframeTools
         + shellTools + searchTools + mcpGateTool + mcpTools
         // 「取工具」这个网关本身也得在册：它长在 AgentToolGate 上，不在上面任何一组里。
         // 漏了它的后果就是上面那段注释说的原样重演 —— 模型看得见、调得动，

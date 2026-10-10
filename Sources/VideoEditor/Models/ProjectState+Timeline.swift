@@ -286,6 +286,8 @@ extension ProjectState {
         pushUndoThrottled()
         for i in shapeTracks.indices {
             if let j = shapeTracks[i].clips.firstIndex(where: { $0.id == id }) {
+                // 只改起点 = 左边裁 / 拉：关键帧入点跟着挪，不跑位（起止一起改是整体平移，不用挪）
+                if let s = start, end == nil { shapeTracks[i].clips[j].shiftKeyframeIn(by: s - shapeTracks[i].clips[j].startTime) }
                 if let s = start { shapeTracks[i].clips[j].startTime = s }
                 if let e = end   { shapeTracks[i].clips[j].endTime   = e }
                 return
@@ -307,6 +309,8 @@ extension ProjectState {
         pushUndoThrottled()
         for i in textTracks.indices {
             if let j = textTracks[i].clips.firstIndex(where: { $0.id == id }) {
+                // 只改起点 = 左边裁 / 拉：关键帧入点跟着挪，不跑位（起止一起改是整体平移，不用挪）
+                if let s = start, end == nil { textTracks[i].clips[j].shiftKeyframeIn(by: s - textTracks[i].clips[j].startTime) }
                 if let s = start { textTracks[i].clips[j].startTime = s }
                 if let e = end   { textTracks[i].clips[j].endTime   = e }
                 return
@@ -812,6 +816,271 @@ extension ProjectState {
                 modify(&videoTracks[i].clips[j]); return
             }
         }
+    }
+
+    // MARK: - 关键帧（视频、图片共用）
+
+    /// id 对应的可打关键帧片段（视频 / 图片 / 文字 / 图形）
+    func keyframedClip(_ id: UUID) -> (any KeyframeAnimatable)? {
+        if let c = videoTracks.flatMap(\.clips).first(where: { $0.id == id }) { return c }
+        if let c = imageTracks.flatMap(\.clips).first(where: { $0.id == id }) { return c }
+        if let c = textTracks.flatMap(\.clips).first(where: { $0.id == id }) { return c }
+        if let c = shapeTracks.flatMap(\.clips).first(where: { $0.id == id }) { return c }
+        if let c = audioTracks.flatMap(\.clips).first(where: { $0.id == id }) { return c }
+        return nil
+    }
+
+    /// 所有可打关键帧的片段（只看显示着的轨道）
+    var keyframedClips: [any KeyframeAnimatable] {
+        let v: [any KeyframeAnimatable] = videoTracks.filter(\.isVisible).flatMap(\.clips)
+        let i: [any KeyframeAnimatable] = imageTracks.filter(\.isVisible).flatMap(\.clips)
+        let tx: [any KeyframeAnimatable] = textTracks.filter(\.isVisible).flatMap(\.clips)
+        let sh: [any KeyframeAnimatable] = shapeTracks.filter(\.isVisible).flatMap(\.clips)
+        let au: [any KeyframeAnimatable] = audioTracks.filter(\.isVisible).flatMap(\.clips)
+        return v + i + tx + sh + au
+    }
+
+    /// 改一个可打关键帧的片段，改完按类型写回
+    func updateKeyframedClip(_ id: UUID, _ f: (inout any KeyframeAnimatable) -> Void) {
+        if videoTracks.contains(where: { $0.clips.contains { $0.id == id } }) {
+            updateVideoClip(id: id) { c in
+                var a: any KeyframeAnimatable = c
+                f(&a)
+                if let v = a as? VideoClip { c = v }
+            }
+        } else if imageTracks.contains(where: { $0.clips.contains { $0.id == id } }) {
+            updateImageClip(id: id) { c in
+                var a: any KeyframeAnimatable = c
+                f(&a)
+                if let v = a as? ImageClip { c = v }
+            }
+        } else if textTracks.contains(where: { $0.clips.contains { $0.id == id } }) {
+            updateTextClip(id: id) { c in
+                var a: any KeyframeAnimatable = c
+                f(&a)
+                if let v = a as? TextClip { c = v }
+            }
+        } else if shapeTracks.contains(where: { $0.clips.contains { $0.id == id } }) {
+            updateShapeClip(id: id) { c in
+                var a: any KeyframeAnimatable = c
+                f(&a)
+                if let v = a as? ShapeClip { c = v }
+            }
+        } else if audioTracks.contains(where: { $0.clips.contains { $0.id == id } }) {
+            updateAudioClip(id: id) { c in
+                var a: any KeyframeAnimatable = c
+                f(&a)
+                if let v = a as? AudioClip { c = v }
+            }
+        }
+    }
+
+    /// 改视频片段「播放头这一刻」的样子：打过关键帧的属性写进播放头处的关键帧，
+    /// 没打过的照旧改静态值。属性面板和预览手柄改变换都走这里
+    func updateVideoClipAnimated(id: UUID, _ edit: (inout VideoClip) -> Void) {
+        let t = currentTime
+        updateVideoClip(id: id) { $0.applyAnimatedEdit(atTimeline: t, edit) }
+        // 画面立刻跟上：这一刻的样子直接喂给合成器并重绘当前帧，整份重建照常防抖
+        // （重建会清掉这份临时值，届时分段数据里已是同样的真值）
+        if let tid = videoClipTrackIDMap[id],
+           let c = videoTracks.flatMap(\.clips).first(where: { $0.id == id }) {
+            previewCompositor.setLiveClip(trackID: tid, c.animated(atTimeline: t))
+            clock.refreshSeekRequest &+= 1
+        }
+        rebuildTimelinePreviewDebounced()
+    }
+
+    /// 同上，图片片段。图片是 SwiftUI 那层画的，改完数据界面自己就刷新
+    func updateImageClipAnimated(id: UUID, _ edit: (inout ImageClip) -> Void) {
+        let t = currentTime
+        updateImageClip(id: id) { $0.applyAnimatedEdit(atTimeline: t, edit) }
+        rebuildTimelinePreviewDebounced()
+    }
+
+    /// 同上，文字 / 图形片段
+    func updateTextClipAnimated(id: UUID, _ edit: (inout TextClip) -> Void) {
+        let t = currentTime
+        updateTextClip(id: id) { $0.applyAnimatedEdit(atTimeline: t, edit) }
+    }
+
+    func updateAudioClipAnimated(id: UUID, _ edit: (inout AudioClip) -> Void) {
+        let t = currentTime
+        updateAudioClip(id: id) { $0.applyAnimatedEdit(atTimeline: t, edit) }
+        rebuildTimelinePreviewDebounced()
+    }
+
+    func updateShapeClipAnimated(id: UUID, _ edit: (inout ShapeClip) -> Void) {
+        let t = currentTime
+        updateShapeClip(id: id) { $0.applyAnimatedEdit(atTimeline: t, edit) }
+    }
+
+    /// 改完关键帧的收尾：标脏、自动存、重建预览
+    private func keyframesChanged() {
+        isSaved = false
+        scheduleAutoSave()
+        rebuildTimelinePreviewDebounced()
+    }
+
+    /// 播放头处给这个属性打 / 删关键帧。锁着等比时宽高一起打、一起删
+    func toggleKeyframe(clipID: UUID, prop: KeyframeProp) {
+        pushUndo()
+        let t = currentTime
+        updateKeyframedClip(clipID) { c in
+            let on = !c.hasKeyframe(prop, atTimeline: c.clampedTimeline(t))
+            for p in lockedPartners(c, prop) { c.setKeyframe(p, atTimeline: t, on: on) }
+        }
+        keyframesChanged()
+    }
+
+    /// 锁着等比时宽高是一对：改一个，另一个同一时刻的帧也跟着改
+    private func lockedPartners(_ c: any KeyframeAnimatable, _ prop: KeyframeProp) -> [KeyframeProp] {
+        c.lockAspect && (prop == .scaleX || prop == .scaleY) ? [.scaleX, .scaleY] : [prop]
+    }
+
+    /// 改某一段的过渡曲线（段首帧下标 index）
+    func setKeyframeEasing(clipID: UUID, prop: KeyframeProp, index: Int, _ e: KeyframeEasing) {
+        updateKeyframedClip(clipID) { c in
+            guard var kf = c.keyframes, kf.frames(prop).indices.contains(index) else { return }
+            let t0 = kf.frames(prop)[index].time
+            // 锁着等比时宽高是一起打的帧，曲线也一起改，不然两边变化快慢不一样、画面被拉变形
+            for p in lockedPartners(c, prop) {
+                if let j = kf.frames(p).firstIndex(where: { abs($0.time - t0) < 1e-3 }) {
+                    kf.setEasing(p, index: j, e)
+                }
+            }
+            c.keyframes = kf
+        }
+        keyframesChanged()
+    }
+
+    /// 改一段的时长（时间轴秒）：挪段尾那一帧，夹在「段首 + 0.05」和「下一帧 / 片段末尾」之间。
+    /// 只挪这个属性（锁定等比时连带宽高）的帧，别的属性同一时刻的帧不动
+    func setKeyframeSegmentDuration(clipID: UUID, prop: KeyframeProp, index: Int, seconds: Double) {
+        updateKeyframedClip(clipID) { c in
+            guard var kf = c.keyframes else { return }
+            let f = kf.frames(prop)
+            guard index + 1 < f.count else { return }
+            let from = c.timelineTime(ofKeyframe: f[index].time)
+            var upper = c.endTime - 0.001
+            if index + 2 < f.count { upper = min(upper, c.timelineTime(ofKeyframe: f[index + 2].time) - 0.02) }
+            let newEnd = min(max(from + seconds, from + 0.05), upper)
+            let oldK = f[index + 1].time, newK = c.keyframeTime(atTimeline: newEnd), startK = f[index].time
+            for p in lockedPartners(c, prop) {
+                var g = kf.frames(p)
+                guard let j = g.firstIndex(where: { abs($0.time - oldK) < 1e-3 }) else { continue }
+                g[j].time = newK
+                // 延时不能比新时长还长
+                if j > 0, var e = g[j - 1].easing, let d = e.delay, d > newK - startK - 1e-3 {
+                    e.delay = max(0, newK - startK - 1e-3); g[j - 1].easing = e
+                }
+                g.sort { $0.time < $1.time }
+                kf.props[p.rawValue] = g
+            }
+            c.keyframes = kf
+        }
+        keyframesChanged()
+    }
+
+    /// 改一段的延时（时间轴秒），夹在 0 和这段时长之间
+    func setKeyframeDelay(clipID: UUID, prop: KeyframeProp, index: Int, seconds: Double) {
+        updateKeyframedClip(clipID) { c in
+            guard var kf = c.keyframes else { return }
+            let f = kf.frames(prop)
+            guard index + 1 < f.count else { return }
+            let span = f[index + 1].time - f[index].time
+            let d = min(max(0, seconds * c.keyframeTimeScale), max(0, span - 1e-3))
+            let t0 = f[index].time
+            for p in lockedPartners(c, prop) {
+                guard let j = kf.frames(p).firstIndex(where: { abs($0.time - t0) < 1e-3 }) else { continue }
+                var e = kf.frames(p)[j].easing ?? .linear
+                e.delay = d > 1e-9 ? d : nil
+                kf.setEasing(p, index: j, e)
+            }
+            c.keyframes = kf
+        }
+        keyframesChanged()
+    }
+
+    /// 选中关键帧后让属性区滚到它所属的属性。一个菱形可能是好几个属性的帧，取属性区里排最前的那个
+    func focusInspector(onKeyframe sel: KeyframeSelection) {
+        guard let c = keyframedClip(sel.clipID),
+              let p = KeyframeProp.allCases.first(where: { c.hasKeyframe($0, atTimeline: sel.time) })
+        else { return }
+        inspectorFocus = InspectorFocusRequest(prop: p, seq: (inspectorFocus?.seq ?? 0) + 1)
+    }
+
+    /// 复制选中的关键帧（每处都是那一时刻所有属性的帧）
+    @discardableResult
+    func copySelectedKeyframes() -> Bool {
+        let sels = selectedKeyframes.filter { keyframedClip($0.clipID) != nil }
+        guard let t0 = sels.map(\.time).min() else { return false }
+        var items: [KeyframeClipItem] = []
+        for sel in sels {
+            guard let c = keyframedClip(sel.clipID), let kf = c.keyframes else { continue }
+            for p in KeyframeProp.allCases {
+                guard let f = kf.frames(p).first(where: { abs(c.timelineTime(ofKeyframe: $0.time) - sel.time) < 0.02 })
+                else { continue }
+                items.append(KeyframeClipItem(prop: p, dt: sel.time - t0, value: f.value, easing: f.easing))
+            }
+        }
+        guard !items.isEmpty else { return false }
+        Self.keyframeClipboard = items
+        pasteKeyframesNext = true
+        return true
+    }
+
+    /// 把复制的关键帧贴到播放头处（保持彼此间距）。贴到哪个片段：选中的视频 / 图片片段 → 复制来源 →
+    /// 播放头下的视频片段 → 播放头下的图片片段，都得播放头在片段里。超出片段的那几帧夹在片段末尾
+    @discardableResult
+    func pasteKeyframesAtPlayhead() -> Bool {
+        let items = Self.keyframeClipboard
+        guard !items.isEmpty else { return false }
+        let t = currentTime
+        let clips = keyframedClips
+        let inside = { (c: any KeyframeAnimatable) in c.startTime <= t && t < c.endTime }
+        let selected = [selectedVideoClipID, selectedImageClipID, selectedTextClipID, selectedShapeClipID,
+                        selectedAudioClipID].compactMap { $0 }
+        let target = clips.first { selected.contains($0.id) && inside($0) }
+            ?? clips.first { c in selectedKeyframes.contains { $0.clipID == c.id } && inside(c) }
+            ?? clips.first(where: inside)
+        guard let target else { return false }
+        pushUndo()
+        var pasted: [Double] = []
+        updateKeyframedClip(target.id) { c in
+            var kf = c.keyframes ?? ClipKeyframes()
+            for it in items where c.propValue(it.prop) != nil {
+                let tt = c.clampedTimeline(t + it.dt)
+                let k = c.keyframeTime(atTimeline: tt)
+                let tol = abs(c.keyframeTime(atTimeline: tt + 0.02) - k)
+                kf.upsert(it.prop, at: k, value: it.value, tolerance: tol)
+                var f = kf.frames(it.prop)
+                if let i = f.firstIndex(where: { abs($0.time - k) <= tol }) {
+                    f[i].easing = it.easing
+                    kf.props[it.prop.rawValue] = f
+                }
+                if !pasted.contains(where: { abs($0 - tt) < 0.02 }) { pasted.append(tt) }
+            }
+            c.keyframes = kf.isEmpty ? nil : kf
+        }
+        selectedKeyframes = pasted.map { KeyframeSelection(clipID: target.id, time: $0) }
+        keyframesChanged()
+        return true
+    }
+
+    /// 删掉时间轴上选中的关键帧（每处都是那一时刻所有属性的帧）。没选中关键帧返回 false，交给片段删除
+    @discardableResult
+    func deleteSelectedKeyframes() -> Bool {
+        let sels = selectedKeyframes.filter { keyframedClip($0.clipID) != nil }
+        guard !sels.isEmpty else { return false }
+        pushUndo()
+        for sel in sels {
+            updateKeyframedClip(sel.clipID) { c in
+                for p in KeyframeProp.allCases { c.setKeyframe(p, atTimeline: sel.time, on: false) }
+            }
+        }
+        selectedKeyframes = []
+        keyframesChanged()
+        return true
     }
 
     func updateImageClip(id: UUID, _ modify: (inout ImageClip) -> Void) {
@@ -1597,6 +1866,7 @@ extension ProjectState {
         // 转场也算一种选中。漏掉它的话，选中转场后点轨道空白、点别的片段、
         // 切标签页都取消不掉，属性区一直停在「转场」那页
         selectedTransitionClipID = nil
+        selectedKeyframes = []
     }
 
     // MARK: - 特效

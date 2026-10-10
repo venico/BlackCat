@@ -537,6 +537,9 @@ final class AgentRunner: ObservableObject {
         if let r = AgentToolbox.runPropsTool(call.name, args: call.arguments, project: project) {
             return r
         }
+        if let r = AgentToolbox.runKeyframeTool(call.name, args: call.arguments, project: project) {
+            return r
+        }
         if let r = AgentToolbox.runGenerateTool(call.name, args: call.arguments, project: project) {
             return r
         }
@@ -655,6 +658,7 @@ final class AgentRunner: ObservableObject {
         · **说「没有这个功能」「做不了」之前，先用 search_tools 换几个说法搜一遍**。
           你的工具很多、分组挂着，手上没看到不等于没有（实测：加图形、改圆角投影其实都有，它却回没有）。
           get_properties / set_properties 能读改任何片段的全部属性，专门工具没开放的参数先试它。
+          要动画（移动、缩放、旋转、淡入淡出、字变大）或音量渐强渐弱，用 set_keyframes 打关键帧。
           都试过还是做不了，调 report_gap 记下来，再如实告诉用户。
         · 干完用一两句话说清楚你改了什么，不用复述每一步工具调用。
         · 生成图片/视频/音频是后台任务，**提交完就接着做别的，别在那儿等**。
@@ -815,6 +819,9 @@ enum AgentPhaseText {
         "report_gap":            "正在记录能力缺口",
         "get_properties":        "正在读属性",
         "set_properties":        "正在改属性",
+        "list_keyframes":        "正在看关键帧",
+        "set_keyframes":         "正在打关键帧",
+        "delete_keyframes":      "正在删关键帧",
         "split_at":              "正在分割片段",
         "move_clip":             "正在移动片段",
         "move_track":            "正在调整轨道顺序",

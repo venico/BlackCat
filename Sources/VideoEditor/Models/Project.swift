@@ -73,6 +73,16 @@ final class ProjectState: ObservableObject {
     @Published var selectedAdjustClipID: UUID? = nil
     @Published var selectedEffectClipID: UUID? = nil
     @Published var selectedMarkerID: UUID? = nil
+    /// 时间轴上选中的关键帧菱形（shift 可多选）。有选中时按删除键删的是它们，不是片段
+    @Published var selectedKeyframes: [KeyframeSelection] = []
+    /// 属性区要滚到哪个属性（选中关键帧时发）
+    @Published var inspectorFocus: InspectorFocusRequest? = nil
+    /// 复制的关键帧。所有窗口共用，能从一个项目复制到另一个
+    static var keyframeClipboard: [KeyframeClipItem] = []
+    /// 最近一次复制的是关键帧（⌘V 就粘关键帧，不粘片段）
+    @Published var pasteKeyframesNext = false
+    /// 属性区展开曲线面板、正在调的那一段。时间轴上这段连线画成黄色
+    @Published var editingEasing: EasingSegmentRef? = nil
 
     // 复合片段编辑栈
     struct CompositionLevel {
@@ -192,18 +202,25 @@ final class ProjectState: ObservableObject {
     func overlayContentKey(at t: Double) -> String {
         var out = ""
         for track in imageTracks where track.isVisible {
-            for c in track.clips where c.startTime <= t && c.endTime > t {
+            for raw in track.clips where raw.startTime <= t && raw.endTime > t {
+                // 按这一刻求值：打了关键帧的话静态值不变、画面在变，拿静态值当 key 会一直用旧图
+                let c = raw.animated(atTimeline: t)
                 out += "i\(c.id)\(c.offsetX)\(c.offsetY)\(c.scaleX)\(c.scaleY)\(c.rotation)\(c.opacity ?? 1)\(c.cornerRadius ?? 0)"
+                out += "\(c.cropTop)\(c.cropBottom)\(c.cropLeft)\(c.cropRight)\(String(describing: c.colorAdjust))"
             }
         }
         for track in textTracks where track.isVisible {
-            for c in track.clips where c.startTime <= t && c.endTime > t {
+            for raw in track.clips where raw.startTime <= t && raw.endTime > t {
+                let c = raw.animated(atTimeline: t)   // 关键帧按这一刻求值，理由同上
                 out += "t\(c.id)\(c.text)\(c.posX)\(c.posY)\(c.fontSize)\(c.rotation)\(c.opacity)"
+                out += "\(c.cropTop)\(c.cropBottom)\(c.cropLeft)\(c.cropRight)"
             }
         }
         for track in shapeTracks where track.isVisible {
-            for c in track.clips where c.startTime <= t && c.endTime > t {
+            for raw in track.clips where raw.startTime <= t && raw.endTime > t {
+                let c = raw.animated(atTimeline: t)
                 out += "s\(c.id)\(c.posX)\(c.posY)\(c.scaleX)\(c.scaleY)\(c.rotation)\(c.opacity)"
+                out += "\(c.cropTop)\(c.cropBottom)\(c.cropLeft)\(c.cropRight)"
             }
         }
         for track in subtitleTracks where track.isVisible {
@@ -847,6 +864,39 @@ final class ProjectState: ObservableObject {
     var selectedVideoClip: VideoClip? {
         guard let id = selectedVideoClipID else { return nil }
         for t in videoTracks { if let c = t.clips.first(where:{ $0.id == id }) { return c } }
+        return nil
+    }
+
+    /// 选着关键帧（片段本身没选中）时，关键帧所在的那个视频片段 —— 属性区显示它
+    var keyframeOwnerClip: VideoClip? {
+        guard let id = selectedKeyframes.first?.clipID else { return nil }
+        for t in videoTracks { if let c = t.clips.first(where: { $0.id == id }) { return c } }
+        return nil
+    }
+
+    /// 同上，关键帧在图片片段上
+    var keyframeOwnerImage: ImageClip? {
+        guard let id = selectedKeyframes.first?.clipID else { return nil }
+        for t in imageTracks { if let c = t.clips.first(where: { $0.id == id }) { return c } }
+        return nil
+    }
+
+    /// 同上，关键帧在文字 / 图形片段上
+    var keyframeOwnerText: TextClip? {
+        guard let id = selectedKeyframes.first?.clipID else { return nil }
+        for t in textTracks { if let c = t.clips.first(where: { $0.id == id }) { return c } }
+        return nil
+    }
+
+    var keyframeOwnerAudio: AudioClip? {
+        guard let id = selectedKeyframes.first?.clipID else { return nil }
+        for t in audioTracks { if let c = t.clips.first(where: { $0.id == id }) { return c } }
+        return nil
+    }
+
+    var keyframeOwnerShape: ShapeClip? {
+        guard let id = selectedKeyframes.first?.clipID else { return nil }
+        for t in shapeTracks { if let c = t.clips.first(where: { $0.id == id }) { return c } }
         return nil
     }
 

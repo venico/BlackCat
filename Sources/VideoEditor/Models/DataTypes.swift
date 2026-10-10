@@ -445,6 +445,16 @@ struct VideoClip: Identifiable, Equatable, Codable {
     // 转场：从前一个 clip 到本 clip 的转场效果（nil = 无转场）
     var inTransition: Transition? = nil
     var markers: [Marker]? = nil
+    /// 不透明度 0~1。可选是为了兼容老 .bcj（自动合成的 Codable 缺非可选字段会整个解不开）
+    var opacity: Double? = nil
+    /// 任意角度旋转（度），叠加在上面 90° 一档的 `rotation` 之上。
+    /// 分开存是因为画面贴合画布只看 90° 那一档 —— 转 45° 时画面不该跟着缩放
+    var angle: Double? = nil
+    /// 关键帧（见 Keyframes.swift）。nil = 没打过
+    var keyframes: ClipKeyframes? = nil
+
+    var alpha: Double { opacity ?? 1 }
+    var angleDeg: Double { angle ?? 0 }
 }
 
 struct AudioClip: Identifiable, Equatable, Codable {
@@ -469,6 +479,8 @@ struct AudioClip: Identifiable, Equatable, Codable {
     // 播放速率
     var speed: Double = 1.0
     var markers: [Marker]? = nil
+    /// 关键帧（目前只有音量）。nil = 没打过
+    var keyframes: ClipKeyframes? = nil
 }
 
 struct ImageClip: Identifiable, Equatable, Codable {
@@ -508,6 +520,11 @@ struct ImageClip: Identifiable, Equatable, Codable {
     var cornerRadius: Double? = nil
     /// 不透明度 0~1。同上，可选是为了兼容老 .bcj
     var opacity: Double? = nil
+    /// 关键帧（见 Keyframes.swift）。nil = 没打过
+    var keyframes: ClipKeyframes? = nil
+    /// 关键帧的「入点」：左边裁掉 / 从中间切开时往后推，关键帧就还贴着原来那一刻的动画
+    /// （图片没有素材入点，自己记一个）。nil = 0
+    var kfIn: Double? = nil
 
     /// 圆角半径，nil = 不切
     var corner: Double { cornerRadius ?? 0 }
@@ -631,6 +648,10 @@ struct TextClip: Identifiable, Equatable, Codable {
     var mirrorV: Bool = false
     /// 范围框缩放是否锁比例（面板上的开关，不影响渲染）
     var lockBoxAspect: Bool = true
+    /// 关键帧（见 Keyframes.swift）。nil = 没打过
+    var keyframes: ClipKeyframes? = nil
+    /// 关键帧入点：左边裁掉 / 切开时往后推，关键帧不跑位。nil = 0
+    var kfIn: Double? = nil
 
     enum CodingKeys: String, CodingKey {
         case id, text, startTime, endTime, posX, posY
@@ -641,6 +662,7 @@ struct TextClip: Identifiable, Equatable, Codable {
         case cropTop, cropBottom, cropLeft, cropRight
         case boxWidth, boxHeight
         case mirrorH, mirrorV, lockBoxAspect
+        case keyframes, kfIn
     }
     func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
@@ -675,6 +697,8 @@ struct TextClip: Identifiable, Equatable, Codable {
         try c.encode(mirrorH, forKey: .mirrorH)
         try c.encode(mirrorV, forKey: .mirrorV)
         try c.encode(lockBoxAspect, forKey: .lockBoxAspect)
+        try c.encodeIfPresent(keyframes, forKey: .keyframes)
+        try c.encodeIfPresent(kfIn, forKey: .kfIn)
     }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -709,6 +733,9 @@ struct TextClip: Identifiable, Equatable, Codable {
         mirrorH    = (try? c.decode(Bool.self, forKey: .mirrorH)) ?? false
         mirrorV    = (try? c.decode(Bool.self, forKey: .mirrorV)) ?? false
         lockBoxAspect = (try? c.decode(Bool.self, forKey: .lockBoxAspect)) ?? true
+        // 手写解码：加了字段这里必须补，不然存得进读不回
+        keyframes = try? c.decodeIfPresent(ClipKeyframes.self, forKey: .keyframes)
+        kfIn = try? c.decodeIfPresent(Double.self, forKey: .kfIn)
     }
     init(text: String = "标题文字", startTime: Double, endTime: Double) {
         self.text = text; self.startTime = startTime; self.endTime = endTime
@@ -872,6 +899,10 @@ struct ShapeClip: Identifiable, Equatable, Codable {
     var cropBottom: Double = 0
     var cropLeft: Double   = 0
     var cropRight: Double  = 0
+    /// 关键帧（见 Keyframes.swift）。nil = 没打过
+    var keyframes: ClipKeyframes? = nil
+    /// 关键帧入点：左边裁掉 / 切开时往后推，关键帧不跑位。nil = 0
+    var kfIn: Double? = nil
 
     /// 是否闭合路径（pen 由 penClosed 决定，其余由 ShapeType 决定）
     var effectiveIsClosed: Bool { type == .pen ? penClosed : type.isClosed }
@@ -887,6 +918,7 @@ struct ShapeClip: Identifiable, Equatable, Codable {
         case penPoints, penClosed
         case markers
         case cropTop, cropBottom, cropLeft, cropRight
+        case keyframes, kfIn
     }
     func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
@@ -927,6 +959,8 @@ struct ShapeClip: Identifiable, Equatable, Codable {
         try c.encode(cropBottom, forKey: .cropBottom)
         try c.encode(cropLeft, forKey: .cropLeft)
         try c.encode(cropRight, forKey: .cropRight)
+        try c.encodeIfPresent(keyframes, forKey: .keyframes)
+        try c.encodeIfPresent(kfIn, forKey: .kfIn)
     }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -967,6 +1001,9 @@ struct ShapeClip: Identifiable, Equatable, Codable {
         cropLeft   = (try? c.decode(Double.self, forKey: .cropLeft)) ?? 0
         cropRight  = (try? c.decode(Double.self, forKey: .cropRight)) ?? 0
         markers = try? c.decode([Marker].self, forKey: .markers)
+        // 手写解码：加了字段这里必须补，不然存得进读不回
+        keyframes = try? c.decodeIfPresent(ClipKeyframes.self, forKey: .keyframes)
+        kfIn = try? c.decodeIfPresent(Double.self, forKey: .kfIn)
     }
     init(type: ShapeType, startTime: Double, endTime: Double) {
         self.type = type; self.startTime = startTime; self.endTime = endTime
@@ -1450,6 +1487,8 @@ struct CompoundClip: Identifiable, Equatable, Codable {
                     for var c in st.clips {
                         let vs = max(c.startTime, ni); let ve = min(c.endTime, ne)
                         guard ve - vs > 0.01 else { continue }
+                        // 被外层复合片段裁掉开头的那一截，关键帧入点跟着挪
+                        c.shiftKeyframeIn(by: vs - c.startTime)
                         c.startTime = nested.startTime + (vs - ni)
                         c.endTime   = nested.startTime + (ve - ni)
                         mc.append(c)
@@ -1476,6 +1515,7 @@ struct CompoundClip: Identifiable, Equatable, Codable {
                     for var c in st.clips {
                         let vs = max(c.startTime, ni); let ve = min(c.endTime, ne)
                         guard ve - vs > 0.01 else { continue }
+                        c.shiftKeyframeIn(by: vs - c.startTime)   // 被外层裁掉的开头，关键帧不跑位
                         c.startTime = nested.startTime + (vs - ni)
                         c.endTime   = nested.startTime + (ve - ni)
                         mc.append(c)
@@ -1487,6 +1527,7 @@ struct CompoundClip: Identifiable, Equatable, Codable {
                     for var c in st.clips {
                         let vs = max(c.startTime, ni); let ve = min(c.endTime, ne)
                         guard ve - vs > 0.01 else { continue }
+                        c.shiftKeyframeIn(by: vs - c.startTime)   // 被外层裁掉的开头，关键帧不跑位
                         c.startTime = nested.startTime + (vs - ni)
                         c.endTime   = nested.startTime + (ve - ni)
                         mc.append(c)

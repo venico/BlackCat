@@ -143,6 +143,9 @@ struct PlayerView: View {
             // 之间来回横跳，看着就是抖。改成始终朝同一个方向、在 1/600 秒内
             // 取四档循环 —— 相邻两次的差最多 1/2400 秒，远小于一帧，画面稳得住
             let step = (1.0 / 2400.0) * Double(clock.refreshSeekRequest % 4 + 1)
+            // 暂停时光 seek 不够：落在同一帧里，播放器直接拿缓存那帧，合成器根本不会被叫起来
+            // （实测拖角度滑块全程零次合成，松手重建后才变）。把合成设置重新挂一遍逼它重画
+            if !ctrl.isPlaying { ctrl.invalidateComposedFrame() }
             ctrl.seek(to: clock.currentTime + step)
         }
         .onAppear {
@@ -304,7 +307,9 @@ private struct OverlayStack: View {
         GeometryReader { geo in
             if let track = project.imageTracks.first(where: { $0.id == trackID }),
                track.isVisible,
-               let clip = track.clips.first(where: { $0.startTime <= clock.currentTime && $0.endTime > clock.currentTime }) {
+               let raw = track.clips.first(where: { $0.startTime <= clock.currentTime && $0.endTime > clock.currentTime }) {
+                // 打了关键帧的话按这一刻求值
+                let clip = raw.animated(atTimeline: clock.currentTime)
                 let imgRect = imageRenderRect(clip: clip, viewSize: geo.size)
                 ImageLayerView(clip: clip, viewSize: geo.size, videoSize: project.previewRenderSize)
                     .allowsHitTesting(false)
@@ -429,7 +434,7 @@ private struct OverlayStack: View {
             let scale = geo.size.width / max(project.previewRenderSize.width, 1)
             if let track = project.textTracks.first(where: { $0.id == trackID }),
                track.isVisible,
-               let clip = track.clips.first(where: { $0.startTime <= clock.currentTime && $0.endTime > clock.currentTime }) {
+               let clip = track.clips.first(where: { $0.startTime <= clock.currentTime && $0.endTime > clock.currentTime })?.animated(atTimeline: clock.currentTime) {
                 if project.editingTextClipID == clip.id {
                     TextEditField(text: $editText, clip: clip, scale: scale, onCommit: { commitTextEdit() })
                         .fixedSize()
@@ -439,7 +444,7 @@ private struct OverlayStack: View {
                         })
                         .overlay(RoundedRectangle(cornerRadius: 4 * scale).strokeBorder(Color.accent, lineWidth: 1.5))
                         .onDisappear {
-                            project.updateTextClip(id: clip.id) { $0.text = editText }
+                            project.updateTextClipAnimated(id: clip.id) { $0.text = editText }
                         }
                         .position(x: geo.size.width * clip.posX, y: geo.size.height * clip.posY)
                 } else {
@@ -471,9 +476,9 @@ private struct OverlayStack: View {
                             let dy = v.translation.height / geo.size.height
                             for (id, s) in dragStart {
                                 if project.shapeTracks.flatMap(\.clips).contains(where: { $0.id == id }) {
-                                    project.updateShapeClip(id: id) { $0.posX = min(1, max(0, s.x + dx)); $0.posY = min(1, max(0, s.y + dy)) }
+                                    project.updateShapeClipAnimated(id: id) { $0.posX = min(1, max(0, s.x + dx)); $0.posY = min(1, max(0, s.y + dy)) }
                                 } else if project.textTracks.flatMap(\.clips).contains(where: { $0.id == id }) {
-                                    project.updateTextClip(id: id) { $0.posX = min(1, max(0, s.x + dx)); $0.posY = min(1, max(0, s.y + dy)) }
+                                    project.updateTextClipAnimated(id: id) { $0.posX = min(1, max(0, s.x + dx)); $0.posY = min(1, max(0, s.y + dy)) }
                                 } else if project.imageTracks.flatMap(\.clips).contains(where: { $0.id == id }) {
                                     project.updateImageClip(id: id) { $0.offsetX = s.x + dx; $0.offsetY = s.y + dy }
                                 }
@@ -502,7 +507,7 @@ private struct OverlayStack: View {
             let scale = geo.size.width / max(project.previewRenderSize.width, 1)
             if let track = project.shapeTracks.first(where: { $0.id == trackID }),
                track.isVisible,
-               let clip = track.clips.first(where: { $0.startTime <= clock.currentTime && $0.endTime > clock.currentTime }) {
+               let clip = track.clips.first(where: { $0.startTime <= clock.currentTime && $0.endTime > clock.currentTime })?.animated(atTimeline: clock.currentTime) {
                 ShapeClipView(clip: clip, scale: scale,
                               selected: project.selectedClipIDs.count > 1 && project.selectedClipIDs.contains(clip.id))
                     .position(x: geo.size.width * clip.posX, y: geo.size.height * clip.posY)
@@ -526,9 +531,9 @@ private struct OverlayStack: View {
                                 let dy = v.translation.height / geo.size.height
                                 for (id, s) in dragStart {
                                     if project.shapeTracks.flatMap(\.clips).contains(where: { $0.id == id }) {
-                                        project.updateShapeClip(id: id) { $0.posX = min(1, max(0, s.x + dx)); $0.posY = min(1, max(0, s.y + dy)) }
+                                        project.updateShapeClipAnimated(id: id) { $0.posX = min(1, max(0, s.x + dx)); $0.posY = min(1, max(0, s.y + dy)) }
                                     } else if project.textTracks.flatMap(\.clips).contains(where: { $0.id == id }) {
-                                        project.updateTextClip(id: id) { $0.posX = min(1, max(0, s.x + dx)); $0.posY = min(1, max(0, s.y + dy)) }
+                                        project.updateTextClipAnimated(id: id) { $0.posX = min(1, max(0, s.x + dx)); $0.posY = min(1, max(0, s.y + dy)) }
                                     } else if project.imageTracks.flatMap(\.clips).contains(where: { $0.id == id }) {
                                         project.updateImageClip(id: id) { $0.offsetX = s.x + dx; $0.offsetY = s.y + dy }
                                     }
@@ -615,7 +620,7 @@ private struct OverlayStack: View {
 
     private func commitTextEdit() {
         guard let id = project.editingTextClipID else { return }
-        project.updateTextClip(id: id) { $0.text = editText }
+        project.updateTextClipAnimated(id: id) { $0.text = editText }
         project.editingTextClipID = nil
     }
 
@@ -757,7 +762,7 @@ private struct OverlayStack: View {
         if let track = compound.imageTracks.first(where: { $0.id == trackID }), track.isVisible {
             let clips = track.clips.filter { $0.startTime <= it && $0.endTime > it }
             ForEach(clips) { clip in
-                ImageLayerView(clip: clip, viewSize: geo.size, videoSize: project.previewRenderSize)
+                ImageLayerView(clip: clip.animated(atTimeline: it), viewSize: geo.size, videoSize: project.previewRenderSize)
             }
         }
     }
@@ -767,7 +772,7 @@ private struct OverlayStack: View {
                                 it: Double, geo: GeometryProxy) -> some View {
         if let track = compound.shapeTracks.first(where: { $0.id == trackID }), track.isVisible {
             let scale = geo.size.width / max(project.previewRenderSize.width, 1)
-            let clips = track.clips.filter { $0.startTime <= it && $0.endTime > it }
+            let clips = track.clips.filter { $0.startTime <= it && $0.endTime > it }.map { $0.animated(atTimeline: it) }
             ForEach(clips) { clip in
                 ShapeClipView(clip: clip, scale: scale, selected: false)
                     .position(x: geo.size.width * clip.posX, y: geo.size.height * clip.posY)
@@ -780,7 +785,7 @@ private struct OverlayStack: View {
                                it: Double, geo: GeometryProxy) -> some View {
         if let track = compound.textTracks.first(where: { $0.id == trackID }), track.isVisible {
             let scale = geo.size.width / max(project.previewRenderSize.width, 1)
-            let clips = track.clips.filter { $0.startTime <= it && $0.endTime > it }
+            let clips = track.clips.filter { $0.startTime <= it && $0.endTime > it }.map { $0.animated(atTimeline: it) }
             ForEach(clips) { clip in
                 TextLabel(clip: clip, scale: scale, time: it)
                     .position(x: geo.size.width * clip.posX, y: geo.size.height * clip.posY)
@@ -1044,11 +1049,12 @@ private struct TextOverlay: View {
             .filter { $0.isVisible }
             .flatMap { $0.clips }
             .filter { $0.startTime <= clock.currentTime && $0.endTime > clock.currentTime }
+            .map { $0.animated(atTimeline: clock.currentTime) }
     }
 
     private func commitEdit() {
         guard let id = editingID else { return }
-        project.updateTextClip(id: id) { $0.text = editText }
+        project.updateTextClipAnimated(id: id) { $0.text = editText }
         editingID = nil
     }
 
@@ -1081,7 +1087,7 @@ private struct TextOverlay: View {
                             DragGesture()
                                 .onChanged { v in
                                     project.selectedTextClipID = clip.id
-                                    project.updateTextClip(id: clip.id) {
+                                    project.updateTextClipAnimated(id: clip.id) {
                                         $0.posX = min(1, max(0, v.location.x / geo.size.width))
                                         $0.posY = min(1, max(0, v.location.y / geo.size.height))
                                     }
@@ -1704,7 +1710,8 @@ private struct VideoTransformOverlay: View {
 
     var body: some View {
         GeometryReader { geo in
-            if let clip = project.selectedVideoClip,
+            // 框贴着「这一刻」的画面：打了关键帧的话位置/缩放/裁剪随播放头变
+            if let clip = project.selectedVideoClip?.animated(atTimeline: clock.currentTime),
                clip.videoWidth > 0, clip.videoHeight > 0,
                clip.startTime <= clock.currentTime,
                clip.endTime > clock.currentTime {
@@ -1755,7 +1762,8 @@ private struct VideoTransformOverlay: View {
                 }
                 // 整个框跟着画面转，锚点用画面中心 —— 跟合成层的旋转锚点是同一个，
                 // 这样框始终贴着画面边界，而不是停在旋转前的位置
-                .rotationEffect(.degrees(Double(clip.rotation)),
+                // 任意角度叠在 90° 档上（顺时针为正，跟合成器一致）
+                .rotationEffect(.degrees(Double(clip.rotation) + clip.angleDeg),
                                 anchor: rotationAnchor(clip: clip, info: info, in: geo.size))
             }
         }
@@ -1800,7 +1808,7 @@ private struct VideoTransformOverlay: View {
                 let dy = value.translation.height / info.renderArea.height
                 let newOffX = dragStartOffset.x + dx
                 let newOffY = dragStartOffset.y + dy
-                project.updateVideoClip(id: clip.id) {
+                project.updateVideoClipAnimated(id: clip.id) {
                     $0.offsetX = newOffX
                     $0.offsetY = newOffY
                 }
@@ -1812,9 +1820,9 @@ private struct VideoTransformOverlay: View {
                 let ndy = value.translation.height / viewSize.height
                 for (id, s) in multiStart {
                     if project.shapeTracks.flatMap(\.clips).contains(where: { $0.id == id }) {
-                        project.updateShapeClip(id: id) { $0.posX = min(1, max(0, s.x + ndx)); $0.posY = min(1, max(0, s.y + ndy)) }
+                        project.updateShapeClipAnimated(id: id) { $0.posX = min(1, max(0, s.x + ndx)); $0.posY = min(1, max(0, s.y + ndy)) }
                     } else if project.textTracks.flatMap(\.clips).contains(where: { $0.id == id }) {
-                        project.updateTextClip(id: id) { $0.posX = min(1, max(0, s.x + ndx)); $0.posY = min(1, max(0, s.y + ndy)) }
+                        project.updateTextClipAnimated(id: id) { $0.posX = min(1, max(0, s.x + ndx)); $0.posY = min(1, max(0, s.y + ndy)) }
                     } else if project.imageTracks.flatMap(\.clips).contains(where: { $0.id == id }) {
                         project.updateImageClip(id: id) { $0.offsetX = s.x + dx; $0.offsetY = s.y + dy }
                     }
@@ -1848,7 +1856,7 @@ private struct VideoTransformOverlay: View {
                                     value.location.y - center.y)
                 guard startDist > 1 else { return }
                 let ratio = curDist / startDist
-                project.updateVideoClip(id: clip.id) {
+                project.updateVideoClipAnimated(id: clip.id) {
                     $0.scaleX = max(0.05, scaleStartValues.sx * ratio)
                     $0.scaleY = max(0.05, scaleStartValues.sy * ratio)
                 }
@@ -1874,7 +1882,7 @@ private struct VideoTransformOverlay: View {
                 // 手势给的是屏幕坐标的位移，而 cropTop/cropLeft 说的是画面**自己**的
                 // 上下左右。画面转了 90° 之后两者差一个旋转，得先转回画面坐标，
                 // 否则拖上边的手柄画面从侧面被裁
-                let d = unrotateTranslation(value.translation, rotation: Double(startClip.rotation))
+                let d = unrotateTranslation(value.translation, rotation: Double(startClip.rotation) + startClip.angleDeg)
                 var delta: Double = 0
                 switch edge {
                 case 0: delta =  d.height / vidRect.height
@@ -1892,7 +1900,7 @@ private struct VideoTransformOverlay: View {
                 default: startVal = 0
                 }
                 let newCrop = (startVal + delta).clamped(to: 0...0.99)
-                project.updateVideoClip(id: clip.id) {
+                project.updateVideoClipAnimated(id: clip.id) {
                     switch edge {
                     case 0: $0.cropTop    = newCrop
                     case 1: $0.cropBottom = newCrop
@@ -2114,7 +2122,8 @@ private struct ImageTransformOverlay: View {
 
     var body: some View {
         GeometryReader { geo in
-            if let clip = project.selectedImageClip,
+            // 框贴着「这一刻」的画面：打了关键帧的话随播放头变
+            if let clip = project.selectedImageClip?.animated(atTimeline: clock.currentTime),
                clip.startTime <= clock.currentTime,
                clip.endTime > clock.currentTime {
                 let info = computeRenderInfo(viewSize: geo.size)
@@ -2156,14 +2165,14 @@ private struct ImageTransformOverlay: View {
                                 project.rebuildTimelinePreview()
                             },
                             onScale: { ratio in
-                                project.updateImageClip(id: clip.id) {
+                                project.updateImageClipAnimated(id: clip.id) {
                                     $0.scaleX = max(0.05, scaleStartValues.sx * ratio)
                                     $0.scaleY = max(0.05, scaleStartValues.sy * ratio)
                                 }
                                 project.rebuildTimelinePreviewDebounced()
                             },
                             onCrop: { e, value in
-                                project.updateImageClip(id: clip.id) {
+                                project.updateImageClipAnimated(id: clip.id) {
                                     switch e {
                                     case 0: $0.cropTop = value
                                     case 1: $0.cropBottom = value
@@ -2174,7 +2183,7 @@ private struct ImageTransformOverlay: View {
                                 project.rebuildTimelinePreviewDebounced()
                             },
                             onRotate: { delta in
-                                project.updateImageClip(id: clip.id) { $0.rotation = rotStartValue + delta }
+                                project.updateImageClipAnimated(id: clip.id) { $0.rotation = rotStartValue + delta }
                                 project.rebuildTimelinePreviewDebounced()
                             }
                         )
@@ -2229,7 +2238,7 @@ private struct ImageTransformOverlay: View {
                 guard dragMode == .move else { return }
                 let dx = value.translation.width / info.renderArea.width
                 let dy = value.translation.height / info.renderArea.height
-                project.updateImageClip(id: clip.id) {
+                project.updateImageClipAnimated(id: clip.id) {
                     $0.offsetX = dragStartOffset.x + dx
                     $0.offsetY = dragStartOffset.y + dy
                 }
@@ -2237,9 +2246,9 @@ private struct ImageTransformOverlay: View {
                 let ndy = value.translation.height / viewSize.height
                 for (id, s) in multiStart {
                     if project.shapeTracks.flatMap(\.clips).contains(where: { $0.id == id }) {
-                        project.updateShapeClip(id: id) { $0.posX = min(1, max(0, s.x + ndx)); $0.posY = min(1, max(0, s.y + ndy)) }
+                        project.updateShapeClipAnimated(id: id) { $0.posX = min(1, max(0, s.x + ndx)); $0.posY = min(1, max(0, s.y + ndy)) }
                     } else if project.textTracks.flatMap(\.clips).contains(where: { $0.id == id }) {
-                        project.updateTextClip(id: id) { $0.posX = min(1, max(0, s.x + ndx)); $0.posY = min(1, max(0, s.y + ndy)) }
+                        project.updateTextClipAnimated(id: id) { $0.posX = min(1, max(0, s.x + ndx)); $0.posY = min(1, max(0, s.y + ndy)) }
                     } else if project.imageTracks.flatMap(\.clips).contains(where: { $0.id == id }) {
                         project.updateImageClip(id: id) { $0.offsetX = s.x + dx; $0.offsetY = s.y + dy }
                     }
@@ -2507,6 +2516,7 @@ private struct ShapeOverlay: View {
             .filter { $0.isVisible }
             .flatMap { $0.clips }
             .filter { $0.startTime <= clock.currentTime && $0.endTime > clock.currentTime }
+            .map { $0.animated(atTimeline: clock.currentTime) }
     }
 
     var body: some View {
@@ -2542,7 +2552,7 @@ private struct ShapeOverlay: View {
                                     let dx = v.translation.width / geo.size.width
                                     let dy = v.translation.height / geo.size.height
                                     for (id, s) in dragStart {
-                                        project.updateShapeClip(id: id) {
+                                        project.updateShapeClipAnimated(id: id) {
                                             $0.posX = min(1, max(0, Double(s.x) + Double(dx)))
                                             $0.posY = min(1, max(0, Double(s.y) + Double(dy)))
                                         }
@@ -2688,12 +2698,13 @@ struct TextTransformOverlay: View {
         guard let c = project.selectedTextClip,
               c.startTime <= clock.currentTime, c.endTime > clock.currentTime,
               project.selectedClipIDs.count <= 1 else { return nil }
-        return c
+        // 框贴着「这一刻」的样子：打了关键帧的话随播放头变
+        return c.animated(atTimeline: clock.currentTime)
     }
 
     /// 改动写给谁：外部接管就交出去，否则写时间轴
     private func update(_ id: UUID, _ f: @escaping (inout TextClip) -> Void) {
-        if let onUpdate { onUpdate(id, f) } else { project.updateTextClip(id: id, f) }
+        if let onUpdate { onUpdate(id, f) } else { project.updateTextClipAnimated(id: id, f) }
     }
 
     private func rotate(_ dx: CGFloat, _ dy: CGFloat, _ deg: Double) -> CGPoint {
@@ -2915,12 +2926,13 @@ struct ShapeTransformOverlay: View {
               c.startTime <= clock.currentTime, c.endTime > clock.currentTime,
               !project.penDrawingMode, project.penEditingClipID != c.id,
               project.selectedClipIDs.count <= 1 else { return nil }
-        return c
+        // 框贴着「这一刻」的样子：打了关键帧的话随播放头变
+        return c.animated(atTimeline: clock.currentTime)
     }
 
     /// 改动写给谁：外部接管就交出去，否则写时间轴
     private func update(_ id: UUID, _ f: @escaping (inout ShapeClip) -> Void) {
-        if let onUpdate { onUpdate(id, f) } else { project.updateShapeClip(id: id, f) }
+        if let onUpdate { onUpdate(id, f) } else { project.updateShapeClipAnimated(id: id, f) }
     }
 
     private func pushUndoOnce() {
@@ -3369,7 +3381,7 @@ struct PenEditOverlay: View {
 
     /// 改一条钢笔图形。给了 onUpdate 就交给它，否则走项目的图形轨道
     private func writeBack(_ id: UUID, _ apply: @escaping (inout ShapeClip) -> Void) {
-        if let up = onUpdate { up(id, apply) } else { project.updateShapeClip(id: id, apply) }
+        if let up = onUpdate { up(id, apply) } else { project.updateShapeClipAnimated(id: id, apply) }
     }
 
     private func anchorDrag(clipID: UUID, pointIndex i: Int, fw: CGFloat, fh: CGFloat, pt: PenPoint) -> some Gesture {
@@ -3429,7 +3441,7 @@ struct PenEditOverlay: View {
             }
             if event.keyCode == 51, let editID = project.penEditingClipID { // Delete key
                 project.pushUndo()
-                project.updateShapeClip(id: editID) { c in
+                project.updateShapeClipAnimated(id: editID) { c in
                     guard var pts = c.penPoints, pts.count > 2 else { return }
                     // 删暂不实现（需要选中某个点的状态），后续可扩展
                 }
@@ -3521,6 +3533,13 @@ final class PlayerController: ObservableObject {
         timer?.invalidate()
         player.pause()
         player.replaceCurrentItem(with: nil)
+    }
+
+    /// 让播放器丢掉缓存的合成帧：换一份同样的 videoComposition，下一次 seek 就会重新走合成器
+    func invalidateComposedFrame() {
+        guard let item = player.currentItem,
+              let vc = item.videoComposition?.mutableCopy() as? AVMutableVideoComposition else { return }
+        item.videoComposition = vc
     }
 
     func seek(to t: Double) {

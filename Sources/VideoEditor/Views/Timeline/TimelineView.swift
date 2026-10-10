@@ -12,6 +12,45 @@ private struct VScrollOffsetKey: PreferenceKey {
 }
 
 struct TimelineView: View {
+    /// 右键菜单：指针停在关键帧菱形上（或已经选着关键帧）时只给关键帧的操作。
+    /// 右键前不用先左键选中 —— 停在哪个菱形上就对哪个下手
+    @ViewBuilder
+    private var keyframeMenuItems: some View {
+        Button {
+            selectHoveredKeyframeIfNeeded()
+            project.copySelectedKeyframes()
+        } label: {
+            Image(nsImage: SidebarSVGIcon.load("copy", size: 14))
+            Text("复制关键帧")
+        }
+        Button {
+            selectHoveredKeyframeIfNeeded()
+            if project.copySelectedKeyframes() { project.deleteSelectedKeyframes() }
+        } label: {
+            Image(nsImage: SidebarSVGIcon.load("cut", size: 14))
+            Text("剪切关键帧")
+        }
+        Button { project.pasteKeyframesAtPlayhead() } label: {
+            Image(nsImage: SidebarSVGIcon.load("paste", size: 14))
+            Text("粘贴关键帧")
+        }
+            .disabled(ProjectState.keyframeClipboard.isEmpty)
+        Divider()
+        Button(role: .destructive) {
+            selectHoveredKeyframeIfNeeded()
+            project.deleteSelectedKeyframes()
+        } label: {
+            Image(nsImage: TimelineSVGIcon.load("delete", size: 14))
+            Text("删除关键帧")
+        }
+    }
+
+    /// 右键时指针下的那个菱形没在选中里 → 改成只选它
+    private func selectHoveredKeyframeIfNeeded() {
+        guard let h = hoveredKeyframe, !isKeyframeSelected((h.clipID, h.time)) else { return }
+        selectKeyframe((h.clipID, h.time))
+    }
+
     /// 按片段类型显示的那几组功能（识别/分析/分离音轨/清晰度/转语音/翻译/去背景）。
     /// 全摊在 contextMenu 里会让 ViewBuilder 的类型推断炸掉，必须抽出来
     @ViewBuilder
@@ -180,6 +219,8 @@ struct TimelineView: View {
     @State private var lastCompoundClickID: UUID? = nil
     @State private var lastCompoundClickTime: Date = .distantPast
     @State private var hoveredMarkerID: UUID? = nil
+    /// 指针下的关键帧菱形（右键菜单据此决定给关键帧的操作）
+    @State private var hoveredKeyframe: KeyframeSelection? = nil
     @State private var hoveredMarkerY: CGFloat = 0
     @State private var editingMarkerID: UUID? = nil
     @State private var lastMarkerClickID: UUID? = nil
@@ -225,6 +266,8 @@ struct TimelineView: View {
         case trimEffectRight(id: UUID, originStart: Double, originEnd: Double)
         case trimCompoundLeft(id: UUID, originStart: Double, originEnd: Double, originInternalStart: Double)
         case trimCompoundRight(id: UUID, originStart: Double, originEnd: Double)
+        /// 拖关键帧：起点那份关键帧留底，每次都从它重算，拖过别的帧也不会把它吃掉
+        case moveKeyframes(grabTime: Double, items: [KeyframeSelection], originKF: [UUID: ClipKeyframes])
         case movingPlayhead
         case resizeTrack(TrackKind)
         case box
@@ -522,29 +565,39 @@ struct TimelineView: View {
                 project.selectedSubtitleClipID   = nil
                 project.selectedCompoundClipID   = nil
                 project.selectedTransitionClipID = nil
+                project.selectedKeyframes = []
                 project.selectedClipIDs.removeAll()
                 return nil
             }
 
-            // ⌫ or ⌦ → 删除（有撤销兜底，无需确认）
+            // ⌫ or ⌦ → 删除（有撤销兜底，无需确认）。选着关键帧时删的是关键帧
             if event.keyCode == 51 || event.keyCode == 117 {
-                project.deleteSelected()
+                if !project.deleteSelectedKeyframes() { project.deleteSelected() }
                 return nil
             }
 
-            // ⌘C → 复制
+            // ⌘C → 复制。选着关键帧时复制的是关键帧
             if event.modifierFlags.contains(.command) && event.charactersIgnoringModifiers == "c" {
-                project.copySelected()
+                if !project.copySelectedKeyframes() {
+                    project.copySelected()
+                    project.pasteKeyframesNext = false
+                }
                 return nil
             }
             // ⌘X → 剪切
             if event.modifierFlags.contains(.command) && event.charactersIgnoringModifiers == "x" {
-                project.cutSelected()
+                if project.copySelectedKeyframes() {
+                    project.deleteSelectedKeyframes()
+                } else {
+                    project.cutSelected()
+                    project.pasteKeyframesNext = false
+                }
                 return nil
             }
             // ⌘V → 粘贴到播放头位置
             if event.modifierFlags.contains(.command) && event.charactersIgnoringModifiers == "v" {
-                project.pasteAtPlayhead()
+                // 最近复制的是关键帧就贴关键帧；贴不上（播放头不在任何视频片段里）就什么都不做
+                if project.pasteKeyframesNext { project.pasteKeyframesAtPlayhead() } else { project.pasteAtPlayhead() }
                 return nil
             }
             // ⌘⇧Z → 重做（先检查，避免被⌘Z拦截）
@@ -1172,6 +1225,9 @@ struct TimelineView: View {
                 .frame(minHeight: effectiveH, alignment: .top)
                 .contentShape(Rectangle())
                 .contextMenu {
+                  if hoveredKeyframe != nil || !project.selectedKeyframes.isEmpty {
+                    keyframeMenuItems
+                  } else {
                     let selID = project.selectedVideoClipID ?? project.selectedImageClipID
                               ?? project.selectedAudioClipID ?? project.selectedSubtitleClipID
                               ?? project.selectedTextClipID ?? project.selectedShapeClipID
@@ -1221,6 +1277,12 @@ struct TimelineView: View {
                             Text("粘贴")
                         }
                             .disabled(project.clipboard.isEmpty)
+                        if !ProjectState.keyframeClipboard.isEmpty {
+                            Button { project.pasteKeyframesAtPlayhead() } label: {
+                                Image(nsImage: SidebarSVGIcon.load("paste", size: 14))
+                                Text("粘贴关键帧")
+                            }
+                        }
                         clipTypeMenuItems
                         if selID != nil {
                             Divider()
@@ -1271,10 +1333,13 @@ struct TimelineView: View {
                             } label: { Label("删除标记", systemImage: "xmark.circle") }
                         }
                     }
+                  }
                 }
                 .onContinuousHover { phase in
                     switch phase {
                     case .active(let loc):
+                        let hk = hitTestKeyframe(at: loc).map { KeyframeSelection(clipID: $0.clipID, time: $0.time) }
+                        if hk != hoveredKeyframe { hoveredKeyframe = hk }
                         // 24 必须 ≤ TimelineScrollBar.hitH(22) 对应的实际可点范围，
                         // 否则最下面那几 pt 是"看得见滚动条、却拖不动"的死区。
                         // 这里取 22 跟它对齐。滚动条固定在视口底边，loc 是内容坐标，
@@ -1302,6 +1367,7 @@ struct TimelineView: View {
                             NSCursor.arrow.set()
                         }
                     case .ended:
+                        if hoveredKeyframe != nil { hoveredKeyframe = nil }
                         // 延迟一拍再收，别立刻置 false。指针从轨道区移到滚动条上时，
                         // 这里会先收到 .ended（滚动条把事件挡住了），而滚动条自己的
                         // onHover 要等它仍然可 hit test 才能触发——立刻置 false 会让
@@ -1391,6 +1457,17 @@ struct TimelineView: View {
                         dragOp = nil; return
                     }
                     project.selectedMarkerID = nil
+                    // 点中关键帧：选中它（shift 加减选），播放头跳过去
+                    if let hit = hitTestKeyframe(at: v.startLocation) {
+                        if NSEvent.modifierFlags.contains(.shift) {
+                            toggleKeyframeSelection(hit)
+                        } else {
+                            selectKeyframe(hit)
+                            project.requestSeek(to: hit.time)
+                        }
+                        dragOp = nil; return
+                    }
+                    project.selectedKeyframes = []
                     // 点轨道区任意位置都结束重命名（输入框失焦会自动提交）
                     if project.renamingClipID != nil || project.renamingCompoundClipID != nil {
                         project.renamingClipID = nil
@@ -1625,7 +1702,8 @@ struct TimelineView: View {
                      .trimCompoundLeft, .trimCompoundRight:
                     NSCursor.arrow.set()
                     project.rebuildTimelinePreview()
-                case .moveVideo, .moveImage, .moveAudio, .moveSubtitle, .moveText, .moveShape, .moveCompound, .moveMulti:
+                case .moveVideo, .moveImage, .moveAudio, .moveSubtitle, .moveText, .moveShape, .moveCompound, .moveMulti,
+                     .moveKeyframes:
                     project.rebuildTimelinePreview()
                 case .resizeTrack:
                     NSCursor.arrow.set()
@@ -1645,6 +1723,21 @@ struct TimelineView: View {
 
     private func startDrag(at pt: CGPoint) {
         project.selectedMarkerID = nil
+        // 关键帧排在播放头前面判：刚在播放头处打的帧，跟播放头正好叠在一起
+        if let hit = hitTestKeyframe(at: pt) {
+            // 按在已选中的那几个上 → 一起拖；按在没选中的上 → shift 就加进来一起拖，否则只拖它
+            if !isKeyframeSelected(hit) {
+                if NSEvent.modifierFlags.contains(.shift) { toggleKeyframeSelection(hit) } else { selectKeyframe(hit) }
+            }
+            let items = project.selectedKeyframes
+            var origin: [UUID: ClipKeyframes] = [:]
+            for it in items where origin[it.clipID] == nil {
+                if let kf = project.keyframedClip(it.clipID)?.keyframes { origin[it.clipID] = kf }
+            }
+            project.pushUndo()
+            dragOp = .moveKeyframes(grabTime: hit.time, items: items, originKF: origin)
+            return
+        }
         let playheadX = clock.currentTime * project.pixelsPerSecond
         // Dragging anywhere on the playhead stem (±10 px) moves the playhead.
         if abs(pt.x - playheadX) < 10 { dragOp = .movingPlayhead; return }
@@ -2086,7 +2179,8 @@ struct TimelineView: View {
             var ns = max(0, min(originStart + dt, originEnd - 0.1))
             let (snapped, sp) = snapEdge(ns, excluding: [id])
             ns = snapped; activeSnapTime = sp
-            project.updateImageClip(id: id) { $0.startTime = ns }
+            // 左边拖进来 / 拖出去：关键帧入点同步挪，关键帧还贴着原来那一刻
+            project.updateImageClip(id: id) { $0.shiftKeyframeIn(by: ns - $0.startTime); $0.startTime = ns }
         case .trimImageRight(let id, let originStart, let originEnd):
             var ne = max(originStart + 0.1, originEnd + dt)
             let (snapped, sp) = snapEdge(ne, excluding: [id])
@@ -2186,6 +2280,27 @@ struct TimelineView: View {
             ne = snapped; activeSnapTime = sp
             project.updateCompoundClip(id: id) { $0.endTime = ne }
             if ne > clock.duration { clock.duration = ne }
+        case .moveKeyframes(let grab, let items, let origin):
+            // 只动水平方向：竖直位移不看。多选时整组一起平移，
+            // 位移量夹到「谁都不出自己片段」的范围里，相对间距不变
+            activeSnapTime = nil
+            var lo = -Double.infinity, hi = Double.infinity
+            for it in items {
+                guard let c = project.keyframedClip(it.clipID) else { continue }
+                lo = max(lo, c.startTime - it.time)
+                hi = min(hi, c.endTime - 0.001 - it.time)
+            }
+            let d = lo <= hi ? min(max(dt, lo), hi) : 0
+            for (id, kf0) in origin {
+                let moves = items.filter { $0.clipID == id }.map { (from: $0.time, to: $0.time + d) }
+                project.updateKeyframedClip(id) { c in
+                    c.keyframes = kf0
+                    c.moveKeyframes(moves)
+                }
+            }
+            project.selectedKeyframes = items.map { KeyframeSelection(clipID: $0.clipID, time: $0.time + d) }
+            project.requestSeek(to: grab + d)
+            project.rebuildTimelinePreviewDebounced()
         case .movingPlayhead:
             activeSnapTime = nil
             let t = max(0, Double(current.x) / pps)
@@ -2226,6 +2341,99 @@ struct TimelineView: View {
     /// Returns the clip at `pt` plus which trim edge was hit (nil = interior / move).
     /// The edge hit zone is 8 px; clips narrower than 20 px are always treated as interior.
     /// 检测点击是否命中转场菱形图标，返回对应 clip 的 ID
+    /// 选中关键帧，连带选中它所在的视频片段（属性区才会显示它的 `< ◇ >`）
+    /// 选中关键帧。**不连带选中片段**：选着关键帧时删除 / 复制都只冲着关键帧去
+    private func selectKeyframe(_ hit: (clipID: UUID, time: Double)) {
+        project.clearClipSelections()      // 会把选中的关键帧也清掉，所以排在前面
+        project.selectedClipIDs.removeAll()
+        let sel = KeyframeSelection(clipID: hit.clipID, time: hit.time)
+        project.selectedKeyframes = [sel]
+        project.focusInspector(onKeyframe: sel)
+    }
+
+    private func isKeyframeSelected(_ hit: (clipID: UUID, time: Double)) -> Bool {
+        project.selectedKeyframes.contains { $0.clipID == hit.clipID && abs($0.time - hit.time) < 0.02 }
+    }
+
+    /// shift 点关键帧：没选中的加进来，选中的去掉
+    private func toggleKeyframeSelection(_ hit: (clipID: UUID, time: Double)) {
+        if isKeyframeSelected(hit) {
+            project.selectedKeyframes.removeAll { $0.clipID == hit.clipID && abs($0.time - hit.time) < 0.02 }
+        } else {
+            // 片段的选中去掉（选关键帧不连带片段）；已选的关键帧留着
+            if project.selectedKeyframes.isEmpty {
+                project.clearClipSelections()
+                project.selectedClipIDs.removeAll()
+            }
+            let sel = KeyframeSelection(clipID: hit.clipID, time: hit.time)
+            project.selectedKeyframes.append(sel)
+            project.focusInspector(onKeyframe: sel)
+        }
+    }
+
+    /// 点在哪个关键帧菱形上（菱形画在视频片段竖直正中，见 clipKeyframeDiamonds）
+    private func hitTestKeyframe(at pt: CGPoint) -> (clipID: UUID, time: Double)? {
+        guard pt.y >= rulerH else { return nil }
+        let pps = project.pixelsPerSecond
+        // 这一行里离指针最近的菱形（7pt 以内）
+        func pick(_ clips: [any KeyframeAnimatable]) -> (clipID: UUID, time: Double)? {
+            var best: (clipID: UUID, time: Double, d: CGFloat)?
+            for clip in clips where clip.hasKeyframes {
+                for t in clip.allKeyframeTimelineTimes()
+                where t >= clip.startTime - 0.001 && t <= clip.endTime + 0.001 {
+                    let d = abs(pt.x - t * pps)
+                    if d < 7, d < (best?.d ?? .infinity) { best = (clip.id, t, d) }
+                }
+            }
+            return best.map { ($0.clipID, $0.time) }
+        }
+        var rowTop: CGFloat = rulerH
+        var first = true
+        // 行位置跟 hitTestTransitionIcon 同一套（按界面上的排列走）：先叠加层（图片在这里），再视频区
+        for entry in visibleOverlays {
+            if !first { rowTop += 1 }; first = false
+            let h = overlayH(entry)
+            if pt.y >= rowTop && pt.y < rowTop + h {
+                guard abs(pt.y - (rowTop + h / 2)) < 9 else { return nil }
+                switch entry.kind {
+                case .image where project.imageTracks.indices.contains(entry.index):
+                    return pick(project.imageTracks[entry.index].clips)
+                case .text where project.textTracks.indices.contains(entry.index):
+                    return pick(project.textTracks[entry.index].clips)
+                case .shape where project.shapeTracks.indices.contains(entry.index):
+                    return pick(project.shapeTracks[entry.index].clips)
+                default:
+                    return nil
+                }
+            }
+            rowTop += h
+        }
+        if project.showVideoTracks {
+            for item in resolvedVideoSection {
+                if !first { rowTop += 1 }; first = false
+                let h = videoSectionH(item)
+                if pt.y >= rowTop && pt.y < rowTop + h {
+                    guard item.kind == .video, abs(pt.y - (rowTop + h / 2)) < 9 else { return nil }
+                    return pick(project.videoTracks[item.trackIndex].clips)
+                }
+                rowTop += h
+            }
+        }
+        // 音频区（音量关键帧）。行位置跟 trackIndexFromY 同一套
+        if project.showAudioTracks {
+            for item in resolvedAudioSection {
+                if !first { rowTop += 1 }; first = false
+                let h = audioSectionH(item)
+                if pt.y >= rowTop && pt.y < rowTop + h {
+                    guard item.kind == .audio, abs(pt.y - (rowTop + h / 2)) < 9 else { return nil }
+                    return pick(project.audioTracks[item.trackIndex].clips)
+                }
+                rowTop += h
+            }
+        }
+        return nil
+    }
+
     private func hitTestTransitionIcon(at pt: CGPoint) -> UUID? {
         guard pt.y >= rulerH, project.showVideoTracks else { return nil }
         let pps = project.pixelsPerSecond
@@ -2693,6 +2901,8 @@ struct TimelineView: View {
                         transitionIcons(trackIndex: i, trackHeight: vidH(i))
                         clipMarkerPins(project.videoTracks[i].clips, pps: project.pixelsPerSecond,
                                        trackHeight: vidH(i), startTime: \.startTime, markers: \.markers)
+                        clipKeyframeDiamonds(project.videoTracks[i].clips, pps: project.pixelsPerSecond,
+                                             trackHeight: vidH(i))
                     }
                     .offset(y: isTrackDragging(.video, secIdx) ? trackLabelDragOffset : 0)
                     .zIndex(isTrackDragging(.video, secIdx) ? 10 : 0)
@@ -2731,6 +2941,8 @@ struct TimelineView: View {
                         }
                         clipMarkerPins(project.audioTracks[i].clips, pps: project.pixelsPerSecond,
                                        trackHeight: audH(i), startTime: \.startTime, markers: \.markers)
+                        clipKeyframeDiamonds(project.audioTracks[i].clips, pps: project.pixelsPerSecond,
+                                             trackHeight: audH(i))
                     }
                     .offset(y: isTrackDragging(.audio, secIdx) ? trackLabelDragOffset : 0)
                     .zIndex(isTrackDragging(.audio, secIdx) ? 10 : 0)
@@ -2831,6 +3043,8 @@ struct TimelineView: View {
                 }
                 clipMarkerPins(project.imageTracks[i].clips, pps: project.pixelsPerSecond,
                                trackHeight: imgH(i), startTime: \.startTime, markers: \.markers)
+                clipKeyframeDiamonds(project.imageTracks[i].clips, pps: project.pixelsPerSecond,
+                                     trackHeight: imgH(i))
             }
         case .subtitle:
             trackRow(height: subH(i), hidden: !project.subtitleTracks[i].isVisible, tint: Color(hex: "#7B6FC4")) {
@@ -2853,6 +3067,8 @@ struct TimelineView: View {
                 }
                 clipMarkerPins(project.textTracks[i].clips, pps: project.pixelsPerSecond,
                                trackHeight: txtH(i), startTime: \.startTime, markers: \.markers)
+                clipKeyframeDiamonds(project.textTracks[i].clips, pps: project.pixelsPerSecond,
+                                     trackHeight: txtH(i))
             }
         case .shape:
             trackRow(height: shpH(i), hidden: !project.shapeTracks[i].isVisible, tint: Color(hex: "#5B8FF9")) {
@@ -2864,6 +3080,8 @@ struct TimelineView: View {
                 }
                 clipMarkerPins(project.shapeTracks[i].clips, pps: project.pixelsPerSecond,
                                trackHeight: shpH(i), startTime: \.startTime, markers: \.markers)
+                clipKeyframeDiamonds(project.shapeTracks[i].clips, pps: project.pixelsPerSecond,
+                                     trackHeight: shpH(i))
             }
         case .filter:
             trackRow(height: defaultSubTrackH,
@@ -3356,6 +3574,54 @@ struct TimelineView: View {
             // 但 hover 时 pin 变高到 14、顶部就成了 1，间距会跳一下 ——
             // 改成按高度算，两种状态都稳定在 2
             .position(x: entry.absTime * pps + 1, y: (isHov ? 14 : 12) / 2 + 2)
+            .allowsHitTesting(false)
+        }
+    }
+
+    /// 片段缩略图正中的关键帧菱形（所有属性合在一起，同一时刻只画一个）。
+    /// 点击 / 拖动走时间轴那个统一手势（hitTestKeyframe），这里只管画
+    @ViewBuilder
+    private func clipKeyframeDiamonds<Clip: Identifiable & KeyframeAnimatable>(
+        _ clips: [Clip], pps: Double, trackHeight: CGFloat
+    ) -> some View where Clip.ID == UUID {
+        // 同一属性相邻两帧之间连一条线；属性区正在调曲线的那一段画黄色，压在最上面
+        let live = clips.filter { $0.hasKeyframes && !isDraggingClip($0.id) }
+        let segs: [(id: String, x0: Double, x1: Double, hot: Bool)] = live.flatMap { clip in
+            KeyframeProp.allCases.flatMap { p -> [(id: String, x0: Double, x1: Double, hot: Bool)] in
+                let ts = clip.keyframeTimelineTimes(p)
+                guard ts.count >= 2 else { return [] }
+                return (0..<(ts.count - 1)).compactMap { i in
+                    let a = max(ts[i], clip.startTime), b = min(ts[i + 1], clip.endTime)
+                    guard b > a else { return nil }
+                    let hot = project.editingEasing == EasingSegmentRef(clipID: clip.id, prop: p, index: i)
+                    return ("\(clip.id)-\(p.rawValue)-\(i)", a, b, hot)
+                }
+            }
+        }.sorted { !$0.hot && $1.hot }
+        ForEach(segs, id: \.id) { sg in
+            Rectangle()
+                .fill(sg.hot ? Color(hex: "#E8A54B") : Color.white.opacity(0.75))
+                .frame(width: max(0, (sg.x1 - sg.x0) * pps), height: sg.hot ? 2 : 1.5)
+                .shadow(color: .black.opacity(0.25), radius: 0.5, y: 0.5)
+                .position(x: (sg.x0 + sg.x1) / 2 * pps, y: trackHeight / 2)
+                .allowsHitTesting(false)
+        }
+        ForEach(live.flatMap { clip in
+            clip.allKeyframeTimelineTimes()
+                .filter { $0 >= clip.startTime - 0.001 && $0 <= clip.endTime + 0.001 }
+                .map { (id: "\(clip.id)-\($0)", clipID: clip.id, t: $0) }
+        }, id: \.id) { entry in
+            let isSel = project.selectedKeyframes.contains { $0.clipID == entry.clipID && abs($0.time - entry.t) < 0.02 }
+            ZStack {
+                Image(systemName: "diamond.fill")
+                    .font(.system(size: 11))
+                    .foregroundColor(isSel ? Color(hex: "#E8A54B") : .white)
+                Image(systemName: "diamond")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundColor(Color.black.opacity(0.45))
+            }
+            .shadow(color: .black.opacity(0.35), radius: 0.5, y: 0.5)
+            .position(x: entry.t * pps, y: trackHeight / 2)
             .allowsHitTesting(false)
         }
     }

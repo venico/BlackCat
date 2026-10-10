@@ -61,7 +61,9 @@ final class AgentToolGate {
                         "加进", "放到", "素材库", "剪",
                         "顺序", "置顶", "盖住", "上层", "下层", "换轨",
                         "图形", "形状", "矩形", "方块", "圆形", "椭圆", "三角", "箭头", "线条",
-                        "填充", "圆角", "投影", "阴影", "描边", "颜色", "透明"]
+                        "填充", "圆角", "投影", "阴影", "描边", "颜色", "透明",
+                        "关键帧", "动画", "动起来", "移动到", "飞入", "飞出", "渐显", "渐隐", "淡入", "淡出",
+                        "放大", "缩小", "旋转", "音量", "渐强", "渐弱", "keyframe"]
             case .canvas:
                 return ["画布", "卡片", "连线", "节点", "连到", "画板"]
             case .generate:
@@ -194,7 +196,9 @@ final class AgentToolGate {
                     + AgentToolbox.editTools
                     + (AgentToolbox.studioTools + AgentToolbox.mediaTools).filter { crossGroup.contains($0.name) }
                     // 通用读写属性：专门工具没开放的参数靠它兜底
-                    + AgentToolbox.propsTools)
+                    + AgentToolbox.propsTools
+                    // 关键帧动画 / 音量曲线
+                    + AgentToolbox.keyframeTools)
                 .filter { !Self.alwaysOnNames.contains($0.name) }
         case .canvas:   return (AgentToolbox.canvasTools + AgentToolbox.canvasEditTools)
                 .filter { !Self.alwaysOnNames.contains($0.name) }

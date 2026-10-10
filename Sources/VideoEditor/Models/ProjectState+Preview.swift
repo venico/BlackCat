@@ -118,9 +118,9 @@ extension ProjectState {
 
         // 指纹检测：跳过无变化的重复 rebuild（seekTo 除外）
         var hasher = Hasher()
-        hasher.combine(vTracks.flatMap(\.clips).map { "\($0.id)\($0.startTime)\($0.endTime)\($0.trimStart)\($0.speed)\($0.volume)\($0.scaleX)\($0.scaleY)\($0.offsetX)\($0.offsetY)\($0.cropTop)\($0.cropBottom)\($0.cropLeft)\($0.cropRight)\($0.audioTrackIndex)\($0.inTransition?.type.rawValue ?? "")\($0.inTransition?.duration ?? 0)\($0.colorAdjust.brightness)\($0.colorAdjust.contrast)\($0.colorAdjust.saturation)\($0.colorAdjust.hue)\($0.mirrorH)\($0.mirrorV)\($0.rotation)\($0.reversed)" }.joined())
+        hasher.combine(vTracks.flatMap(\.clips).map { "\($0.id)\($0.startTime)\($0.endTime)\($0.trimStart)\($0.speed)\($0.volume)\($0.scaleX)\($0.scaleY)\($0.offsetX)\($0.offsetY)\($0.cropTop)\($0.cropBottom)\($0.cropLeft)\($0.cropRight)\($0.audioTrackIndex)\($0.inTransition?.type.rawValue ?? "")\($0.inTransition?.duration ?? 0)\($0.colorAdjust.brightness)\($0.colorAdjust.contrast)\($0.colorAdjust.saturation)\($0.colorAdjust.hue)\($0.mirrorH)\($0.mirrorV)\($0.rotation)\($0.reversed)\($0.opacity ?? 1)\($0.angle ?? 0)\($0.keyframes?.hashValue ?? 0)" }.joined())
         hasher.combine(iTracks.flatMap(\.clips).map { "\($0.id)\($0.startTime)\($0.endTime)\($0.scaleX)\($0.scaleY)\($0.offsetX)\($0.offsetY)\($0.cropTop)\($0.cropBottom)\($0.cropLeft)\($0.cropRight)\($0.colorAdjust.brightness)\($0.colorAdjust.contrast)\($0.colorAdjust.saturation)\($0.colorAdjust.hue)\($0.mirrorH)\($0.mirrorV)\($0.rotation)" }.joined())
-        hasher.combine(aTracks.flatMap(\.clips).map { "\($0.id)\($0.startTime)\($0.endTime)\($0.trimStart)\($0.speed)\($0.volume)\($0.leftChannel)\($0.rightChannel)\($0.fadeInEnabled)\($0.fadeInDuration)\($0.fadeOutEnabled)\($0.fadeOutDuration)" }.joined())
+        hasher.combine(aTracks.flatMap(\.clips).map { "\($0.id)\($0.startTime)\($0.endTime)\($0.trimStart)\($0.speed)\($0.volume)\($0.leftChannel)\($0.rightChannel)\($0.fadeInEnabled)\($0.fadeInDuration)\($0.fadeOutEnabled)\($0.fadeOutDuration)\($0.keyframes?.hashValue ?? 0)" }.joined())
         hasher.combine(vTracks.map { "\($0.isVisible)\($0.isMuted)" }.joined())
         hasher.combine(iTracks.map { "\($0.isVisible)" }.joined())
         hasher.combine(aTracks.map { "\($0.isVisible)\($0.isMuted)" }.joined())
@@ -153,6 +153,8 @@ extension ProjectState {
         rebuildTask = Task {
             let composition = AVMutableComposition()
             var audioParams: [(trackID: CMPersistentTrackID, volume: Float, left: Float, right: Float, startTime: Double, duration: Double, fadeIn: Double, fadeOut: Double)] = []
+            /// 打了音量关键帧的片段：音轨 → 音量曲线取样点（混音时按它写 ramp，没有的照旧用静态音量）
+            var volumeCurves: [CMPersistentTrackID: [(t: Double, v: Float)]] = [:]
             var videoCompTracks: [(track: AVMutableCompositionTrack, clip: VideoClip, startTime: Double, endTime: Double)] = []  // from video clips
             var imageCompTracks: [(track: AVMutableCompositionTrack, clip: ImageClip)] = []  // from image clips (on top)
             let renderSize = previewRenderSize
@@ -271,6 +273,7 @@ extension ProjectState {
                                         let ins = CMTimeMinimum(sDur, CMTime(seconds: useDur.seconds, preferredTimescale: 44100))
                                         try? at2.insertTimeRange(CMTimeRange(start: .zero, duration: ins), of: sTrack, at: audioAt)
                                         audioParams.append((at2.trackID, clip.volume, 1.0, 1.0, clip.startTime, ins.seconds, 0, 0))
+                                    if let c = VolumeCurve.points(for: clip, start: clip.startTime, duration: ins.seconds) { volumeCurves[at2.trackID] = c }
                                     }
                                 }
                             } else if clip.reversed {
@@ -282,6 +285,7 @@ extension ProjectState {
                                     let useDurC = CMTimeMinimum(revDur, CMTime(seconds: useDur.seconds, preferredTimescale: 44100))
                                     try? at2.insertTimeRange(CMTimeRange(start: .zero, duration: useDurC), of: aTrack, at: audioAt)
                                     audioParams.append((at2.trackID, clip.volume, 1.0, 1.0, clip.startTime, useDurC.seconds, 0, 0))
+                                    if let c = VolumeCurve.points(for: clip, start: clip.startTime, duration: useDurC.seconds) { volumeCurves[at2.trackID] = c }
                                 }
                             } else {
                                 let allAudioTracks = (try? await asset.loadTracks(withMediaType: .audio)) ?? []
@@ -294,6 +298,7 @@ extension ProjectState {
                                     let useDurC = CMTime(seconds: useDur.seconds, preferredTimescale: ats)
                                     try? at2.insertTimeRange(CMTimeRange(start: trimSt, duration: useDurC), of: aAsset, at: audioAt)
                                     audioParams.append((at2.trackID, clip.volume, 1.0, 1.0, clip.startTime, useDur.seconds, 0, 0))
+                                    if let c = VolumeCurve.points(for: clip, start: clip.startTime, duration: useDur.seconds) { volumeCurves[at2.trackID] = c }
                                 }
                             }
                         }
@@ -351,6 +356,8 @@ extension ProjectState {
                                     var dummyClip = subClip
                                     dummyClip.startTime = clampedStart
                                     dummyClip.endTime = clampedEnd
+                                    // 起点挪了，入点跟着挪 —— 关键帧按「入点 + 离起点多远」换算源素材时间
+                                    dummyClip.trimStart = effectiveTrimStart
                                     videoCompTracks.append((vt, dummyClip, clampedStart, clampedEnd))
                                 }
                                 if !cTrack.isMuted {
@@ -526,6 +533,7 @@ extension ProjectState {
                                 let fadeIn  = clip.fadeInEnabled  ? min(max(0, clip.fadeInDuration),  effDur) : 0
                                 let fadeOut = clip.fadeOutEnabled ? min(max(0, clip.fadeOutDuration), max(0, effDur - fadeIn)) : 0
                                 audioParams.append((at2.trackID, clip.volume, clip.leftChannel, clip.rightChannel, clip.startTime, effDur, fadeIn, fadeOut))
+                                if let c = VolumeCurve.points(for: clip, start: clip.startTime, duration: effDur) { volumeCurves[at2.trackID] = c }
                             }
                         }
                     } else {
@@ -538,7 +546,8 @@ extension ProjectState {
 
                         // 只有「无淡入淡出」才进复用池：有 fade 的要按各自时间段加
                         // volume ramp，共用一条 track 会让 ramp 互相打架
-                        let poolKey = (fadeIn > 0 || fadeOut > 0) ? nil
+                        // 打了音量关键帧的也不进：曲线要按各自时间段写 ramp
+                        let poolKey = (fadeIn > 0 || fadeOut > 0 || clip.keyframes?.has(.volume) == true) ? nil
                             : "v\(clip.volume)-l\(clip.leftChannel)-r\(clip.rightChannel)"
 
                         // 同签名里找一条已经排到本片段起点之前的，续在它后面
@@ -553,6 +562,7 @@ extension ProjectState {
                                                                   preferredTrackID: kCMPersistentTrackID_Invalid) {
                             try? at2.insertTimeRange(CMTimeRange(start: trimSt, duration: useDur), of: aAsset, at: at)
                             audioParams.append((at2.trackID, clip.volume, clip.leftChannel, clip.rightChannel, clip.startTime, effDur, fadeIn, fadeOut))
+                                if let c = VolumeCurve.points(for: clip, start: clip.startTime, duration: effDur) { volumeCurves[at2.trackID] = c }
                             if let key = poolKey {
                                 audioLanePool[key, default: []].append((at2, clipEnd))
                             }
@@ -580,7 +590,11 @@ extension ProjectState {
                 let ts: CMTimeScale = 600
                 let clipStart = CMTime(seconds: param.startTime, preferredTimescale: ts)
                 let clipDur   = param.duration
-                if param.fadeIn > 0 || param.fadeOut > 0 {
+                if let curve = volumeCurves[param.trackID] {
+                    // 音量关键帧：按曲线写 ramp（淡入淡出乘在上面）
+                    VolumeCurve.apply(p, points: curve, start: param.startTime, duration: clipDur,
+                                      fadeIn: param.fadeIn, fadeOut: param.fadeOut)
+                } else if param.fadeIn > 0 || param.fadeOut > 0 {
                     // volume ramp 必须按时间递增顺序添加：淡入 → 中间 → 淡出，否则 AVFoundation 抛异常崩溃
                     // 1) 淡入：0 → volume
                     if param.fadeIn > 0 {
@@ -802,10 +816,13 @@ extension ProjectState {
                 mirrorH:     clip.mirrorH,
                 mirrorV:     clip.mirrorV,
                 rotation:    Double(clip.rotation),
+                baseOpacity: clip.alpha,
                 naturalSize: natSize,
                 sourceTransform: (try? await entry.track.load(.preferredTransform)) ?? .identity,
                 opacityRamp: nil,
                 pushRamp:    nil)
+            te.fineAngle = clip.angleDeg
+            if clip.hasKeyframes { te.keyframedClip = clip }
             // 转场渐变
             for trans in transitionInfos {
                 let isA = entry.track === trans.trackA

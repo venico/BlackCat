@@ -790,6 +790,8 @@ actor TimelineExporter {
 
         let composition = AVMutableComposition()
         var audioMixParams: [(trackID: CMPersistentTrackID, volume: Float, left: Float, right: Float, startTime: Double, duration: Double, fadeIn: Double, fadeOut: Double)] = []
+        /// 打了音量关键帧的片段：音轨 → 音量曲线取样点（混音时按它写 ramp，没有的照旧用静态音量）
+        var volumeCurves: [CMPersistentTrackID: [(t: Double, v: Float)]] = [:]
         var sourceVideoSize: CGSize = CGSize(width: 1920, height: 1080)
         var sourceFrameDuration: CMTime = CMTime(value: 1, timescale: 30)
         let includeVideo = settings.content == .video
@@ -916,6 +918,7 @@ actor TimelineExporter {
                                 let ins  = CMTimeMinimum(sDur, CMTime(seconds: useDur.seconds, preferredTimescale: 44100))
                                 try? at2.insertTimeRange(CMTimeRange(start: .zero, duration: ins), of: sTrack, at: aAt)
                                 audioMixParams.append((at2.trackID, clip.volume, 1.0, 1.0, clip.startTime, ins.seconds, 0, 0))
+                                    if let c = VolumeCurve.points(for: clip, start: clip.startTime, duration: ins.seconds) { volumeCurves[at2.trackID] = c }
                             }
                         }
                     } else if clip.reversed {
@@ -927,6 +930,7 @@ actor TimelineExporter {
                             let useDurC = CMTimeMinimum(revDur, CMTime(seconds: useDur.seconds, preferredTimescale: 44100))
                             try? at2.insertTimeRange(CMTimeRange(start: .zero, duration: useDurC), of: aTrack, at: aAt)
                             audioMixParams.append((at2.trackID, clip.volume, 1.0, 1.0, clip.startTime, useDurC.seconds, 0, 0))
+                                    if let c = VolumeCurve.points(for: clip, start: clip.startTime, duration: useDurC.seconds) { volumeCurves[at2.trackID] = c }
                         }
                     } else {
                         let allAudioTracks = (try? await asset.loadTracks(withMediaType: .audio)) ?? []
@@ -939,6 +943,7 @@ actor TimelineExporter {
                             let aSrcDur = CMTime(seconds: srcContentDurSec, preferredTimescale: ats)
                             try? at2.insertTimeRange(CMTimeRange(start: aStart, duration: aSrcDur), of: aAsset, at: aAt)
                             audioMixParams.append((at2.trackID, clip.volume, 1.0, 1.0, clip.startTime, useDur.seconds, 0, 0))
+                                    if let c = VolumeCurve.points(for: clip, start: clip.startTime, duration: useDur.seconds) { volumeCurves[at2.trackID] = c }
                         }
                     }
                 }
@@ -999,7 +1004,12 @@ actor TimelineExporter {
                                     vt.scaleTimeRange(CMTimeRange(start: atCM, duration: exSrc),
                                                        toDuration: CMTime(seconds: visDur, preferredTimescale: 600))
                                 }
-                                videoCompTracks.append((track: vt, clip: clip, startTime: mainAt, endTime: mainAt + visDur))
+                                // 换算成合成时间轴上的起点和入点，关键帧才能按合成时间求值（同预览那边）
+                                var kfClip = clip
+                                kfClip.startTime = mainAt
+                                kfClip.endTime = mainAt + visDur
+                                kfClip.trimStart = adjTrim
+                                videoCompTracks.append((track: vt, clip: kfClip, startTime: mainAt, endTime: mainAt + visDur))
                             }
                             if firstVideoClipID == nil {
                                 firstVideoClipID = clip.id
@@ -1127,6 +1137,7 @@ actor TimelineExporter {
                     let fadeIn  = clip.fadeInEnabled  ? min(max(0, clip.fadeInDuration),  effDur) : 0
                     let fadeOut = clip.fadeOutEnabled ? min(max(0, clip.fadeOutDuration), max(0, effDur - fadeIn)) : 0
                     audioMixParams.append((tid, clip.volume, clip.leftChannel, clip.rightChannel, clip.startTime, effDur, fadeIn, fadeOut))
+                    if let c = VolumeCurve.points(for: clip, start: clip.startTime, duration: effDur) { volumeCurves[tid] = c }
                 }
             }
         }
@@ -1226,7 +1237,11 @@ actor TimelineExporter {
             p.trackID = param.trackID
             let ts: CMTimeScale = 600
             let clipStart = CMTime(seconds: param.startTime, preferredTimescale: ts)
-            if param.fadeIn > 0 || param.fadeOut > 0 {
+            if let curve = volumeCurves[param.trackID] {
+                // 音量关键帧：按曲线写 ramp（淡入淡出乘在上面），跟预览同一份算法
+                VolumeCurve.apply(p, points: curve, start: param.startTime, duration: param.duration,
+                                  fadeIn: param.fadeIn, fadeOut: param.fadeOut)
+            } else if param.fadeIn > 0 || param.fadeOut > 0 {
                 // volume ramp 必须按时间递增顺序添加：淡入 → 中间 → 淡出，否则 AVFoundation 抛异常崩溃
                 if param.fadeIn > 0 {
                     p.setVolumeRamp(fromStartVolume: 0, toEndVolume: param.volume,
@@ -1970,7 +1985,8 @@ actor TimelineExporter {
                                                 if let clips = imageClipsByTrack[trackID],
                                                    let clip = clips.first(where: { $0.startTime <= targetTime && $0.endTime > targetTime }),
                                                    let overlay = OverlayRenderer.renderImageOverlay(
-                                                       clip: clip, renderSize: renderSize, ciCache: imageCICache) {
+                                                       clip: clip, renderSize: renderSize, ciCache: imageCICache,
+                                                       atTime: targetTime) {
                                                     image = overlay.composited(over: image)
                                                 }
                                             case .subtitle(_):

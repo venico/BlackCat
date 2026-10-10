@@ -99,21 +99,11 @@ struct ProjectInspector: View {
                     }
                 }
 
-                HStack {
-                    Text("码率")
-                        .font(.system(size: 10))
-                        .foregroundColor(Color.labelSecondary)
-                    Spacer()
-                    Text("\(project.projectBitrate) kbps")
-                        .font(.system(size: 10, weight: .medium).monospacedDigit())
-                        .foregroundColor(Color.labelPrimary)
-                }
-                // 不用 step：macOS 上带 step 的 Slider 会画出刻度线，改为赋值时取整
-                Slider(value: Binding(
+                // 用属性区统一的胶囊滑块（可拖可直接输数），赋值时按 500 取整
+                ICapsuleSlider(label: "码率", value: Binding(
                     get: { Double(project.projectBitrate) },
                     set: { project.projectBitrate = Int(($0 / 500).rounded()) * 500 }
-                ), in: 1000...50000)
-                .tint(Color.accent)
+                ), range: 1000...50000, unit: "kbps")
             }
         }
         .onAppear { syncDrafts() }

@@ -19,6 +19,7 @@ struct InspectorView: View {
         VStack(spacing: 0) {
             header
             GeometryReader { geo in
+             ScrollViewReader { proxy in
               ScrollView(showsIndicators: false) {
                 // 统一给所有属性面板留出底部间距，各 Inspector 不必各自处理
                 Group {
@@ -43,17 +44,19 @@ struct InspectorView: View {
                         FilterInspector(clip: clip).id(clip.id)
                     } else if let transID = project.selectedTransitionClipID {
                         TransitionInspector(clipID: transID)
-                    } else if let clip = project.selectedTextClip {
+                    } else if let clip = project.selectedTextClip ?? project.keyframeOwnerText {
                         TextInspector(clip: clip).id(clip.id)
-                    } else if let clip = project.selectedShapeClip {
+                    } else if let clip = project.selectedShapeClip ?? project.keyframeOwnerShape {
                         ShapeInspector(clip: clip).id(clip.id)
                     } else if let clip = project.selectedSubtitleClip {
                         SubtitleInspector(clip: clip).id(clip.id)
-                    } else if let clip = project.selectedImageClip {
+                    } else if let clip = project.selectedImageClip ?? project.keyframeOwnerImage {
+                        // 选着关键帧时片段本身不算选中，但属性区照样显示它所在片段的属性
                         ImageInspector(clip: clip).id(clip.id)
-                    } else if let clip = project.selectedVideoClip {
+                    } else if let clip = project.selectedVideoClip ?? project.keyframeOwnerClip {
+                        // 选着关键帧时片段本身不算选中，但属性区照样显示它所在片段的属性
                         VideoInspector(clip: clip).id(clip.id)
-                    } else if let clip = project.selectedAudioClip {
+                    } else if let clip = project.selectedAudioClip ?? project.keyframeOwnerAudio {
                         AudioInspector(clip: clip).id(clip.id)
                     } else if let clip = project.selectedCompoundClip {
                         CompoundInspector(clip: clip).id(clip.id)
@@ -70,6 +73,25 @@ struct InspectorView: View {
                 // 就往两边溢出，左边那一列（按钮、滑块标签）直接被裁掉
                 .frame(width: geo.size.width, alignment: .leading)
               }
+              // 选中关键帧 → 滚到它所属的那个属性。稍等一拍：面板可能刚从「项目」换成「视频」，
+              // 调节那组也可能刚展开，行还没排好
+              .onChange(of: project.inspectorFocus) { f in
+                  guard let f else { return }
+                  // 面板刚换过来时第一下滚不到位（实测停在半路），排好之后再补一下
+                  DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
+                      proxy.scrollTo("kf-\(f.prop.rawValue)", anchor: .center)
+                  }
+                  DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+                      withAnimation(.easeInOut(duration: 0.2)) {
+                          proxy.scrollTo("kf-\(f.prop.rawValue)", anchor: .center)
+                      }
+                      // 用完就清，不然之后正常选片段时调节那组也会被自动展开
+                      DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                          if project.inspectorFocus == f { project.inspectorFocus = nil }
+                      }
+                  }
+              }
+             }
             }
         }
     }
@@ -142,6 +164,11 @@ struct InspectorView: View {
         if project.selectedVideoClipID      != nil { return "视频" }
         if project.selectedAudioClipID      != nil { return "音频" }
         if project.selectedCompoundClipID   != nil { return "复合片段" }
+        if project.keyframeOwnerClip        != nil { return "视频" }
+        if project.keyframeOwnerImage       != nil { return "图片" }
+        if project.keyframeOwnerText        != nil { return "文字" }
+        if project.keyframeOwnerShape       != nil { return "图形" }
+        if project.keyframeOwnerAudio       != nil { return "音频" }
         return "项目"
     }
 
@@ -158,6 +185,34 @@ struct InspectorView: View {
             || project.selectedAudioClipID != nil || project.selectedSubtitleClipID != nil
             || project.selectedCompoundClipID != nil {
             return { project.deleteSelected() }
+        }
+        // 只选着关键帧时属性区显示的是它所在的片段，删除图标照旧删这个片段
+        if let owner = project.keyframeOwnerClip {
+            return {
+                project.selectedKeyframes = []
+                project.selectedVideoClipID = owner.id
+                project.deleteSelected()
+            }
+        }
+        if let owner = project.keyframeOwnerImage {
+            return {
+                project.selectedKeyframes = []
+                project.selectedImageClipID = owner.id
+                project.deleteSelected()
+            }
+        }
+        if let owner = project.keyframeOwnerText {
+            return { project.selectedKeyframes = []; project.deleteTextClip(id: owner.id) }
+        }
+        if let owner = project.keyframeOwnerShape {
+            return { project.selectedKeyframes = []; project.deleteShapeClip(id: owner.id) }
+        }
+        if let owner = project.keyframeOwnerAudio {
+            return {
+                project.selectedKeyframes = []
+                project.selectedAudioClipID = owner.id
+                project.deleteSelected()
+            }
         }
         return nil
     }
@@ -1224,6 +1279,13 @@ private struct TextInspector: View {
     @State private var rotation: Double = 0
     @State private var opacity: Double = 1
     @State private var animation: TextAnimation = .none
+    // 裁剪也存一份：打了关键帧时显示的是播放头这一刻的值
+    @State private var cropT = 0.0
+    @State private var cropB = 0.0
+    @State private var cropL = 0.0
+    @State private var cropR = 0.0
+    /// 展开了曲线面板的属性。默认都收着
+    @State private var easingOpen: Set<KeyframeProp> = []
     @State private var syncing = false
     /// 面板最近一次写进去的片段，用来认出「自己写入引起的回流」
     @State private var lastWritten: TextClip? = nil
@@ -1272,7 +1334,15 @@ private struct TextInspector: View {
                         MiniStepper(value: $fontSize, step: 1, decimals: 0, minValue: 8, maxValue: 300)
                             .onChange(of: fontSize) { _ in write { $0.fontSize = CGFloat(fontSize) } }
                     }.frame(width: 92)
+                    // 字号能打关键帧（字变大变小的动画）：展开箭头 + `< ◇ >`，曲线面板在下面
+                    HStack(spacing: 2) {
+                        if let t = kf.toggle(.fontSize) { t }
+                        kf.nav(.fontSize)
+                    }
+                    .frame(height: 26)
                 }
+                kf.panel(.fontSize)
+                    .id("kf-fontSize")
                 HStack(spacing: 8) {
                     styleGlyph("B", isOn: bold, weight: .bold) { bold.toggle(); write { $0.bold = bold } }
                     styleGlyph("I", isOn: italic, italic: true) { italic.toggle(); write { $0.italic = italic } }
@@ -1311,6 +1381,7 @@ private struct TextInspector: View {
 
             // 六组共同属性，跟图片、图形、封面那三个面板同一份
             LayerCommonSections(
+                keyframeHooks: kf.hooks,
                 mirrorH: Binding(get: { clip.mirrorH }, set: { v in write { $0.mirrorH = v } }),
                 mirrorV: Binding(get: { clip.mirrorV }, set: { v in write { $0.mirrorV = v } }),
                 rotation: Binding(get: { rotation }, set: { rotation = $0; write { $0.rotation = rotation } }),
@@ -1339,10 +1410,10 @@ private struct TextInspector: View {
                                     set: { v in write { $0.lockBoxAspect = v } }),
                 scaleRange: 20...2000,
                 scaleUnit: "px",
-                cropTop: Binding(get: { clip.cropTop * 100 }, set: { v in write { $0.cropTop = v / 100 } }),
-                cropBottom: Binding(get: { clip.cropBottom * 100 }, set: { v in write { $0.cropBottom = v / 100 } }),
-                cropLeft: Binding(get: { clip.cropLeft * 100 }, set: { v in write { $0.cropLeft = v / 100 } }),
-                cropRight: Binding(get: { clip.cropRight * 100 }, set: { v in write { $0.cropRight = v / 100 } }),
+                cropTop: Binding(get: { cropT * 100 }, set: { v in cropT = v / 100; write { $0.cropTop = v / 100 } }),
+                cropBottom: Binding(get: { cropB * 100 }, set: { v in cropB = v / 100; write { $0.cropBottom = v / 100 } }),
+                cropLeft: Binding(get: { cropL * 100 }, set: { v in cropL = v / 100; write { $0.cropLeft = v / 100 } }),
+                cropRight: Binding(get: { cropR * 100 }, set: { v in cropR = v / 100; write { $0.cropRight = v / 100 } }),
                 opacity: Binding(get: { opacity * 100 },
                                  set: { opacity = $0 / 100; write { $0.opacity = opacity } }),
                 // 文字没有圆角（背景框的圆角跟着字号走）
@@ -1381,20 +1452,34 @@ private struct TextInspector: View {
             guard !syncing, newClip != lastWritten else { return }
             syncAll(from: newClip)
         }
+        // 打过关键帧的话，属性区显示的是播放头这一刻的值
+        .onReceive(project.clock.$currentTime) { t in
+            if fresh.hasKeyframes { syncAll(from: fresh, at: t) }
+        }
+    }
+
+    /// 最新的片段（回调里别读 self.clip，那是改之前的）
+    private var fresh: TextClip { project.textTracks.flatMap(\.clips).first { $0.id == clip.id } ?? clip }
+
+    private var kf: KeyframeControls {
+        KeyframeControls(project: project, clip: clip, easingOpen: $easingOpen)
     }
 
     private func write(_ mutate: (inout TextClip) -> Void) {
         guard !syncing else { return }
-        project.updateTextClip(id: clip.id, mutate)
+        // 按播放头写：打过关键帧的属性写进关键帧，其余照旧
+        project.updateTextClipAnimated(id: clip.id, mutate)
         lastWritten = project.textTracks.lazy.flatMap(\.clips).first { $0.id == clip.id }
         project.pushUndoThrottled()
     }
     /// 把片段的值同步进面板。
     /// - Parameter src: 数据源。onChange 必须传闭包给的**新值**——
     ///   视图属性 `clip` 在闭包里是旧快照
-    private func syncAll(from src: TextClip? = nil) {
-        let c = src ?? clip
+    private func syncAll(from src: TextClip? = nil, at t: Double? = nil) {
+        // 能打关键帧的那几项显示播放头这一刻的值
+        let c = (src ?? clip).animated(atTimeline: t ?? project.currentTime)
         syncing = true
+        cropT = c.cropTop; cropB = c.cropBottom; cropL = c.cropLeft; cropR = c.cropRight
         text = c.text; startTime = c.startTime; endTime = c.endTime
         fontName = c.fontName; fontSize = Double(c.fontSize)
         bold = c.bold; italic = c.italic
@@ -1429,6 +1514,13 @@ private struct ShapeInspector: View {
 
     @State private var startTime = 0.0
     @State private var endTime = 0.0
+    // 裁剪也存一份：打了关键帧时显示的是播放头这一刻的值
+    @State private var cropT = 0.0
+    @State private var cropB = 0.0
+    @State private var cropL = 0.0
+    @State private var cropR = 0.0
+    /// 展开了曲线面板的属性。默认都收着
+    @State private var easingOpen: Set<KeyframeProp> = []
     @State private var width = 100.0
     @State private var height = 100.0
     @State private var scale = 100.0
@@ -1483,6 +1575,7 @@ private struct ShapeInspector: View {
 
             // 六组共同属性，跟图片、文字、封面那三个面板同一份
             LayerCommonSections(
+                keyframeHooks: KeyframeControls(project: project, clip: clip, easingOpen: $easingOpen).hooks,
                 mirrorH: Binding(get: { clip.mirrorH }, set: { v in write { $0.mirrorH = v } }),
                 mirrorV: Binding(get: { clip.mirrorV }, set: { v in write { $0.mirrorV = v } }),
                 rotation: Binding(get: { rotation }, set: { rotation = $0; write { $0.rotation = rotation } }),
@@ -1496,10 +1589,10 @@ private struct ShapeInspector: View {
                 scaleW: Binding(get: { scaleXPct }, set: { scaleXPct = $0; write { $0.scaleX = scaleXPct / 100 } }),
                 scaleH: Binding(get: { scaleYPct }, set: { scaleYPct = $0; write { $0.scaleY = scaleYPct / 100 } }),
                 lockAspect: Binding(get: { lockAspect }, set: { lockAspect = $0; write { $0.lockAspect = lockAspect } }),
-                cropTop: Binding(get: { clip.cropTop * 100 }, set: { v in write { $0.cropTop = v / 100 } }),
-                cropBottom: Binding(get: { clip.cropBottom * 100 }, set: { v in write { $0.cropBottom = v / 100 } }),
-                cropLeft: Binding(get: { clip.cropLeft * 100 }, set: { v in write { $0.cropLeft = v / 100 } }),
-                cropRight: Binding(get: { clip.cropRight * 100 }, set: { v in write { $0.cropRight = v / 100 } }),
+                cropTop: Binding(get: { cropT * 100 }, set: { v in cropT = v / 100; write { $0.cropTop = v / 100 } }),
+                cropBottom: Binding(get: { cropB * 100 }, set: { v in cropB = v / 100; write { $0.cropBottom = v / 100 } }),
+                cropLeft: Binding(get: { cropL * 100 }, set: { v in cropL = v / 100; write { $0.cropLeft = v / 100 } }),
+                cropRight: Binding(get: { cropR * 100 }, set: { v in cropR = v / 100; write { $0.cropRight = v / 100 } }),
                 opacity: Binding(get: { opacity * 100 }, set: { opacity = $0 / 100; write { $0.opacity = opacity } }),
                 cornerRadius: Binding(get: { cornerRadius },
                                       set: { cornerRadius = $0; write { $0.cornerRadius = cornerRadius } }),
@@ -1588,6 +1681,23 @@ private struct ShapeInspector: View {
         }
         .onAppear { syncAll() }
         .onChange(of: clip.id) { _ in syncAll() }
+        // 打过关键帧的话，属性区显示的是播放头这一刻的值
+        .onChange(of: clip.keyframes) { _ in syncAnimated() }
+        .onReceive(project.clock.$currentTime) { t in
+            if fresh.hasKeyframes { syncAnimated(at: t) }
+        }
+    }
+
+    /// 最新的片段（回调里别读 self.clip，那是改之前的）
+    private var fresh: ShapeClip { project.shapeTracks.flatMap(\.clips).first { $0.id == clip.id } ?? clip }
+
+    /// 能打关键帧的那几项按播放头这一刻同步。不碰 syncing（只是显示值，不会触发写回）
+    private func syncAnimated(at t: Double? = nil) {
+        let a = fresh.animated(atTimeline: t ?? project.currentTime)
+        func set(_ s: inout Double, _ v: Double) { if abs(s - v) > 1e-6 { s = v } }
+        set(&posX, a.posX); set(&posY, a.posY); set(&rotation, a.rotation); set(&opacity, a.opacity)
+        set(&scaleXPct, a.scaleX * 100); set(&scaleYPct, a.scaleY * 100); set(&scale, a.scaleX * 100)
+        set(&cropT, a.cropTop); set(&cropB, a.cropBottom); set(&cropL, a.cropLeft); set(&cropR, a.cropRight)
     }
 
     private var clipNow: ShapeClip { project.selectedShapeClip ?? clip }
@@ -1610,7 +1720,8 @@ private struct ShapeInspector: View {
 
     private func write(_ mutate: (inout ShapeClip) -> Void) {
         guard !syncing else { return }
-        for id in targetIDs { project.updateShapeClip(id: id, mutate) }
+        // 按播放头写：打过关键帧的属性写进关键帧，其余照旧
+        for id in targetIDs { project.updateShapeClipAnimated(id: id, mutate) }
         project.pushUndoThrottled()
     }
 
@@ -1720,6 +1831,7 @@ private struct ShapeInspector: View {
         cornerRadius = clip.cornerRadius
         shadowEnabled = clip.shadowEnabled; shadowColor = clip.shadowColor
         shadowRadius = clip.shadowRadius; shadowOffsetX = clip.shadowOffsetX; shadowOffsetY = clip.shadowOffsetY
+        syncAnimated()
         shadowOpacityV = clip.shadowOpacity
         shadowDistance = hypot(clip.shadowOffsetX, clip.shadowOffsetY)
         shadowAngle = atan2(clip.shadowOffsetY, clip.shadowOffsetX) * 180 / .pi
@@ -1770,6 +1882,20 @@ private struct ImageInspector: View {
     @State private var strokeColor: Color = .white
     @State private var strokeWidth: Double = 0
     @State private var strokeSoftness: Double = 0
+    // 旋转 / 不透明度：打了关键帧时显示播放头这一刻的值，所以也存一份
+    @State private var rotation: Double = 0
+    @State private var opacity: Double = 1
+    /// 展开了曲线面板的属性。默认都收着
+    @State private var easingOpen: Set<KeyframeProp> = []
+
+    /// 最新的片段（回调里别读 self.clip，那是改之前的）
+    private var current: ImageClip {
+        project.imageTracks.flatMap(\.clips).first { $0.id == clip.id } ?? clip
+    }
+
+    private var kf: KeyframeControls {
+        KeyframeControls(project: project, clip: clip, easingOpen: $easingOpen)
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -1789,6 +1915,7 @@ private struct ImageInspector: View {
 
             // 六组共同属性，跟文字、图形、封面那三个面板同一份
             LayerCommonSections(
+                keyframeHooks: kf.hooks,
                 mirrorH: Binding(get: { clip.mirrorH },
                                  set: { v in
                                      project.updateImageClip(id: clip.id) { $0.mirrorH = v }
@@ -1799,15 +1926,16 @@ private struct ImageInspector: View {
                                      project.updateImageClip(id: clip.id) { $0.mirrorV = v }
                                      project.rebuildTimelinePreview()
                                  }),
-                rotation: Binding(get: { clip.rotation },
+                rotation: Binding(get: { rotation },
                                   set: { v in
-                                      project.updateImageClip(id: clip.id) { $0.rotation = v }
-                                      project.rebuildTimelinePreviewDebounced()
+                                      rotation = v
+                                      pushUndoOnce()
+                                      project.updateImageClipAnimated(id: clip.id) { $0.rotation = v }
                                   }),
                 onRotate90: {
-                    project.updateImageClip(id: clip.id) {
-                        $0.rotation = ($0.rotation - 90 + 360).truncatingRemainder(dividingBy: 360)
-                    }
+                    let v = (rotation - 90 + 360).truncatingRemainder(dividingBy: 360)
+                    rotation = v
+                    project.updateImageClipAnimated(id: clip.id) { $0.rotation = v }
                     project.rebuildTimelinePreview()
                 },
                 // 图片的位置存的是相对画面的偏移（0 = 居中），换算成 0~100 的位置
@@ -1830,10 +1958,11 @@ private struct ImageInspector: View {
                                   set: { cropLeft = $0 / 100; applyTransform() }),
                 cropRight: Binding(get: { cropRight * 100 },
                                    set: { cropRight = $0 / 100; applyTransform() }),
-                opacity: Binding(get: { clip.alpha * 100 },
+                opacity: Binding(get: { opacity * 100 },
                                  set: { v in
-                                     project.updateImageClip(id: clip.id) { $0.opacity = v / 100 }
-                                     project.rebuildTimelinePreviewDebounced()
+                                     opacity = v / 100
+                                     pushUndoOnce()
+                                     project.updateImageClipAnimated(id: clip.id) { $0.opacity = v / 100 }
                                  }),
                 cornerRadius: Binding(get: { clip.corner },
                                       set: { v in
@@ -1845,17 +1974,17 @@ private struct ImageInspector: View {
                 onBeforeChange: { project.pushUndo() }
             )
 
-            ISection(title: nil) {
-                imgSectionHeader("描边") {
-                    Button { strokeWidth = 0; applyStroke() } label: {
-                        Text("重置")
-                            .font(.system(size: 9, weight: .medium))
-                            .foregroundColor(strokeWidth > 0.01 ? .black : Color.labelSecondary)
-                            .padding(.horizontal, 6).padding(.vertical, 2)
-                            .background(strokeWidth > 0.01 ? Color(hex: "#E8A54B") : Color.white.opacity(0.08))
-                            .clipShape(RoundedRectangle(cornerRadius: 4))
-                    }.buttonStyle(.plain).disabled(strokeWidth <= 0.01)
-                }
+            ISection(title: "描边", trailing: {
+                Button { strokeWidth = 0; applyStroke() } label: {
+                    Text("重置")
+                        .font(.system(size: 10))
+                        .foregroundColor(Color.labelSecondary)
+                        .padding(.horizontal, 8)
+                        .frame(height: 20)
+                        .background(Color.white.opacity(0.06))
+                        .cornerRadius(4)
+                }.buttonStyle(.plain).disabled(strokeWidth <= 0.01)
+            }) {
                 IFieldRow(label: "颜色") {
                     ColorPicker("", selection: $strokeColor)
                         .inspectorColorWell()
@@ -1875,7 +2004,13 @@ private struct ImageInspector: View {
 
             ISection(title: nil) {
                 // 跟视频属性区、调节轨道同一个组件，这边默认收起来
-                AdjustSliders(adjust: $colorAdj, expandedByDefault: false) {
+                AdjustSliders(adjust: $colorAdj, expandedByDefault: false,
+                              // 选中的关键帧是调节里的某一项：先展开，属性区才滚得到那一行
+                              expandSignal: project.inspectorFocus.flatMap { $0.prop.adjustKeyPath != nil ? $0.seq : nil } ?? 0,
+                              rowAnchor: { kp in KeyframeProp.adjust(kp).map { "kf-\($0.rawValue)" } },
+                              rowAccessory: { kp in KeyframeProp.adjust(kp).flatMap { kf.nav($0) } },
+                              rowLeading: { kp in KeyframeProp.adjust(kp).flatMap { kf.toggle($0) } },
+                              rowBelow: { kp in KeyframeProp.adjust(kp).map { kf.panel($0) } }) {
                     applyColorAdjust()
                 }
             }
@@ -1891,6 +2026,34 @@ private struct ImageInspector: View {
         .onChange(of: clip.cropLeft)   { v in if abs(v - cropLeft)   > 0.001 { cropLeft   = v } }
         .onChange(of: clip.cropRight)  { v in if abs(v - cropRight)  > 0.001 { cropRight  = v } }
         .onChange(of: clip.colorAdjust) { v in if v != colorAdj { colorAdj = v } }
+        .onChange(of: clip.rotation) { _ in syncValues() }
+        .onChange(of: clip.opacity) { _ in syncValues() }
+        // 打过关键帧的话，属性区显示的是播放头这一刻的值
+        .onChange(of: clip.keyframes) { _ in syncValues() }
+        .onReceive(project.clock.$currentTime) { t in
+            if current.hasKeyframes { syncValues(at: t) }
+        }
+    }
+
+    /// 面板上的值 = 这一刻的样子（关键帧求值后）。从项目里取最新的片段
+    private func syncValues(at t: Double? = nil) {
+        let a = current.animated(atTimeline: t ?? project.currentTime)
+        func set(_ s: inout Double, _ v: Double) { if abs(s - v) > 1e-6 { s = v } }
+        set(&scaleX, a.scaleX); set(&scaleY, a.scaleY)
+        set(&offsetX, a.offsetX); set(&offsetY, a.offsetY)
+        set(&cropTop, a.cropTop); set(&cropBottom, a.cropBottom)
+        set(&cropLeft, a.cropLeft); set(&cropRight, a.cropRight)
+        set(&rotation, a.rotation); set(&opacity, a.alpha)
+        lockAspect = a.lockAspect
+        if colorAdj != a.colorAdjust { colorAdj = a.colorAdjust }
+    }
+
+    private func pushUndoOnce() {
+        if !hasPushedUndo {
+            project.pushUndo()
+            hasPushedUndo = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { hasPushedUndo = false }
+        }
     }
 
     private var hasOffset: Bool {
@@ -1909,16 +2072,7 @@ private struct ImageInspector: View {
     }
 
     private func syncFromClip() {
-        scaleX = clip.scaleX
-        scaleY = clip.scaleY
-        lockAspect = clip.lockAspect
-        offsetX = clip.offsetX
-        offsetY = clip.offsetY
-        cropTop = clip.cropTop
-        cropBottom = clip.cropBottom
-        cropLeft = clip.cropLeft
-        cropRight = clip.cropRight
-        colorAdj = clip.colorAdjust
+        syncValues()
         strokeColor = clip.strokeColor
         strokeWidth = clip.strokeW
         strokeSoftness = clip.strokeSoft
@@ -1948,7 +2102,7 @@ private struct ImageInspector: View {
             hasPushedUndo = true
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { hasPushedUndo = false }
         }
-        project.updateImageClip(id: clip.id) {
+        project.updateImageClipAnimated(id: clip.id) {
             $0.scaleX = scaleX
             $0.scaleY = scaleY
             $0.lockAspect = lockAspect
@@ -1969,7 +2123,7 @@ private struct ImageInspector: View {
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { hasPushedUndo = false }
         }
         let adj = colorAdj
-        project.updateImageClip(id: clip.id) { $0.colorAdjust = adj }
+        project.updateImageClipAnimated(id: clip.id) { $0.colorAdjust = adj }
         project.rebuildTimelinePreviewDebounced()
     }
 
@@ -2056,6 +2210,11 @@ private struct VideoInspector: View {
     @State private var hasPushedUndo = false
     // 色调调节。整份存着，跟调节轨道共用同一个结构
     @State private var colorAdj = ColorAdjust.identity
+    @State private var opacity: Double = 1
+    @State private var angle: Double = 0
+    @State private var volumeV: Double = 1
+    /// 展开了曲线面板的属性。默认都收着
+    @State private var easingOpen: Set<KeyframeProp> = []
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -2137,8 +2296,16 @@ private struct VideoInspector: View {
                 }
             }
 
+            // 外观放在变换前面（各面板统一）
+            ISection(title: "外观") {
+                kfRow(.opacity) {
+                    dualSlider("不透明度", value: $opacity, range: 0...1, unit: "%", scale: 100) { _ in applyOpacity() }
+                }
+            }
+
             ISection(title: "变换") {
-                HStack(spacing: 4) {
+                // 卡片样式同图片 / 文字 / 图形的「变换」：等分撑满一行，图标下面带文字
+                HStack(spacing: 6) {
                     canvasBtn(.mirrorH, label: "水平镜像", active: clip.mirrorH) {
                         project.updateVideoClip(id: clip.id) { $0.mirrorH.toggle() }
                         project.rebuildTimelinePreview()
@@ -2155,23 +2322,74 @@ private struct VideoInspector: View {
                         project.updateVideoClip(id: clip.id) { $0.reversed.toggle() }
                         project.rebuildTimelinePreview()
                     }
-                    Spacer()
                 }
                 if clip.rotation != 0 {
                     Text("旋转 \(clip.rotation)°")
                         .font(.system(size: 10))
                         .foregroundColor(Color.labelSecondary)
                 }
+                // 任意角度，同图片 / 文字 / 图形放在「变换」里。顺时针为正，叠加在上面 90° 一档的旋转上
+                kfRow(.angle) {
+                    ICapsuleSlider(label: "旋转", value: $angle, range: -180...180,
+                                   decimals: 1, unit: "°", onChange: { _ in applyTransform() })
+                }
+                // 三级分组：位置 / 缩放 / 裁剪
+                IFoldGroup(title: "位置", trailing: {
+                    headerButton("居中") { offsetX = 0; offsetY = 0; applyTransform() }
+                }) {
+                    // 跟图片 / 文字 / 图形同一套：0~100%，50% = 居中（内部存的是 -0.5~0.5 的偏移）
+                    kfRow(.offsetX) {
+                        ICapsuleSlider(label: "水平位置", value: Binding(get: { (offsetX + 0.5) * 100 },
+                                                                     set: { offsetX = $0 / 100 - 0.5 }),
+                                       range: 0...100, unit: "%", onChange: { _ in applyTransform() })
+                    }
+                    kfRow(.offsetY) {
+                        ICapsuleSlider(label: "垂直位置", value: Binding(get: { (offsetY + 0.5) * 100 },
+                                                                     set: { offsetY = $0 / 100 - 0.5 }),
+                                       range: 0...100, unit: "%", onChange: { _ in applyTransform() })
+                    }
+                }
+
+                IFoldGroup(title: "缩放", trailing: {
+                    Button { lockAspect.toggle(); syncLock() } label: {
+                        Image(systemName: lockAspect ? "lock.fill" : "lock.open")
+                            .font(.system(size: 10))
+                            .foregroundColor(lockAspect ? Color.accent : Color.labelSecondary)
+                            .frame(width: 22, height: 20)
+                            .background(Color.white.opacity(0.06))
+                            .cornerRadius(4)
+                    }.buttonStyle(.plain)
+                }) {
+                    kfRow(.scaleX) {
+                        dualSlider("宽", value: $scaleX, range: 0.1...3.0, unit: "%", scale: 100) { v in
+                            if lockAspect { scaleY = v }; applyTransform()
+                        }
+                    }
+                    kfRow(.scaleY) {
+                        dualSlider("高", value: $scaleY, range: 0.1...3.0, unit: "%", scale: 100) { v in
+                            if lockAspect { scaleX = v }; applyTransform()
+                        }
+                    }
+                }
+
+                IFoldGroup(title: "裁剪", trailing: {
+                    headerButton("重置") { cropTop = 0; cropBottom = 0; cropLeft = 0; cropRight = 0; applyTransform() }
+                }) {
+                    kfRow(.cropTop)    { videoCropSlider(label: "上", value: $cropTop, edge: 0) }
+                    kfRow(.cropBottom) { videoCropSlider(label: "下", value: $cropBottom, edge: 1) }
+                    kfRow(.cropLeft)   { videoCropSlider(label: "左", value: $cropLeft, edge: 2) }
+                    kfRow(.cropRight)  { videoCropSlider(label: "右", value: $cropRight, edge: 3) }
+                }
             }
 
+
             ISection(title: "音量") {
-                ISlider(label: "整体音量", value: Binding(
-                    get: { Double(clip.volume) * 100 },
-                    set: { v in
-                        project.updateVideoClip(id: clip.id) { $0.volume = Float(v / 100) }
-                        project.rebuildTimelinePreview()
-                    }
-                ), range: 0...400, unit: "%")
+                // 音量能打关键帧（音量曲线）
+                kfRow(.volume) {
+                    ICapsuleSlider(label: "整体音量",
+                                   value: Binding(get: { volumeV * 100 }, set: { volumeV = $0 / 100 }),
+                                   range: 0...400, unit: "%", onChange: { _ in applyVolume() })
+                }
             }
 
             if audioTrackLabels.count >= 2 {
@@ -2188,60 +2406,23 @@ private struct VideoInspector: View {
             }
 
             ISection(title: nil) {
-                sectionHeader("位置") {
-                    Button { offsetX = 0; offsetY = 0; applyTransform() } label: {
-                        Text("居中")
-                            .font(.system(size: 9, weight: .medium))
-                            .foregroundColor(hasOffset ? .black : Color.labelSecondary)
-                            .padding(.horizontal, 6).padding(.vertical, 2)
-                            .background(hasOffset ? Color(hex: "#E8A54B") : Color.white.opacity(0.08))
-                            .clipShape(RoundedRectangle(cornerRadius: 4))
-                    }.buttonStyle(.plain).disabled(!hasOffset)
-                }
-                // 一行一个。两个并排的话属性区一窄，右边那个就被挤出容器
-                dualSlider("X", value: $offsetX, range: -1.0...1.0) { _ in applyTransform() }
-                dualSlider("Y", value: $offsetY, range: -1.0...1.0) { _ in applyTransform() }
-            }
-
-            ISection(title: nil) {
-                sectionHeader("缩放") {
-                    Button { lockAspect.toggle(); syncLock() } label: {
-                        Image(systemName: lockAspect ? "lock.fill" : "lock.open")
-                            .font(.system(size: 10))
-                            .foregroundColor(lockAspect ? Color.accent : Color.labelSecondary)
-                    }.buttonStyle(.plain)
-                }
-                dualSlider("宽", value: $scaleX, range: 0.1...3.0, unit: "%", scale: 100) { v in
-                    if lockAspect { scaleY = v }; applyTransform()
-                }
-                dualSlider("高", value: $scaleY, range: 0.1...3.0, unit: "%", scale: 100) { v in
-                    if lockAspect { scaleX = v }; applyTransform()
-                }
-            }
-
-            ISection(title: nil) {
-                sectionHeader("裁剪") {
-                    Button { cropTop = 0; cropBottom = 0; cropLeft = 0; cropRight = 0; applyTransform() } label: {
-                        Text("重置")
-                            .font(.system(size: 9, weight: .medium))
-                            .foregroundColor(hasCrop ? .black : Color.labelSecondary)
-                            .padding(.horizontal, 6).padding(.vertical, 2)
-                            .background(hasCrop ? Color(hex: "#E8A54B") : Color.white.opacity(0.08))
-                            .clipShape(RoundedRectangle(cornerRadius: 4))
-                    }.buttonStyle(.plain).disabled(!hasCrop)
-                }
-                VStack(spacing: 8) {
-                    videoCropSlider(label: "上", value: $cropTop, edge: 0)
-                    videoCropSlider(label: "下", value: $cropBottom, edge: 1)
-                    videoCropSlider(label: "左", value: $cropLeft, edge: 2)
-                    videoCropSlider(label: "右", value: $cropRight, edge: 3)
-                }
-            }
-
-            ISection(title: nil) {
                 // 跟调节轨道用的是同一个组件，这边默认收起来 ——
                 // 挂在单个片段上的调节属于「进阶」，不该一上来就占满属性区
-                AdjustSliders(adjust: $colorAdj, expandedByDefault: false) {
+                AdjustSliders(adjust: $colorAdj, expandedByDefault: false,
+                              // 选中的关键帧是调节里的某一项：先展开，属性区才滚得到那一行
+                              expandSignal: project.inspectorFocus.flatMap { $0.prop.adjustKeyPath != nil ? $0.seq : nil } ?? 0,
+                              rowAnchor: { kp in KeyframeProp.adjust(kp).map { "kf-\($0.rawValue)" } },
+                              rowAccessory: { kp in
+                                  guard let p = KeyframeProp.adjust(kp) else { return nil }
+                                  return AnyView(kfNav(p))
+                              },
+                              rowLeading: { kp in
+                                  KeyframeProp.adjust(kp).flatMap { easingToggle($0) }
+                              },
+                              rowBelow: { kp in
+                                  guard let p = KeyframeProp.adjust(kp) else { return nil }
+                                  return AnyView(easingPanel(p))
+                              }) {
                     applyColorAdjust()
                 }
             }
@@ -2257,6 +2438,67 @@ private struct VideoInspector: View {
         .onChange(of: clip.cropLeft)   { v in if abs(v - cropLeft)   > 0.001 { cropLeft   = v } }
         .onChange(of: clip.cropRight)  { v in if abs(v - cropRight)  > 0.001 { cropRight  = v } }
         .onChange(of: clip.colorAdjust) { v in if v != colorAdj { colorAdj = v } }
+        .onChange(of: clip.opacity) { _ in syncValues() }
+        .onChange(of: clip.angle) { _ in syncValues() }
+        .onChange(of: clip.volume) { _ in syncValues() }
+        // 打过关键帧的话，属性区显示的是播放头这一刻的值
+        .onChange(of: clip.keyframes) { _ in syncValues() }
+        .onReceive(project.clock.$currentTime) { t in
+            let cur = project.videoTracks.flatMap(\.clips).first { $0.id == clip.id }
+            if cur?.hasKeyframes == true { syncValues(at: t) }
+        }
+    }
+
+    /// 某个属性的 `< ◇ >`
+    private func kfNav(_ p: KeyframeProp) -> some View {
+        KeyframeNav(clock: project.clock, times: clip.keyframeTimelineTimes(p),
+                    clipStart: clip.startTime, clipEnd: clip.endTime) {
+            project.toggleKeyframe(clipID: clip.id, prop: p)
+        }
+    }
+
+    /// 滑块 + 它后面的 `< ◇ >` + 曲线面板开关；展开时滑块下面出曲线面板
+    private func kfRow<S: View>(_ p: KeyframeProp, @ViewBuilder _ slider: () -> S) -> some View {
+        // id 给属性区「选中关键帧时滚到这一行」用
+        VStack(spacing: 10) {
+            HStack(spacing: 4) {
+                slider()
+                    .environment(\.capsuleSliderLeading, easingToggle(p))
+                kfNav(p)
+            }
+            easingPanel(p)
+        }
+        .id("kf-\(p.rawValue)")
+    }
+
+    /// 曲线面板的展开箭头，放在滑块标签前（样子同转场分组的折叠箭头）。
+    /// 这个属性不到两帧就不出现（一帧没有「两帧之间」可调）
+    private func easingToggle(_ p: KeyframeProp) -> AnyView? {
+        guard (clip.keyframes?.frames(p).count ?? 0) >= 2 else { return nil }
+        let open = easingOpen.contains(p)
+        return AnyView(
+            Button {
+                // 同一时间只展开一个；锁着等比时宽高是一对，一起开一起关
+                let pair: Set<KeyframeProp> = clip.lockAspect && (p == .scaleX || p == .scaleY)
+                    ? [.scaleX, .scaleY] : [p]
+                easingOpen = open ? easingOpen.subtracting(pair) : pair
+            } label: {
+                Image(nsImage: SidebarSVGIcon.load(open ? "groupExpanded" : "groupCollapsed", size: 9))
+                    .renderingMode(.template)
+                    .foregroundColor(Color.labelSecondary)
+                    .frame(width: 10, height: 18)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help(open ? "收起曲线" : "调节这一段的变化曲线")
+        )
+    }
+
+    @ViewBuilder
+    private func easingPanel(_ p: KeyframeProp) -> some View {
+        if easingOpen.contains(p), (clip.keyframes?.frames(p).count ?? 0) >= 2 {
+            KeyframeEasingPanel(clock: project.clock, clipID: clip.id, prop: p)
+        }
     }
 
     private var hasOffset: Bool {
@@ -2267,6 +2509,20 @@ private struct VideoInspector: View {
         cropTop > 0.001 || cropBottom > 0.001 || cropLeft > 0.001 || cropRight > 0.001
     }
 
+
+    /// 分组标题右边的小按钮，样子同图片 / 文字 / 图形面板
+    private func headerButton(_ title: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Text(title)
+                .font(.system(size: 10))
+                .foregroundColor(Color.labelSecondary)
+                .padding(.horizontal, 8)
+                .frame(height: 20)
+                .background(Color.white.opacity(0.06))
+                .cornerRadius(4)
+        }
+        .buttonStyle(.plain)
+    }
 
     @ViewBuilder
     private func sectionHeader<Trailing: View>(_ title: String, @ViewBuilder trailing: () -> Trailing) -> some View {
@@ -2297,17 +2553,27 @@ private struct VideoInspector: View {
     }
 
     private func syncFromClip() {
-        scaleX = clip.scaleX
-        scaleY = clip.scaleY
-        lockAspect = clip.lockAspect
-        offsetX = clip.offsetX
-        offsetY = clip.offsetY
-        cropTop = clip.cropTop
-        cropBottom = clip.cropBottom
-        cropLeft = clip.cropLeft
-        cropRight = clip.cropRight
-        colorAdj = clip.colorAdjust
+        syncValues()
         hasPushedUndo = false
+    }
+
+    /// 面板上的值 = 这一刻的样子（关键帧求值后）。没打关键帧时就是片段自己的值
+    private func syncValues(at t: Double? = nil) {
+        // **从项目里取最新的片段**，别用 self.clip：onChange / onReceive 回调里拿到的
+        // 还是改之前那份。拿旧的同步会把面板值拨回去，滑块又拿这个旧值写回关键帧，
+        // 来回打架 —— 拖动抖、值存不住、锁定宽高不跟，全是它
+        let cur = project.videoTracks.flatMap(\.clips).first { $0.id == clip.id } ?? clip
+        let a = cur.animated(atTimeline: t ?? project.currentTime)
+        func set(_ s: inout Double, _ v: Double) { if abs(s - v) > 1e-6 { s = v } }
+        set(&scaleX, a.scaleX); set(&scaleY, a.scaleY)
+        set(&offsetX, a.offsetX); set(&offsetY, a.offsetY)
+        set(&cropTop, a.cropTop); set(&cropBottom, a.cropBottom)
+        set(&cropLeft, a.cropLeft); set(&cropRight, a.cropRight)
+        set(&opacity, a.alpha)
+        set(&angle, a.angleDeg)
+        set(&volumeV, Double(a.volume))
+        lockAspect = a.lockAspect
+        if colorAdj != a.colorAdjust { colorAdj = a.colorAdjust }
     }
 
     private func syncLock() {
@@ -2320,7 +2586,7 @@ private struct VideoInspector: View {
             hasPushedUndo = true
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { hasPushedUndo = false }
         }
-        project.updateVideoClip(id: clip.id) {
+        project.updateVideoClipAnimated(id: clip.id) {
             $0.scaleX = scaleX
             $0.scaleY = scaleY
             $0.lockAspect = lockAspect
@@ -2330,6 +2596,7 @@ private struct VideoInspector: View {
             $0.cropBottom = cropBottom
             $0.cropLeft = cropLeft
             $0.cropRight = cropRight
+            $0.angle = angle
         }
         if let trackID = project.videoClipTrackIDMap[clip.id] {
             project.previewCompositor.setDragOffset(trackID: trackID, offsetX: CGFloat(offsetX), offsetY: CGFloat(offsetY))
@@ -2345,7 +2612,7 @@ private struct VideoInspector: View {
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { hasPushedUndo = false }
         }
         let adj = colorAdj
-        project.updateVideoClip(id: clip.id) { $0.colorAdjust = adj }
+        project.updateVideoClipAnimated(id: clip.id) { $0.colorAdjust = adj }
         // 视频的色调在 compositor 里逐帧算，光改 clip 要等 rebuild 才可见（防抖 0.15s，
         // 表现就是"松手才变"）。这里照位移滑块的做法把值直接喂给 compositor
         // 并逼播放器重绘当前帧，拖动过程就是实时的。
@@ -2354,6 +2621,27 @@ private struct VideoInspector: View {
             project.previewCompositor.setLiveColorAdjust(trackID: trackID, adj)
             project.clock.refreshSeekRequest &+= 1
         }
+        project.rebuildTimelinePreviewDebounced()
+    }
+
+    private func applyVolume() {
+        if !hasPushedUndo {
+            project.pushUndo()
+            hasPushedUndo = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { hasPushedUndo = false }
+        }
+        let v = Float(volumeV)
+        project.updateVideoClipAnimated(id: clip.id) { $0.volume = v }
+    }
+
+    private func applyOpacity() {
+        if !hasPushedUndo {
+            project.pushUndo()
+            hasPushedUndo = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { hasPushedUndo = false }
+        }
+        let o = opacity
+        project.updateVideoClipAnimated(id: clip.id) { $0.opacity = o }
         project.rebuildTimelinePreviewDebounced()
     }
 
@@ -2416,15 +2704,23 @@ private struct VideoInspector: View {
             project.pushUndo()
             action()
         } label: {
-            Image(nsImage: nsImg)
-                .renderingMode(.template)
-                .resizable()
-                .aspectRatio(contentMode: .fit)
-                .frame(width: 14, height: 14)
-                .foregroundColor(active ? .black : Color.labelSecondary)
-                .frame(width: 28, height: 22)
-                .background(active ? Color(hex: "#E8A54B") : Color.white.opacity(0.08))
-                .clipShape(RoundedRectangle(cornerRadius: 4))
+            VStack(spacing: 3) {
+                Image(nsImage: nsImg)
+                    .renderingMode(.template)
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .frame(width: 14, height: 14)
+                    .foregroundColor(active ? .black : Color.labelSecondary)
+                    .frame(maxWidth: .infinity)
+                    .frame(height: 22)
+                    .background(active ? Color(hex: "#E8A54B") : Color.white.opacity(0.08))
+                    .cornerRadius(4)
+                Text(label)
+                    .font(.system(size: 9))
+                    .foregroundColor(Color.labelSecondary)
+                    .lineLimit(1)
+            }
+            .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         .help(label)
@@ -2513,6 +2809,34 @@ private struct AudioInspector: View {
     @State private var sourceChannels: String = "—"
     @State private var sourceBitrate: String = "—"
     @State private var sourceFormat: String = "—"
+    /// 音量显示值：打了关键帧时是播放头这一刻的值
+    @State private var volumeV: Double = 1
+    @State private var hasPushedUndo = false
+    /// 展开了曲线面板的属性。默认收着
+    @State private var easingOpen: Set<KeyframeProp> = []
+
+    /// 最新的片段（回调里别读 self.clip，那是改之前的）
+    private var fresh: AudioClip { project.audioTracks.flatMap(\.clips).first { $0.id == clip.id } ?? clip }
+
+    private var kf: KeyframeControls {
+        KeyframeControls(project: project, clip: clip, easingOpen: $easingOpen)
+    }
+
+    private func syncVolume(at t: Double? = nil) {
+        let v = Double(fresh.animated(atTimeline: t ?? project.currentTime).volume)
+        if abs(v - volumeV) > 1e-6 { volumeV = v }
+    }
+
+    private func applyVolume() {
+        if !hasPushedUndo {
+            project.pushUndo()
+            hasPushedUndo = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { hasPushedUndo = false }
+        }
+        let v = Float(volumeV)
+        // 按播放头写：打过音量关键帧的写进关键帧；多选时每条都改
+        for id in selectedAudioClipIDs { project.updateAudioClipAnimated(id: id) { $0.volume = v } }
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -2593,7 +2917,24 @@ private struct AudioInspector: View {
             }
 
             ISection(title: "音量") {
-                ISlider(label: "整体音量", value: dbl(\.volume, scale: 100), range: 0...400, unit: "%")
+                // 音量能打关键帧（音量曲线）
+                VStack(spacing: 10) {
+                    HStack(spacing: 4) {
+                        ICapsuleSlider(label: "整体音量",
+                                       value: Binding(get: { volumeV * 100 }, set: { volumeV = $0 / 100 }),
+                                       range: 0...400, unit: "%", onChange: { _ in applyVolume() })
+                            .environment(\.capsuleSliderLeading, kf.toggle(.volume))
+                        if let n = kf.nav(.volume) { n }
+                    }
+                    kf.panel(.volume)
+                }
+                .id("kf-volume")
+                .onAppear { syncVolume() }
+                .onChange(of: clip.volume) { _ in syncVolume() }
+                .onChange(of: clip.keyframes) { _ in syncVolume() }
+                .onReceive(project.clock.$currentTime) { t in
+                    if fresh.hasKeyframes { syncVolume(at: t) }
+                }
                 ISlider(label: "左声道",  value: dbl(\.leftChannel,  scale: 100), range: 0...100, unit: "%")
                 ISlider(label: "右声道",  value: dbl(\.rightChannel, scale: 100), range: 0...100, unit: "%")
             }
@@ -2742,18 +3083,128 @@ enum ISectionMetrics {
     static let hPadding: CGFloat = 14
 }
 
-struct ISection<Content: View>: View {
+/// 属性区分组的折叠状态。按标题记，所有面板共用（在图片里收起「位置」，换到视频也是收着的）。
+/// 默认全展开，只有「片段信息」默认收起
+final class ISectionFoldStore: ObservableObject {
+    static let shared = ISectionFoldStore()
+    @Published var folded: Set<String> = ["片段信息"]
+}
+
+/// 折叠用的实心三角（同素材库 / 转场分组那个）
+struct IFoldTriangle: View {
+    let folded: Bool
+    var body: some View {
+        Image(nsImage: SidebarSVGIcon.load(folded ? "groupCollapsed" : "groupExpanded", size: 12))
+            .renderingMode(.template)
+            .foregroundColor(Color.labelSecondary)
+            .frame(width: 12)
+            // 图标自带 1.5pt 留白，往左挪掉，三角的墨迹才跟下面控件的左边缘齐
+            .padding(.leading, -1.5)
+    }
+}
+
+/// 三级分组：嵌在二级分组里面（变换下面的位置 / 缩放 / 裁剪）。自己不带内边距，
+/// 标题小一档、淡一档，同样能折叠（折叠状态跟二级分组存在同一个地方）
+struct IFoldGroup<Content: View, Trailing: View>: View {
+    let title: String
+    let trailing: Trailing
+    let content: Content
+    @ObservedObject private var fold = ISectionFoldStore.shared
+
+    init(title: String, @ViewBuilder trailing: () -> Trailing, @ViewBuilder content: () -> Content) {
+        self.title = title
+        self.trailing = trailing()
+        self.content = content()
+    }
+
+    init(title: String, @ViewBuilder content: () -> Content) where Trailing == EmptyView {
+        self.title = title
+        self.trailing = EmptyView()
+        self.content = content()
+    }
+
+    private var key: String { "变换/" + title }
+    private var isFolded: Bool { fold.folded.contains(key) }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 8) {
+                Button {
+                    withAnimation(.easeInOut(duration: 0.15)) {
+                        if isFolded { fold.folded.remove(key) } else { fold.folded.insert(key) }
+                    }
+                } label: {
+                    HStack(spacing: 4) {
+                        IFoldTriangle(folded: isFolded)
+                        Text(title)
+                            .font(.system(size: 10, weight: .medium))
+                            .foregroundColor(Color.labelSecondary)
+                    }
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                Spacer(minLength: 0)
+                trailing
+            }
+            if !isFolded {
+                content
+            }
+        }
+        .padding(.top, 4)
+    }
+}
+
+/// 属性区的一组。有标题就能点标题折叠（三角在标题前）。
+/// `sub` = 二级分组（位置 / 缩放 / 裁剪这种），标题样式淡一档；`trailing` 是标题右边的按钮（居中、重置、锁）
+struct ISection<Content: View, Trailing: View>: View {
     let title: String?
-    @ViewBuilder let content: Content
+    var sub = false
+    let trailing: Trailing
+    let content: Content
+    @ObservedObject private var fold = ISectionFoldStore.shared
+
+    init(title: String?, @ViewBuilder content: () -> Content) where Trailing == EmptyView {
+        self.title = title
+        self.trailing = EmptyView()
+        self.content = content()
+    }
+
+    init(title: String, sub: Bool = false,
+         @ViewBuilder trailing: () -> Trailing, @ViewBuilder content: () -> Content) {
+        self.title = title
+        self.sub = sub
+        self.trailing = trailing()
+        self.content = content()
+    }
+
+    private var isFolded: Bool { title.map { fold.folded.contains($0) } ?? false }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             if let t = title {
-                Text(t)
-                    .font(.system(size: 11, weight: .semibold))
-                    .foregroundColor(Color.labelPrimary)
-                    .tracking(0.2)
+                HStack(spacing: 8) {
+                    Button {
+                        withAnimation(.easeInOut(duration: 0.15)) {
+                            if fold.folded.contains(t) { fold.folded.remove(t) } else { fold.folded.insert(t) }
+                        }
+                    } label: {
+                        HStack(spacing: 4) {
+                            IFoldTriangle(folded: isFolded)
+                            Text(t)
+                                .font(.system(size: 11, weight: sub ? .medium : .semibold))
+                                .foregroundColor(sub ? Color.labelSecondary : Color.labelPrimary)
+                                .tracking(0.2)
+                        }
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    Spacer(minLength: 0)
+                    trailing
+                }
             }
-            content
+            if !isFolded {
+                content
+            }
         }
         .padding(.horizontal, ISectionMetrics.hPadding)
         .padding(.top, 12)
@@ -2851,7 +3302,20 @@ struct IFieldRow<Content: View>: View {
     }
 }
 
+/// 胶囊滑块标签前面的小控件（关键帧曲线的展开箭头）。走环境值，外层包一下就行，不用改每个调用点
+private struct CapsuleSliderLeadingKey: EnvironmentKey {
+    static let defaultValue: AnyView? = nil
+}
+
+extension EnvironmentValues {
+    var capsuleSliderLeading: AnyView? {
+        get { self[CapsuleSliderLeadingKey.self] }
+        set { self[CapsuleSliderLeadingKey.self] = newValue }
+    }
+}
+
 struct ICapsuleSlider: View {
+    @Environment(\.capsuleSliderLeading) private var leading
     let label: String
     @Binding var value: Double
     let range: ClosedRange<Double>
@@ -2865,6 +3329,8 @@ struct ICapsuleSlider: View {
     @State private var editText: String = ""
     @State private var dragging = false
     @FocusState private var focused: Bool
+    /// 回车提交后紧跟着失焦，失焦那下就别再提交一遍了
+    @State private var justSubmitted = false
 
     private var disp: Double { value * displayScale }
     private var fmt: String {
@@ -2873,11 +3339,19 @@ struct ICapsuleSlider: View {
 
     var body: some View {
         HStack(spacing: 6) {
-            Text(label)
-                .font(.system(size: 10))
-                .foregroundColor(Color.labelSecondary)
-                .frame(width: labelWidth, alignment: .leading)
-                .lineLimit(1)
+            // 标签前有小控件时，它占掉左内边距的一部分 + 标签宽度的一点点（左边留 5），
+            // 滑轨起点跟别的行照样对齐，「不透明度」四个字也放得下
+            HStack(spacing: 2) {
+                if let leading {
+                    leading.frame(width: 10)
+                }
+                Text(label)
+                    .font(.system(size: 10))
+                    .foregroundColor(Color.labelSecondary)
+                    .frame(width: leading == nil ? labelWidth : labelWidth - 9, alignment: .leading)
+                    .lineLimit(1)
+            }
+            .padding(.leading, leading == nil ? 0 : -(ILayout.hPadding - 5))
             CustomSlider(value: $value, range: range, onDragging: { d in
                 dragging = d
             })
@@ -2899,9 +3373,12 @@ struct ICapsuleSlider: View {
                     .frame(width: 34)
                     .onAppear { editText = fmt }
                     .onChange(of: value) { v in if dragging { onChange?(v) } }
-                    .onSubmit { commit() }
+                    // 回车：提交并退出编辑
+                    .onSubmit { commit(); justSubmitted = true; focused = false }
                     .onChange(of: focused) { f in
-                        if f { editText = fmt } else { commit() }
+                        if f { editText = fmt }
+                        else if justSubmitted { justSubmitted = false }
+                        else { commit() }
                     }
                 if !unit.isEmpty {
                     Text(unit)
@@ -2925,11 +3402,18 @@ struct ICapsuleSlider: View {
     }
 
     private func commit() {
-        if let v = Double(editText) {
-            value = (v / displayScale).clamped(to: range)
-            onChange?(value)
-        }
-        editText = fmt
+        guard let v = Double(editText) else { editText = fmt; return }
+        let nv = (v / displayScale).clamped(to: range)
+        value = nv
+        // 用刚算出的新值，别读 value：很多调用方的绑定是 Binding(get: { clip.xxx }) 现拼的，
+        // 这一刻读回来还是旧值 —— 回调会拿旧值去写，输入框也会显示回旧数
+        onChange?(nv)
+        editText = format(nv)
+    }
+
+    private func format(_ x: Double) -> String {
+        let d = x * displayScale
+        return decimals > 0 ? String(format: "%.\(decimals)f", d) : "\(Int(d.rounded()))"
     }
 }
 
@@ -3037,6 +3521,8 @@ struct MiniStepper: View {
 
     @State private var editText: String = ""
     @FocusState private var isFocused: Bool
+    /// 回车提交后紧跟着失焦，失焦那下就别再提交一遍了
+    @State private var justSubmitted = false
 
     var body: some View {
         HStack(spacing: 4) {
@@ -3049,9 +3535,16 @@ struct MiniStepper: View {
                 .padding(.leading, 6)
                 .focused($isFocused)
                 .onAppear { editText = formatted }
-                .onChange(of: value) { _ in editText = formatted }
-                .onSubmit { applyText() }
-                .onChange(of: isFocused) { _ in if !isFocused { applyText() } }
+                // 用回调带进来的新值。回调里读 self.value 拿到的是改之前的（实测），
+                // 显示会停在旧数上
+                .onChange(of: value) { nv in editText = format(nv) }
+                // 回车：提交并失焦（跟属性区别的输入框一样，按完就退出编辑）
+                .onSubmit { applyText(); justSubmitted = true; isFocused = false }
+                .onChange(of: isFocused) { _ in
+                    if !isFocused {
+                        if justSubmitted { justSubmitted = false } else { applyText() }
+                    }
+                }
 
             Rectangle().fill(Color.white.opacity(0.12)).frame(width: 1, height: 18)
 
@@ -3082,15 +3575,19 @@ struct MiniStepper: View {
         .overlay(RoundedRectangle(cornerRadius: 5).stroke(isFocused ? Color.accent : Color.clear))
     }
 
-    private var formatted: String {
-        decimals > 0 ? String(format: "%.\(decimals)f", value) : "\(Int(value))"
+    private var formatted: String { format(value) }
+
+    private func format(_ x: Double) -> String {
+        decimals > 0 ? String(format: "%.\(decimals)f", x) : "\(Int(x))"
     }
 
     private func applyText() {
-        if let v = Double(editText) {
-            value = max(minValue, min(maxValue, v))
-        }
-        editText = formatted
+        guard let v = Double(editText) else { editText = formatted; return }
+        let nv = max(minValue, min(maxValue, v))
+        value = nv
+        // **用刚提交的值刷新显示**，别读 value：绑定是外面按旧数据给的，这一刻读回来还是旧值，
+        // 输入框会显示回旧数，下次回车 / 失焦又把旧数提交一遍（「要按两次回车」就是这么来的）
+        editText = format(nv)
     }
 }
 
