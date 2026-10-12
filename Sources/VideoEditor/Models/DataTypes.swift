@@ -652,6 +652,10 @@ struct TextClip: Identifiable, Equatable, Codable {
     var keyframes: ClipKeyframes? = nil
     /// 关键帧入点：左边裁掉 / 切开时往后推，关键帧不跑位。nil = 0
     var kfIn: Double? = nil
+    /// 「缩放 100%」对应的字号。属性区缩放按比例显示 = 字号 ÷ 它。
+    /// nil = 还没缩放过，就拿当前字号当 100%；第一次缩放时定下来（`ProjectState.pinTextScaleRef`）
+    var scaleRefFontSize: Double? = nil
+    var scaleRef: Double { max(scaleRefFontSize ?? Double(fontSize), 1) }
 
     enum CodingKeys: String, CodingKey {
         case id, text, startTime, endTime, posX, posY
@@ -662,7 +666,7 @@ struct TextClip: Identifiable, Equatable, Codable {
         case cropTop, cropBottom, cropLeft, cropRight
         case boxWidth, boxHeight
         case mirrorH, mirrorV, lockBoxAspect
-        case keyframes, kfIn
+        case keyframes, kfIn, scaleRefFontSize
     }
     func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
@@ -699,6 +703,7 @@ struct TextClip: Identifiable, Equatable, Codable {
         try c.encode(lockBoxAspect, forKey: .lockBoxAspect)
         try c.encodeIfPresent(keyframes, forKey: .keyframes)
         try c.encodeIfPresent(kfIn, forKey: .kfIn)
+        try c.encodeIfPresent(scaleRefFontSize, forKey: .scaleRefFontSize)
     }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -736,6 +741,7 @@ struct TextClip: Identifiable, Equatable, Codable {
         // 手写解码：加了字段这里必须补，不然存得进读不回
         keyframes = try? c.decodeIfPresent(ClipKeyframes.self, forKey: .keyframes)
         kfIn = try? c.decodeIfPresent(Double.self, forKey: .kfIn)
+        scaleRefFontSize = try? c.decodeIfPresent(Double.self, forKey: .scaleRefFontSize)
     }
     init(text: String = "标题文字", startTime: Double, endTime: Double) {
         self.text = text; self.startTime = startTime; self.endTime = endTime

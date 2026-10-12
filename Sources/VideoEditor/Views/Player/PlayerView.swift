@@ -2641,6 +2641,8 @@ struct TextTransformOverlay: View {
                     showBorder: !editing,
                     onBegin: {
                         pushUndoOnce()
+                        // 缩放比例的基准定在拖之前（封面弹窗接管时不在时间轴上，不用定）
+                        if onUpdate == nil { project.pinTextScaleRef(id: clip.id) }
                         startFontSize = clip.fontSize
                         startRotation = clip.rotation
                         startBoxW = clip.boxWidth

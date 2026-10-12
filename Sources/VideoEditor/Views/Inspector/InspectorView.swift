@@ -1330,19 +1330,13 @@ private struct TextInspector: View {
                                 options: FontHelper.fontOptions)
                             .onChange(of: fontName) { _ in write { $0.fontName = fontName } }
                     }
+                    // 字号的关键帧挂在「变换 → 缩放」那一行（缩放就是字号带着范围框一起变），
+                    // 缩放会出小数字号，这里带一位小数
                     IField(label: "字号") {
-                        MiniStepper(value: $fontSize, step: 1, decimals: 0, minValue: 8, maxValue: 300)
-                            .onChange(of: fontSize) { _ in write { $0.fontSize = CGFloat(fontSize) } }
+                        MiniStepper(value: $fontSize, step: 1, decimals: 1, minValue: 8, maxValue: 300)
+                            .onChange(of: fontSize) { nv in write { $0.fontSize = CGFloat(nv) } }
                     }.frame(width: 92)
-                    // 字号能打关键帧（字变大变小的动画）：展开箭头 + `< ◇ >`，曲线面板在下面
-                    HStack(spacing: 2) {
-                        if let t = kf.toggle(.fontSize) { t }
-                        kf.nav(.fontSize)
-                    }
-                    .frame(height: 26)
                 }
-                kf.panel(.fontSize)
-                    .id("kf-fontSize")
                 HStack(spacing: 8) {
                     styleGlyph("B", isOn: bold, weight: .bold) { bold.toggle(); write { $0.bold = bold } }
                     styleGlyph("I", isOn: italic, italic: true) { italic.toggle(); write { $0.italic = italic } }
@@ -1366,22 +1360,30 @@ private struct TextInspector: View {
                 .padding(.top, 6)
             }
 
-            ISection(title: "颜色与描边") {
-                colorRow("文字颜色", $textColor) { write { $0.textColor = textColor } }
-                colorRow("描边颜色", $strokeColor) { write { $0.strokeColor = strokeColor } }
-                ISlider(label: "描边宽度", value: $strokeWidth, range: 0...100, unit: "px")
-                    .onChange(of: strokeWidth) { _ in write { $0.strokeWidth = strokeWidth } }
-                ISlider(label: "柔和", value: $strokeSoftness, range: 0...1, unit: "", decimals: 2)
-                    .onChange(of: strokeSoftness) { _ in write { $0.strokeSoftness = strokeSoftness } }
-                colorRow("背景颜色", $bgColor) { write { $0.bgColor = bgColor } }
-                ISlider(label: "背景不透明", value: Binding(get:{bgOpacity*100}, set:{bgOpacity=$0/100}), range: 0...100, unit: "%")
-                    .onChange(of: bgOpacity) { _ in write { $0.bgOpacity = bgOpacity } }
-            
+            // 每一项都能打关键帧（颜色按通道过渡）。onChange 里用回调给的新值，别读 self 上的旧值
+            ISection(title: "颜色与描边", trailing: {
+                if let g = kf.group([.textColor, .strokeColor, .strokeWidth, .strokeSoftness, .bgColor, .bgOpacity]) { g }
+            }) {
+                kfColorRow(.textColor, "文字颜色", $textColor) { nv in write { $0.textColor = nv } }
+                kfColorRow(.strokeColor, "描边颜色", $strokeColor) { nv in write { $0.strokeColor = nv } }
+                kfSliderRow(.strokeWidth) {
+                    ISlider(label: "描边宽度", value: $strokeWidth, range: 0...100, unit: "px")
+                        .onChange(of: strokeWidth) { nv in write { $0.strokeWidth = nv } }
+                }
+                kfSliderRow(.strokeSoftness) {
+                    ISlider(label: "柔和", value: $strokeSoftness, range: 0...1, unit: "", decimals: 2)
+                        .onChange(of: strokeSoftness) { nv in write { $0.strokeSoftness = nv } }
+                }
+                kfColorRow(.bgColor, "背景颜色", $bgColor) { nv in write { $0.bgColor = nv } }
+                kfSliderRow(.bgOpacity) {
+                    ISlider(label: "背景不透明", value: Binding(get:{bgOpacity*100}, set:{bgOpacity=$0/100}), range: 0...100, unit: "%")
+                        .onChange(of: bgOpacity) { nv in write { $0.bgOpacity = nv } }
+                }
             }
 
             // 六组共同属性，跟图片、图形、封面那三个面板同一份
             LayerCommonSections(
-                keyframeHooks: kf.hooks,
+                keyframeHooks: textKeyframeHooks,
                 mirrorH: Binding(get: { clip.mirrorH }, set: { v in write { $0.mirrorH = v } }),
                 mirrorV: Binding(get: { clip.mirrorV }, set: { v in write { $0.mirrorV = v } }),
                 rotation: Binding(get: { rotation }, set: { rotation = $0; write { $0.rotation = rotation } }),
@@ -1392,24 +1394,34 @@ private struct TextInspector: View {
                 posX: Binding(get: { posX * 100 }, set: { posX = $0 / 100; write { $0.posX = posX } }),
                 posY: Binding(get: { posY * 100 }, set: { posY = $0 / 100; write { $0.posY = posY } }),
                 onCenter: { posX = 0.5; posY = 0.5; write { $0.posX = 0.5; $0.posY = 0.5 } },
-                // 文字量的是**范围框**的像素宽高，不是百分比
+                // 解开比例时：宽高是**范围框**的像素，只改框不改字号；有字号动画时显示播放头这一刻的
                 scaleW: Binding(
-                    get: { clip.boxWidth ?? Double(clip.fontSize) * Double(max(clip.text.count, 1)) },
-                    set: { v in
-                        let old = clip.boxWidth ?? Double(clip.fontSize) * Double(max(clip.text.count, 1))
-                        // 锁着比例时字号跟着一起放大，跟拖四角圆点的手感一致
-                        if clip.lockBoxAspect, old > 0.01 {
-                            write { $0.fontSize = max(8, $0.fontSize * CGFloat(v / old)) }
-                        }
-                        write { $0.boxWidth = v }
-                    }),
+                    get: { anim.propValue(.scaleX) ?? 0 },
+                    set: { v in write { $0.boxWidth = v } }),
                 scaleH: Binding(
-                    get: { clip.boxHeight ?? Double(clip.fontSize) * 1.4 },
+                    get: { anim.propValue(.scaleY) ?? 0 },
                     set: { v in write { $0.boxHeight = v } }),
                 lockAspect: Binding(get: { clip.lockBoxAspect },
                                     set: { v in write { $0.lockBoxAspect = v } }),
                 scaleRange: 20...2000,
                 scaleUnit: "px",
+                // 锁着比例时是「缩放」：按比例显示（字号 ÷ 100% 那个字号），字号带着拖过边的框一起变，
+                // 跟拖四角圆点一个意思。打了关键帧时就是在播放头处记一帧
+                scaleBoth: Binding(
+                    get: { Double(anim.fontSize) / fresh.scaleRef * 100 },
+                    set: { v in
+                        project.pinTextScaleRef(id: clip.id)
+                        let cur = Double(anim.fontSize)
+                        guard cur > 0 else { return }
+                        let k = fresh.scaleRef * v / 100 / cur
+                        write {
+                            $0.fontSize = max(1, $0.fontSize * CGFloat(k))
+                            if let w = $0.boxWidth { $0.boxWidth = w * k }
+                            if let h = $0.boxHeight { $0.boxHeight = h * k }
+                        }
+                    }),
+                scaleBothRange: 5...800,
+                scaleBothUnit: "%",
                 cropTop: Binding(get: { cropT * 100 }, set: { v in cropT = v / 100; write { $0.cropTop = v / 100 } }),
                 cropBottom: Binding(get: { cropB * 100 }, set: { v in cropB = v / 100; write { $0.cropBottom = v / 100 } }),
                 cropLeft: Binding(get: { cropL * 100 }, set: { v in cropL = v / 100; write { $0.cropLeft = v / 100 } }),
@@ -1461,6 +1473,16 @@ private struct TextInspector: View {
     /// 最新的片段（回调里别读 self.clip，那是改之前的）
     private var fresh: TextClip { project.textTracks.flatMap(\.clips).first { $0.id == clip.id } ?? clip }
 
+    /// 播放头这一刻的样子（范围框跟着字号动画走）
+    private var anim: TextClip { fresh.animated(atTimeline: project.clock.currentTime) }
+
+    /// 锁着比例时「缩放」那一行挂字号的关键帧；解开后宽 / 高各挂自己的（范围框像素）
+    private var textKeyframeHooks: LayerKeyframeHooks {
+        var h = kf.hooks
+        if fresh.lockBoxAspect { h.alias = [.scaleX: .fontSize] }
+        return h
+    }
+
     private var kf: KeyframeControls {
         KeyframeControls(project: project, clip: clip, easingOpen: $easingOpen)
     }
@@ -1484,18 +1506,48 @@ private struct TextInspector: View {
         fontName = c.fontName; fontSize = Double(c.fontSize)
         bold = c.bold; italic = c.italic
         textColor = c.textColor; strokeColor = c.strokeColor; strokeWidth = c.strokeWidth
+        strokeSoftness = c.strokeSoftness
         bgColor = c.bgColor; bgOpacity = c.bgOpacity
         alignment = c.alignment; posX = c.posX; posY = c.posY
         rotation = c.rotation; opacity = c.opacity; animation = c.animation
         DispatchQueue.main.async { syncing = false }
     }
 
-    @ViewBuilder private func colorRow(_ label: String, _ binding: Binding<Color>, _ onChange: @escaping () -> Void) -> some View {
-        IFieldRow(label: label) {
-            ColorPicker("", selection: binding)
-                .inspectorColorWell()
-                .onChange(of: binding.wrappedValue) { _ in onChange() }
+    /// 滑块 + 后面的 `< ◇ >`，两帧以上标签前出曲线展开箭头，展开时下面是曲线面板
+    @ViewBuilder private func kfSliderRow<S: View>(_ p: KeyframeProp, @ViewBuilder _ slider: () -> S) -> some View {
+        VStack(spacing: 10) {
+            HStack(spacing: 4) {
+                slider()
+                    .environment(\.capsuleSliderLeading, kf.toggle(p))
+                if let n = kf.nav(p) { n }
+            }
+            kf.panel(p)
         }
+        .id("kf-\(p.rawValue)")
+    }
+
+    /// 取色行 + `< ◇ >`。曲线展开箭头放在标题前（跟滑块一样的位置）
+    @ViewBuilder private func kfColorRow(_ p: KeyframeProp, _ label: String, _ binding: Binding<Color>,
+                                         _ onChange: @escaping (Color) -> Void) -> some View {
+        VStack(spacing: 10) {
+            HStack(spacing: ILayout.gap) {
+                HStack(spacing: 2) {
+                    if let t = kf.toggle(p) { t }
+                    Text(label)
+                        .font(.system(size: 10))
+                        .foregroundColor(Color.labelSecondary)
+                        .lineLimit(1)
+                }
+                .frame(width: ILayout.labelWidth + ILayout.hPadding, alignment: .leading)
+                ColorPicker("", selection: binding)
+                    .inspectorColorWell()
+                    .onChange(of: binding.wrappedValue) { nv in onChange(nv) }
+                Spacer(minLength: 0)
+                if let n = kf.nav(p) { n }
+            }
+            kf.panel(p)
+        }
+        .id("kf-\(p.rawValue)")
     }
     @ViewBuilder private func styleToggle(_ label: String, isOn: Bool, _ action: @escaping () -> Void) -> some View {
         Button(action: action) {
@@ -1605,17 +1657,23 @@ private struct ShapeInspector: View {
 
             // 填充只对有面积的图形有意义（线段、箭头没有）
             if clip.effectiveIsClosed {
-                ISection(title: "填充") {
+                ISection(title: "填充", trailing: {
+                    if fillEnabled, let g = shapeKF.group([.fillColor, .fillOpacity]) { g }
+                }) {
                     toggleRow("启用填充", $fillEnabled, dimKP: \.fillEnabled) { write { $0.fillEnabled = fillEnabled } }
                     if fillEnabled {
-                        colorRow("颜色", $fillColor, dimKP: \.fillColor) { write { $0.fillColor = fillColor } }
-                        ISlider(label: "不透明度", value: Binding(get: { fillOpacity * 100 }, set: { fillOpacity = $0 / 100 }), range: 0...100, unit: "%")
-                            .onChange(of: fillOpacity) { _ in write { $0.fillOpacity = fillOpacity } }
+                        colorRow("颜色", $fillColor, dimKP: \.fillColor, kfProp: .fillColor) { nv in write { $0.fillColor = nv } }
+                        kfSliderRow(.fillOpacity) {
+                            ISlider(label: "不透明度", value: Binding(get: { fillOpacity * 100 }, set: { fillOpacity = $0 / 100 }), range: 0...100, unit: "%")
+                                .onChange(of: fillOpacity) { nv in writeKF(.fillOpacity, nv) { $0.fillOpacity = nv } }
+                        }
                     }
                 }
             }
 
-            ISection(title: "描边") {
+            ISection(title: "描边", trailing: {
+                if strokeEnabled, let g = shapeKF.group([.strokeColor, .strokeWidth, .strokeOpacity]) { g }
+            }) {
                 toggleRow("启用描边", $strokeEnabled, dimKP: \.strokeEnabled) { write { $0.strokeEnabled = strokeEnabled } }
                 if strokeEnabled {
                     IFieldRow(label: "样式") {
@@ -1624,12 +1682,16 @@ private struct ShapeInspector: View {
                             set: { strokeDashed = ($0 == "虚线"); write { $0.strokeDashed = strokeDashed } }
                         ), options: [("直线", "直线"), ("虚线", "虚线")])
                     }
-                    colorRow("颜色", $strokeColor, dimKP: \.strokeColor) { write { $0.strokeColor = strokeColor } }
-                    ISlider(label: "粗细", value: $strokeWidth, range: 1...30, unit: "px")
-                        .onChange(of: strokeWidth) { _ in write { $0.strokeWidth = strokeWidth } }
-                        .dimNonUniform(dim(\.strokeWidth))
-                    ISlider(label: "不透明度", value: Binding(get: { strokeOpacity * 100 }, set: { strokeOpacity = $0 / 100 }), range: 0...100, unit: "%")
-                        .onChange(of: strokeOpacity) { _ in write { $0.strokeOpacity = strokeOpacity } }
+                    colorRow("颜色", $strokeColor, dimKP: \.strokeColor, kfProp: .strokeColor) { nv in write { $0.strokeColor = nv } }
+                    kfSliderRow(.strokeWidth) {
+                        ISlider(label: "粗细", value: $strokeWidth, range: 1...30, unit: "px")
+                            .onChange(of: strokeWidth) { nv in writeKF(.strokeWidth, nv) { $0.strokeWidth = nv } }
+                            .dimNonUniform(dim(\.strokeWidth))
+                    }
+                    kfSliderRow(.strokeOpacity) {
+                        ISlider(label: "不透明度", value: Binding(get: { strokeOpacity * 100 }, set: { strokeOpacity = $0 / 100 }), range: 0...100, unit: "%")
+                            .onChange(of: strokeOpacity) { nv in writeKF(.strokeOpacity, nv) { $0.strokeOpacity = nv } }
+                    }
                     if !clip.type.isClosed && clip.type != .pen {
                         IFieldRow(label: "起点") {
                             IPicker(selection: Binding(get: { capStartV.label }, set: { setCap($0, start: true) }), options: LineCapStyle.allCases.map { ($0.label, $0.label) })
@@ -1642,16 +1704,24 @@ private struct ShapeInspector: View {
             }
 
 
-            ISection(title: "投影") {
+            ISection(title: "投影", trailing: {
+                if shadowEnabled, let g = shapeKF.group([.shadowColor, .shadowOpacity, .shadowDistance, .shadowAngle]) { g }
+            }) {
                 toggleRow("启用投影", $shadowEnabled, dimKP: \.shadowEnabled) { write { $0.shadowEnabled = shadowEnabled } }
                 if shadowEnabled {
-                    colorRow("颜色", $shadowColor, dimKP: \.shadowColor) { write { $0.shadowColor = shadowColor } }
-                    ISlider(label: "不透明度", value: Binding(get: { shadowOpacityV * 100 }, set: { shadowOpacityV = $0 / 100 }), range: 0...100, unit: "%")
-                        .onChange(of: shadowOpacityV) { _ in write { $0.shadowOpacity = shadowOpacityV } }
-                    ISlider(label: "距离", value: $shadowDistance, range: 0...100, unit: "px")
-                        .onChange(of: shadowDistance) { _ in applyShadowVector() }
-                    ISlider(label: "角度", value: $shadowAngle, range: 0...360, unit: "°")
-                        .onChange(of: shadowAngle) { _ in applyShadowVector() }
+                    colorRow("颜色", $shadowColor, dimKP: \.shadowColor, kfProp: .shadowColor) { nv in write { $0.shadowColor = nv } }
+                    kfSliderRow(.shadowOpacity) {
+                        ISlider(label: "不透明度", value: Binding(get: { shadowOpacityV * 100 }, set: { shadowOpacityV = $0 / 100 }), range: 0...100, unit: "%")
+                            .onChange(of: shadowOpacityV) { nv in writeKF(.shadowOpacity, nv) { $0.shadowOpacity = nv } }
+                    }
+                    kfSliderRow(.shadowDistance) {
+                        ISlider(label: "距离", value: $shadowDistance, range: 0...100, unit: "px")
+                            .onChange(of: shadowDistance) { nv in applyShadowVector(distance: nv, angle: shadowAngle) }
+                    }
+                    kfSliderRow(.shadowAngle) {
+                        ISlider(label: "角度", value: $shadowAngle, range: 0...360, unit: "°")
+                            .onChange(of: shadowAngle) { nv in applyShadowVector(distance: shadowDistance, angle: nv) }
+                    }
                 }
             }
 
@@ -1688,6 +1758,11 @@ private struct ShapeInspector: View {
         }
     }
 
+    /// 关键帧控件（分组标题上的 `< ◇ >` 用）
+    private var shapeKF: KeyframeControls {
+        KeyframeControls(project: project, clip: clip, easingOpen: $easingOpen)
+    }
+
     /// 最新的片段（回调里别读 self.clip，那是改之前的）
     private var fresh: ShapeClip { project.shapeTracks.flatMap(\.clips).first { $0.id == clip.id } ?? clip }
 
@@ -1698,6 +1773,14 @@ private struct ShapeInspector: View {
         set(&posX, a.posX); set(&posY, a.posY); set(&rotation, a.rotation); set(&opacity, a.opacity)
         set(&scaleXPct, a.scaleX * 100); set(&scaleYPct, a.scaleY * 100); set(&scale, a.scaleX * 100)
         set(&cropT, a.cropTop); set(&cropB, a.cropBottom); set(&cropL, a.cropLeft); set(&cropR, a.cropRight)
+        func setColor(_ s: inout Color, _ v: Color) { if KeyframeColor.pack(s) != KeyframeColor.pack(v) { s = v } }
+        setColor(&fillColor, a.fillColor); setColor(&strokeColor, a.strokeColor); setColor(&shadowColor, a.shadowColor)
+        set(&strokeWidth, a.strokeWidth); set(&fillOpacity, a.fillOpacity); set(&cornerRadius, a.cornerRadius)
+        set(&strokeOpacity, a.strokeOpacity); set(&shadowOpacityV, a.shadowOpacity)
+        let d = hypot(a.shadowOffsetX, a.shadowOffsetY)
+        set(&shadowDistance, d)
+        // 距离为 0 时角度算不出来，留着面板原来的
+        if d > 1e-9 { set(&shadowAngle, ShapeClip.shadowAngleDeg(a.shadowOffsetX, a.shadowOffsetY)) }
     }
 
     private var clipNow: ShapeClip { project.selectedShapeClip ?? clip }
@@ -1725,12 +1808,37 @@ private struct ShapeInspector: View {
         project.pushUndoThrottled()
     }
 
-    private func applyShadowVector() {
-        let rad = shadowAngle * .pi / 180
+    private func applyShadowVector(distance: Double, angle: Double) {
+        // 跟着播放头同步出来的值不算编辑
+        let a = fresh.animated(atTimeline: project.currentTime)
+        let curD = a.propValue(.shadowDistance) ?? 0, curA = a.propValue(.shadowAngle) ?? 0
+        let dA = abs((angle - curA).truncatingRemainder(dividingBy: 360))
+        guard abs(distance - curD) > 1e-6 || (min(dA, 360 - dA) > 1e-6 && distance > 1e-9) else { return }
+        let rad = angle * .pi / 180
         write {
-            $0.shadowOffsetX = shadowDistance * cos(rad)
-            $0.shadowOffsetY = shadowDistance * sin(rad)
+            $0.shadowOffsetX = distance * cos(rad)
+            $0.shadowOffsetY = distance * sin(rad)
         }
+    }
+
+    /// 能打关键帧的数值：值跟播放头这一刻一样就不写（播放时面板同步会触发 onChange，别一路写撤销）
+    private func writeKF(_ p: KeyframeProp, _ v: Double, _ mutate: (inout ShapeClip) -> Void) {
+        if let now = fresh.animated(atTimeline: project.currentTime).propValue(p), abs(now - v) < 1e-9 { return }
+        write(mutate)
+    }
+
+    /// 滑块 + 后面的 `< ◇ >`，两帧以上标签前出曲线展开箭头，展开时下面是曲线面板
+    @ViewBuilder private func kfSliderRow<S: View>(_ p: KeyframeProp, @ViewBuilder _ slider: () -> S) -> some View {
+        let kf = KeyframeControls(project: project, clip: clip, easingOpen: $easingOpen)
+        VStack(spacing: 10) {
+            HStack(spacing: 4) {
+                slider()
+                    .environment(\.capsuleSliderLeading, kf.toggle(p))
+                if let n = kf.nav(p) { n }
+            }
+            kf.panel(p)
+        }
+        .id("kf-\(p.rawValue)")
     }
 
     enum AlignMode {
@@ -1831,20 +1939,43 @@ private struct ShapeInspector: View {
         cornerRadius = clip.cornerRadius
         shadowEnabled = clip.shadowEnabled; shadowColor = clip.shadowColor
         shadowRadius = clip.shadowRadius; shadowOffsetX = clip.shadowOffsetX; shadowOffsetY = clip.shadowOffsetY
-        syncAnimated()
         shadowOpacityV = clip.shadowOpacity
         shadowDistance = hypot(clip.shadowOffsetX, clip.shadowOffsetY)
-        shadowAngle = atan2(clip.shadowOffsetY, clip.shadowOffsetX) * 180 / .pi
+        shadowAngle = ShapeClip.shadowAngleDeg(clip.shadowOffsetX, clip.shadowOffsetY)
+        // 最后按播放头这一刻覆盖能打关键帧的那几项
+        syncAnimated()
         DispatchQueue.main.async { syncing = false }
     }
 
-    @ViewBuilder private func colorRow(_ label: String, _ binding: Binding<Color>, dimKP: KeyPath<ShapeClip, Color>? = nil, _ onChange: @escaping () -> Void) -> some View {
-        IFieldRow(label: label) {
-            ColorPicker("", selection: binding)
-                .inspectorColorWell()
-                .onChange(of: binding.wrappedValue) { _ in onChange() }
+    /// 取色行 + `< ◇ >`（颜色按通道过渡）。曲线展开箭头在标题前，展开时下面是曲线面板
+    @ViewBuilder private func colorRow(_ label: String, _ binding: Binding<Color>, dimKP: KeyPath<ShapeClip, Color>? = nil,
+                                       kfProp: KeyframeProp, _ onChange: @escaping (Color) -> Void) -> some View {
+        let kf = KeyframeControls(project: project, clip: clip, easingOpen: $easingOpen)
+        VStack(spacing: 10) {
+            HStack(spacing: ILayout.gap) {
+                HStack(spacing: 2) {
+                    if let t = kf.toggle(kfProp) { t }
+                    Text(label)
+                        .font(.system(size: 10))
+                        .foregroundColor(Color.labelSecondary)
+                        .lineLimit(1)
+                }
+                .frame(width: ILayout.labelWidth + ILayout.hPadding, alignment: .leading)
+                ColorPicker("", selection: binding)
+                    .inspectorColorWell()
+                    .onChange(of: binding.wrappedValue) { nv in
+                        // 播放时面板跟着播放头同步出来的颜色不算编辑（不然会一路写撤销）
+                        let now = fresh.animated(atTimeline: project.currentTime).propValue(kfProp)
+                        guard KeyframeColor.pack(nv) != now else { return }
+                        onChange(nv)
+                    }
+                Spacer(minLength: 0)
+                if let n = kf.nav(kfProp) { n }
+            }
+            .dimNonUniform(dimKP.map { isMulti && !uniform($0) } ?? false)
+            kf.panel(kfProp)
         }
-        .dimNonUniform(dimKP.map { isMulti && !uniform($0) } ?? false)
+        .id("kf-\(kfProp.rawValue)")
     }
     @ViewBuilder private func toggleRow(_ label: String, _ isOn: Binding<Bool>, dimKP: KeyPath<ShapeClip, Bool>? = nil, _ onChange: @escaping () -> Void) -> some View {
         HStack {
@@ -1964,9 +2095,11 @@ private struct ImageInspector: View {
                                      pushUndoOnce()
                                      project.updateImageClipAnimated(id: clip.id) { $0.opacity = v / 100 }
                                  }),
-                cornerRadius: Binding(get: { clip.corner },
+                // 打了关键帧时显示播放头这一刻的值，改了写进关键帧
+                cornerRadius: Binding(get: { current.animated(atTimeline: project.currentTime).corner },
                                       set: { v in
-                                          project.updateImageClip(id: clip.id) { $0.cornerRadius = v }
+                                          pushUndoOnce()
+                                          project.updateImageClipAnimated(id: clip.id) { $0.cornerRadius = v }
                                           project.rebuildTimelinePreviewDebounced()
                                       }),
                 onAlign: { project.alignLayers($0, anchorID: clip.id) },
@@ -1975,27 +2108,41 @@ private struct ImageInspector: View {
             )
 
             ISection(title: "描边", trailing: {
-                Button { strokeWidth = 0; applyStroke() } label: {
-                    Text("重置")
-                        .font(.system(size: 10))
-                        .foregroundColor(Color.labelSecondary)
-                        .padding(.horizontal, 8)
-                        .frame(height: 20)
-                        .background(Color.white.opacity(0.06))
-                        .cornerRadius(4)
+                Button { strokeWidth = 0; applyStroke(width: 0) } label: {
+                    IHeaderButtonLabel(title: "重置")
                 }.buttonStyle(.plain).disabled(strokeWidth <= 0.01)
+                // 关键帧 `< ◇ >` 放最右，跟每行后面的那一列对齐
+                if let g = kf.group([.strokeColor, .strokeWidth, .strokeSoftness]) { g }
             }) {
-                IFieldRow(label: "颜色") {
-                    ColorPicker("", selection: $strokeColor)
-                        .inspectorColorWell()
-                        .onChange(of: strokeColor) { _ in applyStroke() }
+                // 三项各自能打关键帧：`< ◇ >` 在后面，两帧以上标题前出曲线展开箭头
+                kfStrokeRow(.strokeColor) {
+                    HStack(spacing: ILayout.gap) {
+                        HStack(spacing: 2) {
+                            if let t = kf.toggle(.strokeColor) { t }
+                            Text("颜色")
+                                .font(.system(size: 10))
+                                .foregroundColor(Color.labelSecondary)
+                                .lineLimit(1)
+                        }
+                        .frame(width: ILayout.labelWidth + ILayout.hPadding, alignment: .leading)
+                        ColorPicker("", selection: $strokeColor)
+                            .inspectorColorWell()
+                            .onChange(of: strokeColor) { nv in applyStroke(color: nv) }
+                        Spacer(minLength: 0)
+                    }
                 }
-                ICapsuleSlider(label: "宽度", value: $strokeWidth, range: 0...100,
-                               decimals: 1, unit: "px",
-                               onChange: { _ in applyStroke() })
-                ICapsuleSlider(label: "柔和", value: $strokeSoftness, range: 0...1,
-                               decimals: 2,
-                               onChange: { _ in applyStroke() })
+                kfStrokeRow(.strokeWidth) {
+                    ICapsuleSlider(label: "宽度", value: $strokeWidth, range: 0...100,
+                                   decimals: 1, unit: "px",
+                                   onChange: { nv in applyStroke(width: nv) })
+                        .environment(\.capsuleSliderLeading, kf.toggle(.strokeWidth))
+                }
+                kfStrokeRow(.strokeSoftness) {
+                    ICapsuleSlider(label: "柔和", value: $strokeSoftness, range: 0...1,
+                                   decimals: 2,
+                                   onChange: { nv in applyStroke(softness: nv) })
+                        .environment(\.capsuleSliderLeading, kf.toggle(.strokeSoftness))
+                }
                 // 去背图片会沿主体轮廓描边，未去背的矩形图片则沿画面边缘
                 Text("描边沿图片不透明区域的轮廓生成，柔和 0 为硬边")
                     .font(.system(size: 9))
@@ -2010,7 +2157,8 @@ private struct ImageInspector: View {
                               rowAnchor: { kp in KeyframeProp.adjust(kp).map { "kf-\($0.rawValue)" } },
                               rowAccessory: { kp in KeyframeProp.adjust(kp).flatMap { kf.nav($0) } },
                               rowLeading: { kp in KeyframeProp.adjust(kp).flatMap { kf.toggle($0) } },
-                              rowBelow: { kp in KeyframeProp.adjust(kp).map { kf.panel($0) } }) {
+                              rowBelow: { kp in KeyframeProp.adjust(kp).map { kf.panel($0) } },
+                              headerAccessory: kf.group(KeyframeProp.adjustProps)) {
                     applyColorAdjust()
                 }
             }
@@ -2046,6 +2194,8 @@ private struct ImageInspector: View {
         set(&rotation, a.rotation); set(&opacity, a.alpha)
         lockAspect = a.lockAspect
         if colorAdj != a.colorAdjust { colorAdj = a.colorAdjust }
+        set(&strokeWidth, a.strokeW); set(&strokeSoftness, a.strokeSoft)
+        if KeyframeColor.pack(strokeColor) != KeyframeColor.pack(a.strokeColor) { strokeColor = a.strokeColor }
     }
 
     private func pushUndoOnce() {
@@ -2072,10 +2222,8 @@ private struct ImageInspector: View {
     }
 
     private func syncFromClip() {
+        // 描边也在 syncValues 里按播放头这一刻同步
         syncValues()
-        strokeColor = clip.strokeColor
-        strokeWidth = clip.strokeW
-        strokeSoftness = clip.strokeSoft
         hasPushedUndo = false
     }
 
@@ -2083,16 +2231,34 @@ private struct ImageInspector: View {
         project.updateImageClip(id: clip.id) { $0.lockAspect = lockAspect }
     }
 
-    private func applyStroke() {
+    /// 一行控件 + 后面的 `< ◇ >`，展开曲线时下面是曲线面板
+    @ViewBuilder private func kfStrokeRow<C: View>(_ p: KeyframeProp, @ViewBuilder _ row: () -> C) -> some View {
+        VStack(spacing: 10) {
+            HStack(spacing: 4) {
+                row()
+                if let n = kf.nav(p) { n }
+            }
+            kf.panel(p)
+        }
+        .id("kf-\(p.rawValue)")
+    }
+
+    /// 描边写回。参数给的是刚改的那一项的新值（回调里 self 上的是旧值）；
+    /// 跟播放头这一刻的值一样就不写（播放时面板同步也会触发 onChange）。打了关键帧就写进关键帧
+    private func applyStroke(color: Color? = nil, width: Double? = nil, softness: Double? = nil) {
+        let c = color ?? strokeColor, w = width ?? strokeWidth, s = softness ?? strokeSoftness
+        let a = current.animated(atTimeline: project.currentTime)
+        guard KeyframeColor.pack(c) != KeyframeColor.pack(a.strokeColor)
+                || abs(w - a.strokeW) > 1e-9 || abs(s - a.strokeSoft) > 1e-9 else { return }
         if !hasPushedUndo {
             project.pushUndo()
             hasPushedUndo = true
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { hasPushedUndo = false }
         }
-        project.updateImageClip(id: clip.id) {
-            $0.strokeColorHex = strokeColor.toHex()
-            $0.strokeWidth = strokeWidth
-            $0.strokeSoftness = strokeSoftness
+        project.updateImageClipAnimated(id: clip.id) {
+            if KeyframeColor.pack(c) != KeyframeColor.pack($0.strokeColor) { $0.strokeColorHex = c.toHex() }
+            $0.strokeWidth = w
+            $0.strokeSoftness = s
         }
     }
 
@@ -2303,7 +2469,10 @@ private struct VideoInspector: View {
                 }
             }
 
-            ISection(title: "变换") {
+            ISection(title: "变换", trailing: {
+                if let g = groupKF.group([.angle, .offsetX, .offsetY, .scaleX, .scaleY,
+                                          .cropTop, .cropBottom, .cropLeft, .cropRight]) { g }
+            }) {
                 // 卡片样式同图片 / 文字 / 图形的「变换」：等分撑满一行，图标下面带文字
                 HStack(spacing: 6) {
                     canvasBtn(.mirrorH, label: "水平镜像", active: clip.mirrorH) {
@@ -2422,7 +2591,8 @@ private struct VideoInspector: View {
                               rowBelow: { kp in
                                   guard let p = KeyframeProp.adjust(kp) else { return nil }
                                   return AnyView(easingPanel(p))
-                              }) {
+                              },
+                              headerAccessory: groupKF.group(KeyframeProp.adjustProps)) {
                     applyColorAdjust()
                 }
             }
@@ -2447,6 +2617,11 @@ private struct VideoInspector: View {
             let cur = project.videoTracks.flatMap(\.clips).first { $0.id == clip.id }
             if cur?.hasKeyframes == true { syncValues(at: t) }
         }
+    }
+
+    /// 分组标题上的 `< ◇ >`（只用到它的 group，曲线展开状态用不上）
+    private var groupKF: KeyframeControls {
+        KeyframeControls(project: project, clip: clip, easingOpen: .constant([]))
     }
 
     /// 某个属性的 `< ◇ >`
@@ -2513,13 +2688,7 @@ private struct VideoInspector: View {
     /// 分组标题右边的小按钮，样子同图片 / 文字 / 图形面板
     private func headerButton(_ title: String, action: @escaping () -> Void) -> some View {
         Button(action: action) {
-            Text(title)
-                .font(.system(size: 10))
-                .foregroundColor(Color.labelSecondary)
-                .padding(.horizontal, 8)
-                .frame(height: 20)
-                .background(Color.white.opacity(0.06))
-                .cornerRadius(4)
+            IHeaderButtonLabel(title: title)
         }
         .buttonStyle(.plain)
     }

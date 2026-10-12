@@ -1,4 +1,6 @@
 import Foundation
+import SwiftUI
+import AppKit
 
 // MARK: - 关键帧
 //
@@ -113,6 +115,18 @@ enum KeyframeProp: String, CaseIterable, Codable {
     case temperature, tint, hue
     /// 音量（1 = 100%）。视频、音频片段都有
     case volume
+    /// 文字的颜色与描边。颜色值是打包的 RGBA（见 `KeyframeColor`），两帧之间按通道过渡
+    case textColor, strokeColor, bgColor
+    case strokeWidth, strokeSoftness, bgOpacity
+    /// 图形的填充色、投影色（描边色、描边粗细跟文字共用 strokeColor / strokeWidth）
+    case fillColor, shadowColor
+    /// 图形的填充 / 描边 / 投影不透明度（0~1），投影距离（px）、投影角度（度，0~360）
+    case fillOpacity, strokeOpacity, shadowOpacity, shadowDistance, shadowAngle
+    /// 圆角（px）。图片、图形
+    case cornerRadius
+
+    /// 值是打包颜色、要按通道插值的属性
+    var isColor: Bool { [.textColor, .strokeColor, .bgColor, .fillColor, .shadowColor].contains(self) }
 
     /// 调节的哪一项（不是调节类属性返回 nil）
     var adjustKeyPath: WritableKeyPath<ColorAdjust, Double>? {
@@ -132,9 +146,46 @@ enum KeyframeProp: String, CaseIterable, Codable {
         }
     }
 
+    /// 「调节」这一组的全部属性
+    static var adjustProps: [KeyframeProp] { allCases.filter { $0.adjustKeyPath != nil } }
+
     /// 调节的某一项对应哪个属性
     static func adjust(_ kp: WritableKeyPath<ColorAdjust, Double>) -> KeyframeProp? {
         allCases.first { $0.adjustKeyPath == kp }
+    }
+}
+
+/// 颜色打成一个数存进关键帧：0xRRGGBBAA（32 位整数，Double 能精确表示）
+enum KeyframeColor {
+    static func pack(_ c: Color) -> Double {
+        let nc = NSColor(c).usingColorSpace(.sRGB) ?? .white
+        var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
+        nc.getRed(&r, green: &g, blue: &b, alpha: &a)
+        func ch(_ v: CGFloat) -> UInt32 { UInt32(min(max((v * 255).rounded(), 0), 255)) }
+        return Double(ch(r) << 24 | ch(g) << 16 | ch(b) << 8 | ch(a))
+    }
+    static func channels(_ v: Double) -> [Double] {
+        let u = UInt32(min(max(v.rounded(), 0), Double(UInt32.max)))
+        return [Double(u >> 24 & 0xFF), Double(u >> 16 & 0xFF), Double(u >> 8 & 0xFF), Double(u & 0xFF)]
+    }
+    /// 存档用的 #RRGGBBAA
+    static func hex(_ v: Double) -> String {
+        let c = channels(v)
+        return String(format: "#%02X%02X%02X%02X", Int(c[0]), Int(c[1]), Int(c[2]), Int(c[3]))
+    }
+    static func unpack(_ v: Double) -> Color {
+        let c = channels(v)
+        return Color(.sRGB, red: c[0] / 255, green: c[1] / 255, blue: c[2] / 255, opacity: c[3] / 255)
+    }
+    /// 两个颜色之间按通道过渡（弹性曲线会冲过头，夹在 0~255）
+    static func lerp(_ a: Double, _ b: Double, _ f: Double) -> Double {
+        let ca = channels(a), cb = channels(b)
+        var u: UInt32 = 0
+        for i in 0..<4 {
+            let v = UInt32(min(max((ca[i] + (cb[i] - ca[i]) * f).rounded(), 0), 255))
+            u |= v << UInt32(24 - i * 8)
+        }
+        return Double(u)
     }
 }
 
@@ -164,6 +215,7 @@ struct ClipKeyframes: Codable, Equatable, Hashable {
             var f = rest > 1e-9 ? max(0, t - a.time - d) / rest : (t >= b.time ? 1 : 0)
             f = min(1, f)
             if let e = a.easing { f = e.apply(f) }
+            if p.isColor { return KeyframeColor.lerp(a.value, b.value, f) }
             return a.value + (b.value - a.value) * f
         }
         return last.value
@@ -259,6 +311,14 @@ protocol KeyframeAnimatable {
     /// 这个属性现在的静态值（不看关键帧）。这类片段没有这个属性返回 nil
     func propValue(_ p: KeyframeProp) -> Double?
     mutating func setPropValue(_ p: KeyframeProp, _ v: Double)
+    /// 关键帧属性换成插值结果之后，跟着它走的非关键帧属性在这里补（`base` 是静态的那份）。
+    /// 文字：字号动画时范围框按同样比例缩放
+    mutating func followAnimated(base: Self)
+    /// 编辑写回时，把「这一刻」改出来的跟随属性换算回静态值（`followAnimated` 的反过程）
+    mutating func unfollowAnimated(edited: Self, atTimeline t: Double)
+    /// 打了关键帧的属性写回时保持静态值不动。默认按 propValue / setPropValue 回写；
+    /// 静态值可能是「自适应」（nil）的属性要自己原样拷回（文字的范围框）
+    mutating func restoreStatic(_ p: KeyframeProp, from base: Self)
 }
 
 extension KeyframeAnimatable {
@@ -271,6 +331,12 @@ extension KeyframeAnimatable {
     }
 
     var hasKeyframes: Bool { !(keyframes?.isEmpty ?? true) }
+
+    mutating func followAnimated(base: Self) {}
+    mutating func unfollowAnimated(edited: Self, atTimeline t: Double) {}
+    mutating func restoreStatic(_ p: KeyframeProp, from base: Self) {
+        if let v = base.propValue(p) { setPropValue(p, v) }
+    }
 
     /// 播放头不在片段里时，关键帧打在离它最近的片段边上
     func clampedTimeline(_ t: Double) -> Double {
@@ -285,6 +351,7 @@ extension KeyframeAnimatable {
         for p in KeyframeProp.allCases {
             if let v = kf.sample(p, at: k), propValue(p) != nil { c.setPropValue(p, v) }
         }
+        c.followAnimated(base: self)
         return c
     }
 
@@ -302,12 +369,13 @@ extension KeyframeAnimatable {
         let k = keyframeTime(atTimeline: tt)
         let tol = keyframeTolerance(atTimeline: tt)
         for p in KeyframeProp.allCases where kf.has(p) {
-            if let base = propValue(p) { result.setPropValue(p, base) }
+            result.restoreStatic(p, from: self)
             if let a = after.propValue(p), let b = before.propValue(p), abs(a - b) > 1e-9 {
                 newKF.upsert(p, at: k, value: a, tolerance: tol)
             }
         }
         result.keyframes = newKF
+        result.unfollowAnimated(edited: after, atTimeline: tt)
         self = result
     }
 
@@ -442,12 +510,65 @@ extension KeyframeInPoint {
 // MARK: - 文字片段
 
 extension TextClip: KeyframeInPoint {
-    /// 文字的「缩放」是范围框，不打关键帧；字号单独一项
+    /// 文字锁着比例时的缩放就是字号动画（属性区挂在「缩放」那一行），范围框宽高跟着字号同比例走；
+    /// 解开比例时宽 / 高（`scaleX` / `scaleY`）是范围框像素，可以各自打关键帧
     var lockAspect: Bool { false }
+
+    /// 字号这一刻相对静态字号的倍数（没有字号关键帧是 1）
+    private func fontRatio(animatedSize f: CGFloat) -> Double {
+        guard keyframes?.has(.fontSize) == true, fontSize > 0 else { return 1 }
+        return Double(f / fontSize)
+    }
+
+    /// 框宽 / 框高自己打了关键帧就按自己的走，不再跟字号比例
+    mutating func followAnimated(base: TextClip) {
+        let r = base.fontRatio(animatedSize: fontSize)
+        guard r != 1, r > 0 else { return }
+        let kf = keyframes
+        if kf?.has(.scaleX) != true { boxWidth = base.boxWidth.map { $0 * r } }
+        if kf?.has(.scaleY) != true { boxHeight = base.boxHeight.map { $0 * r } }
+    }
+
+    mutating func unfollowAnimated(edited: TextClip, atTimeline t: Double) {
+        guard keyframes?.has(.fontSize) == true, fontSize > 0 else { return }
+        // 写回后这一刻的字号（可能刚打了新帧），按它把「这一刻」的框换回静态值
+        let k = keyframeTime(atTimeline: t)
+        guard let f = keyframes?.sample(.fontSize, at: k), f > 0 else { return }
+        let r = f / Double(fontSize)
+        if keyframes?.has(.scaleX) != true { boxWidth = edited.boxWidth.map { $0 / r } }
+        if keyframes?.has(.scaleY) != true { boxHeight = edited.boxHeight.map { $0 / r } }
+    }
+
+    /// 范围框的静态值可能是 nil（自适应），原样拷回，别被换成估算值定死
+    mutating func restoreStatic(_ p: KeyframeProp, from base: TextClip) {
+        switch p {
+        case .scaleX: boxWidth = base.boxWidth
+        case .scaleY: boxHeight = base.boxHeight
+        default:      if let v = base.propValue(p) { setPropValue(p, v) }
+        }
+    }
+
+    /// 文字按自己撑开时的大小（渲染坐标，不含外圈留白）。范围框没定死时打关键帧拿它当起始值
+    var naturalBoxSize: CGSize {
+        var font = NSFont(name: fontName, size: fontSize) ?? NSFont.systemFont(ofSize: fontSize)
+        if bold { font = NSFontManager.shared.convert(font, toHaveTrait: .boldFontMask) }
+        let sz = ((text.isEmpty ? " " : text) as NSString).size(withAttributes: [.font: font])
+        // 多留 2 点：定死的宽度比实际排版略窄就会折行
+        return CGSize(width: ceil(sz.width) + 2, height: ceil(sz.height))
+    }
 
     func propValue(_ p: KeyframeProp) -> Double? {
         switch p {
         case .fontSize:   return Double(fontSize)
+        // 解开比例时的宽 / 高（范围框像素）
+        case .scaleX:     return boxWidth ?? Double(naturalBoxSize.width)
+        case .scaleY:     return boxHeight ?? Double(naturalBoxSize.height)
+        case .textColor:  return KeyframeColor.pack(textColor)
+        case .strokeColor: return KeyframeColor.pack(strokeColor)
+        case .bgColor:    return KeyframeColor.pack(bgColor)
+        case .strokeWidth: return strokeWidth
+        case .strokeSoftness: return strokeSoftness
+        case .bgOpacity:  return bgOpacity
         case .offsetX:    return posX
         case .offsetY:    return posY
         case .angle:      return rotation
@@ -463,6 +584,14 @@ extension TextClip: KeyframeInPoint {
     mutating func setPropValue(_ p: KeyframeProp, _ v: Double) {
         switch p {
         case .fontSize:   fontSize = CGFloat(max(1, v))
+        case .scaleX:     boxWidth = max(8, v)
+        case .scaleY:     boxHeight = max(8, v)
+        case .textColor:  textColor = KeyframeColor.unpack(v)
+        case .strokeColor: strokeColor = KeyframeColor.unpack(v)
+        case .bgColor:    bgColor = KeyframeColor.unpack(v)
+        case .strokeWidth: strokeWidth = max(0, v)
+        case .strokeSoftness: strokeSoftness = min(1, max(0, v))
+        case .bgOpacity:  bgOpacity = min(1, max(0, v))
         case .offsetX:    posX = v
         case .offsetY:    posY = v
         case .angle:      rotation = v
@@ -479,6 +608,12 @@ extension TextClip: KeyframeInPoint {
 // MARK: - 图形片段
 
 extension ShapeClip: KeyframeInPoint {
+    /// 投影偏移换成角度（度，0~360）
+    static func shadowAngleDeg(_ x: Double, _ y: Double) -> Double {
+        let a = atan2(y, x) * 180 / .pi
+        return a < 0 ? a + 360 : a
+    }
+
     func propValue(_ p: KeyframeProp) -> Double? {
         switch p {
         case .offsetX:    return posX
@@ -491,12 +626,37 @@ extension ShapeClip: KeyframeInPoint {
         case .cropBottom: return cropBottom
         case .cropLeft:   return cropLeft
         case .cropRight:  return cropRight
+        case .fillColor:  return KeyframeColor.pack(fillColor)
+        case .strokeColor: return KeyframeColor.pack(strokeColor)
+        case .shadowColor: return KeyframeColor.pack(shadowColor)
+        case .strokeWidth: return strokeWidth
+        case .fillOpacity: return fillOpacity
+        case .strokeOpacity: return strokeOpacity
+        case .shadowOpacity: return shadowOpacity
+        // 投影存的是 x / y 偏移，面板上是距离 + 角度
+        case .shadowDistance: return hypot(shadowOffsetX, shadowOffsetY)
+        case .shadowAngle: return ShapeClip.shadowAngleDeg(shadowOffsetX, shadowOffsetY)
+        case .cornerRadius: return cornerRadius
         default:          return nil
         }
     }
 
     mutating func setPropValue(_ p: KeyframeProp, _ v: Double) {
         switch p {
+        case .fillColor:  fillColor = KeyframeColor.unpack(v)
+        case .strokeColor: strokeColor = KeyframeColor.unpack(v)
+        case .shadowColor: shadowColor = KeyframeColor.unpack(v)
+        case .strokeWidth: strokeWidth = max(0, v)
+        case .cornerRadius: cornerRadius = max(0, v)
+        case .fillOpacity: fillOpacity = min(1, max(0, v))
+        case .strokeOpacity: strokeOpacity = min(1, max(0, v))
+        case .shadowOpacity: shadowOpacity = min(1, max(0, v))
+        case .shadowDistance:
+            let a = atan2(shadowOffsetY, shadowOffsetX), d = max(0, v)
+            shadowOffsetX = d * cos(a); shadowOffsetY = d * sin(a)
+        case .shadowAngle:
+            let d = hypot(shadowOffsetX, shadowOffsetY), a = v * .pi / 180
+            shadowOffsetX = d * cos(a); shadowOffsetY = d * sin(a)
         case .offsetX:    posX = v
         case .offsetY:    posY = v
         case .scaleX:     scaleX = v
@@ -529,6 +689,11 @@ extension ImageClip: KeyframeInPoint {
         case .cropBottom: return cropBottom
         case .cropLeft:   return cropLeft
         case .cropRight:  return cropRight
+        // 描边（存的是可选值，nil = 没设过）
+        case .strokeColor: return KeyframeColor.pack(strokeColor)
+        case .strokeWidth: return strokeW
+        case .strokeSoftness: return strokeSoft
+        case .cornerRadius: return corner
         default:          return nil
         }
     }
@@ -546,7 +711,22 @@ extension ImageClip: KeyframeInPoint {
         case .cropBottom: cropBottom = v
         case .cropLeft:   cropLeft = v
         case .cropRight:  cropRight = v
+        case .strokeColor: strokeColorHex = KeyframeColor.hex(v)
+        case .strokeWidth: strokeWidth = max(0, v)
+        case .strokeSoftness: strokeSoftness = min(1, max(0, v))
+        case .cornerRadius: cornerRadius = max(0, v)
         default:          break
+        }
+    }
+
+    /// 描边、圆角的静态值是可选的，原样拷回（别把「没设过」写成具体值）
+    mutating func restoreStatic(_ p: KeyframeProp, from base: ImageClip) {
+        switch p {
+        case .strokeColor:    strokeColorHex = base.strokeColorHex
+        case .strokeWidth:    strokeWidth = base.strokeWidth
+        case .strokeSoftness: strokeSoftness = base.strokeSoftness
+        case .cornerRadius:   cornerRadius = base.cornerRadius
+        default:              if let v = base.propValue(p) { setPropValue(p, v) }
         }
     }
 }

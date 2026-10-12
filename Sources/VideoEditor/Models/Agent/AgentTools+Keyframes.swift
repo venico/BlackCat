@@ -18,6 +18,9 @@ extension AgentToolbox {
         "rotation": .angle, "opacity": .opacity,
         "crop_top": .cropTop, "crop_bottom": .cropBottom, "crop_left": .cropLeft, "crop_right": .cropRight,
         "font_size": .fontSize, "volume": .volume,
+        "stroke_width": .strokeWidth, "stroke_softness": .strokeSoftness, "bg_opacity": .bgOpacity,
+        "fill_opacity": .fillOpacity, "stroke_opacity": .strokeOpacity, "shadow_opacity": .shadowOpacity,
+        "shadow_distance": .shadowDistance, "shadow_angle": .shadowAngle, "corner_radius": .cornerRadius,
         "brightness": .brightness, "contrast": .contrast, "saturation": .saturation, "vibrance": .vibrance,
         "exposure": .exposure, "gamma": .gamma, "highlight": .highlight, "shadow": .shadow,
         "temperature": .temperature, "tint": .tint, "hue": .hue,
@@ -31,6 +34,9 @@ extension AgentToolbox {
         let propList = "position_x / position_y（位置 %，50 = 居中）、scale（宽高一起，%）/ scale_x / scale_y、"
             + "rotation（度，顺时针为正）、opacity（%）、crop_top / crop_bottom / crop_left / crop_right（%）、"
             + "font_size（文字字号 px）、volume（音量 %，100 = 原音量）、"
+            + "文字的 scale_x / scale_y 是文本框宽高（px）；stroke_width（描边 px）、stroke_softness（0~1）、bg_opacity（背景不透明 %）、"
+            + "图形的 fill_opacity / stroke_opacity / shadow_opacity（%）、shadow_distance（px）、shadow_angle（度）、"
+            + "图片 / 图形的 corner_radius（圆角 px）、"
             + "brightness / contrast / saturation / vibrance / highlight / shadow / temperature / tint（-1~1）、"
             + "exposure（-2~2）、gamma（0.25~4，1 = 原样）、hue（-180~180）"
         return [
@@ -204,18 +210,21 @@ extension AgentToolbox {
     private static func posIsOffset(_ c: any KeyframeAnimatable) -> Bool { c is VideoClip || c is ImageClip }
 
     private static func toInternal(_ v: Double, _ p: KeyframeProp, _ c: any KeyframeAnimatable) -> Double {
+        // 文字的 scale_x / scale_y 是文本框像素，原样
+        if c is TextClip, p == .scaleX || p == .scaleY { return v }
         switch p {
         case .offsetX, .offsetY: return posIsOffset(c) ? v / 100 - 0.5 : v / 100
-        case .scaleX, .scaleY, .opacity, .volume,
+        case .scaleX, .scaleY, .opacity, .volume, .bgOpacity, .fillOpacity, .strokeOpacity, .shadowOpacity,
              .cropTop, .cropBottom, .cropLeft, .cropRight: return v / 100
         default: return v   // 旋转（度）、字号（px）、调色（原值）
         }
     }
 
     private static func toUI(_ v: Double, _ p: KeyframeProp, _ c: any KeyframeAnimatable) -> Double {
+        if c is TextClip, p == .scaleX || p == .scaleY { return v }
         switch p {
         case .offsetX, .offsetY: return posIsOffset(c) ? (v + 0.5) * 100 : v * 100
-        case .scaleX, .scaleY, .opacity, .volume,
+        case .scaleX, .scaleY, .opacity, .volume, .bgOpacity, .fillOpacity, .strokeOpacity, .shadowOpacity,
              .cropTop, .cropBottom, .cropLeft, .cropRight: return v * 100
         default: return v
         }

@@ -28,6 +28,10 @@ struct LayerKeyframeHooks {
     let nav: (KeyframeProp) -> AnyView?
     let toggle: (KeyframeProp) -> AnyView?
     let panel: (KeyframeProp) -> AnyView
+    /// 某一行实际挂哪个属性的关键帧。文字的「缩放」行挂的是字号
+    var alias: [KeyframeProp: KeyframeProp] = [:]
+    /// 分组标题上的 `< ◇ >`
+    var group: (([KeyframeProp]) -> AnyView?)? = nil
 }
 
 struct LayerCommonSections: View {
@@ -53,6 +57,10 @@ struct LayerCommonSections: View {
     var scaleRange: ClosedRange<Double> = 5...400
     var scaleUnit: String = "%"
     var scaleLabels: (both: String, w: String, h: String) = ("缩放", "宽", "高")
+    /// 锁着比例时那一条单独给值（文字：按比例显示，跟解开后的宽高像素不是一个量纲）
+    var scaleBoth: Binding<Double>? = nil
+    var scaleBothRange: ClosedRange<Double>? = nil
+    var scaleBothUnit: String? = nil
 
     // ── 裁剪（0~100%）──
     var cropTop: Binding<Double>? = nil
@@ -87,16 +95,16 @@ struct LayerCommonSections: View {
     /// 滑块 + 关键帧控件。没给挂钩就只是滑块；id 给「选中关键帧时属性区滚到这一行」用
     @ViewBuilder
     private func kfRow<S: View>(_ p: KeyframeProp, @ViewBuilder _ slider: () -> S) -> some View {
-        if let h = keyframeHooks, let nav = h.nav(p) {
+        if let h = keyframeHooks, case let q = h.alias[p] ?? p, let nav = h.nav(q) {
             VStack(spacing: 10) {
                 HStack(spacing: 4) {
                     slider()
-                        .environment(\.capsuleSliderLeading, h.toggle(p))
+                        .environment(\.capsuleSliderLeading, h.toggle(q))
                     nav
                 }
-                h.panel(p)
+                h.panel(q)
             }
-            .id("kf-\(p.rawValue)")
+            .id("kf-\(q.rawValue)")
         } else {
             slider()
         }
@@ -104,11 +112,24 @@ struct LayerCommonSections: View {
 
     // MARK: 变换
 
+    /// 「变换」这一组能打帧的属性（缩放行跟着锁定状态 / 文字的字号映射走）
+    private var transformProps: [KeyframeProp] {
+        var ps: [KeyframeProp] = [.angle, .offsetX, .offsetY]
+        if let a = keyframeHooks?.alias[.scaleX], lockAspect?.wrappedValue ?? false {
+            ps.append(a)
+        } else {
+            ps += [.scaleX, .scaleY]
+        }
+        return ps + [.cropTop, .cropBottom, .cropLeft, .cropRight]
+    }
+
     @ViewBuilder
     private var transformSection: some View {
         if mirrorH != nil || mirrorV != nil || rotation != nil
             || posX != nil || scaleW != nil || cropTop != nil {
-            ISection(title: "变换") {
+            ISection(title: "变换", trailing: {
+                if let g = keyframeHooks?.group?(transformProps) { g }
+            }) {
                 HStack(spacing: 6) {
                     if let m = mirrorH {
                         transformCard(.mirrorH, label: "水平镜像", active: m.wrappedValue) {
@@ -218,6 +239,12 @@ struct LayerCommonSections: View {
                     // 锁着的时候拖一条，宽高按**原来的比例**一起走，
                     // 直接把两个值设成一样会把非等比的元素拉方
                     // 锁着时这一条代表宽高两个，关键帧挂在「宽」上（打帧时宽高成对打）
+                    if let sb = scaleBoth {
+                        kfRow(.scaleX) {
+                            ISlider(label: scaleLabels.both, value: sb,
+                                    range: scaleBothRange ?? scaleRange, unit: scaleBothUnit ?? scaleUnit)
+                        }
+                    } else {
                     kfRow(.scaleX) {
                         ISlider(label: scaleLabels.both, value: Binding(
                             get: { w.wrappedValue },
@@ -229,6 +256,7 @@ struct LayerCommonSections: View {
                                                      min(scaleRange.upperBound, h.wrappedValue * k))
                             }
                         ), range: scaleRange, unit: scaleUnit)
+                    }
                     }
                 } else {
                     kfRow(.scaleX) {
@@ -269,19 +297,39 @@ struct LayerCommonSections: View {
     @ViewBuilder
     private var appearanceSection: some View {
         if opacity != nil || cornerRadius != nil {
-            ISection(title: "外观") {
+            ISection(title: "外观", trailing: {
+                if let g = keyframeHooks?.group?(cornerRadius != nil && cornerEnabled
+                                                 ? [.opacity, .cornerRadius] : [.opacity]) { g }
+            }) {
                 if let o = opacity {
                     kfRow(.opacity) { ISlider(label: "不透明度", value: o, range: 0...100, unit: "%") }
                 }
                 if let c = cornerRadius {
                     // 间距 6 和标签宽度都跟 ICapsuleSlider 对齐，
                     // 输入框再占满右边剩下的宽度 —— 这样它和滑块左右两头都齐
-                    IFieldRow(label: "圆角") {
-                        MiniStepper(value: c, step: 1, minValue: 0, maxValue: 500)
-                            .frame(maxWidth: .infinity)
-                            .disabled(!cornerEnabled)
-                            .opacity(cornerEnabled ? 1 : 0.35)
+                    // 圆角也能打关键帧：曲线展开箭头在标题前，`< ◇ >` 在输入框后面
+                    let h = cornerEnabled ? keyframeHooks : nil
+                    VStack(spacing: 10) {
+                        HStack(spacing: 4) {
+                            HStack(spacing: ILayout.gap) {
+                                HStack(spacing: 2) {
+                                    if let t = h?.toggle(.cornerRadius) { t }
+                                    Text("圆角")
+                                        .font(.system(size: 10))
+                                        .foregroundColor(Color.labelSecondary)
+                                        .lineLimit(1)
+                                }
+                                .frame(width: ILayout.labelWidth + ILayout.hPadding, alignment: .leading)
+                                MiniStepper(value: c, step: 1, minValue: 0, maxValue: 500)
+                                    .frame(maxWidth: .infinity)
+                                    .disabled(!cornerEnabled)
+                                    .opacity(cornerEnabled ? 1 : 0.35)
+                            }
+                            if let n = h?.nav(.cornerRadius) { n }
+                        }
+                        h?.panel(.cornerRadius)
                     }
+                    .id("kf-cornerRadius")
                     .help(cornerEnabled ? "" : "这种图形没有圆角")
                 }
             }
@@ -347,18 +395,28 @@ struct LayerCommonSections: View {
 
     private func headerButton(_ title: String, action: @escaping () -> Void) -> some View {
         Button(action: action) {
-            Text(title)
-                .font(.system(size: 10))
-                .foregroundColor(Color.labelSecondary)
-                .padding(.horizontal, 8)
-                .frame(height: 20)
-                .background(Color.white.opacity(0.06))
-                .cornerRadius(4)
+            IHeaderButtonLabel(title: title)
         }
         .buttonStyle(.plain)
     }
 }
 
+
+/// 分组标题右边的小按钮（居中、重置）的样子。能点时字亮一些，灰掉时跟着变暗
+struct IHeaderButtonLabel: View {
+    let title: String
+    @Environment(\.isEnabled) private var enabled
+
+    var body: some View {
+        Text(title)
+            .font(.system(size: 10))
+            .foregroundColor(enabled ? Color.labelPrimary.opacity(0.9) : Color.labelSecondary)
+            .padding(.horizontal, 8)
+            .frame(height: 20)
+            .background(Color.white.opacity(0.06))
+            .cornerRadius(4)
+    }
+}
 
 // MARK: - 调节参数（片段属性区和调节轨道共用这一份）
 
@@ -375,6 +433,8 @@ struct AdjustSliders: View {
     var rowBelow: ((WritableKeyPath<ColorAdjust, Double>) -> AnyView?)? = nil
     /// 每个滑块标签**前面**的小控件（视频片段放曲线面板的展开箭头）
     var rowLeading: ((WritableKeyPath<ColorAdjust, Double>) -> AnyView?)? = nil
+    /// 「调节」标题最右边（重置后面）的分组 `< ◇ >`
+    var headerAccessory: AnyView? = nil
 
     /// 变了就展开（外面要滚到某一行时先展开）
     var expandSignal: Int = 0
@@ -387,7 +447,9 @@ struct AdjustSliders: View {
          rowAccessory: ((WritableKeyPath<ColorAdjust, Double>) -> AnyView?)? = nil,
          rowLeading: ((WritableKeyPath<ColorAdjust, Double>) -> AnyView?)? = nil,
          rowBelow: ((WritableKeyPath<ColorAdjust, Double>) -> AnyView?)? = nil,
+         headerAccessory: AnyView? = nil,
          onChange: @escaping () -> Void) {
+        self.headerAccessory = headerAccessory
         self._adjust = adjust
         // 面板刚建出来时信号就已经在了（点关键帧时属性区从「项目」换成「视频」），onChange 等不到，直接展开
         self._expanded = State(initialValue: expandedByDefault || expandSignal != 0)
@@ -419,19 +481,16 @@ struct AdjustSliders: View {
                 }
                 .buttonStyle(.plain)
                 Spacer()
+                // 样式同描边 / 裁剪的「重置」；关键帧 `< ◇ >` 放在最右，跟每行后面的那一列对齐
                 Button {
                     adjust = .identity
                     onChange()
                 } label: {
-                    Text("重置")
-                        .font(.system(size: 9, weight: .medium))
-                        .foregroundColor(isNeutral ? Color.labelSecondary : .black)
-                        .padding(.horizontal, 6).padding(.vertical, 2)
-                        .background(isNeutral ? Color.white.opacity(0.08) : Color(hex: "#E8A54B"))
-                        .clipShape(RoundedRectangle(cornerRadius: 4))
+                    IHeaderButtonLabel(title: "重置")
                 }
                 .buttonStyle(.plain)
                 .disabled(isNeutral)
+                if let h = headerAccessory { h }
             }
 
             if expanded {
@@ -502,6 +561,8 @@ struct KeyframeNav: View {
     let clipStart: Double
     let clipEnd: Double
     let onToggle: () -> Void
+    /// 分组用：这一刻组里是不是**每个**属性都有帧。nil = 单个属性（有帧就算满）
+    var fullAt: ((Double) -> Bool)? = nil
 
     private let snap = 0.02
     private let accent = Color(hex: "#E8A54B")
@@ -510,6 +571,8 @@ struct KeyframeNav: View {
     var body: some View {
         let now = clock.currentTime
         let onFrame = times.contains { abs($0 - now) <= snap }
+        // 分组只有部分属性在这一刻有帧：黄色空心，点了把缺的补上
+        let full = onFrame && (fullAt?(now) ?? true)
         let prev = times.last { $0 < now - snap }
         let next = times.first { $0 > now + snap }
         let inClip = now >= clipStart - snap && now <= clipEnd + snap
@@ -520,15 +583,16 @@ struct KeyframeNav: View {
                 ZStack {
                     // 悬停时空菱形变成灰色实心、里面白「+」（点了打一帧）；
                     // 黄菱形里显示「−」（点了删掉）
-                    Image(systemName: onFrame || hot ? "diamond.fill" : "diamond")
+                    Image(systemName: full || hot ? "diamond.fill" : "diamond")
                         .font(.system(size: 12, weight: .regular))
-                        .foregroundColor(onFrame ? accent
+                        .foregroundColor(full ? accent
                                          : hot ? Color.white.opacity(0.35)
+                                         : onFrame ? accent
                                          : (times.isEmpty ? Color.labelSecondary : Color.labelPrimary))
                     if hot {
-                        Text(onFrame ? "−" : "+")
+                        Text(full ? "−" : "+")
                             .font(.system(size: 8, weight: .heavy))
-                            .foregroundColor(onFrame ? .black : .white)
+                            .foregroundColor(full ? .black : .white)
                             .offset(y: -0.5)
                     }
                 }
@@ -539,7 +603,8 @@ struct KeyframeNav: View {
             .disabled(!inClip)
             .opacity(inClip ? 1 : 0.35)
             .onHover { hovering = $0 }
-            .help(onFrame ? "删除关键帧" : "添加关键帧")
+            .help(full ? (fullAt == nil ? "删除关键帧" : "删除这一组的关键帧")
+                       : (fullAt == nil ? "添加关键帧" : "给这一组都打上关键帧"))
             arrow("chevron.right", target: next)
         }
     }
@@ -608,7 +673,21 @@ struct KeyframeControls {
         return AnyView(KeyframeEasingPanel(clock: project.clock, clipID: clip.id, prop: p))
     }
 
+    /// 分组标题上的 `< ◇ >`：一次给组里所有能打帧的属性打 / 删，左右跳到组里任一属性的上一帧 / 下一帧
+    func group(_ props: [KeyframeProp]) -> AnyView? {
+        let ps = props.filter { clip.propValue($0) != nil }
+        guard !ps.isEmpty else { return nil }
+        let c = clip, id = clip.id
+        let times = Array(Set(ps.flatMap { c.keyframeTimelineTimes($0) })).sorted()
+        return AnyView(KeyframeNav(clock: project.clock, times: times,
+                                   clipStart: c.startTime, clipEnd: c.endTime,
+                                   onToggle: { project.toggleGroupKeyframes(clipID: id, props: ps) },
+                                   fullAt: { t in ps.allSatisfy { c.hasKeyframe($0, atTimeline: c.clampedTimeline(t)) } }))
+    }
+
     var hooks: LayerKeyframeHooks {
-        LayerKeyframeHooks(nav: nav, toggle: toggle, panel: panel)
+        var h = LayerKeyframeHooks(nav: nav, toggle: toggle, panel: panel)
+        h.group = group
+        return h
     }
 }

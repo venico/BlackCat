@@ -1,5 +1,6 @@
 // 关键帧（v6.8.0）：插值、编辑写回、打/删、分割后不跑位
 import XCTest
+import SwiftUI
 import AVFoundation
 import CoreImage
 @testable import VideoEditorLib
@@ -311,12 +312,180 @@ final class KeyframeTests: XCTestCase {
         let mid = t.animated(atTimeline: 4)
         XCTAssertEqual(Double(mid.fontSize), 96, accuracy: 1e-9)
         XCTAssertEqual(mid.posX, 0.7, accuracy: 1e-9)
-        XCTAssertNil(t.propValue(.scaleX), "文字的范围框不打关键帧")
+        XCTAssertEqual(t.propValue(.scaleX) ?? 0, Double(t.naturalBoxSize.width), "解开比例时的宽 = 范围框，自适应时取文字撑开的宽")
         // 手写编解码：关键帧和入点要存得进、读得回
         t.kfIn = 1.5
         let back = try JSONDecoder().decode(TextClip.self, from: JSONEncoder().encode(t))
         XCTAssertEqual(back.keyframes, t.keyframes)
         XCTAssertEqual(back.kfIn, 1.5)
+    }
+
+    /// 文字的缩放 = 字号动画：拖过边的范围框跟着字号同比例走，静态框不被这一刻的值污染
+    func testTextScaleKeyframeCarriesBox() {
+        var t = TextClip(text: "标题", startTime: 0, endTime: 10)
+        t.fontSize = 50; t.boxWidth = 200; t.boxHeight = 70
+        t.toggleKeyframe(.fontSize, atTimeline: 0)
+        // 播放头在 10 秒处按锁定比例放大一倍：字号和框一起 ×2（面板 / 拖四角都是这么写的）
+        t.applyAnimatedEdit(atTimeline: 9.999) {
+            $0.fontSize *= 2
+            $0.boxWidth = $0.boxWidth.map { $0 * 2 }
+            $0.boxHeight = $0.boxHeight.map { $0 * 2 }
+        }
+        XCTAssertEqual(Double(t.fontSize), 50, accuracy: 1e-9, "静态字号不动")
+        XCTAssertEqual(t.boxWidth ?? 0, 200, accuracy: 1e-6, "静态框不动")
+        let mid = t.animated(atTimeline: 5)
+        XCTAssertEqual(Double(mid.fontSize), 75, accuracy: 0.01)
+        XCTAssertEqual(mid.boxWidth ?? 0, 300, accuracy: 0.1, "框跟字号同比例")
+        XCTAssertEqual(mid.boxHeight ?? 0, 105, accuracy: 0.1)
+        // 在半路改别的属性：框不跟着漂
+        t.applyAnimatedEdit(atTimeline: 5) { $0.posX = 0.3 }
+        XCTAssertEqual(t.boxWidth ?? 0, 200, accuracy: 1e-6)
+        // 半路只拖一条边：这一刻的框是新值，其余时刻按比例
+        t.applyAnimatedEdit(atTimeline: 5) { $0.boxWidth = 450 }
+        XCTAssertEqual(t.animated(atTimeline: 5).boxWidth ?? 0, 450, accuracy: 0.1)
+        XCTAssertEqual(t.animated(atTimeline: 0).boxWidth ?? 0, 300, accuracy: 0.1)
+        // 自适应的框（nil）保持自适应
+        var u = TextClip(text: "x", startTime: 0, endTime: 10)
+        u.toggleKeyframe(.fontSize, atTimeline: 0)
+        u.applyAnimatedEdit(atTimeline: 9.999) { $0.fontSize = 120 }
+        XCTAssertNil(u.animated(atTimeline: 5).boxWidth)
+    }
+
+    /// 文字缩放按比例显示：第一次缩放时定下 100% 的字号，存得进读得回
+    func testTextScaleRefPinnedAndCodable() throws {
+        let p = ProjectState()
+        var t = TextClip(text: "x", startTime: 0, endTime: 10)
+        t.fontSize = 40
+        p.textTracks = [Track(clips: [t])]
+        XCTAssertEqual(t.scaleRef, 40, "没缩放过时当前字号就是 100%")
+        p.pinTextScaleRef(id: t.id)
+        p.updateTextClip(id: t.id) { $0.fontSize = 60 }
+        p.pinTextScaleRef(id: t.id)                    // 第二次不改基准
+        let c = p.textTracks[0].clips[0]
+        XCTAssertEqual(Double(c.fontSize) / c.scaleRef * 100, 150, accuracy: 1e-9)
+        let back = try JSONDecoder().decode(TextClip.self, from: JSONEncoder().encode(c))
+        XCTAssertEqual(back.scaleRefFontSize, 40)
+    }
+
+    /// 文字颜色按通道过渡；描边、背景不透明这些数值照常插值
+    func testTextColorAndStrokeKeyframes() throws {
+        var t = TextClip(text: "x", startTime: 0, endTime: 10)
+        t.textColor = Color(.sRGB, red: 0, green: 0, blue: 0, opacity: 1)
+        t.toggleKeyframe(.textColor, atTimeline: 0)
+        t.toggleKeyframe(.strokeWidth, atTimeline: 0)
+        t.applyAnimatedEdit(atTimeline: 9.999) {
+            $0.textColor = Color(.sRGB, red: 1, green: 0, blue: 1, opacity: 1)
+            $0.strokeWidth = 10
+        }
+        let mid = t.animated(atTimeline: 5)
+        let ch = KeyframeColor.channels(KeyframeColor.pack(mid.textColor))
+        XCTAssertEqual(ch[0], 128, accuracy: 1.5)
+        XCTAssertEqual(ch[1], 0, accuracy: 0.5)
+        XCTAssertEqual(ch[2], 128, accuracy: 1.5)
+        XCTAssertEqual(ch[3], 255, accuracy: 0.5)
+        XCTAssertEqual(mid.strokeWidth, 5, accuracy: 0.01)
+        XCTAssertEqual(KeyframeColor.channels(KeyframeColor.pack(t.textColor))[0], 0, "静态颜色不动")
+        let back = try JSONDecoder().decode(TextClip.self, from: JSONEncoder().encode(t))
+        XCTAssertEqual(back.keyframes, t.keyframes)
+    }
+
+    /// 解开比例时宽高各自打帧；自适应的框在写回别的属性时保持自适应
+    func testTextBoxWidthKeyframesKeepAutoStatic() {
+        var t = TextClip(text: "标题", startTime: 0, endTime: 10)
+        XCTAssertNil(t.boxWidth)
+        t.toggleKeyframe(.scaleX, atTimeline: 0)
+        let w0 = t.animated(atTimeline: 0).boxWidth ?? 0
+        XCTAssertGreaterThan(w0, 0, "打帧时用文字撑开的宽度当起始值")
+        t.applyAnimatedEdit(atTimeline: 9.999) { $0.boxWidth = w0 + 200 }
+        XCTAssertEqual(t.animated(atTimeline: 5).boxWidth ?? 0, w0 + 100, accuracy: 0.1)
+        XCTAssertNil(t.boxWidth, "静态框仍是自适应")
+        XCTAssertNil(t.animated(atTimeline: 5).boxHeight, "高没打帧，保持自适应")
+        // 字号动画不再拉这个已打帧的宽
+        t.toggleKeyframe(.fontSize, atTimeline: 0)
+        t.applyAnimatedEdit(atTimeline: 9.999) { $0.fontSize *= 2 }
+        XCTAssertEqual(t.animated(atTimeline: 5).boxWidth ?? 0, w0 + 100, accuracy: 0.1)
+    }
+
+    /// 图形的填充 / 描边 / 投影颜色按通道过渡
+    func testShapeColorKeyframes() throws {
+        var s = ShapeClip(type: .rectangle, startTime: 0, endTime: 10)
+        s.fillColor = Color(.sRGB, red: 1, green: 1, blue: 1, opacity: 1)
+        s.toggleKeyframe(.fillColor, atTimeline: 0)
+        s.toggleKeyframe(.shadowColor, atTimeline: 0)
+        s.applyAnimatedEdit(atTimeline: 9.999) {
+            $0.fillColor = Color(.sRGB, red: 0, green: 0, blue: 1, opacity: 1)
+            $0.shadowColor = Color(.sRGB, red: 1, green: 0, blue: 0, opacity: 1)
+        }
+        let mid = s.animated(atTimeline: 5)
+        let f = KeyframeColor.channels(KeyframeColor.pack(mid.fillColor))
+        XCTAssertEqual(f[0], 128, accuracy: 1.5)
+        XCTAssertEqual(f[2], 255, accuracy: 0.5)
+        XCTAssertEqual(KeyframeColor.channels(KeyframeColor.pack(mid.shadowColor))[0], 128, accuracy: 1.5)
+        XCTAssertEqual(KeyframeColor.channels(KeyframeColor.pack(s.fillColor))[1], 255, "静态填充色不动")
+        let back = try JSONDecoder().decode(ShapeClip.self, from: JSONEncoder().encode(s))
+        XCTAssertEqual(back.keyframes, s.keyframes)
+    }
+
+    /// 图形的投影距离 / 角度按面板的量过渡（存的是 x / y 偏移），不透明度、描边粗细照常
+    func testShapeShadowAndOpacityKeyframes() {
+        var s = ShapeClip(type: .rectangle, startTime: 0, endTime: 10)
+        s.shadowOffsetX = 10; s.shadowOffsetY = 0          // 距离 10、角度 0°
+        for p in [KeyframeProp.shadowDistance, .shadowAngle, .fillOpacity, .strokeWidth] {
+            s.toggleKeyframe(p, atTimeline: 0)
+        }
+        s.applyAnimatedEdit(atTimeline: 9.999) {
+            $0.shadowOffsetX = 0; $0.shadowOffsetY = 30     // 距离 30、角度 90°
+            $0.fillOpacity = 0; $0.strokeWidth = 20
+        }
+        let mid = s.animated(atTimeline: 5)
+        XCTAssertEqual(mid.propValue(.shadowDistance) ?? 0, 20, accuracy: 0.05)
+        XCTAssertEqual(mid.propValue(.shadowAngle) ?? 0, 45, accuracy: 0.05)
+        XCTAssertEqual(mid.fillOpacity, 0.5, accuracy: 0.01)
+        XCTAssertEqual(mid.strokeWidth, 12, accuracy: 0.05)
+        XCTAssertEqual(s.shadowOffsetX, 10, accuracy: 1e-9, "静态投影不动")
+    }
+
+    /// 分组标题菱形：没打全就把缺的补上，全都有再点一下就全删；片段没有的属性跳过
+    func testGroupKeyframeToggle() {
+        let p = ProjectState()
+        var s = ShapeClip(type: .rectangle, startTime: 0, endTime: 10)
+        s.toggleKeyframe(.fillColor, atTimeline: 2)          // 先单独打了一项
+        p.shapeTracks = [Track(clips: [s])]
+        p.currentTime = 2
+        let group: [KeyframeProp] = [.fillColor, .fillOpacity, .fontSize]   // 图形没有字号
+        p.toggleGroupKeyframes(clipID: s.id, props: group)
+        var c = p.shapeTracks[0].clips[0]
+        XCTAssertTrue(c.hasKeyframe(.fillColor, atTimeline: 2))
+        XCTAssertTrue(c.hasKeyframe(.fillOpacity, atTimeline: 2), "缺的补上")
+        XCTAssertEqual(c.keyframes?.frames(.fillColor).count, 1, "已有的不重复打")
+        p.toggleGroupKeyframes(clipID: s.id, props: group)
+        c = p.shapeTracks[0].clips[0]
+        XCTAssertFalse(c.hasKeyframes, "全都有时再点一下全删")
+    }
+
+    /// 图片描边能打关键帧；没设过描边的静态值保持 nil
+    func testImageStrokeKeyframesKeepOptionalStatic() {
+        var i = ImageClip(assetID: UUID(), startTime: 0, endTime: 10)
+        XCTAssertNil(i.strokeWidth)
+        i.toggleKeyframe(.strokeWidth, atTimeline: 0)
+        i.applyAnimatedEdit(atTimeline: 9.999) { $0.strokeWidth = 20; $0.offsetX = 0.1 }
+        XCTAssertEqual(i.animated(atTimeline: 5).strokeW, 10, accuracy: 0.01)
+        XCTAssertNil(i.strokeWidth, "静态描边仍是没设过")
+    }
+
+    /// 圆角能打关键帧：图片没设过的静态值保持 nil，图形照常
+    func testCornerRadiusKeyframes() {
+        var i = ImageClip(assetID: UUID(), startTime: 0, endTime: 10)
+        i.toggleKeyframe(.cornerRadius, atTimeline: 0)
+        i.applyAnimatedEdit(atTimeline: 9.999) { $0.cornerRadius = 40 }
+        XCTAssertEqual(i.animated(atTimeline: 5).corner, 20, accuracy: 0.05)
+        XCTAssertNil(i.cornerRadius, "图片静态圆角仍是没设过")
+        var s = ShapeClip(type: .rectangle, startTime: 0, endTime: 10)
+        s.cornerRadius = 10
+        s.toggleKeyframe(.cornerRadius, atTimeline: 0)
+        s.applyAnimatedEdit(atTimeline: 9.999) { $0.cornerRadius = 30 }
+        XCTAssertEqual(s.animated(atTimeline: 5).cornerRadius, 20, accuracy: 0.05)
+        XCTAssertEqual(s.cornerRadius, 10)
     }
 
     func testShapeKeyframesScaleRotationAndCodable() throws {

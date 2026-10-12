@@ -932,6 +932,19 @@ extension ProjectState {
         keyframesChanged()
     }
 
+    /// 分组标题上的菱形：组里这几个属性在播放头处**全都有**帧就一起删，否则把缺的补上
+    func toggleGroupKeyframes(clipID: UUID, props: [KeyframeProp]) {
+        pushUndo()
+        let t = currentTime
+        updateKeyframedClip(clipID) { c in
+            let ps = props.filter { c.propValue($0) != nil }
+            let tt = c.clampedTimeline(t)
+            let all = !ps.isEmpty && ps.allSatisfy { c.hasKeyframe($0, atTimeline: tt) }
+            for p in ps { c.setKeyframe(p, atTimeline: t, on: !all) }
+        }
+        keyframesChanged()
+    }
+
     /// 锁着等比时宽高是一对：改一个，另一个同一时刻的帧也跟着改
     private func lockedPartners(_ c: any KeyframeAnimatable, _ prop: KeyframeProp) -> [KeyframeProp] {
         c.lockAspect && (prop == .scaleX || prop == .scaleY) ? [.scaleX, .scaleY] : [prop]
@@ -1205,6 +1218,17 @@ extension ProjectState {
         undoCount = undoStack.count
         redoCount = 0
         isSaved = false
+    }
+
+    /// 文字第一次缩放前，把「缩放 100%」定在现在的（静态）字号上，之后缩放显示的比例才有基准
+    func pinTextScaleRef(id: UUID) {
+        for ti in textTracks.indices {
+            if let ci = textTracks[ti].clips.firstIndex(where: { $0.id == id }),
+               textTracks[ti].clips[ci].scaleRefFontSize == nil {
+                textTracks[ti].clips[ci].scaleRefFontSize = Double(textTracks[ti].clips[ci].fontSize)
+                return
+            }
+        }
     }
 
     /// 更新指定文字片段（Inspector 编辑用）
@@ -1562,7 +1586,7 @@ extension ProjectState {
                 return MultiLayerHandle(
                     id: id, center: b.center, size: b.size, opacity: t.opacity,
                     // 文字的「放大」是字号加范围框一起走，跟拖四角圆点一个意思
-                    scaleBy: { k in self.updateTextClip(id: id) {
+                    scaleBy: { k in self.pinTextScaleRef(id: id); self.updateTextClip(id: id) {
                         $0.fontSize = max(8, $0.fontSize * CGFloat(k))
                         if let w = $0.boxWidth { $0.boxWidth = w * k }
                         if let h = $0.boxHeight { $0.boxHeight = h * k }
