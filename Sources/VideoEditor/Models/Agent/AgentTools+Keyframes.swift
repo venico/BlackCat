@@ -48,9 +48,9 @@ extension AgentToolbox {
                 parameters: [
                     "type": "object",
                     "properties": [
-                        "clip": ["type": "string", "description": "片段 id（list_tracks 给的，前 8 位就行）"]
+                        "clip": ["type": "string", "description": "片段 id（list_tracks 给的，前 8 位就行）。不写或写 selected = 用户当前选中的那一段（用户说「这段」时多半就是它）"]
                     ] as [String: Any],
-                    "required": ["clip"]
+                    "required": [] as [String]
                 ],
                 risk: .readOnly),
 
@@ -65,7 +65,7 @@ extension AgentToolbox {
                 parameters: [
                     "type": "object",
                     "properties": [
-                        "clip": ["type": "string", "description": "片段 id"],
+                        "clip": ["type": "string", "description": "片段 id（list_tracks 给的，前 8 位就行）。不写或写 selected = 用户当前选中的那一段（用户说「这段」时多半就是它）"],
                         "keyframes": [
                             "type": "array",
                             "description": "要打的帧",
@@ -84,7 +84,7 @@ extension AgentToolbox {
                             ] as [String: Any]
                         ] as [String: Any]
                     ] as [String: Any],
-                    "required": ["clip", "keyframes"]
+                    "required": ["keyframes"]
                 ],
                 risk: .mutating),
 
@@ -97,11 +97,11 @@ extension AgentToolbox {
                 parameters: [
                     "type": "object",
                     "properties": [
-                        "clip": ["type": "string", "description": "片段 id"],
+                        "clip": ["type": "string", "description": "片段 id（list_tracks 给的，前 8 位就行）。不写或写 selected = 用户当前选中的那一段（用户说「这段」时多半就是它）"],
                         "property": ["type": "string", "description": "属性名（可选），同 set_keyframes"],
                         "time": ["type": "number", "description": "时间轴上的秒（可选）"]
                     ] as [String: Any],
-                    "required": ["clip"]
+                    "required": [] as [String]
                 ],
                 risk: .mutating),
         ]
@@ -110,10 +110,19 @@ extension AgentToolbox {
     @MainActor
     static func runKeyframeTool(_ name: String, args: [String: Any], project p: ProjectState) -> AgentToolResult? {
         guard ["list_keyframes", "set_keyframes", "delete_keyframes"].contains(name) else { return nil }
-        guard let raw = (args["clip"] as? String)?.trimmingCharacters(in: .whitespaces).lowercased(), !raw.isEmpty
-        else { return .fail("缺 clip（片段 id）。") }
         let all: [any KeyframeAnimatable] = p.videoTracks.flatMap(\.clips) + p.imageTracks.flatMap(\.clips)
             + p.textTracks.flatMap(\.clips) + p.shapeTracks.flatMap(\.clips) + p.audioTracks.flatMap(\.clips)
+        var raw = (args["clip"] as? String)?.trimmingCharacters(in: .whitespaces).lowercased() ?? ""
+        // 不写 / 写 selected = 用户当前选中的那一段（「这段视频」多半就是它，省得模型去翻几百句字幕找 id）
+        if raw.isEmpty || raw == "selected" || raw == "current" {
+            let picked = all.filter { p.selectedClipIDs.contains($0.id) }
+            guard picked.count == 1, let c = picked.first else {
+                return .fail(picked.isEmpty
+                    ? "没有选中能打关键帧的片段（视频 / 图片 / 文字 / 图形 / 音频）。给 clip 写片段 id（list_tracks 拿），或让用户先选中。"
+                    : "选中了 \(picked.count) 个片段，不知道打哪个。给 clip 写片段 id。")
+            }
+            raw = c.id.uuidString.lowercased()
+        }
         let hits = all.filter { $0.id.uuidString.lowercased().hasPrefix(raw) }
         guard hits.count == 1, let clip = hits.first else {
             return .fail(hits.isEmpty ? "找不到片段「\(raw)」。先 list_tracks 拿 id；字幕、滤镜这类片段不能打关键帧。"

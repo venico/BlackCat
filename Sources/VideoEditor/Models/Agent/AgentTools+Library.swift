@@ -34,7 +34,9 @@ extension AgentToolbox {
                         "name": ["type": "string"],
                         "asset_ids": ["type": "array", "items": ["type": "string"]],
                         "color": ["type": "string", "description": "#RRGGBB，传 none 恢复默认"],
-                        "directory": ["type": "string", "description": "collect 时复制到哪个文件夹（绝对路径）"]
+                        "directory": ["type": "string", "description": "collect 时复制到哪个文件夹（绝对路径）"],
+                        "query": ["type": "string", "description": "list 时按文件夹名搜（空格分开的几个词都要有，搜不到自动放宽）"],
+                        "page": ["type": "integer", "description": "list 结果分页，第几页（从 1 开始），默认 1"]
                     ] as [String: Any],
                     "required": ["action"]
                 ],
@@ -182,12 +184,25 @@ extension AgentToolbox {
         switch s("action") ?? "" {
         case "list":
             guard !lib.folders.isEmpty else { return .ok("素材库里还没有文件夹。") }
-            let lines = lib.folders.sorted { ($0.type.rawValue, $0.sortIndex) < ($1.type.rawValue, $1.sortIndex) }.map { f -> String in
+            var list = lib.folders.sorted { ($0.type.rawValue, $0.sortIndex) < ($1.type.rawValue, $1.sortIndex) }
+            if let t = s("type"), let at = AssetType(rawValue: t) { list = list.filter { $0.type == at } }
+            var head = "文件夹"
+            if let q = s("query"), !q.isEmpty {
+                let r = AgentSearch.find(list, q) { $0.name }
+                guard !r.items.isEmpty else { return .ok("没有名字含「\(q)」的文件夹（放宽也没有）。不带 query 再列一次看全部。") }
+                list = r.items
+                head = r.relaxed ? "精确搜「\(q)」没找到，放宽后的文件夹" : "名字含「\(q)」的文件夹"
+            }
+            let page = (args["page"] as? Int) ?? (args["page"] as? Double).map { Int($0) } ?? 1
+            let pg = AgentSearch.page(list, page: page)
+            let lines = pg.items.map { f -> String in
                 let n = p.mediaAssets.filter { $0.folderID == f.id }.count
                 let par = f.parentID.flatMap { id in lib.folders.first { $0.id == id }?.name }
                 return "- \(f.id.uuidString.prefix(8))「\(f.name)」\(f.type.label)，\(n) 个素材" + (par.map { "，在「\($0)」里" } ?? "")
             }
-            return .ok(lines.joined(separator: "\n"))
+            var out = "\(head)（\(list.count) 个\(pg.pages > 1 ? "，第 \(pg.page)/\(pg.pages) 页" : "")）：\n" + lines.joined(separator: "\n")
+            if pg.page < pg.pages { out += "\n下一页：同样的条件加 page=\(pg.page + 1)。" }
+            return .ok(out)
         case "create":
             guard let t = s("type").flatMap(AssetType.init(rawValue:)) else { return .fail("create 要给 type") }
             let parent = folder(s("parent_id"))?.id

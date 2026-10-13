@@ -204,6 +204,11 @@ final class AgentRunner: ObservableObject {
 
         history.append(.user(prompt, images: images))
         var msgs = history
+        // 这句话前面带上编辑器此刻的状态（选中的、播放头下的片段，带 id）。只进这一轮发给模型的消息，
+        // 不改用户原话；会话界面显示的是会话记录里的原话
+        if case .user(let t, let imgs)? = msgs.last {
+            msgs[msgs.count - 1] = .user(AgentToolbox.editorStateNote(project) + t, images: imgs)
+        }
 
         // 整轮一个撤销点：开跑前打一次，期间工具内部的 pushUndo 全部跳过
         // 同一个项目里另一条会话正在跑的话，它已经打开了这个开关：

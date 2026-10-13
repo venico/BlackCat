@@ -26,8 +26,12 @@ extension AgentToolbox {
                 以及卡片之间的连线（上游卡片是下游的参考素材）和分组。
                 想知道某张卡片**画面里**是什么（什么颜色、谁在里面、构图如何），
                 拿它的 id 调 capture_frame 亲眼看一眼，别靠文件名猜。
+                卡片多时分页（page 翻）；找特定卡片用 query 搜内容 / 提示词 / 类型 / 状态。
                 """,
-                parameters: ["type": "object", "properties": [:] as [String: Any],
+                parameters: ["type": "object", "properties": [
+                                "query": ["type": "string", "description": "按内容、提示词、类型、状态搜（空格分开的几个词都要有，搜不到自动放宽）"],
+                                "page": ["type": "integer", "description": "第几页（从 1 开始），默认 1"]
+                             ] as [String: Any],
                              "required": [] as [String]],
                 risk: .readOnly),
 
@@ -170,7 +174,8 @@ extension AgentToolbox {
         switch name {
 
         case "read_canvas":
-            return .ok(canvasReport(p))
+            return .ok(canvasReport(p, query: args["query"] as? String,
+                                    page: (args["page"] as? Int) ?? (args["page"] as? Double).map { Int($0) } ?? 1))
 
         case "add_canvas_node":
             guard let kindRaw = args["kind"] as? String,
@@ -362,13 +367,41 @@ extension AgentToolbox {
 
     /// 画布现状。直接给表格 —— 卡片是并列的多条同构记录，本来就该这么看
     @MainActor
-    private static func canvasReport(_ p: ProjectState) -> String {
+    private static func canvasReport(_ p: ProjectState, query: String? = nil, page: Int = 1) -> String {
         let canvas = p.canvas
         guard !canvas.nodes.isEmpty else { return "画布上还是空的，一张卡片都没有。" }
 
-        var out = "画布上有 \(canvas.nodes.count) 张卡片：\n\n"
+        func contentOf(_ n: CanvasNode) -> String {
+            switch n.kind {
+            case .text:
+                let t = n.text.replacingOccurrences(of: "\n", with: " ")
+                return t.isEmpty ? "（空）" : String(t.prefix(40))
+            default:
+                return n.mediaURL?.lastPathComponent ?? "（还没有素材）"
+            }
+        }
+        func stateOf(_ n: CanvasNode) -> String {
+            if n.isGenerating { return n.progressText ?? "生成中" }
+            if n.isWaiting { return "排队等上游" }
+            if let f = n.failure { return "失败：" + String(f.prefix(30)) }
+            return n.hasContent ? "已完成" : "空着"
+        }
+        // 先搜（内容 / 提示词 / 类型 / 状态），再分页。卡片生成多了能上百张，全列会被截断
+        var list = canvas.nodes
+        var head = "画布上有 \(canvas.nodes.count) 张卡片"
+        if let q = query, !q.trimmingCharacters(in: .whitespaces).isEmpty {
+            let r = AgentSearch.find(list, q) { n in
+                [n.kind.label, n.text, n.prompt, n.mediaURL?.lastPathComponent ?? "", stateOf(n)].joined(separator: " ")
+            }
+            guard !r.items.isEmpty else { return "画布上没有跟「\(q)」相关的卡片（放宽也没有）。不带 query 再看一次全部。" }
+            list = r.items
+            head = r.relaxed ? "精确搜「\(q)」没找到，放宽后有 \(list.count) 张" : "搜「\(q)」有 \(list.count) 张"
+        }
+        let pg = AgentSearch.page(list, page: page)
+        let shownIDs = Set(pg.items.map(\.id))
+        var out = head + (pg.pages > 1 ? "，第 \(pg.page)/\(pg.pages) 页" : "") + "：\n\n"
         out += "| id | 类型 | 内容 | 提示词 | 状态 |\n|---|---|---|---|---|\n"
-        for n in canvas.nodes {
+        for n in pg.items {
             let content: String
             switch n.kind {
             case .text:
@@ -387,9 +420,13 @@ extension AgentToolbox {
             out += "| \(shortID(n.id)) | \(n.kind.label) | \(content) | \(prompt) | \(state) |\n"
         }
 
-        if !canvas.edges.isEmpty {
+        if pg.page < pg.pages { out += "\n下一页：同样的条件加 page=\(pg.page + 1)。\n" }
+
+        // 连线只列跟这一页卡片有关的
+        let edges = canvas.edges.filter { shownIDs.contains($0.from) || shownIDs.contains($0.to) }
+        if !edges.isEmpty {
             out += "\n连线（上游 → 下游，上游是下游的参考素材）：\n"
-            for e in canvas.edges {
+            for e in edges {
                 guard let f = canvas.node(e.from), let t = canvas.node(e.to) else { continue }
                 out += "- \(shortID(f.id)) \(f.kind.label) → \(shortID(t.id)) \(t.kind.label)\n"
             }

@@ -9,6 +9,51 @@ final class AgentKeyframeToolTests: XCTestCase {
         AgentToolbox.runKeyframeTool(name, args: args, project: p)!
     }
 
+    /// 不写 clip / 写 selected：用当前选中的那一段
+    func testSetKeyframesUsesSelectedClip() {
+        let p = ProjectState()
+        let v = VideoClip(assetID: UUID(), startTime: 0, endTime: 10)
+        p.videoTracks[0].clips = [v]
+        XCTAssertTrue(run("set_keyframes", ["keyframes": [["property": "opacity", "time": 1, "value": 0]]], p).isError,
+                      "没选中时要报错，别乱打")
+        p.selectedClipIDs = [v.id]
+        let r = run("set_keyframes", ["keyframes": [
+            ["property": "opacity", "time": 1, "value": 0],
+            ["property": "opacity", "time": 3, "value": 100],
+        ]], p)
+        XCTAssertFalse(r.isError, r.text)
+        XCTAssertEqual(p.videoTracks[0].clips[0].animated(atTimeline: 2).alpha, 0.5, accuracy: 1e-9)
+        XCTAssertFalse(run("list_keyframes", ["clip": "selected"], p).isError)
+    }
+
+    /// 字幕几百句时 list_tracks 每条轨只列前一部分，视频轨照样看得到；点名轨道能看全部
+    func testListTracksCapsLongTracksSoVideoStaysVisible() async {
+        let p = ProjectState()
+        p.subtitleTracks = [Track(clips: (0..<300).map {
+            SubtitleClip(text: "第\($0)句", startTime: Double($0), endTime: Double($0) + 1) })]
+        p.overlayTrackOrder = [.subtitle(p.subtitleTracks[0].id)] + p.overlayTrackOrder
+        let v = VideoClip(assetID: UUID(), startTime: 0, endTime: 300)
+        p.videoTracks[0].clips = [v]
+        let all = await AgentToolbox.runReadTool("list_tracks", args: [:], project: p)!.text
+        XCTAssertLessThan(all.count, 3000, "不能长到被截断")
+        XCTAssertTrue(all.contains(String(v.id.uuidString.prefix(8))), "视频片段 id 要看得到")
+        XCTAssertTrue(all.contains("还有 280 段没列出"))
+        // 选中的 / 播放头下的哪怕排在前 20 段之后也列出来并标注
+        p.selectedClipIDs = [p.subtitleTracks[0].clips[250].id]
+        p.currentTime = 260.5
+        let focus = await AgentToolbox.runReadTool("list_tracks", args: [:], project: p)!.text
+        XCTAssertTrue(focus.contains("第250句（选中）"), focus)
+        XCTAssertTrue(focus.contains("第260句（播放头下）"))
+        XCTAssertFalse(focus.contains("第200句"))
+        p.selectedClipIDs = []
+        let sid = String(p.subtitleTracks[0].id.uuidString.prefix(8))
+        let one = await AgentToolbox.runReadTool("list_tracks", args: ["track": sid], project: p)!.text
+        XCTAssertTrue(one.contains("第299句"), "点名看这条轨就全列")
+        XCTAssertFalse(one.contains(String(v.id.uuidString.prefix(8))))
+        let win = await AgentToolbox.runReadTool("list_tracks", args: ["from": 100.0, "to": 102.0], project: p)!.text
+        XCTAssertTrue(win.contains("第100句") && win.contains("第101句") && !win.contains("第103句"))
+    }
+
     func testSetKeyframesConvertsUIUnitsForVideo() {
         let p = ProjectState()
         let v = VideoClip(assetID: UUID(), startTime: 0, endTime: 10)

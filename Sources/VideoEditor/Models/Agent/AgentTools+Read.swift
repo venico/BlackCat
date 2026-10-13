@@ -22,22 +22,34 @@ extension AgentToolbox {
 
             AgentToolSpec(
                 name: "list_tracks",
-                description: "列出当前时间线的所有轨道和里面的片段（含 id、名字、起止时间，字幕轨带字号）。要改某条片段必须先从这里拿到它的 id；要看它的具体属性用 get_clip。",
-                parameters: ["type": "object", "properties": [:] as [String: Any]],
+                description: "列出当前时间线的所有轨道和里面的片段（含 id、名字、起止时间，字幕轨带字号）。要改某条片段必须先从这里拿到它的 id；要看它的具体属性用 get_clip。"
+                    + "片段多的轨道（比如几百句字幕）每条只列前 \(trackListCap) 段，其余给段数；"
+                    + "要看某条轨的全部片段加 track（轨道 id），只看某段时间加 from / to（秒）。",
+                parameters: [
+                    "type": "object",
+                    "properties": [
+                        "track": ["type": "string", "description": "只看这条轨道（轨道 id，前 8 位就行），列出它的全部片段"],
+                        "from": ["type": "number", "description": "只列跟这段时间有交集的片段：起点（时间轴秒）"],
+                        "to": ["type": "number", "description": "只列跟这段时间有交集的片段：终点（时间轴秒）"],
+                    ] as [String: Any]
+                ],
                 risk: .readOnly),
 
             clipInfoSpec,
 
             AgentToolSpec(
                 name: "list_assets",
-                description: "列出素材库里的素材（含 id、名字、类型、时长），**最近加入的排在最前**。往时间轴加东西之前先看这里有什么。",
+                description: "列出素材库里的素材（含 id、名字、类型、时长），**最近加入的排在最前**。往时间轴加东西之前先看这里有什么。"
+                    + "**找特定素材先用 name 搜**（文件名、文件夹名都搜，空格分开的几个词都要命中；搜不到会自动放宽）；"
+                    + "结果多时分页，用 page 翻，每个素材都能翻到。",
                 parameters: [
                     "type": "object",
                     "properties": [
                         "type": ["type": "string", "enum": ["all", "video", "audio", "image", "subtitle"],
                                  "description": "只看某一类，默认全部"],
                         "name": ["type": "string",
-                                 "description": "按文件名找（包含这段文字就算，不分大小写），比如 gpt_image_C6C1CB68"]
+                                 "description": "搜索词：文件名或所在文件夹名里有它就算，不分大小写；空格分开写几个词 = 都要有。比如 gpt_image_C6C1CB68、猫 水彩"],
+                        "page": ["type": "integer", "description": "第几页（从 1 开始），默认 1"]
                     ] as [String: Any]
                 ],
                 risk: .readOnly),
@@ -68,10 +80,16 @@ extension AgentToolbox {
     static func runReadTool(_ name: String, args: [String: Any], project: ProjectState) async -> AgentToolResult? {
         switch name {
         case "get_project":   return .ok(projectOverview(project))
-        case "list_tracks":   return .ok(trackDump(project))
+        case "list_tracks":
+            let f = TrackDumpFilter(
+                track: (args["track"] as? String)?.trimmingCharacters(in: .whitespaces).lowercased(),
+                from: args["from"] as? Double, to: args["to"] as? Double,
+                selected: project.selectedClipIDs, now: project.currentTime)
+            return .ok(trackDump(project, f))
         case "get_clip":      return clipInfo(project, args: args)
         case "list_assets":   return .ok(assetDump(project, type: args["type"] as? String,
-                                                   name: args["name"] as? String))
+                                                   name: args["name"] as? String,
+                                                   page: (args["page"] as? Int) ?? (args["page"] as? Double).map { Int($0) } ?? 1))
         case "capture_frame": return await captureFrame(project, time: args["time"] as? Double,
                                                         source: args["source"] as? String)
         default: return nil
@@ -93,106 +111,172 @@ extension AgentToolbox {
         return s
     }
 
+    /// 默认每条轨最多列这么多段。字幕轨动辄几百句，全列出来工具结果会被截断，
+    /// 排在后面的视频 / 音频轨整条看不到（模型拿不到视频片段 id，关键帧打不了 —— 实测栽过）
+    static let trackListCap = 20
+
+    /// list_tracks 的筛选：只看某条轨（全列）/ 只看某段时间
+    struct TrackDumpFilter {
+        var track: String?
+        var from: Double?
+        var to: Double?
+        /// 选中的片段、播放头所在时刻：这些片段哪怕排在前 trackListCap 段之后也一定列出来，并标出来
+        var selected: Set<UUID> = []
+        var now: Double? = nil
+    }
+
     @MainActor
-    private static func trackDump(_ p: ProjectState) -> String {
+    private static func trackDump(_ p: ProjectState, _ f: TrackDumpFilter = TrackDumpFilter()) -> String {
         var s = "当前时间线「\(p.tab.name)」的轨道，从上到下（分三块：叠加层 → 视频 → 音频，"
             + "每块里上面的盖住下面的；调顺序用 move_track）：\n"
         for ref in p.overlayTrackOrder {
             switch ref {
             case .image(let id):
-                s += dumpTrack("图片", p.imageTracks.first { $0.id == id }) { "\($0.name)" }
+                s += dumpTrack("图片", p.imageTracks.first { $0.id == id }, f) { "\($0.name)" }
             case .subtitle(let id):
                 let t = p.subtitleTracks.first { $0.id == id }
-                s += dumpTrack("字幕", t) { $0.text.replacingOccurrences(of: "\n", with: " ") }
+                s += dumpTrack("字幕", t, f) { $0.text.replacingOccurrences(of: "\n", with: " ") }
                 if let t, !t.clips.isEmpty {
                     let st = t.subtitleStyle ?? SubtitleStyle()
                     s += "（这条轨的样式：\(st.fontName) \(Int(st.fontSize)) 号\(st.bold ? " 粗体" : "")，"
                         + "颜色 \(st.textColor.toHex())，离底边 \(Int(st.bottomMargin))%；详细用 get_clip）\n"
                 }
             case .text(let id):
-                s += dumpTrack("文字", p.textTracks.first { $0.id == id }) { $0.text }
+                s += dumpTrack("文字", p.textTracks.first { $0.id == id }, f) { $0.text }
             case .shape(let id):
-                s += dumpTrack("图形", p.shapeTracks.first { $0.id == id }) { $0.type.label }
+                s += dumpTrack("图形", p.shapeTracks.first { $0.id == id }, f) { $0.type.label }
             case .filter(let id):
-                s += dumpTrack("滤镜", p.filterTracks.first { $0.id == id }) { $0.name }
+                s += dumpTrack("滤镜", p.filterTracks.first { $0.id == id }, f) { $0.name }
             case .adjust(let id):
-                s += dumpTrack("调节", p.adjustTracks.first { $0.id == id }) { $0.name }
+                s += dumpTrack("调节", p.adjustTracks.first { $0.id == id }, f) { $0.name }
             case .effect(let id):
-                s += dumpTrack("特效", p.effectTracks.first { $0.id == id }) { $0.name }
+                s += dumpTrack("特效", p.effectTracks.first { $0.id == id }, f) { $0.name }
             case .compound(let id):
-                s += dumpTrack("复合", p.compoundTracks.first { $0.id == id }) { $0.name }
+                s += dumpTrack("复合", p.compoundTracks.first { $0.id == id }, f) { $0.name }
             }
         }
         // 视频、音频两块也按界面上的顺序列（跟时间轴看到的一致，调顺序时才对得上号）
         for ref in p.videoSectionOrder {
             switch ref {
-            case .video(let id): s += dumpTrack("视频", p.videoTracks.first { $0.id == id }) { $0.name }
-            case .compound(let id): s += dumpTrack("复合", p.compoundTracks.first { $0.id == id }) { $0.name }
+            case .video(let id): s += dumpTrack("视频", p.videoTracks.first { $0.id == id }, f) { $0.name }
+            case .compound(let id): s += dumpTrack("复合", p.compoundTracks.first { $0.id == id }, f) { $0.name }
             }
         }
         for ref in p.audioSectionOrder {
             switch ref {
-            case .audio(let id): s += dumpTrack("音频", p.audioTracks.first { $0.id == id }) { $0.name }
-            case .compound(let id): s += dumpTrack("复合", p.compoundTracks.first { $0.id == id }) { $0.name }
+            case .audio(let id): s += dumpTrack("音频", p.audioTracks.first { $0.id == id }, f) { $0.name }
+            case .compound(let id): s += dumpTrack("复合", p.compoundTracks.first { $0.id == id }, f) { $0.name }
             }
+        }
+        if let t = f.track, !t.isEmpty, !s.contains("轨「") {
+            return "当前时间线里找不到 id 以「\(t)」开头的轨道。不带 track 再调一次 list_tracks 看全部轨道。"
         }
         if s.hasSuffix("：\n") { s += "（还是空的）\n" }
         return s
     }
 
     private static func dumpTrack<C: Identifiable>(
-        _ kind: String, _ track: Track<C>?, label: (C) -> String
+        _ kind: String, _ track: Track<C>?, _ f: TrackDumpFilter, label: (C) -> String
     ) -> String where C: Equatable & Codable {
         guard let t = track else { return "" }
+        let only = (f.track ?? "").isEmpty ? nil : f.track
+        if let only, !"\(t.id)".lowercased().hasPrefix(only) { return "" }
         // 轨道 id 要给出来：move_track / move_clip 换轨都得点名是哪条轨道
         var s = "\n**\(kind)轨「\(t.label)」** id \(String("\(t.id)".prefix(8)))"
             + "\(t.isVisible ? "" : "（已隐藏）")　\(t.clips.count) 段\n"
         guard !t.clips.isEmpty else { return s }
+        // 按时间窗筛（跟 from~to 有交集的）
+        var clips = t.clips
+        if f.from != nil || f.to != nil {
+            let lo = f.from ?? -.infinity, hi = f.to ?? .infinity
+            clips = clips.filter { c in
+                guard let tc = c as? any AgentTimedClip else { return true }
+                return tc.endTime > lo && tc.startTime < hi
+            }
+            if clips.isEmpty { return s + "（这段时间里没有片段）\n" }
+        }
+        // 点名看这条轨就全列；否则每条最多列前 trackListCap 段，
+        // 再补上选中的、播放头下的（用户说「这段」多半指它们，不能因为排在后面就看不到）
+        func isHead(_ c: C) -> Bool {
+            guard let n = f.now, let tc = c as? any AgentTimedClip else { return false }
+            return tc.startTime <= n && tc.endTime > n
+        }
+        let cap = only == nil ? trackListCap : Int.max
+        let shown = clips.enumerated().filter { i, c in
+            i < cap || f.selected.contains(c.id as? UUID ?? UUID()) || isHead(c)
+        }.map(\.element)
         // 片段列成表格，模型转述时可以直接用
         s += "\n| id | 时间 | 内容 |\n|---|---|---|\n"
-        for c in t.clips {
+        for c in shown {
             let time = (c as? any AgentTimedClip).map { "\(fmt($0.startTime))–\(fmt($0.endTime))" } ?? "—"
             // 竖线会把表格切错列，先转义掉
-            let text = label(c).replacingOccurrences(of: "|", with: "／")
+            var text = label(c).replacingOccurrences(of: "|", with: "／")
+            if let id = c.id as? UUID, f.selected.contains(id) { text += "（选中）" }
+            if isHead(c) { text += "（播放头下）" }
             s += "| \(String("\(c.id)".prefix(8))) | \(time) | \(text) |\n"
+        }
+        if clips.count > shown.count {
+            s += "（还有 \(clips.count - shown.count) 段没列出。看全部：list_tracks track=\(String("\(t.id)".prefix(8)))；"
+                + "或加 from / to 只看某段时间）\n"
         }
         return s
     }
 
     @MainActor
-    private static func assetDump(_ p: ProjectState, type: String?, name: String? = nil) -> String {
+    private static func assetDump(_ p: ProjectState, type: String?, name: String? = nil, page: Int = 1) -> String {
         let want = (type ?? "all").lowercased()
         let key = (name ?? "").trimmingCharacters(in: .whitespaces)
+        let folders = MediaLibrary.shared.folders
         // **最近加入的排前面**。新素材是追加在库尾的，原来按库里顺序只给前 40 个，
         // 库一大，刚生成、刚导入的那几个永远排不进来 —— 后台助手「生成完放进时间轴」
         // 就是这么栽的：查不到新图的 id，反复导入、翻文件，步数用光也没放进去
-        let list = p.mediaAssets.reversed().filter { a in
-            (want == "all" || a.type.rawValue.lowercased() == want)
-                && (key.isEmpty || a.name.localizedCaseInsensitiveContains(key)
-                    || a.url.lastPathComponent.localizedCaseInsensitiveContains(key))
-        }
-        guard !list.isEmpty else {
-            return key.isEmpty ? "素材库里没有\(want == "all" ? "" : want)素材。"
-                               : "素材库里没有名字含「\(key)」的素材。"
-        }
-        // 表格形式给回去，模型可以原样贴出来 —— 省得它自己组织，界面上也整齐。
-        // 列压在三列以内：聊天面板窄，再多就排不下了
-        // 素材可以有好几百个，全量吐回去光这一条就上万字，而且历史每轮重发。
-        // 超过这个数就只给前面一批，剩下的让它按 type 缩小范围再问
-        let cap = 40
-        var s = "素材库（\(list.count) 个，最近加入的在前\(list.count > cap ? "，下面只列最近的 \(cap) 个" : "")）：\n\n"
-        s += "| id | 类型 | 名称 |\n|---|---|---|\n"
-        for a in list.prefix(cap) {
+        let pool = p.mediaAssets.reversed().filter { want == "all" || $0.type.rawValue.lowercased() == want }
+        let kindName = want == "all" ? "" : want
+        guard !pool.isEmpty else { return "素材库里没有\(kindName)素材。" }
+
+        func line(_ a: MediaAsset) -> String {
             let dur = a.duration > 0 ? " \(fmt(a.duration))" : ""
             // 这里原来写反了：文件在的反而标「源文件丢失」
             let missing = a.fileExists ? "" : "（源文件丢失）"
-            s += "| \(String("\(a.id)".prefix(8))) | \(a.type.rawValue)\(dur) | \(a.name)\(missing) |\n"
+            return "| \(String("\(a.id)".prefix(8))) | \(a.type.rawValue)\(dur) | \(a.name)\(missing) |"
         }
-        if list.count > cap {
-            s += "\n还有 \(list.count - cap) 个没列出来。要找特定的东西就加 name（按文件名）"
-                + "或 type（video / audio / image）缩小范围。\n"
+        func table(_ list: [MediaAsset], title: String, more: String) -> String {
+            // 表格形式给回去，模型可以原样贴出来；列压在三列以内（聊天面板窄）。
+            // 素材可以有好几百个，全量吐回去光这一条就上万字、而且历史每轮重发 —— 分页给
+            let pg = AgentSearch.page(list, page: page)
+            var s = "\(title)（\(list.count) 个\(pg.pages > 1 ? "，第 \(pg.page)/\(pg.pages) 页" : "")）：\n\n"
+            s += "| id | 类型 | 名称 |\n|---|---|---|\n" + pg.items.map(line).joined(separator: "\n") + "\n"
+            if pg.page < pg.pages { s += "\n下一页：同样的条件加 page=\(pg.page + 1)。\(more)\n" }
+            return s
         }
-        return s
+
+        guard !key.isEmpty else {
+            return table(Array(pool), title: "素材库\(kindName.isEmpty ? "" : "里的 \(kindName)")，最近加入的在前",
+                         more: "要找特定的东西用 name 搜更快。")
+        }
+        // 搜：文件名 + 显示名 + 所在文件夹名。先精确（几个词都要有），没有再放宽
+        func hay(_ a: MediaAsset) -> String {
+            let folder = a.folderID.flatMap { id in folders.first { $0.id == id }?.name } ?? ""
+            return a.name + " " + a.url.lastPathComponent + " " + folder
+        }
+        let r = AgentSearch.find(Array(pool), key, text: hay)
+        guard !r.items.isEmpty else {
+            // 还没有：给个目录，让它缩到某一类 / 某个文件夹里再翻
+            var s = "素材库里没搜到「\(key)」（放宽成任意一个词、忽略空格下划线也没有）。\n素材库目录：\n"
+            let byType = Dictionary(grouping: pool, by: { $0.type.rawValue })
+            s += byType.keys.sorted().map { "- \($0)：\(byType[$0]!.count) 个" }.joined(separator: "\n") + "\n"
+            let inFolder = Dictionary(grouping: pool.compactMap(\.folderID), by: { $0 })
+            let named = folders.filter { inFolder[$0.id] != nil }
+            if !named.isEmpty {
+                s += "文件夹：\n" + named.map { "- 「\($0.name)」\(inFolder[$0.id]!.count) 个" }.joined(separator: "\n") + "\n"
+            }
+            s += "可以换个词搜、按 type 缩小，或者不带 name 用 page 一页页翻（最近加入的在前）。"
+            return s
+        }
+        let title = r.relaxed
+            ? "精确搜「\(key)」没找到，下面是放宽后的结果（命中任意一个词 / 忽略空格下划线，可能不准）"
+            : "搜「\(key)」的结果"
+        return table(r.items, title: title, more: "")
     }
 
     @MainActor
@@ -346,6 +430,75 @@ extension AdjustClip: AgentTimedClip {}
 extension EffectClip: AgentTimedClip {}
 extension CompoundClip: AgentTimedClip {}
 
+// MARK: - 编辑器当前状态（每轮带给模型）
+
+/// 时间轴上的一个片段，摘要信息（给「选中了什么、播放头下有什么」用）
+struct AgentClipRef {
+    let kind: String
+    let track: String
+    let id: UUID
+    let start: Double
+    let end: Double
+    let text: String
+}
+
+extension AgentToolbox {
+    /// 当前时间线所有片段的摘要
+    @MainActor
+    static func allClipRefs(_ p: ProjectState) -> [AgentClipRef] {
+        var out: [AgentClipRef] = []
+        func add<C: Identifiable & Equatable & Codable>(_ kind: String, _ tracks: [Track<C>], _ label: (C) -> String) {
+            for t in tracks {
+                for c in t.clips {
+                    guard let id = c.id as? UUID, let tc = c as? any AgentTimedClip else { continue }
+                    out.append(AgentClipRef(kind: kind, track: t.label, id: id,
+                                            start: tc.startTime, end: tc.endTime, text: label(c)))
+                }
+            }
+        }
+        add("视频", p.videoTracks) { $0.name }
+        add("音频", p.audioTracks) { $0.name }
+        add("图片", p.imageTracks) { $0.name }
+        add("字幕", p.subtitleTracks) { $0.text.replacingOccurrences(of: "\n", with: " ") }
+        add("文字", p.textTracks) { $0.text.replacingOccurrences(of: "\n", with: " ") }
+        add("图形", p.shapeTracks) { $0.type.label }
+        add("滤镜", p.filterTracks) { $0.name }
+        add("调节", p.adjustTracks) { $0.name }
+        add("特效", p.effectTracks) { $0.name }
+        add("复合", p.compoundTracks) { $0.name }
+        return out
+    }
+
+    /// 用户发这句话时编辑器的样子：选中了哪些片段、播放头在哪、播放头下各轨是什么（都带 id）。
+    /// 每轮拼在用户这句话前面 —— 用户说「这段 / 这里 / 选中的」时模型直接就有 id，
+    /// 不用先 list_tracks 翻一遍（项目一大，翻轨道又慢又可能被截断）
+    @MainActor
+    static func editorStateNote(_ p: ProjectState) -> String {
+        let refs = allClipRefs(p)
+        let now = p.currentTime
+        func line(_ r: AgentClipRef) -> String {
+            let t = r.text.count > 30 ? String(r.text.prefix(30)) + "…" : r.text
+            return "- \(r.kind)轨「\(r.track)」 \(String(r.id.uuidString.prefix(8))) \(fmt(r.start))–\(fmt(r.end)) \(t)"
+        }
+        var s = "[编辑器状态·用户发这句话时。用户说「这段 / 这里 / 选中的」多半指下面这些，片段 id 可以直接用]\n"
+        s += "时间线「\(p.tab.name)」，播放头 \(fmt(now))\n"
+        let sel = refs.filter { p.selectedClipIDs.contains($0.id) }
+        if sel.isEmpty {
+            s += "选中：无\n"
+        } else {
+            s += "选中（\(sel.count) 个）：\n" + sel.prefix(10).map(line).joined(separator: "\n") + "\n"
+            if sel.count > 10 { s += "（还有 \(sel.count - 10) 个选中的没列）\n" }
+        }
+        let under = refs.filter { $0.start <= now && $0.end > now }
+        if under.isEmpty {
+            s += "播放头下：没有片段\n"
+        } else {
+            s += "播放头下：\n" + under.prefix(15).map(line).joined(separator: "\n") + "\n"
+        }
+        return s + "[状态完]\n"
+    }
+}
+
 /// 能改起止时间的片段：move_clip 换轨时要改它们的时间再放进目标轨
 protocol AgentMovableClip: Identifiable, Equatable, Codable {
     var startTime: Double { get set }
@@ -363,3 +516,40 @@ extension EffectClip: AgentMovableClip {}
 
 /// 工具的总入口
 enum AgentToolbox {}
+
+// MARK: - 搜索与分页（列表类工具共用：先精确搜，没有再放宽；结果分页，保证每一条都翻得到）
+
+enum AgentSearch {
+    static let pageSize = 40
+
+    /// 小写、去掉空格下划线连字符点，放宽比对用（「gpt image」能对上 gpt_image_xxx）
+    static func loose(_ s: String) -> String {
+        s.lowercased().filter { !" _-.·".contains($0) }
+    }
+
+    /// 精确：空格分开的每个词都出现在文本里（不分大小写）。
+    /// 没有一条命中时放宽：任意一个词命中，或去掉分隔符后整串包含。relaxed 标明是放宽的结果
+    static func find<T>(_ list: [T], _ query: String, text: (T) -> String) -> (items: [T], relaxed: Bool) {
+        let words = query.lowercased().split(whereSeparator: \.isWhitespace).map(String.init)
+        guard !words.isEmpty else { return (list, false) }
+        let exact = list.filter { item in
+            let t = text(item).lowercased()
+            return words.allSatisfy { t.contains($0) }
+        }
+        if !exact.isEmpty { return (exact, false) }
+        let lq = loose(query)
+        let relaxed = list.filter { item in
+            let t = text(item).lowercased(), lt = loose(t)
+            return words.contains { t.contains($0) || lt.contains(loose($0)) } || (!lq.isEmpty && lt.contains(lq))
+        }
+        return (relaxed, true)
+    }
+
+    /// 第几页（从 1 开始，越界夹回最后一页）
+    static func page<T>(_ list: [T], page: Int, size: Int = pageSize) -> (items: [T], page: Int, pages: Int) {
+        let pages = max(1, (list.count + size - 1) / size)
+        let pg = min(max(1, page), pages)
+        let lo = (pg - 1) * size
+        return (Array(list[lo..<min(lo + size, list.count)]), pg, pages)
+    }
+}

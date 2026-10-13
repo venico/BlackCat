@@ -86,7 +86,7 @@ extension AgentToolbox {
                 name: "marker",
                 description: """
                 时间轴上的标记（挂在片段上的小旗子）。
-                list 列出全部；add 在某片段的某个时刻打一个（time 是时间轴上的绝对秒数，要落在片段范围里）；
+                list 列出（可用 query 按标题搜、from / to 只看某段时间，多了分页用 page 翻）；add 在某片段的某个时刻打一个（time 是时间轴上的绝对秒数，要落在片段范围里）；
                 update 改标题 / 颜色；delete 删掉。颜色：cyan、pink、orange、green、purple。
                 """,
                 parameters: [
@@ -96,6 +96,10 @@ extension AgentToolbox {
                         "clip_id": ["type": "string", "description": "add 时打在哪条片段上"],
                         "time": ["type": "number", "description": "add 时的位置（秒）"],
                         "marker_id": ["type": "string", "description": "update / delete 时用，list 能查到"],
+                        "query": ["type": "string", "description": "list 时按标题搜（空格分开的几个词都要有，搜不到自动放宽）"],
+                        "from": ["type": "number", "description": "list 时只看这个时刻之后的（秒）"],
+                        "to": ["type": "number", "description": "list 时只看这个时刻之前的（秒）"],
+                        "page": ["type": "integer", "description": "list 结果分页，第几页（从 1 开始），默认 1"],
                         "title": ["type": "string"],
                         "color": ["type": "string", "enum": Marker.MarkerColor.allCases.map(\.rawValue)]
                     ] as [String: Any],
@@ -317,6 +321,9 @@ extension AgentToolbox {
                 return .fail("action 只能是 duplicate / rename / close")
             }
         case "marker":
+            if s("action") == "list" {
+                return markerList(p, query: s("query"), from: n("from"), to: n("to"), page: n("page").map { Int($0) } ?? 1)
+            }
             return marker(p, action: s("action") ?? "", clipKey: s("clip_id"), time: n("time"),
                           markerKey: s("marker_id"), title: s("title"), color: s("color"))
         case "copy_clips":
@@ -560,6 +567,31 @@ extension AgentToolbox {
     }
 
     // MARK: - 标记
+
+    /// 标记列表：按时间排；可按标题搜、按时间段筛，分页
+    @MainActor
+    private static func markerList(_ p: ProjectState, query: String?, from: Double?, to: Double?, page: Int) -> AgentToolResult {
+        func fmt(_ t: Double) -> String { String(format: "%.2f", t) }
+        var all = p.allMarkersAbsolute.sorted { $0.absoluteTime < $1.absoluteTime }
+        guard !all.isEmpty else { return .ok("时间轴上还没有标记。") }
+        if from != nil || to != nil {
+            all = all.filter { $0.absoluteTime >= (from ?? -.infinity) && $0.absoluteTime <= (to ?? .infinity) }
+            guard !all.isEmpty else { return .ok("这段时间里没有标记。") }
+        }
+        var head = "标记"
+        if let q = query, !q.trimmingCharacters(in: .whitespaces).isEmpty {
+            let r = AgentSearch.find(all, q) { $0.marker.title }
+            guard !r.items.isEmpty else { return .ok("没有标题里含「\(q)」的标记（放宽也没有）。不带 query 再列一次看全部。") }
+            all = r.items
+            head = r.relaxed ? "精确搜「\(q)」没找到，放宽后的标记" : "标题含「\(q)」的标记"
+        }
+        let pg = AgentSearch.page(all, page: page)
+        var s = "\(head)（\(all.count) 个\(pg.pages > 1 ? "，第 \(pg.page)/\(pg.pages) 页" : "")）：\n"
+        s += pg.items.map { "- \($0.id.uuidString.prefix(8)) @ \(fmt($0.absoluteTime))s「\($0.marker.title)」\($0.marker.color.rawValue)" }
+            .joined(separator: "\n")
+        if pg.page < pg.pages { s += "\n下一页：同样的条件加 page=\(pg.page + 1)。" }
+        return .ok(s)
+    }
 
     @MainActor
     private static func marker(_ p: ProjectState, action: String, clipKey: String?, time: Double?,
