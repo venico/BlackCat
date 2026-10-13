@@ -115,10 +115,11 @@ struct LayerCommonSections: View {
     /// 「变换」这一组能打帧的属性（缩放行跟着锁定状态 / 文字的字号映射走）
     private var transformProps: [KeyframeProp] {
         var ps: [KeyframeProp] = [.angle, .offsetX, .offsetY]
-        if let a = keyframeHooks?.alias[.scaleX], lockAspect?.wrappedValue ?? false {
+        let alias = keyframeHooks?.alias ?? [:]
+        if let a = alias[.scaleX], lockAspect?.wrappedValue ?? false {
             ps.append(a)
         } else {
-            ps += [.scaleX, .scaleY]
+            ps += [alias[.scaleX] ?? .scaleX, alias[.scaleY] ?? .scaleY]
         }
         return ps + [.cropTop, .cropBottom, .cropLeft, .cropRight]
     }

@@ -1168,7 +1168,7 @@ final class ProjectState: ObservableObject {
 
     /// 侧边栏当前在看哪一栏：`ai` / `library`（素材库）/ `transition`（转场）。
     /// **默认 AI 生成** —— 进软件先落在这儿
-    @Published var mediaLibraryTab: String = "ai"
+    @Published var mediaLibraryTab: String = "library"
     /// 素材库里的六个分类标签：video / audio / image / subtitle / text / shape。
     /// 原来这六类各占一个侧边栏图标，v5.3.0 合并进素材库，改成里面的标签页
     @Published var libraryCategory: String = "video"

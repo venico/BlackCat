@@ -1472,6 +1472,11 @@ extension ProjectState {
 
     /// 文字图层的尺寸（渲染坐标）。拖过边定死了范围框就用它，否则按文字量一次
     private func textLayerSize(_ t: TextClip) -> CGSize {
+        let s = textLayerSizeUnstretched(t)
+        return CGSize(width: s.width * t.sx, height: s.height * t.sy)
+    }
+
+    private func textLayerSizeUnstretched(_ t: TextClip) -> CGSize {
         if let w = t.boxWidth {
             return CGSize(width: w + 20, height: (t.boxHeight ?? Double(t.fontSize) * 1.4) + 10)
         }
@@ -1695,7 +1700,11 @@ extension ProjectState {
                       track.isVisible,
                       let tc = track.clips.first(where: { $0.startTime <= t && $0.endTime > t }) else { continue }
                 let cx = viewSize.width * tc.posX, cy = viewSize.height * tc.posY
-                let sz = textClipViewSizes[tc.id] ?? CGSize(width: 100, height: 30)
+                // 实测尺寸是字号动画放大排版时的，除以这一刻的放大倍数
+                let a = tc.animated(atTimeline: t)
+                let boost = tc.layoutBoost(animated: a)
+                let sz = textClipViewSizes[tc.id].map { CGSize(width: $0.width / boost * a.sx, height: $0.height / boost * a.sy) }
+                    ?? CGSize(width: 100, height: 30)
                 if CGRect(x: cx - sz.width / 2, y: cy - sz.height / 2,
                           width: sz.width, height: sz.height).contains(pt) {
                     out.append(tc.id)

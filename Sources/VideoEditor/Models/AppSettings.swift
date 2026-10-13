@@ -11,6 +11,7 @@ final class AppSettings: ObservableObject {
         static let projectDir = "settings.projectSaveDir"
         static let exportDir = "settings.exportSaveDir"
         static let autoSaveInterval = "settings.autoSaveInterval"
+        static let aiPanelOnRight = "settings.aiPanelOnRight"
         static let whisperModelDir = "settings.whisperModelDir"
         static let whisperModel = "settings.whisperModel"
         static let translateProvider = "settings.translateProvider"
@@ -92,6 +93,12 @@ final class AppSettings: ObservableObject {
 
     var effectiveProjectDir: URL { projectSaveDir ?? Self.defaultSaveDir }
     var effectiveExportDir: URL { exportSaveDir ?? Self.defaultSaveDir }
+
+    // MARK: - 布局：AI 创作那一列放左边还是右边（窗口 → 布局）
+
+    @Published var aiPanelOnRight: Bool {
+        didSet { ud.set(aiPanelOnRight, forKey: K.aiPanelOnRight) }
+    }
 
     // MARK: - 自动保存频率（秒，0 = 关闭）
 
@@ -734,6 +741,7 @@ final class AppSettings: ObservableObject {
         // 读回来又被当成没设置过、回落成 3 秒 —— 关不掉，而且 3 秒这档
         // 界面上根本没有，看着像一个都没选中。
         // 没设置过的默认给 30 秒（选项里的第一档），跟界面对得上
+        aiPanelOnRight = ud.bool(forKey: K.aiPanelOnRight)
         if ud.object(forKey: K.autoSaveInterval) != nil {
             autoSaveInterval = ud.double(forKey: K.autoSaveInterval)
         } else {

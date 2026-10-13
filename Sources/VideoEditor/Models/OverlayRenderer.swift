@@ -368,8 +368,11 @@ enum OverlayRenderer {
     static func renderTextOverlay(
         atTime time: Double, clips: [TextClip], fontScale: CGFloat, renderSize: CGSize
     ) -> CIImage? {
-        // 打了关键帧的按这一刻求值
-        let active = clips.filter { $0.startTime <= time && $0.endTime > time }.map { $0.animated(atTimeline: time) }
+        // 打了关键帧的按这一刻求值；字号动画的按最大字号排版、画的时候整体缩回（见 layoutBoost）
+        let active = clips.filter { $0.startTime <= time && $0.endTime > time }.map { raw -> (TextClip, CGFloat) in
+            let a = raw.animated(atTimeline: time)
+            return (a, raw.layoutBoost(animated: a))
+        }
         guard !active.isEmpty else { return nil }
 
         let w = Int(renderSize.width)
@@ -388,9 +391,9 @@ enum OverlayRenderer {
         ctx.translateBy(x: 0, y: CGFloat(h))
         ctx.scaleBy(x: 1.0, y: -1.0)
 
-        let scale = fontScale
-
-        for clip in active {
+        for (clip, boost) in active {
+            // 排版用放大后的尺寸（字号、框、留白、描边一起放大），画之前再绕文字中心缩回 1 / boost
+            let scale = fontScale * boost
             let scaledSize = clip.fontSize * scale
             var ctFont = CTFontCreateWithName(clip.fontName as CFString, scaledSize, nil)
             if clip.bold,
@@ -420,7 +423,8 @@ enum OverlayRenderer {
             }
 
             let padH: CGFloat = 10 * scale, padV: CGFloat = 5 * scale
-            let maxW = CGFloat(w) * 0.9
+            // 自动换行的上限也按放大倍数换算，缩回来后跟不放大时一样
+            let maxW = CGFloat(w) * 0.9 * boost
             let attrs: [NSAttributedString.Key: Any] = [
                 .init(kCTFontAttributeName as String): ctFont,
                 .init(kCTForegroundColorAttributeName as String): textCGColor,
@@ -460,6 +464,13 @@ enum OverlayRenderer {
             if clip.rotation != 0 {
                 ctx.translateBy(x: centerX, y: centerY)
                 ctx.rotate(by: -clip.rotation * .pi / 180)
+                ctx.translateBy(x: -centerX, y: -centerY)
+            }
+            // 拉伸（解开比例时的宽 / 高）在文字自己的坐标轴上做：排在旋转之后 = 先拉伸再转
+            let sx = CGFloat(clip.sx) / boost, sy = CGFloat(clip.sy) / boost
+            if sx != 1 || sy != 1 {
+                ctx.translateBy(x: centerX, y: centerY)
+                ctx.scaleBy(x: sx, y: sy)
                 ctx.translateBy(x: -centerX, y: -centerY)
             }
             if anim.scale != 1 || anim.offsetY != 0 {

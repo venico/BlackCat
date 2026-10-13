@@ -488,6 +488,77 @@ final class KeyframeTests: XCTestCase {
         XCTAssertEqual(s.cornerRadius, 10)
     }
 
+    /// 字号动画按最大字号排版、整体缩回：倍数对，导出画出来的大小跟直接用这一刻字号画的一致
+    func testTextLayoutBoostKeepsRenderedSize() throws {
+        var t = TextClip(text: "放大的标题", startTime: 0, endTime: 10)
+        t.fontSize = 40
+        t.toggleKeyframe(.fontSize, atTimeline: 0)
+        t.applyAnimatedEdit(atTimeline: 9.999) { $0.fontSize = 120 }
+        let a = t.animated(atTimeline: 5)
+        XCTAssertEqual(Double(t.layoutBoost(animated: a)), 120 / Double(a.fontSize), accuracy: 1e-9)
+        XCTAssertEqual(TextClip(text: "x", startTime: 0, endTime: 1).layoutBoost(animated: a), 1, "没打字号帧是 1")
+
+        // 对照：同样大小、不打关键帧的文字直接画
+        var plain = a
+        plain.keyframes = nil
+        let size = CGSize(width: 1280, height: 720)
+        func inkBox(_ c: TextClip) throws -> CGRect {
+            let img = try XCTUnwrap(OverlayRenderer.renderTextOverlay(atTime: 5, clips: [c], fontScale: 1, renderSize: size))
+            let cg = try XCTUnwrap(CIContext().createCGImage(img, from: CGRect(origin: .zero, size: size)))
+            let ctx = try XCTUnwrap(CGContext(data: nil, width: cg.width, height: cg.height, bitsPerComponent: 8,
+                                              bytesPerRow: cg.width * 4, space: CGColorSpaceCreateDeviceRGB(),
+                                              bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
+            ctx.draw(cg, in: CGRect(origin: .zero, size: size))
+            let px = ctx.data!.assumingMemoryBound(to: UInt8.self)
+            var minX = Int.max, minY = Int.max, maxX = -1, maxY = -1
+            for y in 0..<cg.height { for x in 0..<cg.width where px[(y * cg.width + x) * 4 + 3] > 128 {
+                minX = min(minX, x); maxX = max(maxX, x); minY = min(minY, y); maxY = max(maxY, y)
+            } }
+            return CGRect(x: minX, y: minY, width: maxX - minX, height: maxY - minY)
+        }
+        let boosted = try inkBox(t), direct = try inkBox(plain)
+        XCTAssertGreaterThan(direct.width, 50)
+        XCTAssertEqual(boosted.width, direct.width, accuracy: 3)
+        XCTAssertEqual(boosted.height, direct.height, accuracy: 3)
+        XCTAssertEqual(boosted.midX, direct.midX, accuracy: 2)
+        XCTAssertEqual(boosted.midY, direct.midY, accuracy: 2)
+    }
+
+    /// 文字拉伸（解开比例时的宽 / 高）：能打关键帧、存得进读得回，导出时字横向变宽、高度不变
+    func testTextStretchKeyframesAndExport() throws {
+        var t = TextClip(text: "拉伸", startTime: 0, endTime: 10)
+        t.toggleKeyframe(.stretchX, atTimeline: 0)
+        t.applyAnimatedEdit(atTimeline: 9.999) { $0.stretchX = 3 }
+        XCTAssertEqual(t.animated(atTimeline: 5).sx, 2, accuracy: 0.01)
+        XCTAssertNil(t.stretchX, "静态拉伸仍是没设过")
+        let back = try JSONDecoder().decode(TextClip.self, from: JSONEncoder().encode(t))
+        XCTAssertEqual(back.keyframes, t.keyframes)
+
+        var plain = TextClip(text: "拉伸测试", startTime: 0, endTime: 10)
+        plain.fontSize = 60
+        var wide = plain
+        wide.stretchX = 2
+        let size = CGSize(width: 1280, height: 720)
+        func inkBox(_ c: TextClip) throws -> CGRect {
+            let img = try XCTUnwrap(OverlayRenderer.renderTextOverlay(atTime: 1, clips: [c], fontScale: 1, renderSize: size))
+            let cg = try XCTUnwrap(CIContext().createCGImage(img, from: CGRect(origin: .zero, size: size)))
+            let ctx = try XCTUnwrap(CGContext(data: nil, width: cg.width, height: cg.height, bitsPerComponent: 8,
+                                              bytesPerRow: cg.width * 4, space: CGColorSpaceCreateDeviceRGB(),
+                                              bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
+            ctx.draw(cg, in: CGRect(origin: .zero, size: size))
+            let px = ctx.data!.assumingMemoryBound(to: UInt8.self)
+            var minX = Int.max, minY = Int.max, maxX = -1, maxY = -1
+            for y in 0..<cg.height { for x in 0..<cg.width where px[(y * cg.width + x) * 4 + 3] > 128 {
+                minX = min(minX, x); maxX = max(maxX, x); minY = min(minY, y); maxY = max(maxY, y)
+            } }
+            return CGRect(x: minX, y: minY, width: maxX - minX, height: maxY - minY)
+        }
+        let a = try inkBox(plain), b = try inkBox(wide)
+        XCTAssertEqual(b.width / a.width, 2, accuracy: 0.05)
+        XCTAssertEqual(b.height, a.height, accuracy: 2)
+        XCTAssertEqual(b.midX, a.midX, accuracy: 2, "绕中心拉伸")
+    }
+
     func testShapeKeyframesScaleRotationAndCodable() throws {
         var s = ShapeClip(type: .rectangle, startTime: 0, endTime: 10)
         s.toggleKeyframe(.scaleX, atTimeline: 0)

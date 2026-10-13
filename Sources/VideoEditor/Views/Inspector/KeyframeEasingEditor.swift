@@ -63,10 +63,10 @@ struct KeyframeEasingEditor: View {
     var body: some View {
         // 行距跟属性区滑块之间一样（ISection 的 10）
         VStack(spacing: 10) {
-            // 时长 / 延时一行两个，样子同「时间」那组的开始 / 持续
-            HStack(spacing: 8) {
-                IField(label: "时长（秒）") { secondsStepper(duration, min: 0.05, onDuration) }
-                IField(label: "延时（秒）") { secondsStepper(delay, min: 0, onDelay) }
+            // 时长 / 延时一行两个，标签在输入框左边，单位 s 在输入框里
+            HStack(spacing: 12) {
+                inlineField("时长") { secondsStepper(duration, min: 0.05, onDuration) }
+                inlineField("延时") { secondsStepper(delay, min: 0, onDelay) }
             }
             // 模式
             fieldRow("区间缓动") {
@@ -227,9 +227,23 @@ struct KeyframeEasingEditor: View {
         }
     }
 
+    /// 标签在左、输入框在右（输入框撑满剩下的宽度）
+    private func inlineField<C: View>(_ label: String, @ViewBuilder _ content: () -> C) -> some View {
+        HStack(spacing: 6) {
+            Text(label)
+                .font(.system(size: 10))
+                .foregroundColor(Color.labelSecondary)
+                .lineLimit(1)
+                .fixedSize()
+            content()
+                .frame(maxWidth: .infinity)
+        }
+        .frame(maxWidth: .infinity)
+    }
+
     private func secondsStepper(_ v: Double, min lo: Double, _ set: @escaping (Double) -> Void) -> some View {
         MiniStepper(value: Binding(get: { v }, set: { set(Swift.max(lo, $0)) }),
-                    step: 0.1, decimals: 2, minValue: lo, maxValue: 3600)
+                    step: 0.1, decimals: 2, minValue: lo, maxValue: 3600, unit: "s")
     }
 
     private func clamp01(_ v: Double) -> Double { min(1, max(0, v)) }

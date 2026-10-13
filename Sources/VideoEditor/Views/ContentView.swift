@@ -40,8 +40,19 @@ struct ContentView: View {
     @StateObject private var exportManager = ExportManager.shared
     @State private var topHeight: CGFloat = 420
     @State private var isDraggingH = false
+    /// AI 创作那一列是否显示（左上角 / 右上角的收起按钮）
     @State private var sidebarVisible = true
-    @State private var sidebarWidth: CGFloat = 320
+    /// AI 创作那一列的宽度
+    @State private var sidebarWidth: CGFloat = 300
+    /// 素材库 / 效果那一栏的宽度（含左边 44 的竖图标栏）
+    @State private var libraryWidth: CGFloat = 320
+    /// 素材库 / 效果那一栏是否显示
+    @State private var libraryVisible = true
+    /// 窗口内容区的实际宽度。素材栏 / AI 栏 / 属性区按它收窄，保证预览不被挤没
+    @State private var rootWidth: CGFloat = 0
+    @State private var dragOriginLibrary: CGFloat = 320
+    @State private var isDraggingLibrary = false
+    @ObservedObject private var settings = AppSettings.shared
     @State private var inspectorWidth: CGFloat = InspectorLayout.defaultWidth
     // Drag origin tracking (prevents cumulative translation bug)
     @State private var dragOriginSidebar: CGFloat = 320
@@ -58,81 +69,15 @@ struct ContentView: View {
 
     var body: some View {
         HStack(spacing: 0) {
+            // ── AI 创作（左）：整列到底。窗口 → 布局 可以换到右边 ──
+            if sidebarVisible && !settings.aiPanelOnRight { aiColumn(onRight: false, width: fitted.ai) }
 
-            // ── Sidebar ────────────────────────────────────────────
-            if sidebarVisible {
-                VStack(spacing: 0) {
-                    // 标题栏行：自定义交通灯（SwiftUI）+ toggle 按钮
-                    HStack(spacing: 0) {
-                        // 侧栏贴边后少了外面那圈 8pt，交通灯左移 8、上移 8 补回来，
-                        // 在窗口里的位置跟以前一样
-                        TrafficLightsView()
-                            .padding(.leading, 19)
-                        Spacer()
-                        toggleButton
-                            .padding(.trailing, 11)
-                    }
-                    .frame(height: toolbarH)
-                    .padding(.top, 8)
-
-                    // Content
-                    // 宽度传下去给宫格算列数。**必须从这儿给** ——
-                    // 素材区自己拿 GeometryReader 量的话，量到的宽度会被
-                    // 自己算出来的列数影响，绕成环、拉窄时列减不回来
-                    MediaLibraryView(sidebarWidth: sidebarWidth)
-                }
-                .frame(width: sidebarWidth)
-                .frame(maxHeight: .infinity)
-                .sidebarTint()
-                // 不再是浮起来的卡片（没有玻璃底、圆角、阴影、外边距）：贴着窗口左边，
-                // 跟预览 / 属性 / 轨道三块一样不铺底色，只靠右边一条分割线跟主区划界。
-                // 线画在侧栏右边缘上，上下顶头，跟预览区和属性区之间那条同一个样子
-                .overlay(alignment: .trailing) {
-                    Rectangle()
-                        .fill(Color.white.opacity(0.10))
-                        .frame(width: 1)
-                }
-                .simultaneousGesture(TapGesture().onEnded {
-                    // 刚在聊天气泡里选了文字（点、双击、拖选）就别清焦点：
-                    // 清掉之后 ⌘C 落不到气泡上，反被时间轴当成「复制片段」吃掉
-                    let fr = NSApp.keyWindow?.firstResponder
-                    if let tv = fr as? NSTextView, !tv.isEditable { return }
-                    NSApp.keyWindow?.makeFirstResponder(nil)
-                })
-                .transition(.move(edge: .leading).combined(with: .opacity))
-                // 侧边栏右边缘的拖宽手柄。
-                //
-                // **不能再 offset 到边缘外面**：原来那儿有 8pt 空隙才推得出去，
-                // 现在紧挨着的就是预览区，而预览区在 HStack 里排在后面、画在上层，
-                // 推出去的部分会被它盖掉 —— 表现就是光标变了却拖不动
-                .overlay(alignment: .trailing) {
-                    Color.clear
-                        .frame(width: 8)
-                        .contentShape(Rectangle())
-                        .zIndex(100)
-                        .onContinuousHover { phase in
-                            if case .active = phase { NSCursor.resizeLeftRight.set() } else { NSCursor.arrow.set() }
-                        }
-                        .gesture(DragGesture(minimumDistance: 1, coordinateSpace: .global)
-                            .onChanged { v in
-                                if !isDraggingSidebar { dragOriginSidebar = sidebarWidth }
-                                isDraggingSidebar = true
-                                sidebarWidth = min(max(dragOriginSidebar + v.translation.width, 160), 800)
-                            }
-                            .onEnded { _ in
-                                isDraggingSidebar = false
-                                NSCursor.arrow.set()
-                            }
-                        )
-                }
-            }
-
-            // ── Main content ───────────────────────────────────────
+            // ── 主区：上排 素材库/效果 · 预览 · 属性，下排时间轴横跨 ──
             GeometryReader { geo in
-                ZStack(alignment: .topLeading) {
                     VStack(spacing: 0) {
-                        // Player + Inspector cards
                         HStack(spacing: 0) {
+                            // 素材库 / 效果放在预览左边：边跟 AI 聊天边看素材
+                            if libraryVisible { libraryColumn }
                             PlayerView()
                                 .frame(maxWidth: .infinity)
                                 .simultaneousGesture(TapGesture().onEnded {
@@ -140,7 +85,7 @@ struct ContentView: View {
                                 })
                             // 预览区和属性区之间的分割线。**上下顶头** ——
                             InspectorView()
-                                .frame(width: inspectorWidth)
+                                .frame(width: fitted.inspector)
                                 // 分割线**画在属性区左边缘上**，不占 HStack 的一格 ——
                                 // 占一格的话属性区左边就比右边多出这 1pt，
                                 // 里面所有标题和控件都跟着偏 1pt
@@ -165,7 +110,7 @@ struct ContentView: View {
                         }
                                         .gesture(DragGesture(minimumDistance: 1, coordinateSpace: .global)
                                             .onChanged { v in
-                                                if !isDraggingInspector { dragOriginInspector = inspectorWidth }
+                                                if !isDraggingInspector { dragOriginInspector = fitted.inspector }
                                                 isDraggingInspector = true
                                                 inspectorWidth = min(max(dragOriginInspector - v.translation.width,
                                                                          InspectorLayout.minWidth),
@@ -228,18 +173,33 @@ struct ContentView: View {
                     .onAppear {
                         topHeight = geo.size.height * 0.60
                     }
-
-                    // 侧边栏收起时：交通灯 + toggle 在左上角
-                    if !sidebarVisible {
-                        HStack(spacing: 10) {
-                            TrafficLightsView()
-                            toggleButton
+                    // 素材栏和左边的 AI 栏都收起了：交通灯和两个开关浮在主区左上角
+                    .overlay(alignment: .topLeading) {
+                        if !libraryVisible && !aiOnLeftShown {
+                            HStack(spacing: 10) {
+                                TrafficLightsView()
+                                panelToggles
+                            }
+                            .padding(.leading, 19)
+                            .frame(height: toolbarH)
+                            .padding(.top, 8)
                         }
-                        .padding(.leading, 12)
-                        .padding(.top, 8)
                     }
-                }
             }
+
+            // ── AI 创作（右） ──
+            if sidebarVisible && settings.aiPanelOnRight { aiColumn(onRight: true, width: fitted.ai) }
+        }
+        // 量窗口宽度：几栏固定宽加起来超过窗口时按它收窄（不然整排撑出窗口、居中摆，
+        // 左边空一块、右边那栏压到属性区和时间轴上）
+        .background(GeometryReader { g in
+            Color.clear
+                .onAppear { rootWidth = g.size.width }
+                .onChange(of: g.size.width) { _, w in rootWidth = w }
+        })
+        // AI 那一列收起来时撤掉它的拖入登记（不然拖到素材区的文件可能被它收走）
+        .onChange(of: sidebarVisible) { _, visible in
+            if !visible { FileDropRouter.unregister(windowID, kind: .aiChat) }
         }
         .overlay(alignment: .bottomTrailing) {
             VStack(alignment: .trailing, spacing: 8) {
@@ -581,6 +541,10 @@ struct ContentView: View {
             guard note.isFor(windowID) else { return }
             project.showNewProjectSheet = true
         }
+        .onReceive(NotificationCenter.default.publisher(for: MenuCommand.portraitLayout.notificationName)) { note in
+            guard note.isFor(windowID) else { return }
+            applyPortraitLayout()
+        }
         .onReceive(NotificationCenter.default.publisher(for: MenuCommand.exportVideo.notificationName)) { note in
             guard note.isFor(windowID) else { return }
             project.showExportSheet = true
@@ -735,17 +699,212 @@ struct ContentView: View {
         WindowManager.shared.setEscMonitor(monitor, for: windowID)
     }
 
-    private var toggleButton: some View {
-        Button { sidebarVisible.toggle() } label: {
-            Image(nsImage: TimelineSVGIcon.load("sidebarToggle"))
+    /// AI 创作那一列。在左边时顶上一行是交通灯 + 收起按钮；在右边时顶上只放收起按钮
+    @ViewBuilder
+    private func aiColumn(onRight: Bool, width: CGFloat) -> some View {
+        VStack(spacing: 0) {
+            // 在左边时它就是最左边的面板：顶上一行交通灯 + 右上角两个面板开关；
+            // 在右边时不要这一行（空着显得上面空一大块），只留跟主区一样的顶部留白
+            if !onRight {
+                HStack(spacing: 0) {
+                    // 侧栏贴边后少了外面那圈 8pt，交通灯左移 8、上移 8 补回来，在窗口里的位置跟以前一样
+                    TrafficLightsView()
+                        .padding(.leading, 19)
+                    Spacer()
+                    panelToggles
+                        .padding(.trailing, 11)
+                }
+                .frame(height: toolbarH)
+                .padding(.top, 8)
+            } else {
+                Color.clear.frame(height: 14)
+            }
+
+            // 原来左边有 44 宽的图标栏垫着，独立成一列后补上左边距
+            AIChatPanel()
+                .padding(.leading, 12)
+        }
+        .frame(width: width)
+        .frame(maxHeight: .infinity)
+        .sidebarTint()
+        // 跟主区之间一条分割线，画在靠主区那一边，上下顶头
+        .overlay(alignment: onRight ? .leading : .trailing) {
+            Rectangle()
+                .fill(Color.white.opacity(0.10))
+                .frame(width: 1)
+        }
+        .simultaneousGesture(TapGesture().onEnded {
+            // 刚在聊天气泡里选了文字（点、双击、拖选）就别清焦点：
+            // 清掉之后 ⌘C 落不到气泡上，反被时间轴当成「复制片段」吃掉
+            let fr = NSApp.keyWindow?.firstResponder
+            if let tv = fr as? NSTextView, !tv.isEditable { return }
+            NSApp.keyWindow?.makeFirstResponder(nil)
+        })
+        .transition(.move(edge: onRight ? .trailing : .leading).combined(with: .opacity))
+        // 拖宽手柄在靠主区那一边。**不能 offset 到边缘外面**：紧挨着的主区画在上层，推出去的部分会被它盖掉
+        .overlay(alignment: onRight ? .leading : .trailing) {
+            Color.clear
+                .frame(width: 8)
+                .contentShape(Rectangle())
+                .zIndex(100)
+                .onContinuousHover { phase in
+                    if case .active = phase { NSCursor.resizeLeftRight.set() } else { NSCursor.arrow.set() }
+                }
+                .gesture(DragGesture(minimumDistance: 1, coordinateSpace: .global)
+                    .onChanged { v in
+                        if !isDraggingSidebar { dragOriginSidebar = fitted.ai }
+                        isDraggingSidebar = true
+                        let dx = onRight ? -v.translation.width : v.translation.width
+                        sidebarWidth = min(max(dragOriginSidebar + dx, 240), 700)
+                    }
+                    .onEnded { _ in
+                        isDraggingSidebar = false
+                        NSCursor.arrow.set()
+                    }
+                )
+        }
+    }
+
+    /// 素材库 / 效果那一栏（左边竖图标栏切换）。是窗口最左边一栏时（AI 在右边或收起），
+    /// 顶上一行放交通灯；AI 收起时收起按钮也在这一行（点它把 AI 放出来）
+    private var libraryColumn: some View {
+        VStack(spacing: 0) {
+            // 是最左边的面板时：顶上一行交通灯 + 右上角两个面板开关
+            if !aiOnLeftShown {
+                HStack(spacing: 10) {
+                    TrafficLightsView()
+                    Spacer()
+                    panelToggles
+                }
+                .padding(.leading, 19)
+                .padding(.trailing, 11)
+                .frame(height: toolbarH)
+            }
+            // 素材库六个分类 + 效果四个分类平铺（原来是左边两个图标 + 里面一排胶囊标签）
+            LibraryCategoryGrid()
+                .padding(.leading, 10)
+                .padding(.trailing, 10)
+                .padding(.top, aiOnLeftShown ? 6 : 0)
+                .padding(.bottom, 2)
+
+            // 宽度传下去给宫格算列数。**必须从这儿给** ——
+            // 素材区自己拿 GeometryReader 量的话，量到的宽度会被
+            // 自己算出来的列数影响，绕成环、拉窄时列减不回来。
+            // 列宽算法里扣了 44 的图标栏，图标栏挪走了，这里补回去（再扣掉左边距 10）
+            MediaLibraryView(sidebarWidth: fitted.library - 10 + 44, showsTabRail: false)
+                .padding(.leading, 10)
+        }
+        .frame(width: fitted.library)
+        .frame(maxHeight: .infinity)
+        // 跟预览之间的分割线，上下顶头（补上主区顶上那 8pt 和下面拖动缝的一半）
+        .overlay(alignment: .trailing) {
+            Rectangle()
+                .fill(Color.white.opacity(0.10))
+                .frame(width: 1)
+                .padding(.top, -8)
+                .padding(.bottom, -4)
+        }
+        .simultaneousGesture(TapGesture().onEnded {
+            NSApp.keyWindow?.makeFirstResponder(nil)
+        })
+        .overlay(alignment: .trailing) {
+            Color.clear
+                .frame(width: 8)
+                .contentShape(Rectangle())
+                .zIndex(100)
+                .onContinuousHover { phase in
+                    if case .active = phase { NSCursor.resizeLeftRight.set() } else { NSCursor.arrow.set() }
+                }
+                .gesture(DragGesture(minimumDistance: 1, coordinateSpace: .global)
+                    .onChanged { v in
+                        if !isDraggingLibrary { dragOriginLibrary = fitted.library }
+                        isDraggingLibrary = true
+                        libraryWidth = min(max(dragOriginLibrary + v.translation.width, 200), 1200)
+                    }
+                    .onEnded { _ in
+                        isDraggingLibrary = false
+                        NSCursor.arrow.set()
+                    }
+                )
+        }
+    }
+
+    /// 预览区至少留这么宽
+    private static let minPreviewWidth: CGFloat = 420
+
+    /// 按窗口宽度收窄后的各栏宽度。拖出来的宽度是「想要的」，窗口不够时依次收窄：
+    /// 素材栏（最窄 200）→ AI 栏（最窄 240）→ 属性区（到它的最小宽度）
+    private var fitted: (library: CGFloat, ai: CGFloat, inspector: CGFloat) {
+        var lib = libraryVisible ? libraryWidth : 0
+        var ai = sidebarVisible ? sidebarWidth : 0
+        var insp = inspectorWidth
+        guard rootWidth > 0 else { return (libraryWidth, sidebarWidth, inspectorWidth) }
+        var over = lib + ai + insp + Self.minPreviewWidth - rootWidth
+        func take(_ v: inout CGFloat, floor: CGFloat) {
+            guard over > 0, v > floor else { return }
+            let d = min(over, v - floor)
+            v -= d
+            over -= d
+        }
+        if libraryVisible { take(&lib, floor: 200) }
+        if sidebarVisible { take(&ai, floor: 240) }
+        take(&insp, floor: InspectorLayout.minWidth)
+        return (libraryVisible ? lib : libraryWidth, sidebarVisible ? ai : sidebarWidth, insp)
+    }
+
+    /// 素材区放得下十个分类一行的宽度（格子最窄 46 × 10 + 间距 2 × 9 + 左右各 10，再留一点余量）
+    private static let libraryOneRowWidth: CGFloat = 510
+
+    /// 窗口 → 布局 → 竖屏模式：一次性调好，之后各栏照常能拖。
+    /// 当前项目比例改成 9:16；属性区缩到最窄；AI 栏缩到 260；
+    /// 预览刚好装下竖屏画面（最窄 minPreviewWidth，播放控制条不挤）；剩下的宽度给素材区（至少放得下分类一行）
+    private func applyPortraitLayout() {
+        if project.previewAspectRatio != "9:16" {
+            project.previewAspectRatio = "9:16"
+            project.rebuildTimelinePreview()
+        }
+        libraryVisible = true
+        inspectorWidth = InspectorLayout.minWidth
+        if sidebarVisible { sidebarWidth = 260 }
+        guard rootWidth > 0 else { libraryWidth = Self.libraryOneRowWidth; return }
+        // 减掉播放控制条和上下留白，剩下的是画面能用的高度
+        let h = max(topHeight - 60, 120)
+        let preview = max(h * 9 / 16 + 32, Self.minPreviewWidth)
+        let ai: CGFloat = sidebarVisible ? 260 : 0
+        libraryWidth = min(max(rootWidth - ai - inspectorWidth - preview, Self.libraryOneRowWidth), 1200)
+    }
+
+    /// AI 创作在左边且显示着：它就是最左边的面板
+    private var aiOnLeftShown: Bool { sidebarVisible && !settings.aiPanelOnRight }
+
+    /// 两个面板开关：素材库与效果、AI 创作。始终放在最左边那个面板的右上角
+    private var panelToggles: some View {
+        HStack(spacing: 2) {
+            panelToggle(image: SidebarSVGIcon.load("folderFill"), on: libraryVisible,
+                        help: libraryVisible ? "隐藏素材库和效果" : "显示素材库和效果") {
+                libraryVisible.toggle()
+            }
+            panelToggle(image: SidebarSVGIcon.load("ai"), on: sidebarVisible,
+                        help: sidebarVisible ? "隐藏 AI 创作" : "显示 AI 创作") {
+                sidebarVisible.toggle()
+            }
+        }
+    }
+
+    private func panelToggle(image: NSImage, on: Bool, help: String, _ action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(nsImage: image)
                 .renderingMode(.template)
                 .resizable()
                 .aspectRatio(contentMode: .fit)
                 .frame(width: 15, height: 15)
-                .foregroundColor(Color.labelSecondary)
+                // 打开着的亮一些，收起的暗
+                .foregroundColor(on ? Color.labelPrimary : Color.labelSecondary.opacity(0.6))
                 .frame(width: 28, height: 22)
+                .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .help(help)
     }
 }
 

@@ -67,6 +67,27 @@ final class AgentListSearchTests: XCTestCase {
         XCTAssertTrue(note.contains("第一句") && !note.contains("第二句"), "播放头下只列这一刻的")
     }
 
+    /// 画布：读出来带卡片名（卡片上方那行字），工具也能按卡片名找卡片
+    func testCanvasCardsReferredByName() {
+        let p = ProjectState()
+        var a = CanvasNode(kind: .image, position: .zero, size: CGSize(width: 100, height: 100))
+        a.displayName = "图片 2"
+        var b = CanvasNode(kind: .text, position: CGPoint(x: 200, y: 0), size: CGSize(width: 100, height: 100))
+        b.text = "一段说明"
+        p.canvas.nodes = [a, b]
+        let r = AgentToolbox.runCanvasTool("read_canvas", args: [:], project: p)!.text
+        XCTAssertTrue(r.contains("| 图片 2 |"), r)
+        XCTAssertTrue(r.contains("| 文字 |") || r.contains("| \(b.kind.label) |"), "没起名的用类型名")
+        XCTAssertTrue(r.contains("别说 id"))
+        XCTAssertEqual(AgentToolbox.resolveNode("图片 2", p.canvas)?.id, a.id)
+        XCTAssertEqual(AgentToolbox.resolveNode("「图片 2」", p.canvas)?.id, a.id)
+        XCTAssertEqual(AgentToolbox.resolveNode(String(b.id.uuidString.prefix(8)).lowercased(), p.canvas)?.id, b.id)
+        // 重名时按名字认不出来，要用 id
+        var c = a; c.id = UUID()
+        p.canvas.nodes.append(c)
+        XCTAssertNil(AgentToolbox.resolveNode("图片 2", p.canvas))
+    }
+
     /// 标记列表也分页、可按标题搜
     func testMarkerListSearchAndPage() {
         let p = ProjectState()

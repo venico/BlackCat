@@ -209,7 +209,7 @@ extension AgentToolbox {
                 }
             }
             canvas.persist()
-            return .ok("画布上加了一张\(kind.label)卡片，id \(shortID(node.id))。")
+            return .ok("画布上加了一张\(kind.label)卡片\(cardRef(node))。")
 
         case "update_canvas_node":
             guard let node = resolveNode(args["node_id"], canvas) else { return nodeNotFound(args["node_id"]) }
@@ -259,12 +259,12 @@ extension AgentToolbox {
                     guard let up = resolveNode(r, canvas) else { return nodeNotFound(r) }
                     guard up.id != node.id else { continue }
                     guard !canvas.edges.contains(where: { $0.from == up.id && $0.to == node.id }) else {
-                        linked.append(shortID(up.id)); continue
+                        linked.append(cardRef(up)); continue
                     }
                     let p = AIVideoService.provider(for: node.kind.providerCategory)
                     let r2 = canvas.connect(from: up.id, to: node.id, provider: p)
                     if let why = r2.message { return .fail("连不上参考卡片：" + why) }
-                    linked.append(shortID(up.id))
+                    linked.append(cardRef(up))
                 }
             }
             guard node.kind != .text || !node.prompt.isEmpty else {
@@ -303,7 +303,7 @@ extension AgentToolbox {
             if !then.isEmpty {
                 AgentBackgroundTasks.shared.attachFollowUp(
                     instruction: then, taskIDs: [node.id],
-                    labels: [node.id: "画布卡片 id \(shortID(node.id))"],
+                    labels: [node.id: "画布卡片「\(cardName(node))」"],
                     project: p, mode: AppSettings.shared.agentMode)
             }
             let refNote = linked.isEmpty
@@ -355,10 +355,23 @@ extension AgentToolbox {
         String("\(id)".prefix(8))
     }
 
+    /// 卡片名：卡片上方那行字（「图片 2」、文件名或用户改的名字）。**跟用户说卡片时用它**，
+    /// id 用户在画布上看不到，说 id 他对不上号
+    static func cardName(_ n: CanvasNode) -> String {
+        n.displayName.isEmpty ? n.kind.label : n.displayName
+    }
+
+    /// 「卡片名」（id 前 8 位）—— 工具结果里两样都给：名字给用户看，id 给下一步调工具
+    static func cardRef(_ n: CanvasNode) -> String { "「\(cardName(n))」（id \(shortID(n.id))）" }
+
+    /// 按 id 前缀或卡片名找卡片。名字重名时认不出来（返回 nil），得用 id
     @MainActor
-    private static func resolveNode(_ key: Any?, _ canvas: CanvasState) -> CanvasNode? {
-        guard let k = (key as? String)?.trimmingCharacters(in: .whitespaces), !k.isEmpty else { return nil }
-        return canvas.nodes.first { "\($0.id)".hasPrefix(k) }
+    static func resolveNode(_ key: Any?, _ canvas: CanvasState) -> CanvasNode? {
+        guard var k = (key as? String)?.trimmingCharacters(in: .whitespaces), !k.isEmpty else { return nil }
+        k = k.trimmingCharacters(in: CharacterSet(charactersIn: "「」\"'"))
+        if let hit = canvas.nodes.first(where: { "\($0.id)".lowercased().hasPrefix(k.lowercased()) }) { return hit }
+        let byName = canvas.nodes.filter { cardName($0).caseInsensitiveCompare(k) == .orderedSame }
+        return byName.count == 1 ? byName.first : nil
     }
 
     private static func nodeNotFound(_ key: Any?) -> AgentToolResult {
@@ -400,7 +413,7 @@ extension AgentToolbox {
         let pg = AgentSearch.page(list, page: page)
         let shownIDs = Set(pg.items.map(\.id))
         var out = head + (pg.pages > 1 ? "，第 \(pg.page)/\(pg.pages) 页" : "") + "：\n\n"
-        out += "| id | 类型 | 内容 | 提示词 | 状态 |\n|---|---|---|---|---|\n"
+        out += "| 名称 | id | 类型 | 内容 | 提示词 | 状态 |\n|---|---|---|---|---|---|\n"
         for n in pg.items {
             let content: String
             switch n.kind {
@@ -417,7 +430,7 @@ extension AgentToolbox {
             else if n.hasContent { state = "已完成" }
             else { state = "空着" }
             let prompt = n.prompt.isEmpty ? "—" : String(n.prompt.prefix(30))
-            out += "| \(shortID(n.id)) | \(n.kind.label) | \(content) | \(prompt) | \(state) |\n"
+            out += "| \(cardName(n)) | \(shortID(n.id)) | \(n.kind.label) | \(content) | \(prompt) | \(state) |\n"
         }
 
         if pg.page < pg.pages { out += "\n下一页：同样的条件加 page=\(pg.page + 1)。\n" }
@@ -428,7 +441,7 @@ extension AgentToolbox {
             out += "\n连线（上游 → 下游，上游是下游的参考素材）：\n"
             for e in edges {
                 guard let f = canvas.node(e.from), let t = canvas.node(e.to) else { continue }
-                out += "- \(shortID(f.id)) \(f.kind.label) → \(shortID(t.id)) \(t.kind.label)\n"
+                out += "- 「\(cardName(f))」→「\(cardName(t))」\n"
             }
         }
 
@@ -440,7 +453,9 @@ extension AgentToolbox {
             }
         }
 
-        out += "\n要看清楚某张卡片画的是什么，拿它的 id 调 capture_frame（source 填 id）亲眼看。"
+        out += "\n**跟用户说卡片时用「名称」那一列**（就是卡片上方显示的那行字），别说 id —— 用户在画布上看不到 id。"
+            + "调工具时卡片可以填 id，也可以直接填名称（重名时用 id）。"
+            + "\n要看清楚某张卡片画的是什么，拿它的 id 调 capture_frame（source 填 id）亲眼看。"
         return out
     }
 }

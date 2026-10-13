@@ -82,7 +82,8 @@ extension AgentToolbox {
         func nodeIDs() -> [UUID] {
             var keys = (args["node_ids"] as? [Any])?.compactMap { $0 as? String } ?? []
             if let one = s("node_id") { keys.append(one) }
-            return keys.compactMap { k in canvas.nodes.first { "\($0.id)".hasPrefix(k) }?.id }
+            // id 前缀或卡片名都认
+            return keys.compactMap { resolveNode($0, canvas)?.id }
         }
         func one() -> CanvasNode? { nodeIDs().first.flatMap { canvas.node($0) } }
         func group() -> CanvasGroup? {

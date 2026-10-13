@@ -4,6 +4,9 @@ import UniformTypeIdentifiers
 struct MediaLibraryView: View {
     /// 侧栏总宽（含左侧 44pt 图标栏）。宫格的列数和列间距按它算
     var sidebarWidth: CGFloat = 320
+    /// 左边那条竖图标栏（素材库 / 效果切换）和里面的分类胶囊标签。
+    /// 主界面里十个分类拆出来放在素材栏顶上（`LibraryCategoryGrid`），这里两样都不画
+    var showsTabRail: Bool = true
 
     /// 文件夹列表和颜色都读它。不观察的话改完颜色 / 改完名界面纹丝不动
     @ObservedObject private var library = MediaLibrary.shared
@@ -13,7 +16,6 @@ struct MediaLibraryView: View {
     @State private var isDragOver = false
 
     private var isTransitionTab: Bool { project.mediaLibraryTab == "transition" }
-    private var isAITab: Bool { project.mediaLibraryTab == "ai" }
     /// 素材库里的分类（六个标签页）
     private var isTextTab: Bool { project.mediaLibraryTab == "library" && project.libraryCategory == "text" }
     private var isShapeTab: Bool { project.mediaLibraryTab == "library" && project.libraryCategory == "shape" }
@@ -96,7 +98,9 @@ struct MediaLibraryView: View {
         // 不挡的话切过去还挂着上一页的路径，成了「效果 / 小黑猫」
         let chain = project.currentLibraryAssetType == nil ? [] : folderChain(currentFolderID)
         HStack(spacing: 3) {
-            crumbText(isTransitionTab ? "效果" : "素材库",
+            // 分类平铺在栏顶时（主界面），标题就是当前分类名（视频 / 音频 / 转场……）
+            crumbText(showsTabRail ? (isTransitionTab ? "效果" : "素材库")
+                                   : tabName(isTransitionTab ? project.effectCategory : project.libraryCategory),
                       isLast: chain.isEmpty,
                       hovering: crumbRootHover,
                       onHover: { crumbRootHover = $0 }) {
@@ -198,10 +202,7 @@ struct MediaLibraryView: View {
 
     var body: some View {
         HStack(spacing: 0) {
-            verticalTabBar
-            if isAITab {
-                AIChatPanel()
-            } else {
+            if showsTabRail { verticalTabBar }
             VStack(spacing: 0) {
             // Section header
             HStack(spacing: 0) {
@@ -237,10 +238,12 @@ struct MediaLibraryView: View {
             .padding(.bottom, 8)
 
             // 六个分类标签页。样式跟画布素材库那套一致：胶囊底 + 选中态填充
-            if isTransitionTab {
-                effectTabBar
-            } else {
-                libraryTabBar
+            if showsTabRail {
+                if isTransitionTab {
+                    effectTabBar
+                } else {
+                    libraryTabBar
+                }
             }
 
             // 音频页：左边竖排导航（我的 / 音乐库 / 音效库），右边是内容。
@@ -252,7 +255,7 @@ struct MediaLibraryView: View {
             }
             VStack(spacing: 0) {
             // Search + Sort bar
-            if !isTransitionTab && !isTextTab && !isShapeTab && !isAITab && !showOnlineAudio {
+            if !isTransitionTab && !isTextTab && !isShapeTab && !showOnlineAudio {
                 HStack(spacing: 4) {
                     HStack(spacing: 4) {
                         Image(nsImage: SidebarSVGIcon.load("search"))
@@ -461,20 +464,9 @@ struct MediaLibraryView: View {
             Spacer()
 
             }
-            } // else (non-AI tabs)
         }
-        // 标签页一变就核一次登记：AI 那条排在素材区前面，漏撤会把素材区的拖入吃掉
-        .onAppear { syncAIDropZone() }
-        .onChange(of: project.mediaLibraryTab) { _, _ in syncAIDropZone() }
-    }
-
-    /// 切走 AI 标签页时撤掉聊天区的拖入登记。
-    ///
-    /// **不能只靠 AIChatPanel 的 onDisappear**：那条登记排在素材区**前面**
-    /// （聊天卡片浮在素材区上面，得优先），一旦漏撤，拖到素材区的文件会被
-    /// 聊天区收走当附件 —— 而那时聊天区不可见，看着就是「没高亮、导不进去」
-    private func syncAIDropZone() {
-        if !isAITab { FileDropRouter.unregister(windowID, kind: .aiChat) }
+        // AI 创作现在是独立的一列，老项目里记着的「ai」标签页换成素材库
+        .onAppear { if project.mediaLibraryTab == "ai" { project.mediaLibraryTab = "library" } }
     }
 
     /// 文件夹格子。双击进去，右键有重命名 / 收集素材 / 删除。
@@ -1012,11 +1004,10 @@ struct MediaLibraryView: View {
             // AI 生成排第一（进软件默认选中它），素材库第二。
             // 视频/音频/图片/字幕/文字/图形原来各占一个图标，现在并进素材库当标签页。
             // **转场留着**：它不是素材，是拖到片段上的效果，没并进去
-            tabBtnAI()
+            // AI 创作独立成一列（窗口 → 布局 选左右）、导入导出挪到属性区右上角，这里只剩素材库和效果
             tabBtnSVG("library", icon: "folderFill")
             tabBtnSVG("transition")
             Spacer()
-            importExportMenuBtn
         }
         .padding(.top, 10)
         .padding(.bottom, 14)
@@ -1111,25 +1102,6 @@ struct MediaLibraryView: View {
         .help(tabName(tab))
     }
 
-    @ViewBuilder
-    private func tabBtnAI() -> some View {
-        let isActive = project.mediaLibraryTab == "ai"
-        Button { project.mediaLibraryTab = "ai" } label: {
-            Image(nsImage: SidebarSVGIcon.load("ai"))
-                .renderingMode(.template)
-                .resizable()
-                .aspectRatio(contentMode: .fit)
-                .frame(width: 16, height: 16)
-                .foregroundColor(isActive ? .white : Color.labelSecondary)
-                .frame(width: 30, height: 30)
-                .background(isActive ? Color.white.opacity(0.15) : Color.clear)
-                .clipShape(RoundedRectangle(cornerRadius: 7))
-                .contentShape(RoundedRectangle(cornerRadius: 7))
-        }
-        .buttonStyle(.plain)
-        .help("AI 创作")
-    }
-
     private var emptyState: some View {
         // 图标直接复用左侧标签栏那套 SVG（同一个 key），只是放大。
         // 原来这里是 SF Symbols，跟标签栏的自绘图标不是一套，形状对不上
@@ -1160,48 +1132,12 @@ struct MediaLibraryView: View {
     }
 
     /// 把内容摆到容器高度 1/3 的位置（水平居中）
-    // 导入/导出合并菜单按钮
-    private var importExportMenuBtn: some View {
-        Button {
-            let menu = NSMenu()
-            let importItem = NSMenuItem(title: "导入素材", action: #selector(NSApp.sendAction(_:to:from:)), keyEquivalent: "")
-            importItem.image = SidebarSVGIcon.load("importFile", size: 14)
-            importItem.isEnabled = project.projectFileURL != nil
-            importItem.target = nil
-            importItem.representedObject = "import" as NSString
-            let exportItem = NSMenuItem(title: "导出 MP4", action: #selector(NSApp.sendAction(_:to:from:)), keyEquivalent: "")
-            exportItem.image = SidebarSVGIcon.load("exportFile", size: 14)
-            exportItem.isEnabled = project.projectFileURL != nil
-            exportItem.representedObject = "export" as NSString
-            menu.addItem(importItem)
-            menu.addItem(exportItem)
-            ImportExportMenuHandler.shared.project = project
-            importItem.target = ImportExportMenuHandler.shared
-            importItem.action = #selector(ImportExportMenuHandler.handleImport)
-            exportItem.target = ImportExportMenuHandler.shared
-            exportItem.action = #selector(ImportExportMenuHandler.handleExport)
-            if let event = NSApp.currentEvent {
-                NSMenu.popUpContextMenu(menu, with: event, for: NSApp.keyWindow?.contentView ?? NSView())
-            }
-        } label: {
-            Image(nsImage: SidebarSVGIcon.load("importExport"))
-                .renderingMode(.template)
-                .resizable()
-                .aspectRatio(contentMode: .fit)
-                .frame(width: 16, height: 16)
-                .foregroundColor(Color.labelSecondary)
-                .frame(width: 30, height: 30)
-                .contentShape(RoundedRectangle(cornerRadius: 7))
-        }
-        .buttonStyle(.plain)
-        .help("导入 / 导出")
-    }
 }
 
 
 // MARK: - Import/Export Menu Handler
 
-private class ImportExportMenuHandler: NSObject {
+class ImportExportMenuHandler: NSObject {
     static let shared = ImportExportMenuHandler()
     weak var project: ProjectState?
 
@@ -4251,4 +4187,112 @@ private struct PhaseDriven<Content: View>: View, Animatable {
         set { phase = newValue }
     }
     var body: some View { content(phase) }
+}
+
+/// 导入 / 导出合并菜单按钮。原来在侧栏图标栏最下面，现在放在属性区右上角（选什么片段都在）
+struct ImportExportMenuButton: View {
+    @EnvironmentObject private var project: ProjectState
+    var iconSize: CGFloat = 14
+    var body: some View {
+        Button {
+            let menu = NSMenu()
+            let importItem = NSMenuItem(title: "导入素材", action: #selector(ImportExportMenuHandler.handleImport), keyEquivalent: "")
+            importItem.image = SidebarSVGIcon.load("importFile", size: 14)
+            importItem.isEnabled = project.projectFileURL != nil
+            let exportItem = NSMenuItem(title: "导出 MP4", action: #selector(ImportExportMenuHandler.handleExport), keyEquivalent: "")
+            exportItem.image = SidebarSVGIcon.load("exportFile", size: 14)
+            exportItem.isEnabled = project.projectFileURL != nil
+            menu.addItem(importItem)
+            menu.addItem(exportItem)
+            ImportExportMenuHandler.shared.project = project
+            importItem.target = ImportExportMenuHandler.shared
+            exportItem.target = ImportExportMenuHandler.shared
+            if let event = NSApp.currentEvent {
+                NSMenu.popUpContextMenu(menu, with: event, for: NSApp.keyWindow?.contentView ?? NSView())
+            }
+        } label: {
+            Image(nsImage: SidebarSVGIcon.load("importExport"))
+                .renderingMode(.template)
+                .resizable()
+                .aspectRatio(contentMode: .fit)
+                .frame(width: iconSize, height: iconSize)
+                .foregroundColor(Color.labelSecondary)
+                // 图标贴右，跟下面滑块行的右边缘齐
+                .frame(width: 24, height: 24, alignment: .trailing)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help("导入 / 导出")
+    }
+}
+
+/// 素材库六个分类 + 效果四个分类，拆出来平铺在素材栏顶上：上图标下文字，选中灰底、悬停浅灰底。
+/// 栏窄放不下时自动换行
+struct LibraryCategoryGrid: View {
+    @EnvironmentObject private var project: ProjectState
+
+    /// (所属标签页, 分类, 名字, 图标)
+    private static let items: [(tab: String, cat: String, name: String, icon: String)] = [
+        ("library", "video", "视频", "video"),
+        ("library", "audio", "音频", "audio"),
+        ("library", "image", "图片", "image"),
+        ("library", "subtitle", "字幕", "subtitle"),
+        ("library", "text", "文字", "text"),
+        ("library", "shape", "图形", "shape"),
+        ("transition", "effTransition", "转场", "transition"),
+        ("transition", "effFilter", "滤镜", "filter"),
+        ("transition", "effEffect", "特效", "effect"),
+        ("transition", "effAdjust", "调节", "adjust"),
+    ]
+
+    var body: some View {
+        LazyVGrid(columns: [GridItem(.adaptive(minimum: 46, maximum: 64), spacing: 2)], spacing: 4) {
+            ForEach(Self.items, id: \.cat) { item in
+                CategoryCell(name: item.name, icon: item.icon, isOn: isOn(item)) {
+                    project.mediaLibraryTab = item.tab
+                    if item.tab == "library" { project.libraryCategory = item.cat }
+                    else { project.effectCategory = item.cat }
+                }
+            }
+        }
+    }
+
+    private func isOn(_ item: (tab: String, cat: String, name: String, icon: String)) -> Bool {
+        // 老项目记着的「ai」标签页当素材库
+        let tab = project.mediaLibraryTab == "ai" ? "library" : project.mediaLibraryTab
+        guard tab == item.tab else { return false }
+        return item.tab == "library" ? project.libraryCategory == item.cat : project.effectCategory == item.cat
+    }
+
+    private struct CategoryCell: View {
+        let name: String
+        let icon: String
+        let isOn: Bool
+        let action: () -> Void
+        @State private var hovering = false
+
+        var body: some View {
+            Button(action: action) {
+                VStack(spacing: 2) {
+                    Image(nsImage: SidebarSVGIcon.load(icon))
+                        .renderingMode(.template)
+                        .resizable()
+                        .aspectRatio(contentMode: .fit)
+                        .frame(width: 15, height: 15)
+                    Text(name)
+                        .font(.system(size: 9, weight: .medium))
+                        .lineLimit(1)
+                }
+                .foregroundColor(isOn || hovering ? .white : Color.labelSecondary)
+                .frame(maxWidth: .infinity)
+                .frame(height: 38)
+                .background(isOn ? Color.white.opacity(0.15) : hovering ? Color.white.opacity(0.07) : Color.clear)
+                .clipShape(RoundedRectangle(cornerRadius: 7))
+                .contentShape(RoundedRectangle(cornerRadius: 7))
+            }
+            .buttonStyle(.plain)
+            .onHover { hovering = $0 }
+            .help(name)
+        }
+    }
 }

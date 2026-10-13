@@ -656,6 +656,11 @@ struct TextClip: Identifiable, Equatable, Codable {
     /// nil = 还没缩放过，就拿当前字号当 100%；第一次缩放时定下来（`ProjectState.pinTextScaleRef`）
     var scaleRefFontSize: Double? = nil
     var scaleRef: Double { max(scaleRefFontSize ?? Double(fontSize), 1) }
+    /// 横向 / 纵向拉伸文字本身（整层一起：字、背景框）。nil = 100%。属性区解开比例时的宽 / 高调的就是它
+    var stretchX: Double? = nil
+    var stretchY: Double? = nil
+    var sx: Double { stretchX ?? 1 }
+    var sy: Double { stretchY ?? 1 }
 
     enum CodingKeys: String, CodingKey {
         case id, text, startTime, endTime, posX, posY
@@ -666,7 +671,7 @@ struct TextClip: Identifiable, Equatable, Codable {
         case cropTop, cropBottom, cropLeft, cropRight
         case boxWidth, boxHeight
         case mirrorH, mirrorV, lockBoxAspect
-        case keyframes, kfIn, scaleRefFontSize
+        case keyframes, kfIn, scaleRefFontSize, stretchX, stretchY
     }
     func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
@@ -704,6 +709,8 @@ struct TextClip: Identifiable, Equatable, Codable {
         try c.encodeIfPresent(keyframes, forKey: .keyframes)
         try c.encodeIfPresent(kfIn, forKey: .kfIn)
         try c.encodeIfPresent(scaleRefFontSize, forKey: .scaleRefFontSize)
+        try c.encodeIfPresent(stretchX, forKey: .stretchX)
+        try c.encodeIfPresent(stretchY, forKey: .stretchY)
     }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -742,6 +749,8 @@ struct TextClip: Identifiable, Equatable, Codable {
         keyframes = try? c.decodeIfPresent(ClipKeyframes.self, forKey: .keyframes)
         kfIn = try? c.decodeIfPresent(Double.self, forKey: .kfIn)
         scaleRefFontSize = try? c.decodeIfPresent(Double.self, forKey: .scaleRefFontSize)
+        stretchX = try? c.decodeIfPresent(Double.self, forKey: .stretchX)
+        stretchY = try? c.decodeIfPresent(Double.self, forKey: .stretchY)
     }
     init(text: String = "标题文字", startTime: Double, endTime: Double) {
         self.text = text; self.startTime = startTime; self.endTime = endTime

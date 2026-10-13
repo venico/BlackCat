@@ -21,6 +21,7 @@ extension AgentToolbox {
         "stroke_width": .strokeWidth, "stroke_softness": .strokeSoftness, "bg_opacity": .bgOpacity,
         "fill_opacity": .fillOpacity, "stroke_opacity": .strokeOpacity, "shadow_opacity": .shadowOpacity,
         "shadow_distance": .shadowDistance, "shadow_angle": .shadowAngle, "corner_radius": .cornerRadius,
+        "stretch_x": .stretchX, "stretch_y": .stretchY,
         "brightness": .brightness, "contrast": .contrast, "saturation": .saturation, "vibrance": .vibrance,
         "exposure": .exposure, "gamma": .gamma, "highlight": .highlight, "shadow": .shadow,
         "temperature": .temperature, "tint": .tint, "hue": .hue,
@@ -36,7 +37,7 @@ extension AgentToolbox {
             + "font_size（文字字号 px）、volume（音量 %，100 = 原音量）、"
             + "文字的 scale_x / scale_y 是文本框宽高（px）；stroke_width（描边 px）、stroke_softness（0~1）、bg_opacity（背景不透明 %）、"
             + "图形的 fill_opacity / stroke_opacity / shadow_opacity（%）、shadow_distance（px）、shadow_angle（度）、"
-            + "图片 / 图形的 corner_radius（圆角 px）、"
+            + "图片 / 图形的 corner_radius（圆角 px）、文字的 stretch_x / stretch_y（横向 / 纵向拉伸文字本身 %，100 = 不拉伸）、"
             + "brightness / contrast / saturation / vibrance / highlight / shadow / temperature / tint（-1~1）、"
             + "exposure（-2~2）、gamma（0.25~4，1 = 原样）、hue（-180~180）"
         return [
@@ -223,7 +224,7 @@ extension AgentToolbox {
         if c is TextClip, p == .scaleX || p == .scaleY { return v }
         switch p {
         case .offsetX, .offsetY: return posIsOffset(c) ? v / 100 - 0.5 : v / 100
-        case .scaleX, .scaleY, .opacity, .volume, .bgOpacity, .fillOpacity, .strokeOpacity, .shadowOpacity,
+        case .scaleX, .scaleY, .opacity, .volume, .bgOpacity, .fillOpacity, .strokeOpacity, .shadowOpacity, .stretchX, .stretchY,
              .cropTop, .cropBottom, .cropLeft, .cropRight: return v / 100
         default: return v   // 旋转（度）、字号（px）、调色（原值）
         }
@@ -233,7 +234,7 @@ extension AgentToolbox {
         if c is TextClip, p == .scaleX || p == .scaleY { return v }
         switch p {
         case .offsetX, .offsetY: return posIsOffset(c) ? (v + 0.5) * 100 : v * 100
-        case .scaleX, .scaleY, .opacity, .volume, .bgOpacity, .fillOpacity, .strokeOpacity, .shadowOpacity,
+        case .scaleX, .scaleY, .opacity, .volume, .bgOpacity, .fillOpacity, .strokeOpacity, .shadowOpacity, .stretchX, .stretchY,
              .cropTop, .cropBottom, .cropLeft, .cropRight: return v * 100
         default: return v
         }

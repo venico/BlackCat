@@ -434,7 +434,10 @@ private struct OverlayStack: View {
             let scale = geo.size.width / max(project.previewRenderSize.width, 1)
             if let track = project.textTracks.first(where: { $0.id == trackID }),
                track.isVisible,
-               let clip = track.clips.first(where: { $0.startTime <= clock.currentTime && $0.endTime > clock.currentTime })?.animated(atTimeline: clock.currentTime) {
+               let raw = track.clips.first(where: { $0.startTime <= clock.currentTime && $0.endTime > clock.currentTime }) {
+                let clip = raw.animated(atTimeline: clock.currentTime)
+                // 字号动画：按最大字号排版一次，再整体缩回这一刻的大小（逐帧换字号会一档一档跳）
+                let boost = raw.layoutBoost(animated: clip)
                 if project.editingTextClipID == clip.id {
                     TextEditField(text: $editText, clip: clip, scale: scale, onCommit: { commitTextEdit() })
                         .fixedSize()
@@ -448,13 +451,23 @@ private struct OverlayStack: View {
                         }
                         .position(x: geo.size.width * clip.posX, y: geo.size.height * clip.posY)
                 } else {
-                    TextLabel(clip: clip, scale: scale, selected: false, time: clock.currentTime)
+                    TextLabel(clip: clip, scale: scale * boost, selected: false, time: clock.currentTime)
                         .overlay(
                             project.selectedClipIDs.count > 1 && project.selectedClipIDs.contains(clip.id)
-                            ? Rectangle().stroke(Color.accent, lineWidth: 1.5) : nil
+                            ? Rectangle().stroke(Color.accent, lineWidth: 1.5 * boost) : nil
                         )
+                        .scaleEffect(1 / boost)
+                        // 量到的是放大排版时的尺寸（缩放不改布局），用的地方再除以这一刻的 layoutBoost。
+                        // 字号动画播放时尺寸每帧都在变，每帧写回项目会拖着整个预览重绘 —— 播放中不写，
+                        // 停下 / 拖播放头时再写（选中框、点选命中只在这时候用得到）
                         .background(GeometryReader { g in
-                            Color.clear.onChange(of: g.size) { _ in project.textClipViewSizes[clip.id] = g.size }
+                            Color.clear
+                                .onChange(of: g.size) { _ in
+                                    if boost == 1 || !clock.isPlaying { project.textClipViewSizes[clip.id] = g.size }
+                                }
+                                .onChange(of: clock.isPlaying) { playing in
+                                    if !playing { project.textClipViewSizes[clip.id] = g.size }
+                                }
                                 .onAppear { project.textClipViewSizes[clip.id] = g.size }
                         })
                         .position(x: geo.size.width * clip.posX, y: geo.size.height * clip.posY)
@@ -785,9 +798,14 @@ private struct OverlayStack: View {
                                it: Double, geo: GeometryProxy) -> some View {
         if let track = compound.textTracks.first(where: { $0.id == trackID }), track.isVisible {
             let scale = geo.size.width / max(project.previewRenderSize.width, 1)
-            let clips = track.clips.filter { $0.startTime <= it && $0.endTime > it }.map { $0.animated(atTimeline: it) }
-            ForEach(clips) { clip in
-                TextLabel(clip: clip, scale: scale, time: it)
+            let clips = track.clips.filter { $0.startTime <= it && $0.endTime > it }.map { raw -> (TextClip, CGFloat) in
+                let a = raw.animated(atTimeline: it)
+                return (a, raw.layoutBoost(animated: a))
+            }
+            ForEach(clips, id: \.0.id) { clip, boost in
+                // 字号动画同上：按最大字号排版、整体缩回
+                TextLabel(clip: clip, scale: scale * boost, time: it)
+                    .scaleEffect(1 / boost)
                     .position(x: geo.size.width * clip.posX, y: geo.size.height * clip.posY)
             }
         }
@@ -1315,7 +1333,8 @@ struct TextLabel: View {
             .cornerRadius(4 * scale)
             // 裁剪排在旋转之前：裁完再转，裁剪边跟着一起转
             .modifier(TextCropMask(clip: clip))
-            .scaleEffect(x: clip.mirrorH ? -1 : 1, y: clip.mirrorV ? -1 : 1)
+            // 镜像 + 拉伸（解开比例时的宽 / 高），都在自己的坐标轴上做，然后再转
+            .scaleEffect(x: (clip.mirrorH ? -1 : 1) * clip.sx, y: (clip.mirrorV ? -1 : 1) * clip.sy)
             .rotationEffect(.degrees(applyRotation ? clip.rotation : 0))
             // 入场动画只动画面（scaleEffect / offset 不改布局），选中框、变换框的尺寸不受影响
             .scaleEffect(anim.scale)
@@ -2622,11 +2641,14 @@ struct TextTransformOverlay: View {
                 let center = CGPoint(x: geo.size.width * clip.posX, y: geo.size.height * clip.posY)
                 // 拖过边就**以范围框为准**，裁剪框跟着它走；
                 // 没拖过才用实测尺寸（文字自适应，测出来的才准）
+                // 实测的是放大排版时的尺寸，除以这一刻的放大倍数才是看到的大小
+                let boost = project.selectedTextClip.map { $0.layoutBoost(animated: clip) } ?? 1
                 let measured = (clip.boxWidth == nil && clip.boxHeight == nil && clipOverride == nil)
-                    ? project.textClipViewSizes[clip.id] : nil
+                    ? project.textClipViewSizes[clip.id].map { CGSize(width: $0.width / boost, height: $0.height / boost) } : nil
                 let sz = measured ?? textBoundsSize(clip: clip, scale: scale)
-                let w = max(sz.width, 8)
-                let h = max(sz.height, 8)
+                // 拉伸不改排版尺寸，框按拉伸后的样子画
+                let w = max(sz.width * clip.sx, 8)
+                let h = max(sz.height * clip.sy, 8)
 
                 let editing = forceEditing || (clipOverride == nil && project.editingTextClipID == clip.id)
                 // 跟图片、图形同一个框组件。文字多的那个编辑态：
@@ -2682,9 +2704,11 @@ struct TextTransformOverlay: View {
                         let midLocal = (moving + fixed) / 2
                         let back = rotate(vertical ? 0 : midLocal,
                                           vertical ? midLocal : 0, clip.rotation)
+                        // 拖的是拉伸后的边，换回没拉伸时的长度再写文本框
+                        let local = newLen / CGFloat(vertical ? clip.sy : clip.sx)
                         update(clip.id) {
-                            if vertical { $0.boxHeight = Double(max(newLen - padV, 8) / scale) }
-                            else { $0.boxWidth = Double(max(newLen - padH, 8) / scale) }
+                            if vertical { $0.boxHeight = Double(max(local - padV, 8) / scale) }
+                            else { $0.boxWidth = Double(max(local - padH, 8) / scale) }
                             $0.posX = min(1, max(0, Double((center.x + back.x) / max(geo.size.width, 1))))
                             $0.posY = min(1, max(0, Double((center.y + back.y) / max(geo.size.height, 1))))
                         }

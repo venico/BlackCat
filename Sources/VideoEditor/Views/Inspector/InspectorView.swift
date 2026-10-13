@@ -116,30 +116,18 @@ struct InspectorView: View {
         case subtitle(SubtitleClip)
     }
 
-    /// 头部：左边是当前选中的东西叫什么，右边是删除。跟封面弹窗那套一致，
-    /// 各面板底部原来那个大红删除按钮就不用了
+    /// 头部：左边是当前选中的东西叫什么，右边是导入 / 导出（选什么片段、没选片段都在）。
+    /// 原来右边是删除片段的图标，已去掉（删除走 Delete 键、右键菜单、时间轴工具栏）
     private var header: some View {
         HStack {
             Text(tag)
                 .font(.system(size: 12, weight: .semibold))
                 .foregroundColor(Color.labelPrimary)
             Spacer()
-            if let del = deleteAction {
-                Button(action: del) {
-                    Image(nsImage: TimelineSVGIcon.load("delete"))
-                        .renderingMode(.template)
-                        .resizable()
-                        .aspectRatio(contentMode: .fit)
-                        .frame(width: 13, height: 13)
-                        .foregroundColor(Color.labelSecondary)
-                        // 图标贴右，才跟下面滑块行的右边缘齐
-                        .frame(width: 24, height: 24, alignment: .trailing)
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .help("删除")
-            }
+            ImportExportMenuButton()
         }
+        // 没有右边图标时行高会塌，标题上下跳
+        .frame(height: 24)
         // **边距不自己写死**：跟下面每一组内容走同一个容器的同一份内边距，
         // 各写各的迟早会差那么一两个点，肉眼还真看得出来
         .padding(.horizontal, ISectionMetrics.hPadding)
@@ -172,50 +160,6 @@ struct InspectorView: View {
         return "项目"
     }
 
-    /// 当前该删谁。项目设置那一档没有删除，返回 nil 就不画图标
-    private var deleteAction: (() -> Void)? {
-        // 除了文字和图形有各自的删除，其余（含多选）都走时间轴那个统一入口
-        if project.selectedClipIDs.count > 1 { return { project.deleteSelected() } }
-        if let id = project.selectedAdjustClipID { return { project.deleteAdjustClip(id: id) } }
-        if let id = project.selectedEffectClipID { return { project.deleteEffectClip(id: id) } }
-        if let id = project.selectedFilterClipID { return { project.deleteFilterClip(id: id) } }
-        if let id = project.selectedTextClipID { return { project.deleteTextClip(id: id) } }
-        if let id = project.selectedShapeClipID { return { project.deleteShapeClip(id: id) } }
-        if project.selectedImageClipID != nil || project.selectedVideoClipID != nil
-            || project.selectedAudioClipID != nil || project.selectedSubtitleClipID != nil
-            || project.selectedCompoundClipID != nil {
-            return { project.deleteSelected() }
-        }
-        // 只选着关键帧时属性区显示的是它所在的片段，删除图标照旧删这个片段
-        if let owner = project.keyframeOwnerClip {
-            return {
-                project.selectedKeyframes = []
-                project.selectedVideoClipID = owner.id
-                project.deleteSelected()
-            }
-        }
-        if let owner = project.keyframeOwnerImage {
-            return {
-                project.selectedKeyframes = []
-                project.selectedImageClipID = owner.id
-                project.deleteSelected()
-            }
-        }
-        if let owner = project.keyframeOwnerText {
-            return { project.selectedKeyframes = []; project.deleteTextClip(id: owner.id) }
-        }
-        if let owner = project.keyframeOwnerShape {
-            return { project.selectedKeyframes = []; project.deleteShapeClip(id: owner.id) }
-        }
-        if let owner = project.keyframeOwnerAudio {
-            return {
-                project.selectedKeyframes = []
-                project.selectedAudioClipID = owner.id
-                project.deleteSelected()
-            }
-        }
-        return nil
-    }
 }
 
 // MARK: - Compound
@@ -1394,26 +1338,37 @@ private struct TextInspector: View {
                 posX: Binding(get: { posX * 100 }, set: { posX = $0 / 100; write { $0.posX = posX } }),
                 posY: Binding(get: { posY * 100 }, set: { posY = $0 / 100; write { $0.posY = posY } }),
                 onCenter: { posX = 0.5; posY = 0.5; write { $0.posX = 0.5; $0.posY = 0.5 } },
-                // 解开比例时：宽高是**范围框**的像素，只改框不改字号；有字号动画时显示播放头这一刻的
+                // 解开比例时：宽 / 高拉伸文字本身。显示的是「字号比例 × 拉伸」，
+                // 刚解开时两个都等于锁着时的缩放；改宽只改横向拉伸，字号不动
                 scaleW: Binding(
-                    get: { anim.propValue(.scaleX) ?? 0 },
-                    set: { v in write { $0.boxWidth = v } }),
-                scaleH: Binding(
-                    get: { anim.propValue(.scaleY) ?? 0 },
-                    set: { v in write { $0.boxHeight = v } }),
-                lockAspect: Binding(get: { clip.lockBoxAspect },
-                                    set: { v in write { $0.lockBoxAspect = v } }),
-                scaleRange: 20...2000,
-                scaleUnit: "px",
-                // 锁着比例时是「缩放」：按比例显示（字号 ÷ 100% 那个字号），字号带着拖过边的框一起变，
-                // 跟拖四角圆点一个意思。打了关键帧时就是在播放头处记一帧
-                scaleBoth: Binding(
-                    get: { Double(anim.fontSize) / fresh.scaleRef * 100 },
+                    get: { fontPct * anim.sx * 100 },
                     set: { v in
                         project.pinTextScaleRef(id: clip.id)
-                        let cur = Double(anim.fontSize)
+                        let f = fontPct
+                        guard f > 0 else { return }
+                        write { $0.stretchX = max(0.01, v / 100 / f) }
+                    }),
+                scaleH: Binding(
+                    get: { fontPct * anim.sy * 100 },
+                    set: { v in
+                        project.pinTextScaleRef(id: clip.id)
+                        let f = fontPct
+                        guard f > 0 else { return }
+                        write { $0.stretchY = max(0.01, v / 100 / f) }
+                    }),
+                lockAspect: Binding(get: { clip.lockBoxAspect },
+                                    set: { v in write { $0.lockBoxAspect = v } }),
+                scaleRange: 5...800,
+                scaleUnit: "%",
+                // 锁着比例时是「缩放」：按比例显示（字号 ÷ 100% 那个字号，再乘横向拉伸），
+                // 拖它 = 字号带着拖过边的框一起变（拉伸比例不动），跟拖四角圆点一个意思。打了关键帧时就是在播放头处记一帧
+                scaleBoth: Binding(
+                    get: { fontPct * anim.sx * 100 },
+                    set: { v in
+                        project.pinTextScaleRef(id: clip.id)
+                        let cur = fontPct * anim.sx * 100
                         guard cur > 0 else { return }
-                        let k = fresh.scaleRef * v / 100 / cur
+                        let k = v / cur
                         write {
                             $0.fontSize = max(1, $0.fontSize * CGFloat(k))
                             if let w = $0.boxWidth { $0.boxWidth = w * k }
@@ -1476,12 +1431,15 @@ private struct TextInspector: View {
     /// 播放头这一刻的样子（范围框跟着字号动画走）
     private var anim: TextClip { fresh.animated(atTimeline: project.clock.currentTime) }
 
-    /// 锁着比例时「缩放」那一行挂字号的关键帧；解开后宽 / 高各挂自己的（范围框像素）
+    /// 锁着比例时「缩放」那一行挂字号的关键帧；解开后宽 / 高挂横向 / 纵向拉伸
     private var textKeyframeHooks: LayerKeyframeHooks {
         var h = kf.hooks
-        if fresh.lockBoxAspect { h.alias = [.scaleX: .fontSize] }
+        h.alias = fresh.lockBoxAspect ? [.scaleX: .fontSize] : [.scaleX: .stretchX, .scaleY: .stretchY]
         return h
     }
+
+    /// 播放头这一刻的字号比例（1 = 100%）
+    private var fontPct: Double { Double(anim.fontSize) / fresh.scaleRef }
 
     private var kf: KeyframeControls {
         KeyframeControls(project: project, clip: clip, easingOpen: $easingOpen)
@@ -3687,6 +3645,8 @@ struct MiniStepper: View {
     var decimals: Int = 0
     var minValue: Double = 0
     var maxValue: Double = .infinity
+    /// 数字后面的单位（比如 s），在输入框里、颜色比数字淡
+    var unit: String? = nil
 
     @State private var editText: String = ""
     @FocusState private var isFocused: Bool
@@ -3714,6 +3674,13 @@ struct MiniStepper: View {
                         if justSubmitted { justSubmitted = false } else { applyText() }
                     }
                 }
+
+            if let unit {
+                Text(unit)
+                    .font(.system(size: 11))
+                    .foregroundColor(Color.labelSecondary)
+                    .padding(.trailing, 2)
+            }
 
             Rectangle().fill(Color.white.opacity(0.12)).frame(width: 1, height: 18)
 

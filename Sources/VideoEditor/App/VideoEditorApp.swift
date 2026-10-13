@@ -118,6 +118,23 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate 
         fullScreen.keyEquivalentModifierMask = [.command, .control]
         windowMenu.addItem(fullScreen)
         windowMenu.addItem(.separator())
+        // 布局：AI 创作那一列放左边还是右边（所有窗口一起变，记住选择）
+        let layoutMenu = NSMenu(title: "布局")
+        let aiLeft = NSMenuItem(title: "AI 创作在左侧", action: #selector(setAIPanelLeft), keyEquivalent: "")
+        aiLeft.target = self
+        let aiRight = NSMenuItem(title: "AI 创作在右侧", action: #selector(setAIPanelRight), keyEquivalent: "")
+        aiRight.target = self
+        layoutMenu.addItem(aiLeft)
+        layoutMenu.addItem(aiRight)
+        layoutMenu.addItem(.separator())
+        // 竖屏模式：一次性调好——当前项目比例改成 9:16，素材区拉宽、预览收窄到刚好装下竖屏画面（之后照常能拖）
+        let portrait = NSMenuItem(title: "竖屏模式", action: #selector(applyPortraitLayout), keyEquivalent: "")
+        portrait.target = self
+        layoutMenu.addItem(portrait)
+        let layoutItem = NSMenuItem(title: "布局", action: nil, keyEquivalent: "")
+        layoutItem.submenu = layoutMenu
+        windowMenu.addItem(layoutItem)
+        windowMenu.addItem(.separator())
         windowMenu.addItem(withTitle: "前置全部窗口", action: #selector(NSApplication.arrangeInFront(_:)), keyEquivalent: "")
         mainMenu.addItem(windowItem)
 
@@ -132,7 +149,19 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate 
         for item in menu.items where item.action == #selector(doToggleFullScreen) {
             item.title = isFS ? "退出全屏幕" : "进入全屏幕"
         }
+        // 布局子菜单：当前那一项打勾
+        if let layout = menu.items.first(where: { $0.title == "布局" })?.submenu {
+            let right = AppSettings.shared.aiPanelOnRight
+            for item in layout.items {
+                if item.action == #selector(setAIPanelLeft) { item.state = right ? .off : .on }
+                if item.action == #selector(setAIPanelRight) { item.state = right ? .on : .off }
+            }
+        }
     }
+
+    @objc func setAIPanelLeft() { AppSettings.shared.aiPanelOnRight = false }
+    @objc func setAIPanelRight() { AppSettings.shared.aiPanelOnRight = true }
+    @objc func applyPortraitLayout() { Task { @MainActor in MenuCommand.portraitLayout.postToActive() } }
 
     public func menuWillOpen(_ menu: NSMenu) {
         cleanupMenu(menu)
@@ -326,7 +355,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate 
     @objc private func showAbout() {
         NSApp.orderFrontStandardAboutPanel(options: [
             .applicationName: "黑猫剪辑",
-            .applicationVersion: "6.8.2",
+            .applicationVersion: "6.9.0",
             .version: "",
             .credits: NSAttributedString(string: "")
         ])

@@ -337,6 +337,8 @@ extension WindowManager: NSWindowDelegate {
 enum MenuCommand: String {
     case newProject, openProject, openProjectFile, saveProject
     case importFiles, exportVideo
+    /// 窗口 → 布局 → 竖屏模式
+    case portraitLayout
 
     var notificationName: Notification.Name { .init("menu.\(rawValue)") }
 

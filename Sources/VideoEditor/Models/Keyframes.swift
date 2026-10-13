@@ -124,6 +124,8 @@ enum KeyframeProp: String, CaseIterable, Codable {
     case fillOpacity, strokeOpacity, shadowOpacity, shadowDistance, shadowAngle
     /// 圆角（px）。图片、图形
     case cornerRadius
+    /// 文字横向 / 纵向拉伸（1 = 100%）。文字解开比例时的宽 / 高
+    case stretchX, stretchY
 
     /// 值是打包颜色、要按通道插值的属性
     var isColor: Bool { [.textColor, .strokeColor, .bgColor, .fillColor, .shadowColor].contains(self) }
@@ -511,7 +513,8 @@ extension KeyframeInPoint {
 
 extension TextClip: KeyframeInPoint {
     /// 文字锁着比例时的缩放就是字号动画（属性区挂在「缩放」那一行），范围框宽高跟着字号同比例走；
-    /// 解开比例时宽 / 高（`scaleX` / `scaleY`）是范围框像素，可以各自打关键帧
+    /// 解开比例时宽 / 高拉伸文字本身（`stretchX` / `stretchY`）。
+    /// `scaleX` / `scaleY` 仍是范围框像素（属性区不再显示，v6.8.1 存下的关键帧和 Agent 还能用）
     var lockAspect: Bool { false }
 
     /// 字号这一刻相对静态字号的倍数（没有字号关键帧是 1）
@@ -544,8 +547,20 @@ extension TextClip: KeyframeInPoint {
         switch p {
         case .scaleX: boxWidth = base.boxWidth
         case .scaleY: boxHeight = base.boxHeight
+        case .stretchX: stretchX = base.stretchX
+        case .stretchY: stretchY = base.stretchY
         default:      if let v = base.propValue(p) { setPropValue(p, v) }
         }
+    }
+
+    /// 字号动画时的排版放大倍数：按关键帧里**最大**的字号排一次版，画的时候整体缩回这一刻的大小。
+    /// 逐帧换字号重新排版，字形和行高会对齐到整像素，大小是一档一档跳的（看着一顿一顿）；
+    /// 字号固定、只做整体缩放就是平滑的，而且只缩不放，字一直清晰。没有字号关键帧是 1。
+    /// `a` 是这一刻的样子（`animated` 之后的）
+    func layoutBoost(animated a: TextClip) -> CGFloat {
+        guard let fs = keyframes?.frames(.fontSize), !fs.isEmpty, a.fontSize > 0,
+              let maxF = fs.map(\.value).max(), maxF > 0 else { return 1 }
+        return CGFloat(maxF) / a.fontSize
     }
 
     /// 文字按自己撑开时的大小（渲染坐标，不含外圈留白）。范围框没定死时打关键帧拿它当起始值
@@ -569,6 +584,8 @@ extension TextClip: KeyframeInPoint {
         case .strokeWidth: return strokeWidth
         case .strokeSoftness: return strokeSoftness
         case .bgOpacity:  return bgOpacity
+        case .stretchX:   return sx
+        case .stretchY:   return sy
         case .offsetX:    return posX
         case .offsetY:    return posY
         case .angle:      return rotation
@@ -592,6 +609,8 @@ extension TextClip: KeyframeInPoint {
         case .strokeWidth: strokeWidth = max(0, v)
         case .strokeSoftness: strokeSoftness = min(1, max(0, v))
         case .bgOpacity:  bgOpacity = min(1, max(0, v))
+        case .stretchX:   stretchX = max(0.01, v)
+        case .stretchY:   stretchY = max(0.01, v)
         case .offsetX:    posX = v
         case .offsetY:    posY = v
         case .angle:      rotation = v
