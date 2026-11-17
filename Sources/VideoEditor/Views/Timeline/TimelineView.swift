@@ -4031,6 +4031,8 @@ private struct VideoClipView: View {
             // Selection border
             RoundedRectangle(cornerRadius:6)
                 .stroke(sel ? Color.white : Color.clear, lineWidth: sel ? 2 : 0)
+                    // 选中线加一圈轻投影：画面是白的时白线也看得清
+                    .shadow(color: .black.opacity(sel ? 0.6 : 0), radius: 1.5)
             // Name label — sticky to viewport left edge，太窄就整行不画
             if w > TimelineClipMetrics.labelMinWidth {
                 HStack(spacing: 3) {
@@ -4268,6 +4270,8 @@ private struct ImageClipView: View {
             }
             RoundedRectangle(cornerRadius:6)
                 .stroke(sel ? Color.white : Color.clear, lineWidth: sel ? 2 : 0)
+                    // 选中线加一圈轻投影：画面是白的时白线也看得清
+                    .shadow(color: .black.opacity(sel ? 0.6 : 0), radius: 1.5)
             if w > TimelineClipMetrics.labelMinWidth {
                 HStack(spacing: 3) {
                     if isRenaming {
@@ -4366,6 +4370,8 @@ private struct AudioClipView: View {
                     .clipShape(RoundedRectangle(cornerRadius: 6))
             }
             RoundedRectangle(cornerRadius:6).stroke(sel ? Color.white : Color.clear, lineWidth: sel ? 2 : 0)
+                    // 选中线加一圈轻投影：画面是白的时白线也看得清
+                    .shadow(color: .black.opacity(sel ? 0.6 : 0), radius: 1.5)
             if w > TimelineClipMetrics.labelMinWidth {
                 HStack(spacing: 3) {
                     if isRenaming {
@@ -4535,7 +4541,9 @@ private struct SubtitleClipView: View {
             RoundedRectangle(cornerRadius:6)
                 .fill(Color(hex:"#7B6FC4").opacity(isPlaceholder ? 0.35 : 0.85))
                 .overlay(RoundedRectangle(cornerRadius:6)
-                    .stroke(sel ? Color.white : Color(hex:"#9B8FD4").opacity(0.4), lineWidth: 1))
+                    .stroke(sel ? Color.white : Color(hex:"#9B8FD4").opacity(0.4), lineWidth: 1)
+                    // 选中线加一圈轻投影：画面是白的时白线也看得清
+                    .shadow(color: .black.opacity(sel ? 0.6 : 0), radius: 1.5))
             if !isPlaceholder && w > TimelineClipMetrics.labelMinWidth {
                 HStack(spacing: 3) {
                     Text(clip.text.components(separatedBy:"\n").first ?? clip.text)
@@ -4588,7 +4596,9 @@ private struct TextClipView: View {
             RoundedRectangle(cornerRadius:6)
                 .fill(Color(hex:"#D4668E").opacity(0.85))
                 .overlay(RoundedRectangle(cornerRadius:6)
-                    .stroke(sel ? Color.white : Color(hex:"#E088A8").opacity(0.4), lineWidth: 1))
+                    .stroke(sel ? Color.white : Color(hex:"#E088A8").opacity(0.4), lineWidth: 1)
+                    // 选中线加一圈轻投影：画面是白的时白线也看得清
+                    .shadow(color: .black.opacity(sel ? 0.6 : 0), radius: 1.5))
             if w > TimelineClipMetrics.labelMinWidth {
                 HStack(spacing: 3) {
                     Text(clip.text.components(separatedBy:"\n").first ?? clip.text)
@@ -4631,7 +4641,9 @@ private struct ShapeTimelineClipView: View {
             RoundedRectangle(cornerRadius:6)
                 .fill(Color(hex:"#5B8FF9").opacity(0.85))
                 .overlay(RoundedRectangle(cornerRadius:6)
-                    .stroke(sel ? Color.white : Color(hex:"#8AB4FF").opacity(0.4), lineWidth: 1))
+                    .stroke(sel ? Color.white : Color(hex:"#8AB4FF").opacity(0.4), lineWidth: 1)
+                    // 选中线加一圈轻投影：画面是白的时白线也看得清
+                    .shadow(color: .black.opacity(sel ? 0.6 : 0), radius: 1.5))
             if w > TimelineClipMetrics.labelMinWidth {
                 HStack(spacing: 3) {
                     Text(clip.type.label)
@@ -4768,6 +4780,8 @@ private struct CompoundClipView: View {
         .overlay(
             RoundedRectangle(cornerRadius: 6)
                 .stroke(sel ? Color.white : Color.clear, lineWidth: sel ? 1 : 0)
+                    // 选中线加一圈轻投影：画面是白的时白线也看得清
+                    .shadow(color: .black.opacity(sel ? 0.6 : 0), radius: 1.5)
         )
         .opacity(isDragging ? 0 : 1.0)
         .offset(x: clip.startTime * pps + 1)
@@ -6384,6 +6398,7 @@ private struct ClipMissingOverlay: View {
                 if selected {
                     RoundedRectangle(cornerRadius: 6)
                         .strokeBorder(Color.white, lineWidth: 1)
+                        .shadow(color: .black.opacity(0.6), radius: 1.5)
                 }
                 Button { relinkAssetWithPanel(assetID, project: project) } label: {
                     HStack(spacing: 3) {
@@ -6435,7 +6450,9 @@ private struct EffectTimelineClipView: View {
             RoundedRectangle(cornerRadius: 6)
                 .fill(Color(hex: "#C97BB0").opacity(0.85))
                 .overlay(RoundedRectangle(cornerRadius: 6)
-                    .stroke(sel ? Color.white : Color(hex: "#E29FCC").opacity(0.4), lineWidth: 1))
+                    .stroke(sel ? Color.white : Color(hex: "#E29FCC").opacity(0.4), lineWidth: 1)
+                    // 选中线加一圈轻投影：画面是白的时白线也看得清
+                    .shadow(color: .black.opacity(sel ? 0.6 : 0), radius: 1.5))
             if w > TimelineClipMetrics.labelMinWidth {
                 HStack(spacing: 3) {
                     Image(nsImage: SidebarSVGIcon.load("effect", size: 9))
@@ -6481,7 +6498,9 @@ private struct AdjustTimelineClipView: View {
             RoundedRectangle(cornerRadius: 6)
                 .fill(Color(hex: "#7E8FD6").opacity(0.85))
                 .overlay(RoundedRectangle(cornerRadius: 6)
-                    .stroke(sel ? Color.white : Color(hex: "#9FAEE8").opacity(0.4), lineWidth: 1))
+                    .stroke(sel ? Color.white : Color(hex: "#9FAEE8").opacity(0.4), lineWidth: 1)
+                    // 选中线加一圈轻投影：画面是白的时白线也看得清
+                    .shadow(color: .black.opacity(sel ? 0.6 : 0), radius: 1.5))
             if w > TimelineClipMetrics.labelMinWidth {
                 HStack(spacing: 3) {
                     Image(nsImage: SidebarSVGIcon.load("adjust", size: 9))
@@ -6527,7 +6546,9 @@ private struct FilterTimelineClipView: View {
             RoundedRectangle(cornerRadius: 6)
                 .fill(Color(hex: "#3F8F6B").opacity(0.85))
                 .overlay(RoundedRectangle(cornerRadius: 6)
-                    .stroke(sel ? Color.white : Color(hex: "#6FBF8F").opacity(0.4), lineWidth: 1))
+                    .stroke(sel ? Color.white : Color(hex: "#6FBF8F").opacity(0.4), lineWidth: 1)
+                    // 选中线加一圈轻投影：画面是白的时白线也看得清
+                    .shadow(color: .black.opacity(sel ? 0.6 : 0), radius: 1.5))
             if w > TimelineClipMetrics.labelMinWidth {
                 HStack(spacing: 3) {
                     Image(nsImage: SidebarSVGIcon.load("filter", size: 9))
